@@ -54,6 +54,25 @@ die()      { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
 
 has_cmd() { command -v "$1" >/dev/null 2>&1; }
 
+# Node.js range the dashboard toolchain supports. Keep this in step with
+# "engines" in dashboard/package.json: Vite 8 needs ^20.19.0 || >=22.12.0 and
+# Vitest 5 needs ^22.12.0 || ^24.0.0 || >=26.0.0; this is their intersection.
+DASHBOARD_NODE_RANGE='^22.12.0 || ^24.0.0 || >=26.0.0'
+
+# Succeeds when the node on PATH satisfies DASHBOARD_NODE_RANGE.
+node_version_supported() {
+    node_v=$(node --version 2>/dev/null) || return 1
+    node_v=${node_v#v}
+    node_major=${node_v%%.*}
+    node_rest=${node_v#*.}
+    node_minor=${node_rest%%.*}
+    case "$node_major" in '' | *[!0-9]*) return 1 ;; esac
+    case "$node_minor" in '' | *[!0-9]*) return 1 ;; esac
+    if [ "$node_major" -eq 22 ] && [ "$node_minor" -ge 12 ]; then return 0; fi
+    if [ "$node_major" -eq 24 ] || [ "$node_major" -ge 26 ]; then return 0; fi
+    return 1
+}
+
 SUDO=""
 if [ "$(id -u)" -ne 0 ]; then
     if has_cmd sudo; then
@@ -265,6 +284,10 @@ verify_environment() {
     if [ "$SKIP_NODE" -eq 0 ]; then
         if has_cmd node; then
             log_info "node:   $(node --version)"
+            if ! node_version_supported; then
+                log_warn "Node.js $(node --version) is outside the dashboard's supported range (${DASHBOARD_NODE_RANGE})."
+                log_warn "npm install in dashboard/ will refuse it. Distribution packages are often too old (Ubuntu 24.04 ships Node.js 18); install a supported release from https://nodejs.org/en/download (NodeSource packages or nvm)."
+            fi
         else
             log_warn "node not found on PATH; dashboard build will not work."
         fi
@@ -310,7 +333,7 @@ Build with Meson:
     meson compile -C builddir-release
     meson test    -C builddir-release --print-errorlogs
 
-Dashboard:
+Dashboard (needs Node.js ${DASHBOARD_NODE_RANGE}):
     cd dashboard && npm install && npm run build && npm test
 
 If you installed Meson via pip --user, open a new shell or add
