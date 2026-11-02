@@ -491,6 +491,9 @@ void Agent::handle_command(const CommandMessage& cmd)
         collectors_.emplace_back(std::make_unique<NetworkCollector>());
         {
             auto lc = std::make_unique<LogCollector>();
+            // SEC-10: without the allowlist the new collector would stay
+            // fail-closed and log monitoring would silently stop.
+            lc->set_allowed_dirs(parse_log_allowed_dirs_from_env());
             log_collector_ = lc.get();
             collectors_.emplace_back(std::move(lc));
         }

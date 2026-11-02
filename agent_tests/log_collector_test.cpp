@@ -4,7 +4,16 @@
 
 #include <filesystem>
 #include <fstream>
+#include <random>
+#include <sstream>
+#include <stdexcept>
 #include <string>
+#include <vector>
+
+#ifndef _WIN32
+#include <cstdlib>
+#include <unistd.h>
+#endif
 
 using namespace thewatcher;
 using namespace thewatcher::agent;
@@ -12,9 +21,47 @@ using namespace thewatcher::agent;
 namespace
 {
 
+// Per-process scratch directory: unique random name (mkdtemp on POSIX) and
+// owner-only permissions, so the tests never trust a fixed, guessable path in
+// the publicly writable system temp directory. Removed at process exit.
+const std::filesystem::path& scratch_root()
+{
+    struct Scratch
+    {
+        std::filesystem::path dir;
+
+        Scratch()
+        {
+#ifdef _WIN32
+            std::random_device rd;
+            std::ostringstream name;
+            name << "thewatcher-log-tests-" << std::hex << rd() << rd();
+            dir = std::filesystem::temp_directory_path() / name.str();
+            std::filesystem::create_directories(dir);
+#else
+            auto tmpl = (std::filesystem::temp_directory_path() / "thewatcher-log-tests-XXXXXX").string();
+            if (::mkdtemp(tmpl.data()) == nullptr)
+                throw std::runtime_error("mkdtemp failed");
+            dir = tmpl;
+#endif
+            std::filesystem::permissions(dir, std::filesystem::perms::owner_all, std::filesystem::perm_options::replace);
+            // Canonical so expectations hold where the temp dir is itself a symlink (macOS /var).
+            dir = std::filesystem::canonical(dir);
+        }
+
+        ~Scratch()
+        {
+            std::error_code ec;
+            std::filesystem::remove_all(dir, ec);
+        }
+    };
+    static const Scratch scratch;
+    return scratch.dir;
+}
+
 std::filesystem::path temp_log_path(const char* name)
 {
-    auto dir = std::filesystem::temp_directory_path() / "thewatcher-log-tests";
+    auto dir = scratch_root() / "logs";
     std::filesystem::create_directories(dir);
     auto path = dir / name;
     std::filesystem::remove(path);
@@ -41,6 +88,13 @@ void write_lines(const std::filesystem::path& p, const std::vector<std::string>&
         f << line << '\n';
 }
 
+// Appends bytes exactly as given (no trailing newline added).
+void append_raw(const std::filesystem::path& p, const std::string& text)
+{
+    std::ofstream f(p, std::ios::app | std::ios::binary);
+    f << text;
+}
+
 void overwrite_lines(const std::filesystem::path& p, const std::vector<std::string>& lines)
 {
     std::ofstream f(p, std::ios::trunc);
@@ -52,7 +106,7 @@ void overwrite_lines(const std::filesystem::path& p, const std::vector<std::stri
 // shared test directory for these behavioural tests.
 void allow_test_logs_dir(LogCollector& collector)
 {
-    collector.set_allowed_dirs({std::filesystem::temp_directory_path() / "thewatcher-log-tests"});
+    collector.set_allowed_dirs({scratch_root() / "logs"});
 }
 
 } // namespace
@@ -403,6 +457,110 @@ SCENARIO("set_configs removes file state for paths that are no longer configured
                     if (m.indicator_name == "log:a")
                         has_a = true;
                 REQUIRE_FALSE(has_a);
+            }
+        }
+    }
+}
+
+// ── Partial lines ─────────────────────────────────────────────────────────────
+//
+// Only '\n'-terminated lines are matched. An unterminated trailing line is
+// held back and read again, whole, once the writer finishes it.
+
+SCENARIO("LogCollector does not lose a line that was still being written when it was polled")
+{
+    GIVEN("a log file ending in an unterminated line")
+    {
+        LogCollector collector;
+        allow_test_logs_dir(collector);
+        auto path = temp_log_path("partial.log");
+        write_lines(path, {"INFO started"});
+        append_raw(path, "ERROR partial");
+        collector.set_configs({make_config(path.string(), "ERROR")});
+
+        WHEN("tick() is called before the line is completed")
+        {
+            collector.tick();
+
+            THEN("the incomplete line is not matched yet")
+            {
+                REQUIRE(collector.take_matches().empty());
+            }
+
+            AND_WHEN("the writer finishes the line and tick() is called again")
+            {
+                append_raw(path, " match\n");
+                collector.tick();
+                auto matches = collector.take_matches();
+
+                THEN("the full line is matched exactly once")
+                {
+                    REQUIRE(matches.size() == 1);
+                    REQUIRE(matches[0].matched_line == "ERROR partial match");
+                }
+
+                AND_THEN("a further tick does not match it again")
+                {
+                    collector.tick();
+                    REQUIRE(collector.take_matches().empty());
+                }
+            }
+        }
+
+        WHEN("tick() is called repeatedly while the line stays unterminated")
+        {
+            collector.tick();
+            collector.tick();
+            collector.tick();
+
+            THEN("nothing is matched and nothing breaks")
+            {
+                REQUIRE(collector.take_matches().empty());
+            }
+        }
+    }
+}
+
+SCENARIO("LogCollector matches a line that straddles the per-tick byte cap exactly once")
+{
+    GIVEN("1023 filler lines of 1 KiB followed by a 2000-byte matching line and a short matching line")
+    {
+        LogCollector collector;
+        allow_test_logs_dir(collector);
+        auto path = temp_log_path("straddle.log");
+
+        // 1023 * 1024 bytes = 1 MiB - 1 KiB, so the 1 MiB cap lands inside the long line.
+        std::string contents;
+        for (int i = 0; i < 1023; ++i)
+            contents += std::string(1023, 'x') + "\n";
+        const std::string straddling = "ERROR straddle" + std::string(1986, 'y');
+        contents += straddling + "\nERROR after\n";
+        append_raw(path, contents);
+        collector.set_configs({make_config(path.string(), "ERROR")});
+
+        WHEN("tick() is called twice")
+        {
+            collector.tick();
+            auto first = collector.take_matches();
+            collector.tick();
+            auto second = collector.take_matches();
+
+            THEN("the first tick stops before the straddling line")
+            {
+                REQUIRE(first.empty());
+            }
+
+            AND_THEN("the second tick matches the whole straddling line and the next line")
+            {
+                REQUIRE(second.size() == 2);
+                REQUIRE(second[0].matched_line == straddling);
+                REQUIRE(second[1].matched_line == "ERROR after");
+            }
+
+            AND_THEN("a third tick produces nothing further")
+            {
+                collector.tick();
+                REQUIRE(collector.take_matches().empty());
             }
         }
     }

@@ -40,7 +40,9 @@ public:
     // SEC-10: agent-local allowlist of directories the log monitor may read.
     // Wired from the LOG_ALLOWED_DIRS environment variable by the Agent —
     // the server has no way to change it. While empty (the default) every
-    // configured path is denied: fail closed.
+    // configured path is denied: fail closed. Entries are canonicalized here
+    // (symlinks, "..", macOS /var -> /private/var, ...) so they compare
+    // against resolved file paths; entries that cannot be resolved are dropped.
     void set_allowed_dirs(std::vector<std::filesystem::path> dirs);
 
     // Poll each configured file for new lines, apply patterns, accumulate matches.
@@ -52,8 +54,11 @@ public:
 private:
     struct FileState
     {
-        int64_t inode = -1; // -1 = file not yet seen
-        int64_t offset = 0;
+        int64_t inode = -1; // file identity (inode / NTFS file index); -1 = file not yet seen
+        int64_t offset = 0; // start of the first byte not yet fully processed
+        // True while the rest of an over-long line is being dropped: the
+        // truncated prefix was already evaluated, so only skip to the next '\n'.
+        bool discarding = false;
     };
 
     std::vector<LogMonitorConfig> configs_;
