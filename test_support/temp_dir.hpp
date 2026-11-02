@@ -1,11 +1,13 @@
 // Shared scratch-directory helper for the test suites.
 //
-// Tests must never build temp paths themselves from a predictable name in the
-// (typically world-writable) system temp directory: another local user could
-// pre-create or swap such a path. ScopedTempDir creates a uniquely named,
-// owner-only directory atomically and removes it recursively on destruction.
+// Tests must never build temp paths from a predictable name in a
+// world-writable directory such as /tmp: another local user could pre-create
+// or swap such a path. ScopedTempDir creates a uniquely named, owner-only
+// directory atomically and removes it recursively on destruction.
 //
-// This is the one place in the test code that queries the system temp directory.
+// The scratch base is ".tmp/" under the current working directory (the build
+// directory under `meson test`; ".tmp/" is git-ignored), not the system temp
+// directory, so scratch data never lives in a publicly writable location.
 #pragma once
 
 #include <cstdio>
@@ -30,16 +32,17 @@ public:
     explicit ScopedTempDir(const std::string& prefix = "thewatcher-test")
     {
         namespace fs = std::filesystem;
-        const fs::path base = fs::temp_directory_path();
+        const fs::path base = fs::current_path() / ".tmp";
+        fs::create_directories(base);
 #ifdef _WIN32
         // No mkdtemp: pick a random 64-bit suffix and let create_directory
         // fail on collisions (it reports false if the path already exists).
-        std::random_device rd;
-        std::mt19937_64 rng((static_cast<unsigned long long>(rd()) << 32) ^ rd());
+        std::random_device rd; // non-deterministic source; no seeded PRNG
         for (int attempt = 0; attempt < 16; ++attempt)
         {
+            const auto value = (static_cast<unsigned long long>(rd()) << 32) ^ static_cast<unsigned long long>(rd());
             char suffix[17];
-            std::snprintf(suffix, sizeof(suffix), "%016llx", static_cast<unsigned long long>(rng()));
+            std::snprintf(suffix, sizeof(suffix), "%016llx", value);
             const fs::path candidate = base / (prefix + "-" + suffix);
             if (fs::create_directory(candidate))
             {

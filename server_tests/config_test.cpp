@@ -234,7 +234,7 @@ SCENARIO("Server config TRUSTED_PROXIES round-trips and is parsed leniently")
         auto path = dir / "server.conf";
         {
             std::ofstream f(path);
-            f << "TRUSTED_PROXIES= 10.0.0.1 ,, 192.168.1.5,\t,::1 ,\n";
+            f << "TRUSTED_PROXIES= 192.0.2.1 ,, 198.51.100.5,\t,::1 ,\n";
         }
 
         WHEN("the config is loaded")
@@ -243,7 +243,7 @@ SCENARIO("Server config TRUSTED_PROXIES round-trips and is parsed leniently")
 
             THEN("entries are trimmed and empty ones skipped")
             {
-                REQUIRE(cfg.trusted_proxies == std::vector<std::string>{"10.0.0.1", "192.168.1.5", "::1"});
+                REQUIRE(cfg.trusted_proxies == std::vector<std::string>{"192.0.2.1", "198.51.100.5", "::1"});
             }
         }
     }
@@ -254,7 +254,7 @@ SCENARIO("Server config TRUSTED_PROXIES round-trips and is parsed leniently")
         auto path = dir / "server.conf";
 
         ServerConfig original = ServerConfig::load_or_create(path);
-        original.trusted_proxies = {"127.0.0.1", "10.1.2.3"};
+        original.trusted_proxies = {"127.0.0.1", "203.0.113.3"};
         original.save(path);
 
         WHEN("the config is reloaded")
@@ -264,7 +264,7 @@ SCENARIO("Server config TRUSTED_PROXIES round-trips and is parsed leniently")
             THEN("the proxy list is preserved in order")
             {
                 REQUIRE(reloaded.trusted_proxies == original.trusted_proxies);
-                REQUIRE(read_file(path).find("TRUSTED_PROXIES=127.0.0.1,10.1.2.3\n") != std::string::npos);
+                REQUIRE(read_file(path).find("TRUSTED_PROXIES=127.0.0.1,203.0.113.3\n") != std::string::npos);
             }
         }
 

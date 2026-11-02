@@ -9,7 +9,6 @@
 #include <cstdio>
 #include <cstring>
 #include <fstream>
-#include <random>
 #include <sstream>
 #include <stdexcept>
 #include <system_error>
@@ -18,8 +17,10 @@
 #include <vector>
 
 #ifdef _WIN32
-#include <shlobj.h>
 #include <windows.h>
+// windows.h first: sddl.h and shlobj.h depend on its declarations.
+#include <sddl.h>
+#include <shlobj.h>
 #else
 #include <fcntl.h>
 #include <pwd.h>
@@ -162,26 +163,41 @@ namespace
         const fs::path dir = target.has_parent_path() ? target.parent_path() : fs::path(".");
         const std::string base = target.filename().string() + ".tmp.";
 
-        std::random_device rd;
-        std::mt19937_64 rng((static_cast<std::uint64_t>(rd()) << 32) ^ rd());
+        // Owner-only from creation, independent of the parent directory ACL
+        // (which is only restricted when the installer created it): protected
+        // DACL (no inheritance) granting full access to SYSTEM, Administrators
+        // and the file's owner (OWNER RIGHTS), so a server run by hand under a
+        // normal account can still read its own config. MoveFileExW keeps this
+        // DACL when it replaces the target.
+        SECURITY_ATTRIBUTES sa{};
+        sa.nLength = sizeof(sa);
+        sa.bInheritHandle = FALSE;
+        if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(L"D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;OW)",
+                                                                  SDDL_REVISION_1, &sa.lpSecurityDescriptor, nullptr))
+            throw std::runtime_error("Cannot build security descriptor for " + target.string());
 
         HANDLE h = INVALID_HANDLE_VALUE;
+        DWORD create_error = ERROR_SUCCESS;
         fs::path tmp;
         for (int attempt = 0; attempt < 16; ++attempt)
         {
+            // Unpredictable name from the OS CSPRNG (libsodium).
+            std::uint64_t r = 0;
+            randombytes_buf(&r, sizeof(r));
             char suffix[17];
-            std::snprintf(suffix, sizeof(suffix), "%016llx", static_cast<unsigned long long>(rng()));
+            std::snprintf(suffix, sizeof(suffix), "%016llx", static_cast<unsigned long long>(r));
             tmp = dir / (base + suffix);
             // CREATE_NEW fails if the name exists (including as a symlink or
-            // junction), so an attacker cannot pre-plant the temp file. No
-            // explicit security descriptor: the file inherits the config
-            // directory ACL, which the installer limits to SYSTEM/Administrators.
-            h = CreateFileW(tmp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
-            if (h != INVALID_HANDLE_VALUE || GetLastError() != ERROR_FILE_EXISTS)
+            // junction), so an attacker cannot pre-plant the temp file.
+            h = CreateFileW(tmp.c_str(), GENERIC_WRITE, 0, &sa, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
+            create_error = (h == INVALID_HANDLE_VALUE) ? GetLastError() : ERROR_SUCCESS;
+            if (h != INVALID_HANDLE_VALUE || create_error != ERROR_FILE_EXISTS)
                 break;
         }
+        LocalFree(sa.lpSecurityDescriptor);
         if (h == INVALID_HANDLE_VALUE)
-            throw std::runtime_error("Cannot create temporary file beside " + target.string());
+            throw std::runtime_error("Cannot create temporary file beside " + target.string() +
+                                     " (error " + std::to_string(create_error) + ")");
 
         bool ok = true;
         const char* p = content.data();

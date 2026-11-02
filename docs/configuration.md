@@ -60,9 +60,10 @@ owner-only (`0600` on POSIX) and then renames it over the config, so an
 interrupted write never truncates the previous config and the secret key is
 never readable by other users. A missing config directory is created
 owner-only (`0700`); a directory that already exists is left unchanged. On
-Windows the temporary file is created exclusively and swapped in with
-`MoveFileExW(MOVEFILE_REPLACE_EXISTING)`, and access is governed by the
-directory ACL set by the installer.
+Windows the temporary file is created exclusively with its own protected ACL
+(SYSTEM, Administrators and the file's owner only), so it does not depend on
+the directory ACL. It is then swapped in with
+`MoveFileExW(MOVEFILE_REPLACE_EXISTING)`, which keeps that ACL.
 
 ## Server Database Settings
 
