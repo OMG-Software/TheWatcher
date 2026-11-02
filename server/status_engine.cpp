@@ -526,7 +526,7 @@ void StatusEngine::record_transition(const std::string& agent_id, const std::str
             alert.new_status = status_to_string(next);
             alert.message = final_message;
             alert.created_at = timestamp_ms;
-            const auto runbook = store_.get_runbook(indicator, alert.new_status);
+            const auto runbook = store_.get_runbook(agent_id, indicator, alert.new_status);
             if (runbook)
                 alert.runbook_url = runbook->url;
             const auto alert_id = store_.insert_alert(alert);

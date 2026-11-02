@@ -77,7 +77,9 @@ entries below call those out explicitly.
   monitors unchanged; adding, changing or removing log monitors needs a
   global admin (SEC-10).
 - Per-agent history, agent-scoped runbooks and view `agent_ids` now enforce
-  group scoping like the rest of the per-agent API (SEC-11).
+  group scoping like the rest of the per-agent API. Alerts attach only the
+  alerting agent's own runbook or a generic one, never a runbook scoped to
+  another agent (SEC-11).
 - Login rate limiting now uses a fixed window that resets on expiry — the
   lockout re-arms instead of allowing unlimited guessing after the first
   15 minutes. The per-account lockout is keyed by client address and
@@ -112,6 +114,10 @@ entries below call those out explicitly.
 
 ### Fixed
 
+- The data-plane ROUTER drops a message with fewer parts than
+  `[identity][empty][payload]` instead of blocking on a receive for the
+  missing part, which stalled enrollment, command dispatch and offline
+  checks until the next message arrived.
 - The API server binds its port before `start()` returns, so the first
   request after startup no longer races the listener. If the bind fails,
   server startup now fails instead of reporting a REST API that is not

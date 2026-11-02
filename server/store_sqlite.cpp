@@ -1699,20 +1699,26 @@ void SqliteStore::delete_runbook(int64_t runbook_id)
     check(sqlite3_step(st.s), db_, "step delete_runbook");
 }
 
-std::optional<RunbookRecord> SqliteStore::get_runbook(const std::string& indicator, const std::string& status)
+std::optional<RunbookRecord> SqliteStore::get_runbook(const std::string& agent_id, const std::string& indicator,
+                                                     const std::string& status)
 {
-    // Prefer exact indicator match over wildcard '*'; limit to 1.
+    // SEC-11: only this agent's runbooks or generic ones (agent_id='') may be
+    // attached, so an alert never carries another agent's runbook URL. Prefer
+    // an exact indicator over '*', then an agent-specific runbook over a
+    // generic one, then the newest; limit to 1.
     Stmt st;
     check(sqlite3_prepare_v2(db_,
                              "SELECT runbook_id,agent_id,indicator,status,url,markdown,notes,created_by,created_at "
                              "FROM runbooks "
-                             "WHERE (indicator=? OR indicator='*') AND status=? "
-                             "ORDER BY CASE WHEN indicator='*' THEN 1 ELSE 0 END, runbook_id DESC "
+                             "WHERE (agent_id=? OR agent_id='') AND (indicator=? OR indicator='*') AND status=? "
+                             "ORDER BY CASE WHEN indicator='*' THEN 1 ELSE 0 END, "
+                             "CASE WHEN agent_id='' THEN 1 ELSE 0 END, runbook_id DESC "
                              "LIMIT 1;",
                              -1, &st.s, nullptr),
           db_, "prepare get_runbook");
-    sqlite3_bind_text(st.s, 1, indicator.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(st.s, 2, status.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st.s, 1, agent_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st.s, 2, indicator.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st.s, 3, status.c_str(), -1, SQLITE_TRANSIENT);
     if (sqlite3_step(st.s) == SQLITE_ROW)
         return row_to_runbook(st.s);
     return std::nullopt;

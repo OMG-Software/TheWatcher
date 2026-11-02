@@ -339,11 +339,24 @@ void Server::handle_router_frame(zmq::socket_t& router)
     // ROUTER prepends the sender's routing-id (set by agent to its agent_id).
     // The agent DEALER explicitly sends [empty delimiter][payload], so the
     // server receives exactly: [identity][empty][payload].
+    // Check RCVMORE before each further receive: a peer that sends fewer
+    // parts would otherwise make the next blocking recv() wait for a later
+    // message and stall this thread (enrollment, commands, offline scans).
     zmq::message_t identity_msg, delim_msg, payload_msg;
     if (!router.recv(identity_msg, zmq::recv_flags::none))
         return;
+    if (!router.get(zmq::sockopt::rcvmore))
+    {
+        LOG_DEBUG("Dropping ROUTER message with no delimiter or payload frame");
+        return;
+    }
     if (!router.recv(delim_msg, zmq::recv_flags::none))
         return;
+    if (!router.get(zmq::sockopt::rcvmore))
+    {
+        LOG_DEBUG("Dropping ROUTER message with no payload frame");
+        return;
+    }
     if (!router.recv(payload_msg, zmq::recv_flags::none))
         return;
 

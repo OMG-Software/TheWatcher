@@ -166,3 +166,30 @@ SCENARIO("Oversize enrollment messages are rejected without harm")
         REQUIRE(runner.error == nullptr);
     }
 }
+SCENARIO("A short data-plane message cannot stall the server loop")
+{
+    GIVEN("a running server with an empty store")
+    {
+        ServerRunner runner(make_in_memory_server_config());
+        REQUIRE(runner.startup.wait().started);
+        REQUIRE(runner.error == nullptr);
+
+        WHEN("a DEALER sends a single-frame message to the ROUTER (no delimiter, no payload frame)")
+        {
+            zmq::context_t ctx{1};
+            auto dealer = connect_dealer(ctx, runner.config.bind_address);
+            // ROUTER delivers [identity][frame]: one part fewer than the
+            // [identity][empty][payload] the server expects. A blocking recv
+            // for the missing part would wait for the next message instead.
+            dealer.send(zmq::message_t("short", 5), zmq::send_flags::none);
+
+            THEN("the server still answers enrollment requests promptly")
+            {
+                require_valid_enrollment_answered(runner, "after-short-frame");
+            }
+        }
+
+        runner.stop();
+        REQUIRE(runner.error == nullptr);
+    }
+}

@@ -272,8 +272,11 @@ public:
     virtual int64_t create_runbook(const RunbookRecord& rec) = 0;
     virtual std::vector<RunbookRecord> list_runbooks() = 0;
     virtual void delete_runbook(int64_t runbook_id) = 0;
-    // Returns the best match for (indicator, status): exact > wildcard indicator.
-    virtual std::optional<RunbookRecord> get_runbook(const std::string& indicator, const std::string& status) = 0;
+    // Returns the best runbook for an alert on `agent_id`: only that agent's
+    // runbooks or generic ones (empty agent_id) match (SEC-11). Order: exact
+    // indicator > '*', then agent-specific > generic, then newest.
+    virtual std::optional<RunbookRecord> get_runbook(const std::string& agent_id, const std::string& indicator,
+                                                     const std::string& status) = 0;
 };
 
 std::unique_ptr<Store> make_store(const std::string& db_type, const std::string& db_path_or_dsn);
