@@ -5,8 +5,6 @@
 #include "common/protocol.hpp"
 #include "report_generator.hpp"
 
-#include <nlohmann/json.hpp>
-
 #include <algorithm>
 #include <array>
 #include <cctype>
@@ -20,6 +18,7 @@
 #include <unordered_set>
 
 #include <httplib.h>
+#include <nlohmann/json.hpp>
 #include <sodium.h>
 
 namespace thewatcher::server
@@ -29,11 +28,14 @@ using json = nlohmann::json;
 
 // ── Construction ──────────────────────────────────────────────────────────────
 
-ApiServer::ApiServer(Store& store, ZapHandler& zap, const std::string& host, int port)
+ApiServer::ApiServer(Store& store, ZapHandler& zap, const std::string& host, int port, int64_t login_lockout_ms,
+                     int64_t login_ip_window_ms)
     : store_(store)
     , zap_(zap)
     , host_(host)
     , port_(port)
+    , login_lockout_ms_(login_lockout_ms)
+    , login_ip_window_ms_(login_ip_window_ms)
     , http_(std::make_unique<httplib::Server>())
 {
     LOG_FUNCTION_TRACE
@@ -182,6 +184,21 @@ namespace
                 throw std::runtime_error("process name is required");
             if (process.expected_count <= 0)
                 throw std::runtime_error("process expected_count must be greater than zero");
+        }
+        // SEC-10: log-monitor entries name files the agent will read whose
+        // contents then surface on the dashboard — validate them strictly.
+        for (const auto& log : config.logs)
+        {
+            if (log.path.empty())
+                throw std::runtime_error("log path is required");
+            if (log.path.size() > 4096)
+                throw std::runtime_error("log path is too long");
+            if (log.pattern.empty() || log.pattern.size() > 256)
+                throw std::runtime_error("log pattern must be 1-256 characters");
+            if (log.indicator_name.empty() || log.indicator_name.size() > 64)
+                throw std::runtime_error("log indicator_name must be 1-64 characters");
+            if (log.severity != "yellow" && log.severity != "amber" && log.severity != "red")
+                throw std::runtime_error("log severity must be yellow, amber, or red");
         }
     }
 
@@ -781,19 +798,55 @@ void ApiServer::setup_routes()
                 return;
             }
 
-            // M-1: Rate-limit failed logins — lock after 5 failures for 15 minutes.
+            // M-1 + SEC-12: login rate limiting. A fixed per-username window
+            // that RESETS on expiry (previously the lockout could never
+            // re-arm, allowing unlimited guessing after the first 15
+            // minutes) plus a per-source-IP throttle across all usernames.
+            // Expired entries are pruned so both maps stay bounded.
             constexpr int max_failures = 5;
-            constexpr int64_t lockout_ms = 15LL * 60LL * 1000LL;
+            constexpr int max_ip_failures = 10;
             const auto now = now_ms();
+            const std::string remote = req.remote_addr;
             {
                 std::lock_guard<std::mutex> lk(login_mutex_);
-                auto& [count, window_start] = login_failures_[username];
-                if (count >= max_failures && now - window_start < lockout_ms)
+
+                // Prune expired windows: an entry whose window has elapsed
+                // is removed, which also implements the fixed-window reset.
+                for (auto it = login_failures_.begin(); it != login_failures_.end();)
+                {
+                    if (now - it->second.second >= login_lockout_ms_)
+                        it = login_failures_.erase(it);
+                    else
+                        ++it;
+                }
+                for (auto it = login_ip_failures_.begin(); it != login_ip_failures_.end();)
+                {
+                    if (now - it->second.second >= login_ip_window_ms_)
+                        it = login_ip_failures_.erase(it);
+                    else
+                        ++it;
+                }
+
+                auto& failures = login_failures_[username];
+                if (failures.first >= max_failures)
                 {
                     res.status = 429;
                     res.set_header("Retry-After", "900");
                     set_json(res, json{
                                       {"error", "too many failed login attempts; try again later"}
+                    });
+                    return;
+                }
+
+                // SEC-12: throttle by source IP across all usernames so a
+                // single host cannot spray many accounts (or lock them out).
+                auto& ip_failures = login_ip_failures_[remote];
+                if (ip_failures.first >= max_ip_failures)
+                {
+                    res.status = 429;
+                    res.set_header("Retry-After", "60");
+                    set_json(res, json{
+                                      {"error", "too many login attempts from this address; try again later"}
                     });
                     return;
                 }
@@ -809,6 +862,11 @@ void ApiServer::setup_routes()
                     if (count == 0)
                         window_start = now;
                     ++count;
+
+                    auto& [ip_count, ip_window_start] = login_ip_failures_[remote];
+                    if (ip_count == 0)
+                        ip_window_start = now;
+                    ++ip_count;
                 }
                 res.status = 401;
                 set_json(res, json{
@@ -1337,7 +1395,9 @@ void ApiServer::setup_routes()
             auto rec = store_.get_agent(id);
             if (rec)
             {
-                zap_.add_key(rec->curve_public_key_z85);
+                // SEC-04: bind the key to the agent it belongs to so ZAP can
+                // report the authenticated identity for the data plane.
+                zap_.add_key(rec->curve_public_key_z85, rec->agent_id);
                 LOGF_DEBUG("Approved agent key added to ZAP id=%s", id.c_str());
             }
             res.set_content(
@@ -1782,6 +1842,21 @@ void ApiServer::setup_routes()
 
             auto config = body.at("collector_config").get<CollectorConfig>();
             validate_collector_config(config);
+
+            // SEC-10: a log path makes the agent read a local file and put
+            // its contents on the dashboard — only global admins may set
+            // them. Operators keep full access to every other collector
+            // setting.
+            if (!config.logs.empty() && session->role != "global_admin")
+            {
+                LOGF_WARNING("Non-admin attempted to configure log monitor paths user=%s role=%s",
+                             session->username.c_str(), session->role.c_str());
+                res.status = 403;
+                set_json(res, json{
+                                  {"error", "log monitor paths can only be configured by a global admin"}
+                });
+                return;
+            }
 
             rec->collection_interval = interval;
             rec->heartbeat_interval = heartbeat_interval;
@@ -2296,7 +2371,17 @@ void ApiServer::setup_routes()
         try
         {
             const auto user_id = std::stoll(req.path_params.at("id"));
-            store_.disable_user(user_id);
+            const auto affected = store_.disable_user(user_id);
+            if (affected == 0)
+            {
+                // SEC-14: unknown id or the built_in guard refused the change;
+                // a silent {"ok":true} hid both cases.
+                res.status = 404;
+                set_json(res, json{
+                                  {"error", "user not found or built-in"}
+                });
+                return;
+            }
             LOGF_INFO("Disabled user user_id=%lld", static_cast<long long>(user_id));
             set_json(res, json{
                               {"ok", true}
@@ -2358,7 +2443,16 @@ void ApiServer::setup_routes()
         try
         {
             const auto user_id = std::stoll(req.path_params.at("id"));
-            store_.delete_user(user_id);
+            const auto affected = store_.delete_user(user_id);
+            if (affected == 0)
+            {
+                // SEC-14: unknown id or the built_in guard refused the change.
+                res.status = 404;
+                set_json(res, json{
+                                  {"error", "user not found or built-in"}
+                });
+                return;
+            }
             LOGF_INFO("Deleted user user_id=%lld", static_cast<long long>(user_id));
             set_json(res, json{
                               {"ok", true}
@@ -2543,11 +2637,14 @@ void ApiServer::setup_routes()
 
     // GET /api/agents/:id/history?limit=N — status history for one agent (viewer+)
     http_->Get("/api/agents/:id/history", [this](const httplib::Request& req, httplib::Response& res) {
-        if (!require_role(req, res, "viewer"))
-            return;
         try
         {
             const auto id = req.path_params.at("id");
+            // SEC-11: history carries indicator transitions and alert
+            // messages for one agent — enforce the same group scoping as
+            // every other per-agent endpoint.
+            if (!require_agent_access(req, res, "viewer", id))
+                return;
             int limit = 100;
             if (req.has_param("limit"))
                 limit = std::min(200, std::max(1, std::stoi(req.get_param_value("limit"))));
@@ -2630,6 +2727,15 @@ void ApiServer::setup_routes()
             }
             if (body.contains("agent_ids") && body["agent_ids"].is_array())
                 rec.agent_ids = body["agent_ids"].get<std::vector<std::string>>();
+            // SEC-11: a view may only reference agents its creator can see.
+            if (!is_global_role(session->role))
+            {
+                for (const auto& agent_id : rec.agent_ids)
+                {
+                    if (!can_access_agent(*session, agent_id))
+                        throw std::runtime_error("view references an agent outside your access");
+                }
+            }
             rec.created_at = now_ms();
             const auto id = store_.create_view(rec);
             rec.view_id = id;
@@ -2722,6 +2828,15 @@ void ApiServer::setup_routes()
             }
             if (body.contains("agent_ids") && body["agent_ids"].is_array())
                 existing->agent_ids = body["agent_ids"].get<std::vector<std::string>>();
+            // SEC-11: a view may only reference agents its editor can see.
+            if (!is_global_role(session->role))
+            {
+                for (const auto& agent_id : existing->agent_ids)
+                {
+                    if (!can_access_agent(*session, agent_id))
+                        throw std::runtime_error("view references an agent outside your access");
+                }
+            }
             store_.update_view(*existing);
             set_json(res, view_to_json(*existing));
         }
@@ -2776,7 +2891,7 @@ void ApiServer::setup_routes()
 
     // ── Runbooks ──────────────────────────────────────────────────────────────
 
-    // GET /api/runbooks — list all runbooks (viewer+)
+    // GET /api/runbooks — list runbooks visible to the session (viewer+)
     http_->Get("/api/runbooks", [this](const httplib::Request& req, httplib::Response& res) {
         try
         {
@@ -2786,7 +2901,13 @@ void ApiServer::setup_routes()
             auto rows = store_.list_runbooks();
             json arr = json::array();
             for (const auto& r : rows)
-                arr.push_back(runbook_to_json(r));
+            {
+                // SEC-11: generic runbooks (no agent_id) are shared knowledge;
+                // agent-specific ones are only visible to sessions that can
+                // already see that agent.
+                if (r.agent_id.empty() || is_global_role(session->role) || can_access_agent(*session, r.agent_id))
+                    arr.push_back(runbook_to_json(r));
+            }
             set_json(res, arr);
         }
         catch (const std::exception& e)
@@ -2823,6 +2944,9 @@ void ApiServer::setup_routes()
             }
             const auto body = json::parse(req.body);
             RunbookRecord rec;
+            // SEC-11: an optional agent_id scopes the runbook to one agent;
+            // it is only shown to sessions that can see that agent.
+            rec.agent_id = body.value("agent_id", std::string(""));
             rec.indicator = body.value("indicator", std::string("*"));
             rec.status = body.at("status").get<std::string>();
             rec.url = body.at("url").get<std::string>();

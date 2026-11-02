@@ -4,11 +4,10 @@
 
 #include "common/SingleLog.hpp"
 
-#include <nlohmann/json.hpp>
-
 #include <stdexcept>
 #include <string>
 
+#include <nlohmann/json.hpp>
 #include <sodium.h>
 
 namespace thewatcher::server
@@ -909,13 +908,17 @@ std::vector<int64_t> PostgresStore::get_user_groups(int64_t user_id)
     return out;
 }
 
-void PostgresStore::disable_user(int64_t user_id)
+int PostgresStore::disable_user(int64_t user_id)
 {
     const auto p = s(user_id);
     const char* params[] = {p.c_str()};
-    Res res(PQexecParams(conn_, "UPDATE users SET disabled=TRUE WHERE user_id=$1;", 1, nullptr, params, nullptr,
-                         nullptr, 0));
+    // SEC-14: the built-in admin must not be disableable — deleting it would
+    // let the next bootstrap recreate it with the public default password.
+    Res res(PQexecParams(conn_, "UPDATE users SET disabled=TRUE WHERE user_id=$1 AND built_in=FALSE;", 1, nullptr,
+                         params, nullptr, nullptr, 0));
     check_res(res.r, "disable_user");
+    const char* affected = PQcmdTuples(res.r);
+    return affected != nullptr ? std::atoi(affected) : 0;
 }
 
 void PostgresStore::enable_user(int64_t user_id)
@@ -927,12 +930,16 @@ void PostgresStore::enable_user(int64_t user_id)
     check_res(res.r, "enable_user");
 }
 
-void PostgresStore::delete_user(int64_t user_id)
+int PostgresStore::delete_user(int64_t user_id)
 {
     const auto p = s(user_id);
     const char* params[] = {p.c_str()};
-    Res res(PQexecParams(conn_, "DELETE FROM users WHERE user_id=$1;", 1, nullptr, params, nullptr, nullptr, 0));
+    // SEC-14: same built_in guard as SQLite — never delete the bootstrap admin.
+    Res res(PQexecParams(conn_, "DELETE FROM users WHERE user_id=$1 AND built_in=FALSE;", 1, nullptr, params, nullptr,
+                         nullptr, 0));
     check_res(res.r, "delete_user");
+    const char* affected = PQcmdTuples(res.r);
+    return affected != nullptr ? std::atoi(affected) : 0;
 }
 
 void PostgresStore::update_user_password(int64_t user_id, const std::string& password_hash)
@@ -965,7 +972,7 @@ std::optional<SessionRecord> PostgresStore::get_session(const std::string& token
     Res res(PQexecParams(conn_, R"(
         SELECT s.token,s.user_id,u.username,u.role,s.created_at,s.expires_at
         FROM sessions s JOIN users u ON u.user_id=s.user_id
-        WHERE s.token=$1 AND s.expires_at>$2;
+        WHERE s.token=$1 AND s.expires_at>$2 AND u.disabled=FALSE;
     )",
                          2, nullptr, params, nullptr, nullptr, 0));
     check_res(res.r, "get_session");

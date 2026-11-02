@@ -42,7 +42,10 @@ struct PendingCommand
 class ApiServer
 {
 public:
-    ApiServer(Store& store, ZapHandler& zap, const std::string& host, int port);
+    // login_lockout_ms / login_ip_window_ms configure the login rate
+    // limiter windows; production uses the defaults, tests shrink them.
+    ApiServer(Store& store, ZapHandler& zap, const std::string& host, int port,
+              int64_t login_lockout_ms = 15LL * 60LL * 1000LL, int64_t login_ip_window_ms = 60LL * 1000LL);
 
     ~ApiServer();
 
@@ -77,6 +80,10 @@ private:
 
     // Login failure tracker for rate limiting (M-1): username -> (fail_count, window_start_ms)
     std::unordered_map<std::string, std::pair<int, int64_t>> login_failures_;
+    // SEC-12: per-source-IP failure throttle: ip -> (fail_count, window_start_ms)
+    std::unordered_map<std::string, std::pair<int, int64_t>> login_ip_failures_;
+    int64_t login_lockout_ms_;
+    int64_t login_ip_window_ms_;
     std::mutex login_mutex_;
 };
 

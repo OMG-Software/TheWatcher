@@ -7,6 +7,7 @@
 #include "collectors/network_collector.hpp"
 #include "collectors/process_collector.hpp"
 #include "common/SingleLog.hpp"
+#include "common/zmq_limits.hpp"
 #include "enrollment.hpp"
 
 #include <chrono>
@@ -120,6 +121,9 @@ Agent::Agent(AgentConfig config)
     collectors_.emplace_back(std::make_unique<NetworkCollector>());
     {
         auto lc = std::make_unique<LogCollector>();
+        // SEC-10: the log monitor only reads files inside LOG_ALLOWED_DIRS —
+        // an agent-local list the server has no way to extend.
+        lc->set_allowed_dirs(parse_log_allowed_dirs_from_env());
         log_collector_ = lc.get();
         collectors_.emplace_back(std::move(lc));
     }
@@ -155,6 +159,10 @@ void Agent::start()
 
     dealer_.set(zmq::sockopt::linger, 0);
     dealer_.set(zmq::sockopt::routing_id, config_.agent_id);
+    // SEC-02: reject oversize server replies at the socket layer and bound
+    // the connection handshake.
+    dealer_.set(zmq::sockopt::maxmsgsize, proto::kDataPlaneMaxMessageBytes);
+    dealer_.set(zmq::sockopt::handshake_ivl, proto::kHandshakeIvlMs);
     if (!config_.server_public_key.empty())
     {
         LOG_DEBUG("Configuring DEALER socket with CURVE keys");

@@ -48,6 +48,7 @@ Options:
 | `OFFLINE_AFTER_SECONDS` | `60` | Approved connected agents are marked disconnected when `last_seen` is older than this number of seconds. Set `0` or a negative value to disable automatic offline marking. |
 | `SERVER_PUBLIC_KEY` | generated | Server CURVE public key. Approved enrollment responses include this key and its fingerprint so agents can learn and pin it. |
 | `SERVER_SECRET_KEY` | generated | Server CURVE secret key. Keep this private. |
+| `ENROLLMENT_TOKEN` | empty | Optional pre-shared token. When set, every enrollment request must carry a matching token (`ENROLLMENT_TOKEN` in the agent config), so arbitrary hosts cannot create pending-agent records. Leave empty for tokenless first-run enrollment. |
 
 If `server_public_key` is empty, the server does not enable CURVE on the data
 socket. The default generated config enables CURVE.
@@ -240,14 +241,22 @@ Options:
 | `THEWATCHER_SERVER` | `127.0.0.1` derived defaults | Hostname or IP of the server. The agent derives `tcp://<host>:5555` for data and `tcp://<host>:5556` for enrollment. |
 | `SERVER_ADDRESS` | `tcp://127.0.0.1:5555` | Explicit data endpoint. Overrides the endpoint derived from `THEWATCHER_SERVER`. |
 | `ENROLLMENT_ADDRESS` | `tcp://127.0.0.1:5556` | Explicit enrollment endpoint. Overrides the endpoint derived from `THEWATCHER_SERVER`. |
-| `SERVER_PUBLIC_KEY` | empty | Server CURVE public key. Normal first enrollment learns this from the approved enrollment response. Set it manually only when pre-pinning a known server key or using `--server-key`. |
+| `SERVER_PUBLIC_KEY` | empty | Server CURVE public key. Normal first enrollment learns this from the approved enrollment response. Set it manually only when pre-pinning a known server key or using `--server-key`. Once set it is a pin: an enrollment reply presenting a different key is rejected. |
 | `SERVER_PUBLIC_KEY_FINGERPRINT` | empty | BLAKE2b-256 hex fingerprint of `SERVER_PUBLIC_KEY`. The agent writes this after approval and rejects future approved enrollment responses whose fingerprint does not match. |
-| `AGENT_ID` | generated UUID | Stable agent identity used for enrollment, routing, and dashboard rows. |
+| `ALLOW_INSECURE` | `0` | Explicit opt-in to connect without CURVE. When `0` (default), an approved enrollment reply without a server key pin is a hard error — the agent never silently runs an unencrypted data plane. |
+| `ENROLLMENT_TOKEN` | empty | Pre-shared enrollment token matching the server's `ENROLLMENT_TOKEN`. Required when the server configures one. |
+| `AGENT_ID` | generated UUID | Stable agent identity used for enrollment, routing, and dashboard rows. Valid characters are letters, digits, `.`, `_`, and `-` (max 64). |
 | `AGENT_PUBLIC_KEY` | generated | Agent CURVE public key sent during enrollment and approved by the server. |
 | `AGENT_SECRET_KEY` | generated | Agent CURVE secret key. Keep this private. |
 | `COLLECTION_INTERVAL` | `30` | Seconds between periodic metrics submissions. The server can update this through the dashboard. |
 | `HEARTBEAT_INTERVAL` | `5` | Seconds between heartbeat frames. The server can update this through the dashboard; valid values are 1 through 60. |
 | `PROCESS_LIMIT` | `25` | Number of top processes collected by the process collector. The server can update this through the dashboard. |
+
+The log monitor additionally respects the `LOG_ALLOWED_DIRS` environment
+variable: a list of directories (separated by `;` on Windows, `:` elsewhere)
+inside which the configured log paths must resolve. While unset, log
+monitoring is disabled entirely — the agent fails closed rather than reading
+arbitrary files chosen on the dashboard.
 
 ## Agent CLI Overrides
 
@@ -258,6 +267,7 @@ Agent command-line options override loaded config values for that process:
 --server <tcp-endpoint>
 --enrollment <tcp-endpoint>
 --server-key <40-character-z85-key>
+--insecure
 --service
 --service-name <name>
 --install-service
@@ -266,7 +276,9 @@ Agent command-line options override loaded config values for that process:
 --help
 ```
 
-`--genkey` prints a new CURVE keypair and exits.
+`--genkey` prints a new CURVE keypair and exits. `--insecure` is the CLI
+equivalent of `ALLOW_INSECURE=1` and must be set explicitly to allow an
+enrollment reply without a server key pin.
 
 ## Enrollment Key Pinning
 
@@ -282,7 +294,9 @@ first approval, the agent stores both values in `TheWatcherAgent.conf` before
 opening the encrypted data socket. On later approvals, an existing
 `SERVER_PUBLIC_KEY_FINGERPRINT` is treated as a pinned identity; if the server
 returns a different fingerprint, enrollment fails instead of silently trusting a
-new key.
+new key. A configured `SERVER_PUBLIC_KEY` is likewise a pin: an approved reply
+presenting a different key is rejected. An approved reply with no key at all
+fails enrollment unless the agent runs with `--insecure` / `ALLOW_INSECURE=1`.
 
 ## Server CLI Options
 

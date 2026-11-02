@@ -38,6 +38,9 @@ static void print_usage(const char* prog)
               << "  --server <addr>   Server ZMQ address (e.g. tcp://host:5555)\n"
               << "  --enrollment <a>  Enrollment ZMQ address\n"
               << "  --server-key <k>  Server CURVE public key (40-char z85)\n"
+              << "  --insecure        Allow enrollment replies without a server key pin\n"
+              << "                    (data plane runs unencrypted; use only on\n"
+              << "                    trusted networks)\n"
               << "  --genkey          Generate a CURVE keypair and print it, then exit\n"
               << "  --service         Run under Windows Service Control Manager\n"
               << "  --service-name <n> Service name (default: TheWatcherAgent)\n"
@@ -57,6 +60,7 @@ int main(int argc, char* argv[])
     std::string override_server_key;
     std::string service_name = "TheWatcherAgent";
     bool do_genkey = false;
+    bool allow_insecure = false;
     bool service_mode = false;
     bool install_service = false;
     bool uninstall_service = false;
@@ -104,6 +108,10 @@ int main(int argc, char* argv[])
         else if (arg == "--server-key" && i + 1 < argc)
         {
             override_server_key = argv[++i];
+        }
+        else if (arg == "--insecure")
+        {
+            allow_insecure = true;
         }
         else
         {
@@ -203,6 +211,13 @@ int main(int argc, char* argv[])
     {
         LOG_DEBUG("Overriding server public key from CLI");
         config.server_public_key = override_server_key;
+    }
+    if (allow_insecure)
+    {
+        // SEC-08: explicit operator opt-in to run without CURVE; without this
+        // flag an enrollment reply missing a server key pin is a hard error.
+        LOG_WARNING("Insecure mode enabled: the agent may connect without CURVE encryption");
+        config.allow_insecure = true;
     }
 
     LOGF_INFO("Agent ID: %s", config.agent_id.c_str());

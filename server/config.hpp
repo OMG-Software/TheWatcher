@@ -21,6 +21,11 @@ struct ServerConfig
     std::string server_public_key;
     std::string server_secret_key;
 
+    // SEC-05: optional pre-shared enrollment token. When non-empty, every
+    // enrollment request must carry a matching token, so unauthenticated
+    // hosts can no longer create pending-agent records at will.
+    std::string enrollment_token;
+
     static std::filesystem::path default_path();
     static ServerConfig load_or_create(const std::filesystem::path& path);
     void save(const std::filesystem::path& path) const;

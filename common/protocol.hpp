@@ -1,7 +1,5 @@
 #pragma once
 
-#include <cbor.h>
-
 #include <cstdint>
 #include <cstdlib>
 #include <limits>
@@ -9,6 +7,8 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+
+#include <cbor.h>
 
 namespace thewatcher::proto
 {
@@ -42,6 +42,9 @@ struct EnrollRequest
     std::string hostname;
     std::string platform;
     std::string curve_public_key_z85; // 40-char z85
+    // SEC-05: optional pre-shared enrollment token; required by the server
+    // when ENROLLMENT_TOKEN is configured. Empty when unused.
+    std::string enrollment_token;
 };
 
 struct EnrollResponse
@@ -66,319 +69,440 @@ struct LogMatch
 namespace detail
 {
 
-struct CborDeleter
-{
-    void operator()(cbor_item_t* item) const noexcept
+    struct CborDeleter
     {
-        if (item != nullptr)
+        void operator()(cbor_item_t* item) const noexcept
         {
-            cbor_decref(&item);
+            if (item != nullptr)
+            {
+                cbor_decref(&item);
+            }
         }
-    }
-};
+    };
 
-using CborPtr = std::unique_ptr<cbor_item_t, CborDeleter>;
+    using CborPtr = std::unique_ptr<cbor_item_t, CborDeleter>;
 
-inline CborPtr adopt(cbor_item_t* item)
-{
-    if (item == nullptr)
+    inline CborPtr adopt(cbor_item_t* item)
     {
-        throw std::runtime_error("libcbor allocation failed");
-    }
-    return CborPtr(item);
-}
-
-inline void push(cbor_item_t* array, cbor_item_t* value)
-{
-    if (array == nullptr || value == nullptr)
-    {
-        throw std::runtime_error("Invalid CBOR array/value");
+        if (item == nullptr)
+        {
+            throw std::runtime_error("libcbor allocation failed");
+        }
+        return CborPtr(item);
     }
 
-    if (!cbor_array_push(array, value))
+    inline void push(cbor_item_t* array, cbor_item_t* value)
     {
+        if (array == nullptr || value == nullptr)
+        {
+            throw std::runtime_error("Invalid CBOR array/value");
+        }
+
+        if (!cbor_array_push(array, value))
+        {
+            cbor_decref(&value);
+            throw std::runtime_error("Failed to append CBOR array item");
+        }
+
+        // cbor_array_push increments the child refcount; release our local ref.
         cbor_decref(&value);
-        throw std::runtime_error("Failed to append CBOR array item");
     }
 
-    // cbor_array_push increments the child refcount; release our local ref.
-    cbor_decref(&value);
-}
-
-inline cbor_item_t* array_get(cbor_item_t* array, size_t index)
-{
-    if (!cbor_isa_array(array) || cbor_array_size(array) <= index)
+    inline cbor_item_t* array_get(cbor_item_t* array, size_t index)
     {
-        throw std::runtime_error("Invalid CBOR array shape");
+        if (!cbor_isa_array(array) || cbor_array_size(array) <= index)
+        {
+            throw std::runtime_error("Invalid CBOR array shape");
+        }
+
+        cbor_item_t** items = cbor_array_handle(array);
+        if (items == nullptr || items[index] == nullptr)
+        {
+            throw std::runtime_error("Invalid CBOR array item");
+        }
+
+        return items[index];
     }
 
-    cbor_item_t** items = cbor_array_handle(array);
-    if (items == nullptr || items[index] == nullptr)
+    inline cbor_item_t* make_uint8(uint8_t value)
     {
-        throw std::runtime_error("Invalid CBOR array item");
+        return cbor_build_uint8(value);
     }
 
-    return items[index];
-}
-
-inline cbor_item_t* make_uint8(uint8_t value)
-{
-    return cbor_build_uint8(value);
-}
-
-inline cbor_item_t* make_int64(int64_t value)
-{
-    if (value >= 0)
+    inline cbor_item_t* make_int64(int64_t value)
     {
-        return cbor_build_uint64(static_cast<uint64_t>(value));
+        if (value >= 0)
+        {
+            return cbor_build_uint64(static_cast<uint64_t>(value));
+        }
+
+        // CBOR negative integer n is encoded as -1 - n.
+        const uint64_t encoded = static_cast<uint64_t>(-(value + 1));
+        return cbor_build_negint64(encoded);
     }
 
-    // CBOR negative integer n is encoded as -1 - n.
-    const uint64_t encoded = static_cast<uint64_t>(-(value + 1));
-    return cbor_build_negint64(encoded);
-}
-
-inline cbor_item_t* make_string(const std::string& value)
-{
-    return cbor_build_stringn(value.data(), value.size());
-}
-
-inline cbor_item_t* make_bytes(const std::vector<uint8_t>& value)
-{
-    return cbor_build_bytestring(
-        reinterpret_cast<cbor_data>(const_cast<uint8_t*>(value.data())),
-        value.size()
-    );
-}
-
-inline cbor_item_t* make_bool(bool value)
-{
-    return cbor_build_bool(value);
-}
-
-// libcbor's cbor_get_uint64 reads 8 raw bytes from item->data, which is only
-// valid for CBOR_INT_64 width items. For narrower widths it returns garbage
-// from adjacent memory. Always dispatch through this helper.
-inline uint64_t cbor_uint_value(const cbor_item_t* item)
-{
-    switch (cbor_int_get_width(item))
+    inline cbor_item_t* make_string(const std::string& value)
     {
-    case CBOR_INT_8:
-        return cbor_get_uint8(const_cast<cbor_item_t*>(item));
-    case CBOR_INT_16:
-        return cbor_get_uint16(const_cast<cbor_item_t*>(item));
-    case CBOR_INT_32:
-        return cbor_get_uint32(const_cast<cbor_item_t*>(item));
-    case CBOR_INT_64:
-        return cbor_get_uint64(const_cast<cbor_item_t*>(item));
-    }
-    throw std::runtime_error("Unknown CBOR integer width");
-}
-
-inline uint8_t read_uint8(cbor_item_t* item)
-{
-    if (!cbor_isa_uint(item))
-    {
-        throw std::runtime_error("Expected CBOR unsigned integer");
+        return cbor_build_stringn(value.data(), value.size());
     }
 
-    const uint64_t value = cbor_uint_value(item);
-    if (value > std::numeric_limits<uint8_t>::max())
+    inline cbor_item_t* make_bytes(const std::vector<uint8_t>& value)
     {
-        throw std::runtime_error("CBOR integer does not fit uint8_t");
+        return cbor_build_bytestring(reinterpret_cast<cbor_data>(const_cast<uint8_t*>(value.data())), value.size());
     }
 
-    return static_cast<uint8_t>(value);
-}
-
-inline int64_t read_int64(cbor_item_t* item)
-{
-    if (cbor_isa_uint(item))
+    inline cbor_item_t* make_bool(bool value)
     {
+        return cbor_build_bool(value);
+    }
+
+    // libcbor's cbor_get_uint64 reads 8 raw bytes from item->data, which is only
+    // valid for CBOR_INT_64 width items. For narrower widths it returns garbage
+    // from adjacent memory. Always dispatch through this helper.
+    inline uint64_t cbor_uint_value(const cbor_item_t* item)
+    {
+        switch (cbor_int_get_width(item))
+        {
+        case CBOR_INT_8:
+            return cbor_get_uint8(const_cast<cbor_item_t*>(item));
+        case CBOR_INT_16:
+            return cbor_get_uint16(const_cast<cbor_item_t*>(item));
+        case CBOR_INT_32:
+            return cbor_get_uint32(const_cast<cbor_item_t*>(item));
+        case CBOR_INT_64:
+            return cbor_get_uint64(const_cast<cbor_item_t*>(item));
+        }
+        throw std::runtime_error("Unknown CBOR integer width");
+    }
+
+    inline uint8_t read_uint8(cbor_item_t* item)
+    {
+        if (!cbor_isa_uint(item))
+        {
+            throw std::runtime_error("Expected CBOR unsigned integer");
+        }
+
         const uint64_t value = cbor_uint_value(item);
-        if (value > static_cast<uint64_t>(std::numeric_limits<int64_t>::max()))
+        if (value > std::numeric_limits<uint8_t>::max())
         {
-            throw std::runtime_error("CBOR integer does not fit int64_t");
+            throw std::runtime_error("CBOR integer does not fit uint8_t");
         }
-        return static_cast<int64_t>(value);
+
+        return static_cast<uint8_t>(value);
     }
 
-    if (cbor_isa_negint(item))
+    inline int64_t read_int64(cbor_item_t* item)
     {
-        const uint64_t encoded = cbor_uint_value(item);
-        if (encoded > static_cast<uint64_t>(std::numeric_limits<int64_t>::max()))
+        if (cbor_isa_uint(item))
         {
-            throw std::runtime_error("CBOR negative integer does not fit int64_t");
+            const uint64_t value = cbor_uint_value(item);
+            if (value > static_cast<uint64_t>(std::numeric_limits<int64_t>::max()))
+            {
+                throw std::runtime_error("CBOR integer does not fit int64_t");
+            }
+            return static_cast<int64_t>(value);
         }
-        return -1 - static_cast<int64_t>(encoded);
+
+        if (cbor_isa_negint(item))
+        {
+            const uint64_t encoded = cbor_uint_value(item);
+            if (encoded > static_cast<uint64_t>(std::numeric_limits<int64_t>::max()))
+            {
+                throw std::runtime_error("CBOR negative integer does not fit int64_t");
+            }
+            return -1 - static_cast<int64_t>(encoded);
+        }
+
+        throw std::runtime_error("Expected CBOR integer");
     }
 
-    throw std::runtime_error("Expected CBOR integer");
-}
-
-inline std::string read_string(cbor_item_t* item)
-{
-    if (!cbor_isa_string(item) || !cbor_string_is_definite(item))
+    inline std::string read_string(cbor_item_t* item)
     {
-        throw std::runtime_error("Expected definite CBOR string");
+        if (!cbor_isa_string(item) || !cbor_string_is_definite(item))
+        {
+            throw std::runtime_error("Expected definite CBOR string");
+        }
+
+        const auto* data = cbor_string_handle(item);
+        const size_t size = cbor_string_length(item);
+
+        return std::string(reinterpret_cast<const char*>(data), size);
     }
 
-    const auto* data = cbor_string_handle(item);
-    const size_t size = cbor_string_length(item);
-
-    return std::string(reinterpret_cast<const char*>(data), size);
-}
-
-inline std::vector<uint8_t> read_bytes(cbor_item_t* item)
-{
-    if (!cbor_isa_bytestring(item) || !cbor_bytestring_is_definite(item))
+    inline std::vector<uint8_t> read_bytes(cbor_item_t* item)
     {
-        throw std::runtime_error("Expected definite CBOR byte string");
+        if (!cbor_isa_bytestring(item) || !cbor_bytestring_is_definite(item))
+        {
+            throw std::runtime_error("Expected definite CBOR byte string");
+        }
+
+        const auto* data = cbor_bytestring_handle(item);
+        const size_t size = cbor_bytestring_length(item);
+
+        return std::vector<uint8_t>(data, data + size);
     }
 
-    const auto* data = cbor_bytestring_handle(item);
-    const size_t size = cbor_bytestring_length(item);
-
-    return std::vector<uint8_t>(data, data + size);
-}
-
-inline bool read_bool(cbor_item_t* item)
-{
-    if (!cbor_is_bool(item))
+    inline bool read_bool(cbor_item_t* item)
     {
-        throw std::runtime_error("Expected CBOR bool");
+        if (!cbor_is_bool(item))
+        {
+            throw std::runtime_error("Expected CBOR bool");
+        }
+
+        return cbor_get_bool(item);
     }
 
-    return cbor_get_bool(item);
-}
+    // ── primary templates for to_cbor / from_cbor ────────────────────────────────
+    // to_cbor and from_cbor are templates so that explicit specialisations defined
+    // in any header are resolved via the primary at instantiation time. This
+    // sidesteps the qualified-name two-phase-lookup gotcha that plain overloads
+    // would hit when called via detail::to_cbor(obj) inside pack<T>.
 
-// ── primary templates for to_cbor / from_cbor ────────────────────────────────
-// to_cbor and from_cbor are templates so that explicit specialisations defined
-// in any header are resolved via the primary at instantiation time. This
-// sidesteps the qualified-name two-phase-lookup gotcha that plain overloads
-// would hit when called via detail::to_cbor(obj) inside pack<T>.
+    template <typename T>
+    CborPtr to_cbor(const T&);
 
-template <typename T>
-CborPtr to_cbor(const T&);
+    template <typename T>
+    T from_cbor(cbor_item_t*);
 
-template <typename T>
-T from_cbor(cbor_item_t*);
-
-template <>
-inline CborPtr to_cbor(const Frame& f)
-{
-    auto root = adopt(cbor_new_definite_array(4));
-
-    push(root.get(), make_uint8(f.type));
-    push(root.get(), make_string(f.agent_id));
-    push(root.get(), make_int64(f.timestamp_ms));
-    push(root.get(), make_bytes(f.payload));
-
-    return root;
-}
-
-template <>
-inline CborPtr to_cbor(const EnrollRequest& r)
-{
-    auto root = adopt(cbor_new_definite_array(4));
-
-    push(root.get(), make_string(r.agent_id));
-    push(root.get(), make_string(r.hostname));
-    push(root.get(), make_string(r.platform));
-    push(root.get(), make_string(r.curve_public_key_z85));
-
-    return root;
-}
-
-template <>
-inline CborPtr to_cbor(const EnrollResponse& r)
-{
-    auto root = adopt(cbor_new_definite_array(4));
-
-    push(root.get(), make_bool(r.approved));
-    push(root.get(), make_string(r.message));
-    push(root.get(), make_string(r.server_public_key_z85));
-    push(root.get(), make_string(r.server_public_key_fingerprint));
-
-    return root;
-}
-
-template <>
-inline Frame from_cbor<Frame>(cbor_item_t* item)
-{
-    if (!cbor_isa_array(item) || cbor_array_size(item) != 4)
+    template <>
+    inline CborPtr to_cbor(const Frame& f)
     {
-        throw std::runtime_error("Invalid Frame CBOR payload");
+        auto root = adopt(cbor_new_definite_array(4));
+
+        push(root.get(), make_uint8(f.type));
+        push(root.get(), make_string(f.agent_id));
+        push(root.get(), make_int64(f.timestamp_ms));
+        push(root.get(), make_bytes(f.payload));
+
+        return root;
     }
 
-    Frame f;
-    f.type = read_uint8(array_get(item, 0));
-    f.agent_id = read_string(array_get(item, 1));
-    f.timestamp_ms = read_int64(array_get(item, 2));
-    f.payload = read_bytes(array_get(item, 3));
-
-    return f;
-}
-
-template <>
-inline EnrollRequest from_cbor<EnrollRequest>(cbor_item_t* item)
-{
-    if (!cbor_isa_array(item) || cbor_array_size(item) != 4)
+    template <>
+    inline CborPtr to_cbor(const EnrollRequest& r)
     {
-        throw std::runtime_error("Invalid EnrollRequest CBOR payload");
+        auto root = adopt(cbor_new_definite_array(5));
+
+        push(root.get(), make_string(r.agent_id));
+        push(root.get(), make_string(r.hostname));
+        push(root.get(), make_string(r.platform));
+        push(root.get(), make_string(r.curve_public_key_z85));
+        push(root.get(), make_string(r.enrollment_token));
+
+        return root;
     }
 
-    EnrollRequest r;
-    r.agent_id = read_string(array_get(item, 0));
-    r.hostname = read_string(array_get(item, 1));
-    r.platform = read_string(array_get(item, 2));
-    r.curve_public_key_z85 = read_string(array_get(item, 3));
-
-    return r;
-}
-
-template <>
-inline EnrollResponse from_cbor<EnrollResponse>(cbor_item_t* item)
-{
-    if (!cbor_isa_array(item) || cbor_array_size(item) != 4)
+    template <>
+    inline CborPtr to_cbor(const EnrollResponse& r)
     {
-        throw std::runtime_error("Invalid EnrollResponse CBOR payload");
+        auto root = adopt(cbor_new_definite_array(4));
+
+        push(root.get(), make_bool(r.approved));
+        push(root.get(), make_string(r.message));
+        push(root.get(), make_string(r.server_public_key_z85));
+        push(root.get(), make_string(r.server_public_key_fingerprint));
+
+        return root;
     }
 
-    EnrollResponse r;
-    r.approved = read_bool(array_get(item, 0));
-    r.message = read_string(array_get(item, 1));
-    r.server_public_key_z85 = read_string(array_get(item, 2));
-    r.server_public_key_fingerprint = read_string(array_get(item, 3));
+    template <>
+    inline Frame from_cbor<Frame>(cbor_item_t* item)
+    {
+        if (!cbor_isa_array(item) || cbor_array_size(item) != 4)
+        {
+            throw std::runtime_error("Invalid Frame CBOR payload");
+        }
 
-    return r;
-}
+        Frame f;
+        f.type = read_uint8(array_get(item, 0));
+        f.agent_id = read_string(array_get(item, 1));
+        f.timestamp_ms = read_int64(array_get(item, 2));
+        f.payload = read_bytes(array_get(item, 3));
 
-template <>
-inline CborPtr to_cbor(const LogMatch& m)
-{
-    auto root = adopt(cbor_new_definite_array(4));
-    push(root.get(), make_string(m.indicator_name));
-    push(root.get(), make_string(m.path));
-    push(root.get(), make_string(m.matched_line));
-    push(root.get(), make_string(m.severity));
-    return root;
-}
+        return f;
+    }
 
-template <>
-inline LogMatch from_cbor<LogMatch>(cbor_item_t* item)
-{
-    if (!cbor_isa_array(item) || cbor_array_size(item) < 4)
-        throw std::runtime_error("Invalid LogMatch CBOR payload");
-    LogMatch m;
-    m.indicator_name = read_string(array_get(item, 0));
-    m.path = read_string(array_get(item, 1));
-    m.matched_line = read_string(array_get(item, 2));
-    m.severity = read_string(array_get(item, 3));
-    return m;
-}
+    template <>
+    inline EnrollRequest from_cbor<EnrollRequest>(cbor_item_t* item)
+    {
+        if (!cbor_isa_array(item) || cbor_array_size(item) != 5)
+        {
+            throw std::runtime_error("Invalid EnrollRequest CBOR payload");
+        }
+
+        EnrollRequest r;
+        r.agent_id = read_string(array_get(item, 0));
+        r.hostname = read_string(array_get(item, 1));
+        r.platform = read_string(array_get(item, 2));
+        r.curve_public_key_z85 = read_string(array_get(item, 3));
+        r.enrollment_token = read_string(array_get(item, 4));
+
+        return r;
+    }
+
+    template <>
+    inline EnrollResponse from_cbor<EnrollResponse>(cbor_item_t* item)
+    {
+        if (!cbor_isa_array(item) || cbor_array_size(item) != 4)
+        {
+            throw std::runtime_error("Invalid EnrollResponse CBOR payload");
+        }
+
+        EnrollResponse r;
+        r.approved = read_bool(array_get(item, 0));
+        r.message = read_string(array_get(item, 1));
+        r.server_public_key_z85 = read_string(array_get(item, 2));
+        r.server_public_key_fingerprint = read_string(array_get(item, 3));
+
+        return r;
+    }
+
+    template <>
+    inline CborPtr to_cbor(const LogMatch& m)
+    {
+        auto root = adopt(cbor_new_definite_array(4));
+        push(root.get(), make_string(m.indicator_name));
+        push(root.get(), make_string(m.path));
+        push(root.get(), make_string(m.matched_line));
+        push(root.get(), make_string(m.severity));
+        return root;
+    }
+
+    template <>
+    inline LogMatch from_cbor<LogMatch>(cbor_item_t* item)
+    {
+        if (!cbor_isa_array(item) || cbor_array_size(item) < 4)
+            throw std::runtime_error("Invalid LogMatch CBOR payload");
+        LogMatch m;
+        m.indicator_name = read_string(array_get(item, 0));
+        m.path = read_string(array_get(item, 1));
+        m.matched_line = read_string(array_get(item, 2));
+        m.severity = read_string(array_get(item, 3));
+        return m;
+    }
 
 } // namespace detail
+
+// ── hostile-payload pre-validation (SEC-03) ────────────────────────────────────
+//
+// libcbor's streaming builder allocates space for a definite container's
+// declared element count up front (count * 8 bytes for arrays) before it
+// reads a single element, and cbor_decref frees children recursively. A
+// 9-byte payload can therefore demand a multi-gigabyte allocation, and a
+// few tens of KB of nested single-element arrays can overflow the stack
+// when the decoded tree is released. This structural scan runs before
+// cbor_load and rejects such shapes: nesting is depth-capped, and a
+// definite container whose declared element count cannot possibly fit in
+// the remaining bytes (each element costs at least one byte) is refused.
+
+inline void validate_cbor_item(const std::uint8_t*& p, const std::uint8_t* end, std::size_t depth)
+{
+    constexpr std::size_t max_depth = 8; // deepest legitimate TheWatcher frame is ~4 levels
+
+    if (depth > max_depth)
+        throw std::runtime_error("CBOR nesting too deep");
+    if (p >= end)
+        throw std::runtime_error("Truncated CBOR payload");
+
+    const std::uint8_t head = *p++;
+    const std::uint8_t major_type = head >> 5;
+    const std::uint8_t info = head & 0x1F;
+
+    std::uint64_t value = 0;
+    if (info <= 23)
+    {
+        value = info;
+    }
+    else if (info <= 27) // 24..27: 1/2/4/8-byte extended value
+    {
+        const std::size_t len = std::size_t{1} << (info - 24);
+        if (static_cast<std::size_t>(end - p) < len)
+            throw std::runtime_error("Truncated CBOR length");
+        for (std::size_t i = 0; i < len; ++i)
+            value = (value << 8) | *p++;
+    }
+    else if (!(info == 31 && (major_type == 2 || major_type == 3 || major_type == 4 || major_type == 5)))
+    {
+        // 28-30 are reserved; 31 (indefinite) is only valid for the
+        // string and container types handled below.
+        throw std::runtime_error("Invalid CBOR additional info");
+    }
+
+    switch (major_type)
+    {
+    case 0: // unsigned integer
+    case 1: // negative integer
+    case 7: // simple value / float
+        return;
+    case 2: // byte string
+    case 3: // text string
+        if (info == 31)
+        {
+            // Indefinite-length string: definite-length chunks of the same
+            // major type, terminated by a break byte.
+            for (;;)
+            {
+                if (p >= end)
+                    throw std::runtime_error("Truncated CBOR string chunk");
+                if (*p == 0xFF)
+                {
+                    ++p;
+                    return;
+                }
+                const std::uint8_t chunk_head = *p;
+                if ((chunk_head >> 5) != major_type || (chunk_head & 0x1F) == 31)
+                    throw std::runtime_error("Invalid CBOR string chunk");
+                validate_cbor_item(p, end, depth); // definite-length chunk
+            }
+        }
+        if (value > static_cast<std::uint64_t>(end - p))
+            throw std::runtime_error("CBOR string length exceeds payload");
+        p += static_cast<std::size_t>(value);
+        return;
+    case 4: // array
+    case 5: // map (each entry is a key + a value)
+    {
+        const std::uint64_t items_per_entry = (major_type == 5) ? 2 : 1;
+        if (info == 31)
+        {
+            // Indefinite-length container terminated by a break byte.
+            for (;;)
+            {
+                if (p >= end)
+                    throw std::runtime_error("Truncated CBOR container");
+                if (*p == 0xFF)
+                {
+                    ++p;
+                    return;
+                }
+                validate_cbor_item(p, end, depth + 1);
+            }
+        }
+        // The amplification vector: a declared count that cannot fit in
+        // the remaining bytes is rejected before libcbor ever allocates.
+        if (value > static_cast<std::uint64_t>(end - p) / items_per_entry)
+            throw std::runtime_error("CBOR container count exceeds payload");
+        for (std::uint64_t i = 0; i < value * items_per_entry; ++i)
+            validate_cbor_item(p, end, depth + 1);
+        return;
+    }
+    case 6: // tag: validate the tagged item
+        validate_cbor_item(p, end, depth + 1);
+        return;
+    default:
+        throw std::runtime_error("Invalid CBOR major type");
+    }
+}
+
+// Structural pre-validation of a whole CBOR payload. Throws
+// std::runtime_error on any hostile or malformed shape.
+inline void validate_cbor_structure(const void* data, std::size_t size)
+{
+    const auto* p = static_cast<const std::uint8_t*>(data);
+    const auto* end = p + size;
+    validate_cbor_item(p, end, 1);
+    if (p != end)
+        throw std::runtime_error("Trailing bytes after CBOR payload");
+}
 
 // ── public helpers ────────────────────────────────────────────────────────────
 
@@ -419,16 +543,13 @@ T unpack(const void* data, std::size_t size)
         throw std::runtime_error("Cannot decode empty CBOR buffer");
     }
 
-    cbor_load_result result {};
-    auto root = detail::adopt(
-    cbor_load(
-                static_cast<cbor_data>(const_cast<std::uint8_t*>(
-                static_cast<const std::uint8_t*>(data)
-            )),
-            size,
-            &result
-        )
-    );
+    // SEC-03: reject hostile declared lengths / nesting before libcbor's
+    // builder can act on them.
+    validate_cbor_structure(data, size);
+
+    cbor_load_result result{};
+    auto root = detail::adopt(cbor_load(
+        static_cast<cbor_data>(const_cast<std::uint8_t*>(static_cast<const std::uint8_t*>(data))), size, &result));
 
     if (result.error.code != CBOR_ERR_NONE)
     {

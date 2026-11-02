@@ -5,7 +5,6 @@
 #include "common/protocol.hpp"
 
 #include <catch2/catch_test_macros.hpp>
-#include <nlohmann/json.hpp>
 
 #include <chrono>
 #include <filesystem>
@@ -15,6 +14,7 @@
 #include <thread>
 
 #include <httplib.h>
+#include <nlohmann/json.hpp>
 #include <zmq.hpp>
 
 using namespace std::chrono_literals;
@@ -41,7 +41,15 @@ std::string free_zmq_endpoint()
 
 int free_http_port()
 {
-    return 20000 + static_cast<int>(now_ms() % 20000);
+    // Ask the OS for a free port rather than deriving one from the clock —
+    // parallel `meson test` runs otherwise collide across test executables.
+    zmq::context_t ctx{1};
+    zmq::socket_t socket{ctx, ZMQ_REP};
+    socket.bind("tcp://127.0.0.1:*");
+    const auto endpoint = socket.get(zmq::sockopt::last_endpoint);
+    socket.close();
+    const auto colon = endpoint.rfind(':');
+    return std::stoi(endpoint.substr(colon + 1));
 }
 
 template <typename Predicate>
@@ -277,7 +285,7 @@ SCENARIO("A real agent enrolls, sends metrics, disconnects, and the server recor
                 [&] {
                     return login_as_default_admin(client);
                 },
-                5s));
+                20s));
 
             REQUIRE(eventually(
                 [&] {
@@ -446,11 +454,14 @@ struct ServerFixture
 
     bool login()
     {
+        // Generous window: under a parallel `meson test` run the host may be
+        // busy with other suites' argon2 password verifications, which makes
+        // individual login attempts slow.
         return eventually(
             [this] {
                 return login_as_default_admin(client);
             },
-            5s);
+            20s);
     }
 
 private:

@@ -10,6 +10,7 @@
 #include <atomic>
 #include <memory>
 #include <unordered_map>
+
 #include <zmq.hpp>
 
 namespace thewatcher::server
@@ -28,6 +29,16 @@ public:
     void stop();
 
 private:
+    // A command dispatched to a specific agent, awaiting its ACK.
+    // SEC-04: target_agent_id lets the server verify that the ACK really
+    // comes from the agent the command was sent to.
+    struct DispatchedCommand
+    {
+        CommandType type;
+        int64_t dispatched_at_ms;
+        std::string target_agent_id;
+    };
+
     // Drain one complete multipart message from the ROUTER and process it.
     void handle_router_frame(zmq::socket_t& router);
 
@@ -45,10 +56,14 @@ private:
     std::unique_ptr<Store> store_;
     std::unique_ptr<ZapHandler> zap_;
     std::unique_ptr<ApiServer> api_;
-    // command_id -> (type, dispatch_time_ms); evicted on ACK or TTL expiry
-    std::unordered_map<std::string, std::pair<CommandType, int64_t>> dispatched_commands_;
+    // command_id -> dispatched command; evicted on matching ACK or TTL expiry
+    std::unordered_map<std::string, DispatchedCommand> dispatched_commands_;
     // agent_id -> last enrollment request time (ms); used for rate limiting
     std::unordered_map<std::string, int64_t> enrollment_last_request_ms_;
+    // SEC-05: peer address -> last enrollment request time (ms); a second,
+    // milder rate limit keyed by connection source instead of the
+    // attacker-chosen agent_id.
+    std::unordered_map<std::string, int64_t> enrollment_peer_last_request_ms_;
     std::atomic<bool> running_{false};
     int64_t last_report_ms_ = 0;
 };

@@ -138,7 +138,10 @@ SCENARIO("Enrollment rejects an approved response when the pinned fingerprint ch
                 }
                 catch (const std::runtime_error& ex)
                 {
-                    REQUIRE(std::string{ex.what()} == "Pinned server fingerprint mismatch");
+                    // SEC-08: the configured key pin fires before the
+                    // fingerprint comparison — an unauthenticated reply can
+                    // neither replace nor shadow a configured key.
+                    REQUIRE(std::string{ex.what()} == "Enrollment server key does not match configured key");
                 }
             }
         }

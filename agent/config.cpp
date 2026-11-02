@@ -118,6 +118,10 @@ namespace
             cfg.server_public_key = it->second;
         if (auto it = values.find("SERVER_PUBLIC_KEY_FINGERPRINT"); it != values.end())
             cfg.server_public_key_fingerprint = it->second;
+        if (auto it = values.find("ALLOW_INSECURE"); it != values.end())
+            cfg.allow_insecure = (it->second == "1" || it->second == "true" || it->second == "yes");
+        if (auto it = values.find("ENROLLMENT_TOKEN"); it != values.end())
+            cfg.enrollment_token = it->second;
         if (auto it = values.find("AGENT_ID"); it != values.end())
             cfg.agent_id = it->second;
         if (auto it = values.find("AGENT_PUBLIC_KEY"); it != values.end())
@@ -216,6 +220,10 @@ void AgentConfig::save(const std::filesystem::path& path) const
     f << "ENROLLMENT_ADDRESS=" << enrollment_address << '\n';
     f << "SERVER_PUBLIC_KEY=" << server_public_key << '\n';
     f << "SERVER_PUBLIC_KEY_FINGERPRINT=" << server_public_key_fingerprint << '\n';
+    if (allow_insecure)
+        f << "ALLOW_INSECURE=1" << '\n';
+    if (!enrollment_token.empty())
+        f << "ENROLLMENT_TOKEN=" << enrollment_token << '\n';
     f << "AGENT_ID=" << agent_id << '\n';
     f << "AGENT_PUBLIC_KEY=" << agent_public_key << '\n';
     f << "AGENT_SECRET_KEY=" << agent_secret_key << '\n';

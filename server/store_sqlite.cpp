@@ -6,12 +6,11 @@
 
 #include "common/SingleLog.hpp"
 
-#include <nlohmann/json.hpp>
-
 #include <cctype>
 #include <stdexcept>
 #include <string>
 
+#include <nlohmann/json.hpp>
 #include <sodium.h>
 
 namespace thewatcher::server
@@ -886,13 +885,15 @@ std::vector<int64_t> SqliteStore::get_user_groups(int64_t user_id)
     return out;
 }
 
-void SqliteStore::disable_user(int64_t user_id)
+int SqliteStore::disable_user(int64_t user_id)
 {
     Stmt st;
     check(sqlite3_prepare_v2(db_, "UPDATE users SET disabled=1 WHERE user_id=? AND built_in=0;", -1, &st.s, nullptr),
           db_, "prepare disable_user");
     sqlite3_bind_int64(st.s, 1, user_id);
     check(sqlite3_step(st.s), db_, "step disable_user");
+    // SEC-13/14: report affected rows so the API can reject no-ops.
+    return sqlite3_changes(db_);
 }
 
 void SqliteStore::enable_user(int64_t user_id)
@@ -904,13 +905,14 @@ void SqliteStore::enable_user(int64_t user_id)
     check(sqlite3_step(st.s), db_, "step enable_user");
 }
 
-void SqliteStore::delete_user(int64_t user_id)
+int SqliteStore::delete_user(int64_t user_id)
 {
     Stmt st;
     check(sqlite3_prepare_v2(db_, "DELETE FROM users WHERE user_id=? AND built_in=0;", -1, &st.s, nullptr), db_,
           "prepare delete_user");
     sqlite3_bind_int64(st.s, 1, user_id);
     check(sqlite3_step(st.s), db_, "step delete_user");
+    return sqlite3_changes(db_);
 }
 
 void SqliteStore::update_user_password(int64_t user_id, const std::string& password_hash)
