@@ -4,16 +4,26 @@
 #include "common/crypto.hpp"
 
 #include <cctype>
+#include <cerrno>
 #include <cstdint>
+#include <cstdio>
+#include <cstring>
 #include <fstream>
+#include <random>
+#include <sstream>
 #include <stdexcept>
+#include <system_error>
 #include <unordered_map>
+#include <utility>
+#include <vector>
 
 #ifdef _WIN32
 #include <shlobj.h>
 #include <windows.h>
 #else
+#include <fcntl.h>
 #include <pwd.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #endif
 
@@ -36,6 +46,24 @@ namespace
         while (!value.empty() && std::isspace(static_cast<unsigned char>(value.back())))
             value.pop_back();
         return value;
+    }
+
+    // Comma-separated list: entries are trimmed and empty entries are skipped.
+    std::vector<std::string> split_csv(const std::string& value)
+    {
+        std::vector<std::string> out;
+        std::size_t start = 0;
+        while (start <= value.size())
+        {
+            auto end = value.find(',', start);
+            if (end == std::string::npos)
+                end = value.size();
+            auto entry = trim(value.substr(start, end - start));
+            if (!entry.empty())
+                out.push_back(std::move(entry));
+            start = end + 1;
+        }
+        return out;
     }
 
     std::unordered_map<std::string, std::string> read_key_value_file(const fs::path& path)
@@ -92,6 +120,8 @@ namespace
             cfg.server_secret_key = it->second;
         if (auto it = values.find("ENROLLMENT_TOKEN"); it != values.end())
             cfg.enrollment_token = it->second;
+        if (auto it = values.find("TRUSTED_PROXIES"); it != values.end())
+            cfg.trusted_proxies = split_csv(it->second);
     }
 
     std::string resolve_sqlite_db_path(const fs::path& config_path, const std::string& db_path)
@@ -109,6 +139,134 @@ namespace
         if (cfg.db_type == "sqlite")
             cfg.db_path = resolve_sqlite_db_path(config_path, cfg.db_path);
     }
+
+    // SEC-15: create a uniquely named temp file next to `target` that is
+    // owner-only from the moment it exists (it will hold SERVER_SECRET_KEY),
+    // write `content`, flush it to stable storage and return its path. On any
+    // failure the temp file is removed and std::runtime_error is thrown.
+#ifdef _WIN32
+    fs::path write_temp_file(const fs::path& target, const std::string& content)
+    {
+        const fs::path dir = target.has_parent_path() ? target.parent_path() : fs::path(".");
+        const std::string base = target.filename().string() + ".tmp.";
+
+        std::random_device rd;
+        std::mt19937_64 rng((static_cast<std::uint64_t>(rd()) << 32) ^ rd());
+
+        HANDLE h = INVALID_HANDLE_VALUE;
+        fs::path tmp;
+        for (int attempt = 0; attempt < 16; ++attempt)
+        {
+            char suffix[17];
+            std::snprintf(suffix, sizeof(suffix), "%016llx", static_cast<unsigned long long>(rng()));
+            tmp = dir / (base + suffix);
+            // CREATE_NEW fails if the name exists (including as a symlink or
+            // junction), so an attacker cannot pre-plant the temp file. No
+            // explicit security descriptor: the file inherits the config
+            // directory ACL, which the installer limits to SYSTEM/Administrators.
+            h = CreateFileW(tmp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, nullptr);
+            if (h != INVALID_HANDLE_VALUE || GetLastError() != ERROR_FILE_EXISTS)
+                break;
+        }
+        if (h == INVALID_HANDLE_VALUE)
+            throw std::runtime_error("Cannot create temporary file beside " + target.string());
+
+        bool ok = true;
+        const char* p = content.data();
+        std::size_t left = content.size();
+        while (ok && left > 0)
+        {
+            const DWORD chunk = left > (1u << 30) ? (1u << 30) : static_cast<DWORD>(left);
+            DWORD written = 0;
+            if (!WriteFile(h, p, chunk, &written, nullptr) || written == 0)
+            {
+                ok = false;
+                break;
+            }
+            p += written;
+            left -= written;
+        }
+        if (ok && !FlushFileBuffers(h))
+            ok = false;
+        if (!CloseHandle(h))
+            ok = false;
+        if (!ok)
+        {
+            DeleteFileW(tmp.c_str());
+            throw std::runtime_error("Failed writing " + tmp.string());
+        }
+        return tmp;
+    }
+
+    void replace_file(const fs::path& tmp, const fs::path& target)
+    {
+        // Atomic replace without deleting the old config first: if this fails
+        // the previous file is still in place.
+        if (!MoveFileExW(tmp.c_str(), target.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+        {
+            DeleteFileW(tmp.c_str());
+            throw std::runtime_error("Cannot replace " + target.string());
+        }
+    }
+#else
+    fs::path write_temp_file(const fs::path& target, const std::string& content)
+    {
+        const fs::path dir = target.has_parent_path() ? target.parent_path() : fs::path(".");
+        std::string tmpl = (dir / (target.filename().string() + ".tmp.XXXXXX")).string();
+
+        // mkstemp picks an unpredictable name and opens it O_CREAT|O_EXCL.
+        const int fd = ::mkstemp(tmpl.data());
+        if (fd < 0)
+            throw std::runtime_error("Cannot create temporary file beside " + target.string() + ": " +
+                                     std::strerror(errno));
+
+        int err = 0;
+        // Explicit 0600 in case a libc creates mkstemp files with looser modes.
+        if (::fchmod(fd, S_IRUSR | S_IWUSR) != 0)
+            err = errno;
+        if (err == 0 && ::fcntl(fd, F_SETFD, FD_CLOEXEC) != 0)
+            err = errno;
+
+        const char* p = content.data();
+        std::size_t left = content.size();
+        while (err == 0 && left > 0)
+        {
+            const ssize_t n = ::write(fd, p, left);
+            if (n < 0)
+            {
+                if (errno == EINTR)
+                    continue;
+                err = errno;
+                break;
+            }
+            p += n;
+            left -= static_cast<std::size_t>(n);
+        }
+        if (err == 0 && ::fsync(fd) != 0)
+            err = errno;
+        if (::close(fd) != 0 && err == 0)
+            err = errno;
+
+        if (err != 0)
+        {
+            ::unlink(tmpl.c_str());
+            throw std::runtime_error("Failed writing " + tmpl + ": " + std::strerror(err));
+        }
+        return fs::path(tmpl);
+    }
+
+    void replace_file(const fs::path& tmp, const fs::path& target)
+    {
+        std::error_code ec;
+        fs::rename(tmp, target, ec);
+        if (ec)
+        {
+            std::error_code cleanup_ec;
+            fs::remove(tmp, cleanup_ec);
+            throw std::runtime_error("Cannot replace " + target.string() + ": " + ec.message());
+        }
+    }
+#endif
 } // namespace
 
 fs::path ServerConfig::default_path()
@@ -160,8 +318,7 @@ ServerConfig ServerConfig::load_or_create(const fs::path& path)
     cfg.server_secret_key = kp.secret_key_z85;
     resolve_runtime_paths(cfg, path);
 
-    if (path.has_parent_path())
-        fs::create_directories(path.parent_path());
+    // save() creates (and, on POSIX, owner-restricts) any missing parent directory.
     cfg.save(path);
     return cfg;
 }
@@ -170,73 +327,74 @@ void ServerConfig::save(const fs::path& path) const
 {
     LOG_FUNCTION_TRACE
     LOGF_DEBUG("Saving server config to %s", path.string().c_str());
+    if (path.filename().empty())
+        throw std::runtime_error("Invalid server config path: " + path.string());
+
     if (path.has_parent_path())
     {
+        // Remember which ancestors do not exist yet: only directories created
+        // here are restricted; a pre-existing directory (e.g. /tmp or /etc)
+        // is never chmod-ed.
+        std::vector<fs::path> created;
+        {
+            std::error_code probe_ec;
+            fs::path dir = path.parent_path();
+            while (!dir.empty() && !fs::exists(dir, probe_ec))
+            {
+                created.push_back(dir);
+                const auto up = dir.parent_path();
+                if (up == dir)
+                    break;
+                dir = up;
+            }
+        }
+
         std::error_code dir_ec;
         fs::create_directories(path.parent_path(), dir_ec);
+        if (dir_ec && !fs::is_directory(path.parent_path()))
+            throw std::runtime_error("Cannot create directory " + path.parent_path().string() + ": " +
+                                     dir_ec.message());
 #ifndef _WIN32
         // SEC-15: the directory holds SERVER_SECRET_KEY and the Postgres DSN;
-        // newly created directories are restricted to the owner. (On Windows
-        // the installer grants only SYSTEM/Administrators on the config dir.)
-        fs::permissions(path.parent_path(), fs::perms::owner_all, fs::perm_options::replace, dir_ec);
-#endif
-    }
-
-    // SEC-15: write to a sibling temp file and rename over the target so a
-    // crash mid-write can never truncate an existing config, and apply
-    // owner-only permissions BEFORE the file ever holds secrets — a plain
-    // ofstream would create the file world-readable until a later chmod.
-    const fs::path tmp = fs::path(path.string() + ".tmp");
-    {
-        std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
-        if (!f)
-            throw std::runtime_error("Cannot write " + tmp.string());
-        f << "BIND_ADDRESS=" << bind_address << '\n';
-        f << "ENROLLMENT_ADDRESS=" << enrollment_address << '\n';
-        f << "API_HOST=" << api_host << '\n';
-        f << "API_PORT=" << api_port << '\n';
-        f << "DB_PATH=" << db_path << '\n';
-        f << "DB_TYPE=" << db_type << '\n';
-        f << "POSTGRES_DSN=" << postgres_dsn << '\n';
-        f << "OFFLINE_AFTER_SECONDS=" << offline_after_seconds << '\n';
-        f << "SERVER_PUBLIC_KEY=" << server_public_key << '\n';
-        f << "SERVER_SECRET_KEY=" << server_secret_key << '\n';
-        if (!enrollment_token.empty())
-            f << "ENROLLMENT_TOKEN=" << enrollment_token << '\n';
-        f.flush();
-        if (!f)
+        // directories created by this call are restricted to the owner. (On
+        // Windows the installer grants only SYSTEM/Administrators on the
+        // config dir.)
+        for (const auto& dir : created)
         {
-            std::error_code cleanup_ec;
-            fs::remove(tmp, cleanup_ec);
-            throw std::runtime_error("Failed writing " + tmp.string());
+            std::error_code perm_ec;
+            fs::permissions(dir, fs::perms::owner_all, fs::perm_options::replace, perm_ec);
+            if (perm_ec)
+                throw std::runtime_error("Cannot restrict permissions on " + dir.string() + ": " + perm_ec.message());
         }
+#endif
     }
 
-#ifndef _WIN32
+    std::ostringstream out;
+    out << "BIND_ADDRESS=" << bind_address << '\n';
+    out << "ENROLLMENT_ADDRESS=" << enrollment_address << '\n';
+    out << "API_HOST=" << api_host << '\n';
+    out << "API_PORT=" << api_port << '\n';
+    out << "DB_PATH=" << db_path << '\n';
+    out << "DB_TYPE=" << db_type << '\n';
+    out << "POSTGRES_DSN=" << postgres_dsn << '\n';
+    out << "OFFLINE_AFTER_SECONDS=" << offline_after_seconds << '\n';
+    out << "SERVER_PUBLIC_KEY=" << server_public_key << '\n';
+    out << "SERVER_SECRET_KEY=" << server_secret_key << '\n';
+    if (!enrollment_token.empty())
+        out << "ENROLLMENT_TOKEN=" << enrollment_token << '\n';
+    if (!trusted_proxies.empty())
     {
-        std::error_code perm_ec;
-        fs::permissions(tmp, fs::perms::owner_read | fs::perms::owner_write, fs::perm_options::replace, perm_ec);
-        if (perm_ec)
-        {
-            std::error_code cleanup_ec;
-            fs::remove(tmp, cleanup_ec);
-            throw std::runtime_error("Cannot restrict permissions on " + tmp.string());
-        }
+        out << "TRUSTED_PROXIES=";
+        for (std::size_t i = 0; i < trusted_proxies.size(); ++i)
+            out << (i ? "," : "") << trusted_proxies[i];
+        out << '\n';
     }
-#endif
 
-    std::error_code ec;
-#ifdef _WIN32
-    // std::filesystem::rename on Windows cannot replace an existing file.
-    fs::remove(path, ec);
-#endif
-    fs::rename(tmp, path, ec);
-    if (ec)
-    {
-        std::error_code cleanup_ec;
-        fs::remove(tmp, cleanup_ec);
-        throw std::runtime_error("Cannot replace " + path.string());
-    }
+    // SEC-15: write to a uniquely named, owner-only sibling temp file (created
+    // exclusively, never world-readable) and rename it over the target so a
+    // crash mid-write can never truncate an existing config.
+    const fs::path tmp = write_temp_file(path, out.str());
+    replace_file(tmp, path);
 }
 
 } // namespace thewatcher::server

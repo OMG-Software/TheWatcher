@@ -6,6 +6,7 @@
 #include <fstream>
 #include <sstream>
 #include <string>
+#include <vector>
 
 using namespace thewatcher::server;
 
@@ -204,6 +205,77 @@ SCENARIO("Server config round-trips through save and reload")
                 REQUIRE(reloaded.offline_after_seconds == original.offline_after_seconds);
                 REQUIRE(reloaded.server_public_key == original.server_public_key);
                 REQUIRE(reloaded.server_secret_key == original.server_secret_key);
+            }
+        }
+    }
+}
+
+SCENARIO("Server config TRUSTED_PROXIES round-trips and is parsed leniently")
+{
+    GIVEN("a config with no TRUSTED_PROXIES key")
+    {
+        auto dir = unique_temp_dir("server-config-proxies-default");
+        auto path = dir / "server.conf";
+        {
+            std::ofstream f(path);
+            f << "API_PORT=8080\n";
+        }
+
+        THEN("no proxies are trusted")
+        {
+            REQUIRE(ServerConfig::load_or_create(path).trusted_proxies.empty());
+        }
+    }
+
+    GIVEN("a config whose TRUSTED_PROXIES has spaces and empty entries")
+    {
+        auto dir = unique_temp_dir("server-config-proxies-parse");
+        auto path = dir / "server.conf";
+        {
+            std::ofstream f(path);
+            f << "TRUSTED_PROXIES= 10.0.0.1 ,, 192.168.1.5,\t,::1 ,\n";
+        }
+
+        WHEN("the config is loaded")
+        {
+            auto cfg = ServerConfig::load_or_create(path);
+
+            THEN("entries are trimmed and empty ones skipped")
+            {
+                REQUIRE(cfg.trusted_proxies == std::vector<std::string>{"10.0.0.1", "192.168.1.5", "::1"});
+            }
+        }
+    }
+
+    GIVEN("a ServerConfig with trusted proxies saved to disk")
+    {
+        auto dir = unique_temp_dir("server-config-proxies-roundtrip");
+        auto path = dir / "server.conf";
+
+        ServerConfig original = ServerConfig::load_or_create(path);
+        original.trusted_proxies = {"127.0.0.1", "10.1.2.3"};
+        original.save(path);
+
+        WHEN("the config is reloaded")
+        {
+            auto reloaded = ServerConfig::load_or_create(path);
+
+            THEN("the proxy list is preserved in order")
+            {
+                REQUIRE(reloaded.trusted_proxies == original.trusted_proxies);
+                REQUIRE(read_file(path).find("TRUSTED_PROXIES=127.0.0.1,10.1.2.3\n") != std::string::npos);
+            }
+        }
+
+        AND_WHEN("the list is cleared and saved again")
+        {
+            original.trusted_proxies.clear();
+            original.save(path);
+
+            THEN("the key is omitted and reload yields an empty list")
+            {
+                REQUIRE(read_file(path).find("TRUSTED_PROXIES") == std::string::npos);
+                REQUIRE(ServerConfig::load_or_create(path).trusted_proxies.empty());
             }
         }
     }

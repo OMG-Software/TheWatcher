@@ -2,6 +2,7 @@
 
 #include <filesystem>
 #include <string>
+#include <vector>
 
 namespace thewatcher::server
 {
@@ -25,6 +26,11 @@ struct ServerConfig
     // enrollment request must carry a matching token, so unauthenticated
     // hosts can no longer create pending-agent records at will.
     std::string enrollment_token;
+
+    // Reverse-proxy addresses whose X-Forwarded-For / X-Real-IP headers the
+    // API trusts for login throttling. Empty = trust none.
+    // Config key TRUSTED_PROXIES (comma-separated).
+    std::vector<std::string> trusted_proxies;
 
     static std::filesystem::path default_path();
     static ServerConfig load_or_create(const std::filesystem::path& path);

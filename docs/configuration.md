@@ -49,9 +49,20 @@ Options:
 | `SERVER_PUBLIC_KEY` | generated | Server CURVE public key. Approved enrollment responses include this key and its fingerprint so agents can learn and pin it. |
 | `SERVER_SECRET_KEY` | generated | Server CURVE secret key. Keep this private. |
 | `ENROLLMENT_TOKEN` | empty | Optional pre-shared token. When set, every enrollment request must carry a matching token (`ENROLLMENT_TOKEN` in the agent config), so arbitrary hosts cannot create pending-agent records. Leave empty for tokenless first-run enrollment. |
+| `TRUSTED_PROXIES` | empty | Comma-separated list of reverse-proxy addresses whose `X-Forwarded-For` / `X-Real-IP` headers the API trusts when attributing login attempts for throttling. Whitespace around entries is ignored and empty entries are skipped. Empty (the default) trusts no proxy, so those headers are ignored and the TCP peer address is used. Omitted from the saved file when empty. |
 
 If `server_public_key` is empty, the server does not enable CURVE on the data
 socket. The default generated config enables CURVE.
+
+When the server writes its config (first run, or after a change), it writes to
+a uniquely named temporary file in the same directory that is created
+owner-only (`0600` on POSIX) and then renames it over the config, so an
+interrupted write never truncates the previous config and the secret key is
+never readable by other users. A missing config directory is created
+owner-only (`0700`); a directory that already exists is left unchanged. On
+Windows the temporary file is created exclusively and swapped in with
+`MoveFileExW(MOVEFILE_REPLACE_EXISTING)`, and access is governed by the
+directory ACL set by the installer.
 
 ## Server Database Settings
 
