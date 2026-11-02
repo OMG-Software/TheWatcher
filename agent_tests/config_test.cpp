@@ -5,6 +5,7 @@
 
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <string>
 
 namespace fs = std::filesystem;
@@ -132,6 +133,59 @@ SCENARIO("AgentConfig survives a save and reload cycle")
         }
 
         // Clean up
+        fs::remove(path);
+    }
+}
+
+SCENARIO("The CLI insecure opt-in is never persisted but a configured ALLOW_INSECURE round-trips")
+{
+    GIVEN("a config with only the process-local allow_insecure_cli set")
+    {
+        auto path = fs::temp_directory_path() / "TheWatcherAgent-insecure-cli.conf";
+        fs::remove(path);
+
+        AgentConfig cfg = AgentConfig::load_or_create(path);
+        cfg.allow_insecure_cli = true;
+
+        WHEN("the config is saved and reloaded")
+        {
+            cfg.save(path);
+
+            std::ifstream in(path);
+            std::string contents((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+            auto reloaded = AgentConfig::load_or_create(path);
+
+            THEN("ALLOW_INSECURE is not written and the reloaded config is secure")
+            {
+                REQUIRE(contents.find("ALLOW_INSECURE") == std::string::npos);
+                REQUIRE_FALSE(reloaded.allow_insecure);
+                REQUIRE_FALSE(reloaded.allow_insecure_cli);
+            }
+        }
+
+        fs::remove(path);
+    }
+
+    GIVEN("a config with allow_insecure persisted by the operator")
+    {
+        auto path = fs::temp_directory_path() / "TheWatcherAgent-insecure-persisted.conf";
+        fs::remove(path);
+
+        AgentConfig cfg = AgentConfig::load_or_create(path);
+        cfg.allow_insecure = true;
+        cfg.save(path);
+
+        WHEN("the config is reloaded")
+        {
+            auto reloaded = AgentConfig::load_or_create(path);
+
+            THEN("allow_insecure is still set")
+            {
+                REQUIRE(reloaded.allow_insecure);
+                REQUIRE_FALSE(reloaded.allow_insecure_cli);
+            }
+        }
+
         fs::remove(path);
     }
 }

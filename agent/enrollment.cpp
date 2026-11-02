@@ -197,7 +197,7 @@ void enroll(AgentConfig& config, zmq::context_t& ctx, const std::atomic<bool>& s
             // plaintext.
             if (er_resp.server_public_key_z85.empty() || er_resp.server_public_key_fingerprint.empty())
             {
-                if (!config.allow_insecure)
+                if (!config.allow_insecure && !config.allow_insecure_cli)
                 {
                     LOG_WARNING("Approved enrollment response did not include a server key pin");
                     throw std::runtime_error("Approved enrollment response missing server key pin");

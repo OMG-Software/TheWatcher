@@ -165,6 +165,10 @@ int main(int argc, char* argv[])
             service_args.push_back("--server-key");
             service_args.push_back(override_server_key);
         }
+        if (allow_insecure)
+        {
+            service_args.push_back("--insecure");
+        }
 
         return thewatcher::service::install_windows_service({
             service_name,
@@ -217,7 +221,7 @@ int main(int argc, char* argv[])
         // SEC-08: explicit operator opt-in to run without CURVE; without this
         // flag an enrollment reply missing a server key pin is a hard error.
         LOG_WARNING("Insecure mode enabled: the agent may connect without CURVE encryption");
-        config.allow_insecure = true;
+        config.allow_insecure_cli = true;
     }
 
     LOGF_INFO("Agent ID: %s", config.agent_id.c_str());

@@ -198,6 +198,45 @@ SCENARIO("Enrollment accepts a keyless reply only with an explicit insecure opt-
     }
 }
 
+SCENARIO("Enrollment accepts a keyless reply when only the process-local CLI opt-in is set")
+{
+    GIVEN("an agent config with allow_insecure_cli set, allow_insecure unset and no server key")
+    {
+        thewatcher::crypto::init();
+        auto agent_kp = thewatcher::crypto::generate_curve_keypair();
+
+        EnrollServer server(base_port + 4);
+
+        AgentConfig cfg;
+        cfg.agent_id = "enroll-sec-insecure-cli";
+        cfg.agent_public_key = agent_kp.public_key_z85;
+        cfg.agent_secret_key = agent_kp.secret_key_z85;
+        cfg.enrollment_address = server.rep.get(zmq::sockopt::last_endpoint);
+        cfg.allow_insecure_cli = true;
+
+        std::thread server_thread([&] {
+            zmq::message_t req;
+            if (!server.rep.recv(req, zmq::recv_flags::none))
+                return;
+            send_enroll_response(server.rep, cfg.agent_id, true);
+        });
+
+        WHEN("enroll receives approval without a server key pin")
+        {
+            std::atomic<bool> stop{false};
+            zmq::context_t agent_ctx(1);
+            enroll(cfg, agent_ctx, stop, /*poll_interval=*/0, /*recv_timeout_ms=*/500);
+            server_thread.join();
+
+            THEN("enrollment completes without persisting the opt-in into allow_insecure")
+            {
+                REQUIRE(cfg.server_public_key.empty());
+                REQUIRE_FALSE(cfg.allow_insecure);
+            }
+        }
+    }
+}
+
 SCENARIO("Enrollment still learns the server key on first run")
 {
     GIVEN("an agent config with no key and a server that presents its key")

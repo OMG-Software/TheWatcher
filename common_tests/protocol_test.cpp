@@ -5,6 +5,10 @@
 #include <catch2/catch_approx.hpp>
 #include <catch2/catch_test_macros.hpp>
 
+#include <cstdint>
+#include <stdexcept>
+#include <vector>
+
 using namespace thewatcher;
 using namespace thewatcher::proto;
 
@@ -99,6 +103,70 @@ SCENARIO("EnrollRequest is serialized and deserialized correctly")
                 REQUIRE(unpacked.platform == req.platform);
                 REQUIRE(unpacked.curve_public_key_z85 == req.curve_public_key_z85);
             }
+        }
+    }
+}
+
+namespace
+{
+// Hand-encodes a CBOR definite array of `count` one-character text strings
+// ("a", "b", ...), so tests can feed EnrollRequest decoders arrays of any size.
+std::vector<uint8_t> enroll_array_payload(std::size_t count)
+{
+    std::vector<uint8_t> bytes;
+    bytes.push_back(static_cast<uint8_t>(0x80 | count)); // definite array, count < 24
+    for (std::size_t i = 0; i < count; ++i)
+    {
+        bytes.push_back(0x61); // text string, length 1
+        bytes.push_back(static_cast<uint8_t>('a' + i));
+    }
+    return bytes;
+}
+} // namespace
+
+SCENARIO("EnrollRequest decoding accepts legacy 4-element and current 5-element payloads")
+{
+    GIVEN("a 0.7.x style 4-element payload without an enrollment token")
+    {
+        const auto payload = enroll_array_payload(4);
+
+        WHEN("it is unpacked as an EnrollRequest")
+        {
+            auto req = unpack<EnrollRequest>(payload);
+
+            THEN("the four fields decode and the token is empty")
+            {
+                REQUIRE(req.agent_id == "a");
+                REQUIRE(req.hostname == "b");
+                REQUIRE(req.platform == "c");
+                REQUIRE(req.curve_public_key_z85 == "d");
+                REQUIRE(req.enrollment_token.empty());
+            }
+        }
+    }
+
+    GIVEN("a current 5-element payload with an enrollment token")
+    {
+        const auto payload = enroll_array_payload(5);
+
+        WHEN("it is unpacked as an EnrollRequest")
+        {
+            auto req = unpack<EnrollRequest>(payload);
+
+            THEN("the token is decoded")
+            {
+                REQUIRE(req.curve_public_key_z85 == "d");
+                REQUIRE(req.enrollment_token == "e");
+            }
+        }
+    }
+
+    GIVEN("payloads with 3 and 6 elements")
+    {
+        THEN("both are rejected")
+        {
+            REQUIRE_THROWS_AS(unpack<EnrollRequest>(enroll_array_payload(3)), std::runtime_error);
+            REQUIRE_THROWS_AS(unpack<EnrollRequest>(enroll_array_payload(6)), std::runtime_error);
         }
     }
 }

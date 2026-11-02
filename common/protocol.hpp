@@ -324,7 +324,16 @@ namespace detail
     template <>
     inline EnrollRequest from_cbor<EnrollRequest>(cbor_item_t* item)
     {
-        if (!cbor_isa_array(item) || cbor_array_size(item) != 5)
+        // 0.7.x agents send 4 elements (no enrollment token); current agents
+        // send 5. Accept both so old agents can still enroll after a server
+        // upgrade. A missing token decodes as empty and so fails the server's
+        // ENROLLMENT_TOKEN comparison when one is configured.
+        if (!cbor_isa_array(item))
+        {
+            throw std::runtime_error("Invalid EnrollRequest CBOR payload");
+        }
+        const auto element_count = cbor_array_size(item);
+        if (element_count != 4 && element_count != 5)
         {
             throw std::runtime_error("Invalid EnrollRequest CBOR payload");
         }
@@ -334,7 +343,10 @@ namespace detail
         r.hostname = read_string(array_get(item, 1));
         r.platform = read_string(array_get(item, 2));
         r.curve_public_key_z85 = read_string(array_get(item, 3));
-        r.enrollment_token = read_string(array_get(item, 4));
+        if (element_count == 5)
+        {
+            r.enrollment_token = read_string(array_get(item, 4));
+        }
 
         return r;
     }

@@ -19,6 +19,9 @@ struct AgentConfig
     // pin is a hard error — the data plane never connects without CURVE
     // silently. Set via ALLOW_INSECURE=1 in the config or --insecure.
     bool allow_insecure = false;
+    // Process-local --insecure opt-in. Never persisted by save(), so a one-off
+    // CLI flag does not become a permanent ALLOW_INSECURE=1 in the config file.
+    bool allow_insecure_cli = false;
     int collection_interval = 30;
     int heartbeat_interval = 5;
     int process_limit = 25;
