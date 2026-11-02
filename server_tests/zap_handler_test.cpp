@@ -2,6 +2,9 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <string>
+#include <vector>
+
 using namespace thewatcher::server;
 
 // The ZAP handler background thread polls inproc://zeromq.zap.01.
@@ -143,6 +146,43 @@ SCENARIO("Adding the same key twice then removing it once leaves it absent (set 
             THEN("has_key returns false — the set has no reference counting")
             {
                 REQUIRE(zap.has_key(key) == false);
+            }
+        }
+    }
+}
+
+SCENARIO("A malformed ZAP request gets a rejection instead of an out-of-bounds read")
+{
+    GIVEN("a running ZapHandler and a client connected to the ZAP endpoint")
+    {
+        zmq::context_t ctx{1};
+        ZapHandler zap{ctx};
+        zmq::socket_t client(ctx, ZMQ_REQ);
+        client.set(zmq::sockopt::rcvtimeo, 2000);
+        client.set(zmq::sockopt::linger, 0);
+        client.connect("inproc://zeromq.zap.01");
+
+        WHEN("a single-frame request without a request_id is sent")
+        {
+            client.send(zmq::message_t("1.0", 3), zmq::send_flags::none);
+
+            std::vector<std::string> reply;
+            bool more = true;
+            while (more)
+            {
+                zmq::message_t part;
+                if (!client.recv(part, zmq::recv_flags::none))
+                    break;
+                reply.emplace_back(static_cast<const char*>(part.data()), part.size());
+                more = client.get(zmq::sockopt::rcvmore) != 0;
+            }
+
+            THEN("the handler answers with a 400 and an empty request id")
+            {
+                REQUIRE(reply.size() == 6);
+                REQUIRE(reply[0] == "1.0");
+                REQUIRE(reply[1].empty());
+                REQUIRE(reply[2] == "400");
             }
         }
     }

@@ -84,6 +84,11 @@ void ZapHandler::run(std::stop_token st)
             more = zap.get(zmq::sockopt::rcvmore) != 0;
         }
 
+        // Nothing was received (e.g. the context is terminating): there is no
+        // request to answer.
+        if (parts.empty())
+            continue;
+
         // Minimum 7 frames for CURVE: version,req_id,domain,addr,identity,mechanism,key
         bool allow = false;
         std::string user_id; // SEC-04: identity reported to libzmq for this peer
@@ -125,7 +130,11 @@ void ZapHandler::run(std::stop_token st)
         // SEC-04: user_id carries the agent_id the CURVE key is bound to; the
         // server reads it back as the "User-Id" metadata on every message
         // from this peer and treats it as the authoritative identity.
-        auto& req_id = parts[1];
+        // A malformed request may have no request_id frame; reply with an
+        // empty one instead of reading past the end of `parts`, so the REP
+        // socket still completes its request/reply cycle.
+        const zmq::message_t no_req_id;
+        const zmq::message_t& req_id = parts.size() > 1 ? parts[1] : no_req_id;
         zap.send(zmq::message_t("1.0", 3), zmq::send_flags::sndmore);
         zap.send(zmq::message_t(req_id.data(), req_id.size()), zmq::send_flags::sndmore);
         if (allow)
