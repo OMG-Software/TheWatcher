@@ -51,9 +51,18 @@ ApiServer::~ApiServer()
 void ApiServer::start()
 {
     LOG_FUNCTION_TRACE
+    // Bind (and listen() on the socket) synchronously so the port accepts
+    // connections by the time start() returns; only the accept loop runs on
+    // the worker thread. Previously the bind raced with callers that treat
+    // start() as "ready" (connection refused on the first request).
+    if (!http_->bind_to_port(host_.c_str(), port_))
+    {
+        LOGF_ERROR("Failed to listen on %s:%d", host_.c_str(), port_);
+        return;
+    }
     thread_ = std::thread([this] {
         LOGF_INFO("Listening on %s:%d", host_.c_str(), port_);
-        if (!http_->listen(host_.c_str(), port_))
+        if (!http_->listen_after_bind())
             LOGF_ERROR("Failed to listen on %s:%d", host_.c_str(), port_);
     });
 }
@@ -67,6 +76,72 @@ void ApiServer::stop()
         thread_.join();
         LOG_DEBUG("API server thread joined");
     }
+}
+
+void ApiServer::set_trusted_proxies(std::vector<std::string> proxies)
+{
+    std::lock_guard<std::mutex> lk(login_mutex_);
+    trusted_proxies_ = std::move(proxies);
+}
+
+namespace
+{
+
+std::string_view trim_ws(std::string_view v)
+{
+    while (!v.empty() && (v.front() == ' ' || v.front() == '\t'))
+        v.remove_prefix(1);
+    while (!v.empty() && (v.back() == ' ' || v.back() == '\t'))
+        v.remove_suffix(1);
+    return v;
+}
+
+// Plausible IPv4/IPv6 literal: bounded length, digits / hex / '.' / ':' only.
+bool plausible_ip_literal(std::string_view v)
+{
+    if (v.empty() || v.size() > 45)
+        return false;
+    return std::all_of(v.begin(), v.end(), [](char c) {
+        return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F') || c == '.' || c == ':';
+    });
+}
+
+} // namespace
+
+std::string ApiServer::client_ip(const httplib::Request& req)
+{
+    const std::string remote = req.remote_addr;
+    std::vector<std::string> proxies;
+    {
+        std::lock_guard<std::mutex> lk(login_mutex_);
+        proxies = trusted_proxies_;
+    }
+    const auto is_trusted = [&proxies](std::string_view addr) {
+        return std::find(proxies.begin(), proxies.end(), addr) != proxies.end();
+    };
+    if (!is_trusted(remote))
+        return remote;
+
+    std::string candidate;
+    const std::string xff = req.get_header_value("X-Forwarded-For");
+    // Walk right to left: the rightmost entries were appended by our own
+    // proxies; the first untrusted one is the real client. Anything further
+    // left is client-supplied and spoofable.
+    std::string_view rest = xff;
+    while (!rest.empty())
+    {
+        const auto comma = rest.rfind(',');
+        const auto entry = trim_ws(comma == std::string_view::npos ? rest : rest.substr(comma + 1));
+        rest = comma == std::string_view::npos ? std::string_view{} : rest.substr(0, comma);
+        if (entry.empty() || is_trusted(entry))
+            continue;
+        candidate = std::string(entry);
+        break;
+    }
+    if (candidate.empty() && trim_ws(xff).empty())
+        candidate = std::string(trim_ws(req.get_header_value("X-Real-IP")));
+
+    return plausible_ip_literal(candidate) ? candidate : remote;
 }
 
 void ApiServer::drain_commands(std::vector<PendingCommand>& out)
@@ -798,38 +873,45 @@ void ApiServer::setup_routes()
                 return;
             }
 
-            // M-1 + SEC-12: login rate limiting. A fixed per-username window
-            // that RESETS on expiry (previously the lockout could never
-            // re-arm, allowing unlimited guessing after the first 15
-            // minutes) plus a per-source-IP throttle across all usernames.
-            // Expired entries are pruned so both maps stay bounded.
+            // M-1 + SEC-12: login rate limiting. Fixed windows that RESET on
+            // expiry (previously the lockout could never re-arm, allowing
+            // unlimited guessing after the first 15 minutes):
+            //  - per (client IP, username): 5 failures, so one client cannot
+            //    lock an account out for everybody else;
+            //  - per client IP across all usernames: 10 failures (spraying);
+            //  - per username across all IPs: 50 failures, a high ceiling
+            //    against distributed guessing.
+            // The client IP honours X-Forwarded-For / X-Real-IP only from
+            // trusted proxies (see client_ip). Expired entries are pruned so
+            // all maps stay bounded.
             constexpr int max_failures = 5;
             constexpr int max_ip_failures = 10;
+            constexpr int max_account_failures = 50;
             const auto now = now_ms();
-            const std::string remote = req.remote_addr;
+            const std::string remote = client_ip(req);
+            const std::string pair_key = remote + "|" + username;
             {
                 std::lock_guard<std::mutex> lk(login_mutex_);
 
                 // Prune expired windows: an entry whose window has elapsed
                 // is removed, which also implements the fixed-window reset.
-                for (auto it = login_failures_.begin(); it != login_failures_.end();)
-                {
-                    if (now - it->second.second >= login_lockout_ms_)
-                        it = login_failures_.erase(it);
-                    else
-                        ++it;
-                }
-                for (auto it = login_ip_failures_.begin(); it != login_ip_failures_.end();)
-                {
-                    if (now - it->second.second >= login_ip_window_ms_)
-                        it = login_ip_failures_.erase(it);
-                    else
-                        ++it;
-                }
+                const auto prune = [now](auto& map, int64_t window_ms) {
+                    for (auto it = map.begin(); it != map.end();)
+                    {
+                        if (now - it->second.second >= window_ms)
+                            it = map.erase(it);
+                        else
+                            ++it;
+                    }
+                };
+                prune(login_failures_, login_lockout_ms_);
+                prune(login_account_failures_, login_lockout_ms_);
+                prune(login_ip_failures_, login_ip_window_ms_);
 
-                auto& failures = login_failures_[username];
-                if (failures.first >= max_failures)
+                const auto pair_it = login_failures_.find(pair_key);
+                if (pair_it != login_failures_.end() && pair_it->second.first >= max_failures)
                 {
+                    LOGF_WARNING("Login locked out for repeated failures from %s", remote.c_str());
                     res.status = 429;
                     res.set_header("Retry-After", "900");
                     set_json(res, json{
@@ -840,13 +922,26 @@ void ApiServer::setup_routes()
 
                 // SEC-12: throttle by source IP across all usernames so a
                 // single host cannot spray many accounts (or lock them out).
-                auto& ip_failures = login_ip_failures_[remote];
-                if (ip_failures.first >= max_ip_failures)
+                const auto ip_it = login_ip_failures_.find(remote);
+                if (ip_it != login_ip_failures_.end() && ip_it->second.first >= max_ip_failures)
                 {
+                    LOGF_WARNING("Login throttled for source address %s", remote.c_str());
                     res.status = 429;
                     res.set_header("Retry-After", "60");
                     set_json(res, json{
                                       {"error", "too many login attempts from this address; try again later"}
+                    });
+                    return;
+                }
+
+                const auto acct_it = login_account_failures_.find(username);
+                if (acct_it != login_account_failures_.end() && acct_it->second.first >= max_account_failures)
+                {
+                    LOGF_WARNING("Account-wide login limit reached (last source %s)", remote.c_str());
+                    res.status = 429;
+                    res.set_header("Retry-After", "900");
+                    set_json(res, json{
+                                      {"error", "too many failed login attempts; try again later"}
                     });
                     return;
                 }
@@ -858,15 +953,15 @@ void ApiServer::setup_routes()
             {
                 {
                     std::lock_guard<std::mutex> lk(login_mutex_);
-                    auto& [count, window_start] = login_failures_[username];
-                    if (count == 0)
-                        window_start = now;
-                    ++count;
-
-                    auto& [ip_count, ip_window_start] = login_ip_failures_[remote];
-                    if (ip_count == 0)
-                        ip_window_start = now;
-                    ++ip_count;
+                    const auto record_failure = [now](auto& map, const std::string& key) {
+                        auto& [count, window_start] = map[key];
+                        if (count == 0)
+                            window_start = now;
+                        ++count;
+                    };
+                    record_failure(login_failures_, pair_key);
+                    record_failure(login_account_failures_, username);
+                    record_failure(login_ip_failures_, remote);
                 }
                 res.status = 401;
                 set_json(res, json{
@@ -877,7 +972,7 @@ void ApiServer::setup_routes()
 
             {
                 std::lock_guard<std::mutex> lk(login_mutex_);
-                login_failures_.erase(username);
+                login_failures_.erase(pair_key);
             }
 
             SessionRecord session;
@@ -1846,8 +1941,10 @@ void ApiServer::setup_routes()
             // SEC-10: a log path makes the agent read a local file and put
             // its contents on the dashboard — only global admins may set
             // them. Operators keep full access to every other collector
-            // setting.
-            if (!config.logs.empty() && session->role != "global_admin")
+            // setting, and may resubmit the stored log monitors unchanged
+            // (the endpoint replaces the whole config); any difference
+            // (added, edited, or removed monitors) needs a global admin.
+            if (session->role != "global_admin" && json(config.logs) != json(rec->collector_config.logs))
             {
                 LOGF_WARNING("Non-admin attempted to configure log monitor paths user=%s role=%s",
                              session->username.c_str(), session->role.c_str());

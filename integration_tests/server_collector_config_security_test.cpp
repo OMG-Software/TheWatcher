@@ -168,12 +168,12 @@ private:
     }
 };
 
-json collector_config_body(json logs)
+json collector_config_body(json logs, int cpu_readings = 1)
 {
     return json{
-        {"collection_interval", 30                             },
-        {"process_limit",       5                              },
-        {"collector_config",    json{{"logs", std::move(logs)}}}
+        {"collection_interval", 30                                                                    },
+        {"process_limit",       5                                                                     },
+        {"collector_config",    json{{"logs", std::move(logs)}, {"cpu_readings", cpu_readings}}}
     };
 }
 
@@ -302,6 +302,101 @@ SCENARIO("Non-admin operators cannot configure log monitor paths")
             {
                 REQUIRE(res);
                 REQUIRE(res->status == 200);
+            }
+        }
+    }
+}
+SCENARIO("Operators keep admin-set log monitors intact")
+{
+    GIVEN("an agent whose admin-set collector config already has a log monitor, and a group operator")
+    {
+        ServerFixture fx;
+        REQUIRE(fx.startup.wait().started);
+        REQUIRE(fx.error == nullptr);
+        REQUIRE(fx.login("thewatcher", "look_at_me"));
+        REQUIRE(fx.setup_agent("cfg-sec-agent-3"));
+
+        auto seeded = fx.client.Post("/api/agents/cfg-sec-agent-3/collector_config",
+                                     collector_config_body(json::array({valid_log_entry()})).dump(),
+                                     "application/json");
+        REQUIRE(seeded);
+        REQUIRE(seeded->status == 200);
+
+        std::optional<int64_t> admins_group_id;
+        {
+            auto res = fx.client.Get("/api/groups");
+            REQUIRE(res);
+            REQUIRE(res->status == 200);
+            for (const auto& g : json::parse(res->body))
+                if (g.value("name", "") == "Admins")
+                    admins_group_id = g.value("group_id", int64_t{0});
+        }
+        REQUIRE(admins_group_id.has_value());
+        auto created = fx.client.Post("/api/users",
+                                      json{
+                                          {"username",  "log_op3"                      },
+                                          {"password",  "operatorpw!"                  },
+                                          {"role",      "group_operator"               },
+                                          {"group_ids", json::array({*admins_group_id})}
+        }
+                                          .dump(),
+                                      "application/json");
+        REQUIRE(created);
+        REQUIRE(created->status == 200);
+
+        WHEN("the global admin changes the log monitors")
+        {
+            auto entry = valid_log_entry();
+            entry["pattern"] = "FATAL";
+            auto res = fx.client.Post("/api/agents/cfg-sec-agent-3/collector_config",
+                                      collector_config_body(json::array({entry})).dump(), "application/json");
+
+            THEN("it is accepted")
+            {
+                REQUIRE(res);
+                REQUIRE(res->status == 200);
+            }
+        }
+
+        WHEN("the operator resubmits the unchanged log monitors with another setting edited")
+        {
+            REQUIRE(fx.login("log_op3", "operatorpw!"));
+            auto res = fx.client.Post("/api/agents/cfg-sec-agent-3/collector_config",
+                                      collector_config_body(json::array({valid_log_entry()}), 2).dump(),
+                                      "application/json");
+
+            THEN("it is accepted")
+            {
+                REQUIRE(res);
+                REQUIRE(res->status == 200);
+            }
+        }
+
+        WHEN("the operator sends an empty log list to wipe the monitors")
+        {
+            REQUIRE(fx.login("log_op3", "operatorpw!"));
+            auto res = fx.client.Post("/api/agents/cfg-sec-agent-3/collector_config",
+                                      collector_config_body(json::array()).dump(), "application/json");
+
+            THEN("it is rejected with 403")
+            {
+                REQUIRE(res);
+                REQUIRE(res->status == 403);
+            }
+        }
+
+        WHEN("the operator changes a log monitor")
+        {
+            REQUIRE(fx.login("log_op3", "operatorpw!"));
+            auto entry = valid_log_entry();
+            entry["path"] = "/var/log/other.log";
+            auto res = fx.client.Post("/api/agents/cfg-sec-agent-3/collector_config",
+                                      collector_config_body(json::array({entry})).dump(), "application/json");
+
+            THEN("it is rejected with 403")
+            {
+                REQUIRE(res);
+                REQUIRE(res->status == 403);
             }
         }
     }

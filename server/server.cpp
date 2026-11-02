@@ -119,6 +119,8 @@ Server::Server(ServerConfig config)
     store_ = make_store(config_.db_type, db_target);
     zap_ = std::make_unique<ZapHandler>(ctx_);
     api_ = std::make_unique<ApiServer>(*store_, *zap_, config_.api_host, config_.api_port);
+    // SEC-12: login throttling honours X-Forwarded-For / X-Real-IP only from these peers.
+    api_->set_trusted_proxies(config_.trusted_proxies);
 
     // Pre-load all already-approved agents into the ZAP key set so they can
     // reconnect after a server restart without needing re-approval. SEC-04:

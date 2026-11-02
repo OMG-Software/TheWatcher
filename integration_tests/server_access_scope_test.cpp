@@ -195,7 +195,8 @@ private:
         cfg.enrollment_address = free_zmq_endpoint();
         cfg.api_host = "127.0.0.1";
         cfg.api_port = free_http_port();
-        cfg.db_path = base.string() + ".db";
+        // The (unique) API port keeps concurrent runs from sharing one DB file.
+        cfg.db_path = base.string() + "-" + std::to_string(cfg.api_port) + ".db";
         config = cfg;
         return cfg;
     }
