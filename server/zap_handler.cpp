@@ -42,6 +42,8 @@ bool ZapHandler::has_key(const std::string& z85_key) const
     return approved_keys_.count(z85_key) > 0;
 }
 
+// Returns the agent_id bound to an approved key, or nullopt when the key is
+// unknown or has no bound identity.
 std::optional<std::string> ZapHandler::user_id_for_key(const std::string& z85_key) const
 {
     std::shared_lock lock(keys_mutex_);
@@ -53,6 +55,10 @@ std::optional<std::string> ZapHandler::user_id_for_key(const std::string& z85_ke
     return it->second;
 }
 
+// Binds inproc://zeromq.zap.01 and answers ZAP requests until stopped. Allows a
+// CURVE peer whose key is approved and replies with its agent_id as user_id.
+// Allows NULL peers (the enrollment socket). Denies others, and replies with an
+// empty request id when the request is malformed.
 void ZapHandler::run(std::stop_token st)
 {
     LOG_FUNCTION_TRACE

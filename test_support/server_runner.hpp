@@ -50,6 +50,7 @@ public:
         });
     }
 
+    // Stops the server and joins the worker thread if it is still running.
     ~ServerRunner()
     {
         if (thread.joinable())

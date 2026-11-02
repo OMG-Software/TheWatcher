@@ -38,6 +38,7 @@ unsigned mode_bits(const fs::path& p)
 }
 #endif
 
+// Returns true when `dir` holds an entry whose name contains ".tmp".
 bool has_temp_leftovers(const fs::path& dir)
 {
     for (const auto& entry : fs::directory_iterator(dir))

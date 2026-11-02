@@ -123,6 +123,10 @@ double get_uptime_seconds()
 #endif
 }
 
+// Sends an EnrollRequest and polls until approved or stop_flag is set. Retries on
+// send failure and receive timeout. Throws std::runtime_error if rejected, if an
+// approved reply lacks a valid server key pin (unless insecure mode is on), or if
+// a fingerprint or configured key pin does not match. Stores the server key on success.
 void enroll(AgentConfig& config, zmq::context_t& ctx, const std::atomic<bool>& stop_flag, int poll_interval_seconds,
             int recv_timeout_ms)
 {

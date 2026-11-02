@@ -141,6 +141,7 @@ namespace
 
 #ifdef _WIN32
 
+    // Closes the handle if open. Safe to call more than once.
     void ReadOnlyFile::close() noexcept
     {
         if (handle_ != INVALID_HANDLE_VALUE)
@@ -150,6 +151,9 @@ namespace
         }
     }
 
+    // Windows: opens without following reparse points, then requires a regular disk
+    // file and resolves its final path. Returns missing, not_regular or failed (with
+    // `error` set). Fails closed when the final path cannot be determined.
     ReadOnlyFile::Status ReadOnlyFile::open(const std::filesystem::path& path, std::string& error)
     {
         handle_ = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
@@ -208,6 +212,8 @@ namespace
         return Status::ok;
     }
 
+    // Windows: reads up to `length` bytes at `offset` with an overlapped ReadFile.
+    // Returns the bytes read, 0 at EOF, or -1 on error.
     int64_t ReadOnlyFile::read_at(int64_t offset, char* buffer, std::size_t length) const
     {
         OVERLAPPED position{};
@@ -221,6 +227,7 @@ namespace
 
 #else
 
+    // Closes the descriptor if open. Safe to call more than once.
     void ReadOnlyFile::close() noexcept
     {
         if (fd_ >= 0)
@@ -249,6 +256,9 @@ namespace
 #endif
     }
 
+    // POSIX: opens read-only with O_NOFOLLOW and O_NONBLOCK, then requires a regular
+    // file. Returns missing, not_regular (symlink, FIFO, device, directory) or failed
+    // (with `error` set). On success it records the inode, size and kernel-reported path.
     ReadOnlyFile::Status ReadOnlyFile::open(const std::filesystem::path& path, std::string& error)
     {
         // O_NOFOLLOW: never traverse a symlink swapped in at the last
@@ -286,6 +296,8 @@ namespace
         return Status::ok;
     }
 
+    // POSIX: reads up to `length` bytes at `offset` with pread, retrying on EINTR.
+    // Returns the bytes read, 0 at EOF, or -1 on error.
     int64_t ReadOnlyFile::read_at(int64_t offset, char* buffer, std::size_t length) const
     {
         for (;;)
@@ -371,6 +383,8 @@ void LogCollector::set_configs(std::vector<LogMonitorConfig> configs)
     }
 }
 
+// Replaces the allowlist with the canonical form of `dirs`. Empty entries and
+// entries that cannot be resolved are dropped with a warning.
 void LogCollector::set_allowed_dirs(std::vector<std::filesystem::path> dirs)
 {
     // tail_file compares fully resolved file paths against this list, so
@@ -396,6 +410,9 @@ void LogCollector::set_allowed_dirs(std::vector<std::filesystem::path> dirs)
     LOGF_DEBUG("LogCollector allowlist updated entry_count=%zu", allowed_dirs_.size());
 }
 
+// Polls each enabled, complete config once. Does nothing while configs exist but
+// the allowlist is empty (fail closed). Skips over-long patterns. An error on one
+// file is logged and does not stop the others.
 void LogCollector::tick()
 {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -433,6 +450,10 @@ std::vector<proto::LogMatch> LogCollector::take_matches()
     return std::exchange(pending_, {});
 }
 
+// Reads new complete lines from one file and queues pattern matches. The caller
+// holds mutex_. Resets the file's state and returns when the path does not
+// resolve, is outside the allowlist, is missing or is not a regular file. Reads
+// are capped per tick. An invalid regex is logged and the file is skipped.
 void LogCollector::tail_file(const LogMonitorConfig& cfg)
 {
     // SEC-10: resolve symlinks and require the real location to sit inside

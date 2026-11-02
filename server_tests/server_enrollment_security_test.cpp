@@ -39,6 +39,8 @@ struct EnrollmentFixture : ServerFixture
     {
     }
 
+    // Returns the agent's last_seen value from GET /api/agents, or nullopt when the
+    // request fails or the agent is not listed.
     std::optional<int64_t> agent_last_seen(const std::string& agent_id)
     {
         auto res = client.Get("/api/agents");
@@ -50,6 +52,8 @@ struct EnrollmentFixture : ServerFixture
         return std::nullopt;
     }
 
+    // Returns true when GET /api/pending-enrollments lists `agent_id`. Returns false
+    // if the request fails.
     bool pending_contains(const std::string& agent_id)
     {
         auto res = client.Get("/api/pending-enrollments");

@@ -210,6 +210,9 @@ AgentConfig AgentConfig::load_or_create(const std::filesystem::path& path)
     return cfg;
 }
 
+// Writes the config as KEY=VALUE lines, creating missing parent directories.
+// On POSIX it limits the file to the owner (it holds the CURVE secret key).
+// Throws std::runtime_error if the file cannot be opened for writing.
 void AgentConfig::save(const std::filesystem::path& path) const
 {
     LOG_FUNCTION_TRACE

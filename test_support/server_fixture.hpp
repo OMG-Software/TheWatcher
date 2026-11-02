@@ -126,12 +126,15 @@ public:
         return enroll_agent(agent_id, hostname) && approve(agent_id, approve_body);
     }
 
+    // Approves `agent_id` through the API, sending `body` as JSON. Returns true only
+    // when the server answers 200.
     bool approve(const std::string& agent_id, const std::string& body = "")
     {
         auto res = client.Post("/api/agents/" + agent_id + "/approve", body, "application/json");
         return res && res->status == 200;
     }
 
+    // Rejects `agent_id` through the API. Returns true only when the server answers 200.
     bool reject(const std::string& agent_id)
     {
         auto res = client.Post("/api/agents/" + agent_id + "/reject", "", "application/json");
@@ -141,6 +144,8 @@ public:
     httplib::Client client;
 
 private:
+    // Builds a config with free ZMQ endpoints and HTTP port and a SQLite file in
+    // `dir`. Adds a CURVE keypair when options.curve is set, and the enrollment token.
     static thewatcher::server::ServerConfig make_config(const std::filesystem::path& dir,
                                                         const ServerFixtureOptions& options)
     {

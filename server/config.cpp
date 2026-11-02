@@ -158,6 +158,9 @@ namespace
     // write `content`, flush it to stable storage and return its path. On any
     // failure the temp file is removed and std::runtime_error is thrown.
 #ifdef _WIN32
+    // Windows variant: CreateFileW with a protected owner-only DACL and CREATE_NEW,
+    // then writes and flushes the data. Removes the temp file and throws
+    // std::runtime_error on any failure.
     fs::path write_temp_file(const fs::path& target, const std::string& content)
     {
         const fs::path dir = target.has_parent_path() ? target.parent_path() : fs::path(".");
@@ -315,6 +318,10 @@ fs::path ServerConfig::default_path()
 #endif
 }
 
+// Loads the KEY=VALUE config at path, or creates it with a new CURVE keypair
+// when missing. Throws std::runtime_error if the file cannot be read or written,
+// and std::invalid_argument or std::out_of_range for a non-numeric port or interval.
+// On POSIX it warns when group or others can read an existing file.
 ServerConfig ServerConfig::load_or_create(const fs::path& path)
 {
     LOG_FUNCTION_TRACE
@@ -357,6 +364,10 @@ ServerConfig ServerConfig::load_or_create(const fs::path& path)
     return cfg;
 }
 
+// Writes the config atomically: an owner-only temp file is renamed over the
+// target. Creates missing parent directories and limits those it created to the
+// owner on POSIX. Throws std::runtime_error on an empty filename or any
+// directory, write or rename failure.
 void ServerConfig::save(const fs::path& path) const
 {
     LOG_FUNCTION_TRACE

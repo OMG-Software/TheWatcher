@@ -26,6 +26,8 @@ namespace
 
 struct ScopeFixture : ServerFixture
 {
+    // Creates a group through the API. Returns its id, or nullopt when the request
+    // fails or does not return 200.
     std::optional<int64_t> create_group(const std::string& name)
     {
         auto res = client.Post("/api/groups",
@@ -39,6 +41,8 @@ struct ScopeFixture : ServerFixture
         return json::parse(res->body).value("group_id", int64_t{0});
     }
 
+    // Creates a user with the given role and group memberships through the API.
+    // Returns true only when the server answers 200.
     bool create_user(const std::string& username, const std::string& role, std::vector<int64_t> group_ids)
     {
         auto res =

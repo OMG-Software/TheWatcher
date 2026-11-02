@@ -137,6 +137,9 @@ Agent::~Agent()
 
 // ── Threading ─────────────────────────────────────────────────────────────────
 
+// Enrolls with the server, then connects the DEALER socket and starts the IO,
+// collection and heartbeat threads. Returns early if enrollment is stopped.
+// Throws if enrollment or the socket connect fails.
 void Agent::start()
 {
     LOG_FUNCTION_TRACE
@@ -423,6 +426,10 @@ void Agent::handle_frame(const proto::Frame& f)
     }
 }
 
+// Runs one server command (interval, process limit, restart, pause, resume,
+// status, disconnect) and sends a COMMAND_ACK. An unknown command type is acked
+// with ok=false. Malformed arguments make proto::unpack throw. Restarting
+// collectors re-applies the LOG_ALLOWED_DIRS allowlist to the new LogCollector.
 void Agent::handle_command(const CommandMessage& cmd)
 {
     LOGF_DEBUG("Handling command type=%u command_id=%s args_size=%zu", static_cast<unsigned>(cmd.command_type),

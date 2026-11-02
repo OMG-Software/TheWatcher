@@ -109,6 +109,9 @@ namespace
 
 // ── Construction ──────────────────────────────────────────────────────────────
 
+// Opens the store named by config.db_type, creates the ZAP handler and API
+// server, and preloads the keys of approved agents into ZAP, bound to their
+// agent ids. Store errors propagate.
 Server::Server(ServerConfig config)
     : config_(std::move(config))
 {
@@ -144,6 +147,10 @@ Server::~Server()
 
 // ── Main loop ─────────────────────────────────────────────────────────────────
 
+// Blocks until stop() is called. Binds the ROUTER (CURVE when a server key is
+// set) and enrollment REP sockets, starts the API, then polls both. A handler
+// exception is logged and does not end the loop. Runs the offline, escalation,
+// maintenance and report checks once a second. A socket bind failure throws.
 void Server::run(StartupSignal* startup)
 {
     LOG_FUNCTION_TRACE
@@ -323,6 +330,10 @@ void Server::stop()
 
 // ── ROUTER handler ────────────────────────────────────────────────────────────
 
+// Reads one multipart message from the ROUTER and processes it. Drops frames
+// that are malformed, fail the CURVE identity check, or come from agents that
+// are not approved. Handles METRICS, HEARTBEAT, CONFIG_REQUEST, COMMAND_ACK
+// and LOG_MATCH frames; other types are ignored.
 void Server::handle_router_frame(zmq::socket_t& router)
 {
     // ROUTER prepends the sender's routing-id (set by agent to its agent_id).
@@ -590,6 +601,10 @@ void Server::handle_router_frame(zmq::socket_t& router)
 
 // ── Enrollment handler ────────────────────────────────────────────────────────
 
+// Reads one enrollment request from the REP socket and always sends a reply.
+// Rejects multipart, malformed, oversized, badly tokened, rate-limited and
+// duplicate-key requests with an error reply. Otherwise records a pending agent
+// or answers an existing record; only approved agents receive the server key.
 void Server::handle_enrollment(zmq::socket_t& enroll)
 {
     LOG_FUNCTION_TRACE
@@ -898,6 +913,9 @@ void Server::handle_enrollment(zmq::socket_t& enroll)
 
 // ── Command dispatch ──────────────────────────────────────────────────────────
 
+// Takes pending commands from the API queue and sends each to its agent through
+// the ROUTER. Records each sent command to match its ACK. A send failure is
+// logged and that command is dropped.
 void Server::dispatch_commands(zmq::socket_t& router)
 {
     std::vector<PendingCommand> cmds;

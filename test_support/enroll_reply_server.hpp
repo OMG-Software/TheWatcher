@@ -70,6 +70,7 @@ public:
         });
     }
 
+    // Waits for the reply thread to finish. Does nothing if it is not running.
     void join()
     {
         if (thread_.joinable())

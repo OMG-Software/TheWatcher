@@ -17,6 +17,7 @@ using namespace thewatcher::server;
 namespace
 {
 
+// Returns the user named `username`, or nullopt when no such user exists.
 std::optional<UserRecord> find_user(SqliteStore& store, const std::string& username)
 {
     auto users = store.list_users();

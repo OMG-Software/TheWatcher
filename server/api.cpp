@@ -48,6 +48,8 @@ ApiServer::~ApiServer()
     stop();
 }
 
+// Binds the port synchronously, then runs the accept loop on a worker thread.
+// Throws std::runtime_error if the bind fails. Logs an error if listening stops.
 void ApiServer::start()
 {
     LOG_FUNCTION_TRACE
@@ -111,6 +113,9 @@ bool plausible_ip_literal(std::string_view v)
 
 } // namespace
 
+// Returns the address used for login throttling. The TCP peer is used unless it
+// is a trusted proxy; then the first untrusted X-Forwarded-For entry (or X-Real-IP
+// when the former is absent) is used. Falls back to the peer if it is not a plausible IP.
 std::string ApiServer::client_ip(const httplib::Request& req)
 {
     const std::string remote = req.remote_addr;
@@ -835,6 +840,9 @@ std::string ApiServer::enqueue_simple_command(const std::string& id, CommandType
 
 // ── Routes ────────────────────────────────────────────────────────────────────
 
+// Registers the default security headers, CORS handling and every REST route on
+// http_. Each handler checks the session role and returns a JSON error on
+// failure (400 for bad input, 403 for permission denied, 404 for unknown ids).
 void ApiServer::setup_routes()
 {
     LOG_FUNCTION_TRACE

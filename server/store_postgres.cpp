@@ -908,6 +908,8 @@ std::vector<int64_t> PostgresStore::get_user_groups(int64_t user_id)
     return out;
 }
 
+// Disables a non-built-in user. Returns the affected row count, so 0 means an
+// unknown id or a built-in user. Throws on SQL error.
 int PostgresStore::disable_user(int64_t user_id)
 {
     const auto p = s(user_id);
@@ -930,6 +932,8 @@ void PostgresStore::enable_user(int64_t user_id)
     check_res(res.r, "enable_user");
 }
 
+// Deletes a non-built-in user. Returns the affected row count, so 0 means an
+// unknown id or a built-in user. Throws on SQL error.
 int PostgresStore::delete_user(int64_t user_id)
 {
     const auto p = s(user_id);
@@ -965,6 +969,8 @@ void PostgresStore::create_session(const SessionRecord& session)
     check_res(res.r, "create_session");
 }
 
+// Returns the session only while it is unexpired and its user is enabled;
+// otherwise nullopt. Throws on SQL error.
 std::optional<SessionRecord> PostgresStore::get_session(const std::string& token, int64_t now_ms)
 {
     const auto p_now = s(now_ms);

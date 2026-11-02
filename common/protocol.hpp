@@ -584,6 +584,9 @@ T unpack(const std::vector<uint8_t>& data)
     return unpack<T>(data.data(), data.size());
 }
 
+// Decodes a T from a CBOR buffer. Throws std::runtime_error on an empty buffer,
+// a payload that fails structural validation, a parse error, trailing bytes, or
+// a shape that does not match T.
 template <typename T>
 T unpack(const void* data, std::size_t size)
 {
