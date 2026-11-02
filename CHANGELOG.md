@@ -46,8 +46,14 @@ entries below call those out explicitly.
 - **Behaviour change:** agent enrollment fails closed. A reply contradicting
   a configured server key is rejected, and an approved reply without a
   server key pin is a hard error unless the operator passes `--insecure`
-  (or sets `ALLOW_INSECURE=1`). The data plane never silently connects
-  without CURVE any more (SEC-08).
+  (or sets `ALLOW_INSECURE=1`). `--insecure` applies to that process only
+  and is never written to the config file; `--install-service --insecure`
+  forwards it to the Windows service command line. The data plane never
+  silently connects without CURVE any more (SEC-08).
+- The server still accepts the 4-element enrollment request sent by 0.7.x
+  agents (no enrollment token), so existing agents keep enrolling after a
+  server upgrade. When `ENROLLMENT_TOKEN` is set, those requests are
+  rejected because the token is missing (SEC-05).
 - **Behaviour change:** approval and revocation are enforced per frame on
   the data plane — rejected, deleted or still-pending agents' frames are
   dropped immediately instead of being honoured on existing sessions
@@ -57,30 +63,52 @@ entries below call those out explicitly.
   log paths; on the agent, log monitoring is disabled until the operator
   sets `LOG_ALLOWED_DIRS`, and reads are additionally capped (line length,
   bytes and matches per tick) and refuse anything but regular files inside
-  the allowlist (symlinks are resolved) (SEC-10).
+  the allowlist. Each file is opened once without following a final
+  symlink and without blocking on FIFOs; all checks and reads use that
+  descriptor, and the opened file's real location is re-checked against
+  the allowlist where the OS reports it. Only newline-terminated lines are
+  matched, so a line still being written is matched once it is complete.
+  Operators may resubmit an agent's collector config with the existing log
+  monitors unchanged; adding, changing or removing log monitors needs a
+  global admin (SEC-10).
 - Per-agent history, agent-scoped runbooks and view `agent_ids` now enforce
   group scoping like the rest of the per-agent API (SEC-11).
 - Login rate limiting now uses a fixed window that resets on expiry — the
   lockout re-arms instead of allowing unlimited guessing after the first
-  15 minutes — and adds a per-source-IP throttle across all usernames
-  (SEC-12).
+  15 minutes. The per-account lockout is keyed by client address and
+  username, so one source can no longer lock an account for everyone; a
+  per-source-address throttle covers all usernames, and an account-wide
+  ceiling of 50 failures limits distributed guessing. New `TRUSTED_PROXIES`
+  server setting: X-Forwarded-For / X-Real-IP are used for the client
+  address only when the connection comes from a listed proxy (SEC-12).
 - PostgreSQL deployments: `get_session` now filters disabled users, and
   `disable_user`/`delete_user` carry the same `built_in` guard as SQLite,
   so the bootstrap admin cannot be deleted and recreated with the public
   default password. Both backends now report affected rows and the API
   returns 404 for unknown or built-in ids instead of `{"ok":true}`
   (SEC-13, SEC-14).
-- The server config is written atomically (temp file + rename) with
-  owner-only permissions on POSIX, and the load path warns when an existing
-  config is group/world readable (SEC-15).
+- The server config is written atomically: a uniquely named owner-only
+  temp file is written and renamed over the target (on Windows, replaced
+  without deleting the old file first). Only directories that the save
+  creates are restricted to the owner; existing directories are left
+  unchanged. The load path warns when an existing config is group/world
+  readable (SEC-15).
 - Bumped cpp-httplib from 0.43.2 to 0.63.0, which upstream fixed several
   server advisories in (CRLF injection via header parsing, X-Forwarded-For
   crash under trusted proxy configs, negative chunk size DoS, trailer
   header CRLF injection) (SEC-44).
 - **Behaviour change (Windows):** the installer no longer grants
   `Users:modify` on the config directory; it now resets the ACL to SYSTEM
-  and Administrators only. Existing installs keep the old ACL until the
-  0.8.0 installer is re-run (SEC-45).
+  and Administrators only, removes the Users, Authenticated Users and
+  Everyone grants left by older installers, resets existing files to
+  inherit that ACL, and aborts the install if the ACL cannot be applied or
+  verified. Existing installs keep the old ACL until the 0.8.0 installer is
+  re-run (SEC-45).
+
+### Fixed
+
+- The API server binds its port before `start()` returns, so the first
+  request after startup no longer races the listener.
 
 ### Changed
 
