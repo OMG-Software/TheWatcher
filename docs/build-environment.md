@@ -114,7 +114,15 @@ Actions artifact, even when the build or tests fail. The Linux, Windows, and
 FreeBSD jobs also publish a download link in the job summary so the archived
 build output can be opened directly from the workflow run page.
 
-Build the dashboard separately with npm:
+Build the dashboard separately with npm. The dashboard needs Node.js
+`^22.12.0 || ^24.0.0 || >=26.0.0` (declared as `engines` in
+`dashboard/package.json`; Vite 8 and Vitest 5 do not support older releases).
+`dashboard/.npmrc` sets `engine-strict`, so `npm install` stops with an error on
+an unsupported release. Distribution packages are often older than this (for
+example Ubuntu 24.04 ships Node.js 18); the Linux and BSD setup scripts warn
+when the installed Node.js is outside the range. Install a supported release
+from <https://nodejs.org/en/download> (or `pkg install node24 npm-node24` on
+FreeBSD).
 
 ```powershell
 cd dashboard
