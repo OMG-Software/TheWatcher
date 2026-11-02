@@ -818,7 +818,7 @@ void Server::handle_enrollment(zmq::socket_t& enroll)
             constexpr std::size_t max_pending_agents = 1'000;
             if (store_->list_pending_agents().size() >= max_pending_agents)
             {
-                LOGF_WARNING("Enrollment rejected: pending agent queue is full");
+                LOGF_WARNING("Enrollment rejected: pending agent queue is full max=%zu", max_pending_agents);
                 send_error("pending queue full");
                 return;
             }

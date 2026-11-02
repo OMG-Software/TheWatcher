@@ -34,9 +34,9 @@ ApiServer::ApiServer(Store& store, ZapHandler& zap, const std::string& host, int
     , zap_(zap)
     , host_(host)
     , port_(port)
+    , http_(std::make_unique<httplib::Server>())
     , login_lockout_ms_(login_lockout_ms)
     , login_ip_window_ms_(login_ip_window_ms)
-    , http_(std::make_unique<httplib::Server>())
 {
     LOG_FUNCTION_TRACE
     LOGF_DEBUG("Constructing API server host=%s port=%d", host_.c_str(), port_);

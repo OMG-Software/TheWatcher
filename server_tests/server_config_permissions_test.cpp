@@ -53,7 +53,7 @@ SCENARIO("ServerConfig::save writes an owner-only config file")
             {
                 REQUIRE(std::filesystem::exists(path));
                 const auto perms = std::filesystem::status(path).permissions();
-                REQUIRE((perms & std::filesystem::perms::owner_rw) == std::filesystem::perms::owner_rw);
+                REQUIRE((perms & (std::filesystem::perms::owner_read | std::filesystem::perms::owner_write)) == (std::filesystem::perms::owner_read | std::filesystem::perms::owner_write));
                 REQUIRE((perms & std::filesystem::perms::group_all) == std::filesystem::perms::none);
                 REQUIRE((perms & std::filesystem::perms::others_all) == std::filesystem::perms::none);
             }
