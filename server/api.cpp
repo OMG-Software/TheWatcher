@@ -87,6 +87,7 @@ void ApiServer::set_trusted_proxies(std::vector<std::string> proxies)
 namespace
 {
 
+// Strips leading and trailing spaces and tabs. The view aliases the input.
 std::string_view trim_ws(std::string_view v)
 {
     while (!v.empty() && (v.front() == ' ' || v.front() == '\t'))
@@ -233,6 +234,10 @@ namespace
         validate_thresholds(thresholds.warning_mbps, thresholds.degraded_mbps, thresholds.critical_mbps, label);
     }
 
+    // Rejects an invalid collector config by throwing std::runtime_error.
+    // Checks thresholds, reading counts and required names. SEC-10: log monitors
+    // need a path (<= 4096 chars), a pattern (<= 256), an indicator name (<= 64)
+    // and a severity of yellow, amber or red.
     void validate_collector_config(const CollectorConfig& config)
     {
         validate_percent_thresholds(config.cpu, "cpu");

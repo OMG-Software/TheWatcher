@@ -33,7 +33,19 @@ struct ServerConfig
     std::vector<std::string> trusted_proxies;
 
     static std::filesystem::path default_path();
+    // Loads the KEY=VALUE config at path, or creates it with a new CURVE keypair
+    // when missing. A relative sqlite DB_PATH resolves against the config
+    // directory. Throws std::runtime_error if the file is over 1 MiB, a line is
+    // over 8 KiB, or the file cannot be read or written. A non-numeric port or
+    // interval throws std::invalid_argument or std::out_of_range. SEC-15: warns
+    // when group or others can read an existing file.
     static ServerConfig load_or_create(const std::filesystem::path& path);
+    // Writes the config to path atomically (SEC-15): an owner-only temp file is
+    // flushed, then renamed over the target, so a crash cannot truncate an
+    // existing config. On POSIX, directories created here are limited to the
+    // owner. ENROLLMENT_TOKEN and TRUSTED_PROXIES are written only when set.
+    // Throws std::runtime_error on an empty filename or any directory, write or
+    // rename failure.
     void save(const std::filesystem::path& path) const;
 };
 

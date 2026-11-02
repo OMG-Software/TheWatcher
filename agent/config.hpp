@@ -31,6 +31,11 @@ struct AgentConfig
     std::string enrollment_token;
 
     static AgentConfig load_or_create(const std::filesystem::path& path);
+    // Writes the config as KEY=VALUE lines. Throws std::runtime_error if the file
+    // cannot be opened. ALLOW_INSECURE is written only when allow_insecure is
+    // set; allow_insecure_cli is never persisted. ENROLLMENT_TOKEN is written
+    // only when non-empty. On POSIX the file is then restricted to owner
+    // read/write because it holds the CURVE secret key.
     void save(const std::filesystem::path& path) const;
 
     static std::filesystem::path default_path();

@@ -16,8 +16,9 @@ namespace thewatcher::agent
 {
 
 // Parses LOG_ALLOWED_DIRS (path-list separator: ';' on Windows, ':'
-// elsewhere) into resolved allowlist directories. Returns an empty list
-// when unset — which disables log monitoring entirely (fail closed).
+// elsewhere) into resolved allowlist directories. Entries that cannot be
+// resolved are dropped. Returns an empty list when unset — which disables log
+// monitoring entirely (fail closed).
 std::vector<std::filesystem::path> parse_log_allowed_dirs_from_env();
 
 class LogCollector final : public Collector
@@ -35,6 +36,8 @@ public:
     {
     }
 
+    // Replaces the monitored-file list and drops read state for paths that are
+    // no longer configured. Thread-safe.
     void set_configs(std::vector<LogMonitorConfig> configs);
 
     // SEC-10: agent-local allowlist of directories the log monitor may read.
@@ -46,6 +49,9 @@ public:
     void set_allowed_dirs(std::vector<std::filesystem::path> dirs);
 
     // Poll each configured file for new lines, apply patterns, accumulate matches.
+    // SEC-10: does nothing while the allowlist is empty (fail closed). Skips
+    // disabled or incomplete configs and over-long patterns. An error on one
+    // file is logged and does not stop the others.
     void tick();
 
     // Drain and return all accumulated matches since the last call.
@@ -67,6 +73,12 @@ private:
     std::vector<proto::LogMatch> pending_;
     std::mutex mutex_;
 
+    // Reads new complete lines from one file and queues pattern matches in
+    // pending_. The caller holds mutex_. SEC-10: fails closed. A path that does
+    // not resolve, sits outside the allowlist or is not a regular file is
+    // skipped and its read state reset. Reads are capped per tick, and a partial
+    // line is re-read on the next tick. Rotation resets the offset. An invalid
+    // regex is logged and the file is skipped. Other exceptions reach tick().
     void tail_file(const LogMonitorConfig& cfg);
 };
 

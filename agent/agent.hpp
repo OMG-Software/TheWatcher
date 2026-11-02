@@ -28,6 +28,11 @@ public:
     explicit Agent(AgentConfig config);
     ~Agent();
 
+    // Enrolls with the server, then configures the DEALER socket and starts the
+    // IO, collection and heartbeat threads. Returns without connecting if
+    // enrollment is stopped first. Throws if enrollment fails (SEC-08). Persists
+    // the enrolled key pin to the config file. Applies SEC-02 socket limits and
+    // uses CURVE only when a server key is known.
     void start(); // Now responsible for starting the background loops.
     void stop();  // Signals all threads to stop.
 
@@ -43,6 +48,10 @@ private:
 
     // ── Command handlers (called from IO thread) ─────────────────────────────
     void handle_frame(const proto::Frame& f);
+    // Runs one server command (interval, process limit, restart, pause, resume,
+    // status, disconnect) and sends a COMMAND_ACK. An unknown command type is
+    // acked with ok=false. Restarting collectors re-applies the SEC-10 log
+    // allowlist to the new LogCollector.
     void handle_command(const CommandMessage& cmd);
 
     // ── Helpers ───────────────────────────────────────────────────────────────

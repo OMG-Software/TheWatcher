@@ -21,10 +21,17 @@ namespace thewatcher::server
 class Server
 {
 public:
+    // Opens the store named by config.db_type ("postgres" or sqlite), creates
+    // the ZAP handler and API server, and preloads the keys of approved agents
+    // into ZAP, bound to their agent ids (SEC-04). Store errors propagate.
     explicit Server(ServerConfig config);
     ~Server();
 
-    // Blocks until stop() is called or a fatal error occurs.
+    // Blocks until stop() is called or a fatal error occurs. Binds the ROUTER
+    // (CURVE when a server key is set) and enrollment REP sockets, starts the
+    // API, then polls them. SEC-01: a handler exception is logged and never
+    // escapes the loop. SEC-02: message size and handshake time are bounded.
+    // Calls startup->succeed() once ready. A socket bind failure throws.
     void run(StartupSignal* startup = nullptr);
     void stop();
 
@@ -40,12 +47,22 @@ private:
     };
 
     // Drain one complete multipart message from the ROUTER and process it.
+    // Undecodable frames are logged and dropped. SEC-04: with CURVE on, drops
+    // frames whose ZAP identity differs from frame.agent_id. SEC-09: drops
+    // frames from agents that are unknown, unapproved or rejected. SEC-07:
+    // stores data under the server receive time, not the agent timestamp.
     void handle_router_frame(zmq::socket_t& router);
 
-    // Drain one enrollment request from the REP socket and reply.
+    // Drain one enrollment request from the REP socket and reply. Once a
+    // request is read, every path sends a reply (SEC-01), so the REP socket
+    // cannot stall. SEC-05: checks field formats, the enrollment token, per-agent
+    // and per-peer rate limits, and a cap on pending agents. SEC-06: an existing
+    // record's key is never replaced. The server key goes only to approved agents.
     void handle_enrollment(zmq::socket_t& enroll);
 
     // Pull commands out of the API queue and send them to agents via ROUTER.
+    // Each sent command is recorded with its target agent (SEC-04). A send
+    // failure is logged and that command is dropped.
     void dispatch_commands(zmq::socket_t& router);
 
     // Send a scheduled digest report if one is due.

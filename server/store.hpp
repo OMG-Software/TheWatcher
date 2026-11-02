@@ -212,6 +212,8 @@ public:
     virtual int delete_user(int64_t user_id) = 0;
     virtual void update_user_password(int64_t user_id, const std::string& password_hash) = 0;
     virtual void create_session(const SessionRecord& session) = 0;
+    // Returns the session for token, or nullopt when the token is unknown,
+    // expired at now_ms, or belongs to a disabled user.
     virtual std::optional<SessionRecord> get_session(const std::string& token, int64_t now_ms) = 0;
     virtual void delete_session(const std::string& token) = 0;
 

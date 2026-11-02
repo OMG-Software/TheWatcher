@@ -71,6 +71,7 @@ namespace detail
 
     struct CborDeleter
     {
+        // Drops one libcbor reference. A null item is ignored.
         void operator()(cbor_item_t* item) const noexcept
         {
             if (item != nullptr)
@@ -82,6 +83,8 @@ namespace detail
 
     using CborPtr = std::unique_ptr<cbor_item_t, CborDeleter>;
 
+    // Takes ownership of a libcbor item. Throws std::runtime_error on null,
+    // which means libcbor failed to allocate.
     inline CborPtr adopt(cbor_item_t* item)
     {
         if (item == nullptr)
@@ -91,6 +94,8 @@ namespace detail
         return CborPtr(item);
     }
 
+    // Appends value to array and releases the caller's reference to value.
+    // Throws std::runtime_error on a null argument or if the append fails.
     inline void push(cbor_item_t* array, cbor_item_t* value)
     {
         if (array == nullptr || value == nullptr)
@@ -108,6 +113,9 @@ namespace detail
         cbor_decref(&value);
     }
 
+    // Returns element index of a CBOR array without taking a reference. Throws
+    // std::runtime_error if array is not an array, index is out of range, or the
+    // element is null.
     inline cbor_item_t* array_get(cbor_item_t* array, size_t index)
     {
         if (!cbor_isa_array(array) || cbor_array_size(array) <= index)
@@ -129,6 +137,8 @@ namespace detail
         return cbor_build_uint8(value);
     }
 
+    // Builds a CBOR integer from value. Negative values use the CBOR -1 - n
+    // encoding. Returns null if libcbor fails to allocate.
     inline cbor_item_t* make_int64(int64_t value)
     {
         if (value >= 0)
@@ -175,6 +185,8 @@ namespace detail
         throw std::runtime_error("Unknown CBOR integer width");
     }
 
+    // Reads an unsigned CBOR integer that fits in uint8_t. Throws
+    // std::runtime_error for any other type or an out-of-range value.
     inline uint8_t read_uint8(cbor_item_t* item)
     {
         if (!cbor_isa_uint(item))
@@ -191,6 +203,8 @@ namespace detail
         return static_cast<uint8_t>(value);
     }
 
+    // Reads a CBOR unsigned or negative integer as int64_t. Throws
+    // std::runtime_error for any other type or a value outside the int64_t range.
     inline int64_t read_int64(cbor_item_t* item)
     {
         if (cbor_isa_uint(item))
@@ -216,6 +230,8 @@ namespace detail
         throw std::runtime_error("Expected CBOR integer");
     }
 
+    // Copies a definite-length CBOR text string. Throws std::runtime_error for any
+    // other type, including indefinite-length strings.
     inline std::string read_string(cbor_item_t* item)
     {
         if (!cbor_isa_string(item) || !cbor_string_is_definite(item))
@@ -229,6 +245,8 @@ namespace detail
         return std::string(reinterpret_cast<const char*>(data), size);
     }
 
+    // Copies a definite-length CBOR byte string. Throws std::runtime_error for any
+    // other type, including indefinite-length strings.
     inline std::vector<uint8_t> read_bytes(cbor_item_t* item)
     {
         if (!cbor_isa_bytestring(item) || !cbor_bytestring_is_definite(item))
@@ -242,6 +260,7 @@ namespace detail
         return std::vector<uint8_t>(data, data + size);
     }
 
+    // Reads a CBOR bool. Throws std::runtime_error for any other type.
     inline bool read_bool(cbor_item_t* item)
     {
         if (!cbor_is_bool(item))
@@ -304,6 +323,8 @@ namespace detail
         return root;
     }
 
+    // Decodes a Frame from a 4-element CBOR array: type, agent_id, timestamp_ms,
+    // payload. Throws std::runtime_error on a wrong shape or element type.
     template <>
     inline Frame from_cbor<Frame>(cbor_item_t* item)
     {
@@ -321,6 +342,9 @@ namespace detail
         return f;
     }
 
+    // Decodes an EnrollRequest from a 4- or 5-element CBOR array. The fifth
+    // element is the SEC-05 token; without it enrollment_token stays empty.
+    // Throws std::runtime_error on any other shape or element type.
     template <>
     inline EnrollRequest from_cbor<EnrollRequest>(cbor_item_t* item)
     {
@@ -351,6 +375,8 @@ namespace detail
         return r;
     }
 
+    // Decodes an EnrollResponse from a 4-element CBOR array. Throws
+    // std::runtime_error on a wrong shape or element type.
     template <>
     inline EnrollResponse from_cbor<EnrollResponse>(cbor_item_t* item)
     {
@@ -379,6 +405,8 @@ namespace detail
         return root;
     }
 
+    // Decodes a LogMatch from a CBOR array of at least four strings; extra
+    // elements are ignored. Throws std::runtime_error on a wrong shape or type.
     template <>
     inline LogMatch from_cbor<LogMatch>(cbor_item_t* item)
     {
@@ -406,6 +434,10 @@ namespace detail
 // definite container whose declared element count cannot possibly fit in
 // the remaining bytes (each element costs at least one byte) is refused.
 
+// Scans one item starting at p and advances p past it,
+// recursing into containers and tags. Callers start with depth 1. Throws
+// std::runtime_error on truncation, an invalid header, nesting beyond the
+// depth cap, or a declared length that exceeds the remaining bytes.
 inline void validate_cbor_item(const std::uint8_t*& p, const std::uint8_t* end, std::size_t depth)
 {
     constexpr std::size_t max_depth = 8; // deepest legitimate TheWatcher frame is ~4 levels
@@ -518,6 +550,8 @@ inline void validate_cbor_structure(const void* data, std::size_t size)
 
 // ── public helpers ────────────────────────────────────────────────────────────
 
+// Serializes obj to CBOR bytes through detail::to_cbor. Throws
+// std::runtime_error if libcbor fails to serialize.
 template <typename T>
 std::vector<uint8_t> pack(const T& obj)
 {
@@ -538,6 +572,9 @@ std::vector<uint8_t> pack(const T& obj)
     return out;
 }
 
+// Decodes a T from a CBOR buffer. Throws std::runtime_error on an empty
+// buffer, a payload that fails SEC-03 structural validation, a parse error,
+// trailing bytes, or a shape that does not match T.
 template <typename T>
 T unpack(const void* data, std::size_t size);
 

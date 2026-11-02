@@ -39,6 +39,7 @@ namespace
     constexpr std::uintmax_t max_config_file_bytes = 1024 * 1024;
     constexpr std::size_t max_config_line_bytes = 8 * 1024;
 
+    // Returns value without leading and trailing whitespace.
     std::string trim(std::string value)
     {
         while (!value.empty() && std::isspace(static_cast<unsigned char>(value.front())))
@@ -66,6 +67,9 @@ namespace
         return out;
     }
 
+    // Parses KEY=VALUE lines into a map. Keys and values are trimmed; blank lines,
+    // '#' comments and lines without '=' are skipped. Throws std::runtime_error
+    // if the file is over 1 MiB, a line is over 8 KiB, or it cannot be opened.
     std::unordered_map<std::string, std::string> read_key_value_file(const fs::path& path)
     {
         std::error_code ec;
@@ -96,6 +100,9 @@ namespace
         return values;
     }
 
+    // Copies recognised keys onto cfg; absent keys keep their defaults. Throws
+    // std::invalid_argument or std::out_of_range if API_PORT or
+    // OFFLINE_AFTER_SECONDS is not a valid integer.
     void apply_key_value(ServerConfig& cfg, const std::unordered_map<std::string, std::string>& values)
     {
         if (auto it = values.find("BIND_ADDRESS"); it != values.end())
@@ -124,6 +131,9 @@ namespace
             cfg.trusted_proxies = split_csv(it->second);
     }
 
+    // Returns a normalised sqlite path. An empty db_path means "thewatcher.db".
+    // A relative path is anchored at the config file's directory, or at the
+    // current directory when the config path has no parent.
     std::string resolve_sqlite_db_path(const fs::path& config_path, const std::string& db_path)
     {
         fs::path raw = db_path.empty() ? fs::path("thewatcher.db") : fs::path(db_path);
@@ -134,6 +144,8 @@ namespace
         return (base / raw).lexically_normal().string();
     }
 
+    // Rewrites cfg.db_path to its resolved form when db_type is "sqlite".
+    // Other database types are left unchanged.
     void resolve_runtime_paths(ServerConfig& cfg, const fs::path& config_path)
     {
         if (cfg.db_type == "sqlite")
@@ -198,6 +210,8 @@ namespace
         return tmp;
     }
 
+    // Renames tmp over target. If that fails the temp file is removed, the old
+    // config stays in place and std::runtime_error is thrown.
     void replace_file(const fs::path& tmp, const fs::path& target)
     {
         // Atomic replace without deleting the old config first: if this fails
@@ -209,6 +223,8 @@ namespace
         }
     }
 #else
+    // POSIX variant: mkstemp creates the file with mode 0600 and FD_CLOEXEC, then
+    // the data is written and fsync-ed. Cleans up and throws as described above.
     fs::path write_temp_file(const fs::path& target, const std::string& content)
     {
         const fs::path dir = target.has_parent_path() ? target.parent_path() : fs::path(".");
@@ -255,6 +271,8 @@ namespace
         return fs::path(tmpl);
     }
 
+    // Renames tmp over target. If that fails the temp file is removed, the old
+    // config stays in place and std::runtime_error is thrown.
     void replace_file(const fs::path& tmp, const fs::path& target)
     {
         std::error_code ec;

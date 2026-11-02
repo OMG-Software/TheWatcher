@@ -126,6 +126,7 @@ namespace
         int64_t read_at(int64_t offset, char* buffer, std::size_t length) const;
 
     private:
+        // Closes the descriptor or handle if open. Safe to call more than once.
         void close() noexcept;
 
 #ifdef _WIN32

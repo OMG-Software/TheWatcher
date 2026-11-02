@@ -50,7 +50,9 @@ public:
 
     ~ApiServer();
 
-    // Non-blocking start.
+    // Non-blocking start. Binds the port before returning, then runs the accept
+    // loop on a worker thread. If the bind fails it logs an error and returns
+    // without starting the thread; it does not throw.
     void start();
 
     void stop();
@@ -74,7 +76,8 @@ private:
                                                       const std::string& role, const std::string& agent_id);
     std::string enqueue_simple_command(const std::string& id, CommandType ct);
     // Client address used for login throttling: honours X-Forwarded-For /
-    // X-Real-IP only when the TCP peer is a trusted proxy.
+    // X-Real-IP only when the TCP peer is a trusted proxy. Falls back to the
+    // peer address when the header value is not a plausible IP literal.
     std::string client_ip(const httplib::Request& req);
 
     Store& store_;

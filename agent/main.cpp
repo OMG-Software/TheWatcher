@@ -49,6 +49,10 @@ static void print_usage(const char* prog)
               << "  --help            Show this help\n";
 }
 
+// Agent entry point. Parses CLI options, loads or creates the config, and runs
+// the agent until a signal or service stop. Returns 0 on clean exit and 1 on
+// an unknown argument, config load failure or fatal error. --insecure sets
+// allow_insecure_cli for this process only (SEC-08).
 int main(int argc, char* argv[])
 {
     namespace fs = std::filesystem;

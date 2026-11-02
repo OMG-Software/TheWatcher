@@ -28,7 +28,8 @@ namespace
     }
 
     // SEC-05: attacker-controlled strings may carry CR/LF or ANSI control
-    // characters used for log forging; replace them before logging.
+    // characters used for log forging; replace them before logging. The result
+    // is also truncated to 64 characters.
     std::string sanitize_log_text(std::string_view text)
     {
         constexpr std::size_t max_length = 64;

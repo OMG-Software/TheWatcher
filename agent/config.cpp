@@ -103,6 +103,10 @@ namespace
         return host_from_server_value(endpoint);
     }
 
+    // Copies recognised KEY=VALUE entries onto cfg; absent keys keep their
+    // defaults. ALLOW_INSECURE is true only for "1", "true" or "yes" (SEC-08).
+    // Throws std::invalid_argument or std::out_of_range if a numeric
+    // value is not a valid integer.
     void apply_key_value(AgentConfig& cfg, const std::unordered_map<std::string, std::string>& values)
     {
         if (auto it = values.find("THEWATCHER_SERVER"); it != values.end())

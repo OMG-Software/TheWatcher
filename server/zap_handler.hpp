@@ -34,6 +34,10 @@ public:
     std::optional<std::string> user_id_for_key(const std::string& z85_key) const;
 
 private:
+    // Thread body: binds inproc://zeromq.zap.01 and answers each ZAP request
+    // until stopped. Accepts a CURVE peer only if its key is approved, and
+    // returns the bound agent_id as user_id (SEC-04). Accepts NULL peers for the
+    // enrollment socket. Any other or malformed request is denied with 400.
     void run(std::stop_token st);
 
     zmq::context_t& ctx_;
