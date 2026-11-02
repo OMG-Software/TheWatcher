@@ -12,6 +12,7 @@
 #include <thread>
 #include <unordered_map>
 #include <utility>
+#include <vector>
 
 namespace httplib
 {
@@ -42,14 +43,25 @@ struct PendingCommand
 class ApiServer
 {
 public:
-    ApiServer(Store& store, ZapHandler& zap, const std::string& host, int port);
+    // login_lockout_ms / login_ip_window_ms configure the login rate
+    // limiter windows; production uses the defaults, tests shrink them.
+    ApiServer(Store& store, ZapHandler& zap, const std::string& host, int port,
+              int64_t login_lockout_ms = 15LL * 60LL * 1000LL, int64_t login_ip_window_ms = 60LL * 1000LL);
 
     ~ApiServer();
 
-    // Non-blocking start.
+    // Non-blocking start. Binds the port before returning, then runs the accept
+    // loop on a worker thread. Throws std::runtime_error if the bind fails, so
+    // Server::run() reports a startup failure instead of a running server.
     void start();
 
     void stop();
+
+    // Addresses (exact remote_addr strings, e.g. "127.0.0.1" or "::1") of
+    // reverse proxies whose X-Forwarded-For / X-Real-IP headers are trusted
+    // for login throttling. Empty (the default) means the headers are
+    // ignored and the TCP peer address is always used.
+    void set_trusted_proxies(std::vector<std::string> proxies);
 
     // Drain pending commands into caller's vector (called from ZMQ thread).
     void drain_commands(std::vector<PendingCommand>& out);
@@ -63,6 +75,10 @@ private:
     std::optional<SessionRecord> require_agent_access(const httplib::Request& req, httplib::Response& res,
                                                       const std::string& role, const std::string& agent_id);
     std::string enqueue_simple_command(const std::string& id, CommandType ct);
+    // Client address used for login throttling: honours X-Forwarded-For /
+    // X-Real-IP only when the TCP peer is a trusted proxy. Falls back to the
+    // peer address when the header value is not a plausible IP literal.
+    std::string client_ip(const httplib::Request& req);
 
     Store& store_;
     ZapHandler& zap_;
@@ -75,8 +91,16 @@ private:
     std::queue<PendingCommand> cmd_queue_;
     std::mutex cmd_mutex_;
 
-    // Login failure tracker for rate limiting (M-1): username -> (fail_count, window_start_ms)
+    // Login failure tracker for rate limiting (M-1): (client_ip, username) -> (fail_count, window_start_ms)
     std::unordered_map<std::string, std::pair<int, int64_t>> login_failures_;
+    // Account-wide failure tracker keyed by username alone (high threshold):
+    // username -> (fail_count, window_start_ms)
+    std::unordered_map<std::string, std::pair<int, int64_t>> login_account_failures_;
+    std::vector<std::string> trusted_proxies_; // guarded by login_mutex_
+    // SEC-12: per-source-IP failure throttle: ip -> (fail_count, window_start_ms)
+    std::unordered_map<std::string, std::pair<int, int64_t>> login_ip_failures_;
+    int64_t login_lockout_ms_;
+    int64_t login_ip_window_ms_;
     std::mutex login_mutex_;
 };
 

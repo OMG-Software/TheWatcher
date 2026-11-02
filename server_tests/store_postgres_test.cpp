@@ -379,7 +379,7 @@ SCENARIO("[postgres] Runbooks can be created, listed, and deleted")
 
             THEN("get_runbook finds it by exact indicator+status")
             {
-                auto rb = store.get_runbook("pg-test-cpu", "red");
+                auto rb = store.get_runbook("", "pg-test-cpu", "red");
                 REQUIRE(rb.has_value());
                 CHECK(rb->url == rec.url);
             }
@@ -399,7 +399,7 @@ SCENARIO("[postgres] Runbooks can be created, listed, and deleted")
 
                 THEN("get_runbook returns nullopt")
                 {
-                    CHECK_FALSE(store.get_runbook("pg-test-cpu", "red").has_value());
+                    CHECK_FALSE(store.get_runbook("", "pg-test-cpu", "red").has_value());
                 }
             }
         }
@@ -434,14 +434,14 @@ SCENARIO("[postgres] get_runbook returns exact indicator match before wildcard")
 
         THEN("get_runbook for the exact indicator returns the exact match")
         {
-            auto rb = store.get_runbook("pg-test-exact", "amber");
+            auto rb = store.get_runbook("", "pg-test-exact", "amber");
             REQUIRE(rb.has_value());
             CHECK(rb->url == "https://example.com/exact");
         }
 
         THEN("get_runbook for an unknown indicator returns the wildcard")
         {
-            auto rb = store.get_runbook("pg-some-other-indicator", "amber");
+            auto rb = store.get_runbook("", "pg-some-other-indicator", "amber");
             REQUIRE(rb.has_value());
             CHECK(rb->url == "https://example.com/wildcard");
         }

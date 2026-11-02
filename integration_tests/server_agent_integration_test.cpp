@@ -3,6 +3,8 @@
 #include "../server/startup_signal.hpp"
 #include "common/crypto.hpp"
 #include "common/protocol.hpp"
+#include "test_support/server_fixture.hpp"
+#include "test_support/temp_dir.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 #include <nlohmann/json.hpp>
@@ -19,43 +21,10 @@
 
 using namespace std::chrono_literals;
 using json = nlohmann::json;
+using namespace thewatcher::test;
 
 namespace
 {
-
-int64_t now_ms()
-{
-    return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch())
-        .count();
-}
-
-std::string free_zmq_endpoint()
-{
-    zmq::context_t ctx{1};
-    zmq::socket_t socket{ctx, ZMQ_REP};
-    socket.bind("tcp://127.0.0.1:*");
-    auto endpoint = socket.get(zmq::sockopt::last_endpoint);
-    socket.close();
-    return endpoint;
-}
-
-int free_http_port()
-{
-    return 20000 + static_cast<int>(now_ms() % 20000);
-}
-
-template <typename Predicate>
-bool eventually(Predicate predicate, std::chrono::milliseconds timeout, std::chrono::milliseconds interval = 100ms)
-{
-    const auto deadline = std::chrono::steady_clock::now() + timeout;
-    while (std::chrono::steady_clock::now() < deadline)
-    {
-        if (predicate())
-            return true;
-        std::this_thread::sleep_for(interval);
-    }
-    return predicate();
-}
 
 std::optional<json> get_json(httplib::Client& client, const std::string& path)
 {
@@ -63,23 +32,6 @@ std::optional<json> get_json(httplib::Client& client, const std::string& path)
     if (!res || res->status != 200)
         return std::nullopt;
     return json::parse(res->body);
-}
-
-bool login_as_default_admin(httplib::Client& client)
-{
-    auto res = client.Post("/api/login", R"({"username":"thewatcher","password":"look_at_me"})", "application/json");
-    if (!res || res->status != 200)
-        return false;
-
-    const auto set_cookie = res->get_header_value("Set-Cookie");
-    const auto end = set_cookie.find(';');
-    if (set_cookie.empty() || end == std::string::npos)
-        return false;
-
-    client.set_default_headers({
-        {"Cookie", set_cookie.substr(0, end)}
-    });
-    return true;
 }
 
 bool post_ok(httplib::Client& client, const std::string& path)
@@ -225,15 +177,14 @@ SCENARIO("A real agent enrolls, sends metrics, disconnects, and the server recor
         const auto agent_keys = thewatcher::crypto::generate_curve_keypair();
         const std::string agent_id = "integration-agent-" + std::to_string(now_ms());
 
-        const auto db_base =
-            std::filesystem::temp_directory_path() / ("thewatcher-integration-" + std::to_string(now_ms()));
+        const thewatcher::test::ScopedTempDir scratch("thewatcher-integration");
 
         thewatcher::server::ServerConfig server_config;
         server_config.bind_address = free_zmq_endpoint();
         server_config.enrollment_address = free_zmq_endpoint();
         server_config.api_host = "127.0.0.1";
         server_config.api_port = free_http_port();
-        server_config.db_path = db_base.string() + ".db";
+        server_config.db_path = (scratch.path() / "thewatcher.db").string();
         server_config.server_public_key = server_keys.public_key_z85;
         server_config.server_secret_key = server_keys.secret_key_z85;
 
@@ -277,7 +228,7 @@ SCENARIO("A real agent enrolls, sends metrics, disconnects, and the server recor
                 [&] {
                     return login_as_default_admin(client);
                 },
-                5s));
+                20s));
 
             REQUIRE(eventually(
                 [&] {
@@ -391,11 +342,6 @@ SCENARIO("A real agent enrolls, sends metrics, disconnects, and the server recor
         server.stop();
         if (server_thread.joinable())
             server_thread.join();
-
-        std::error_code ec;
-        std::filesystem::remove(server_config.db_path, ec);
-        std::filesystem::remove(server_config.db_path + "-shm", ec);
-        std::filesystem::remove(server_config.db_path + "-wal", ec);
     }
 }
 
@@ -404,96 +350,14 @@ SCENARIO("A real agent enrolls, sends metrics, disconnects, and the server recor
 namespace
 {
 
-struct ServerFixture
+// A CURVE-enabled server with a REST client; see test_support/server_fixture.hpp.
+struct ApiFixture : thewatcher::test::ServerFixture
 {
-    thewatcher::server::ServerConfig config;
-    thewatcher::server::Server server;
-    thewatcher::server::StartupSignal startup;
-    std::exception_ptr error;
-    std::thread thread;
-    httplib::Client client;
-
-    explicit ServerFixture()
-        : server(make_config())
-        , client("http://127.0.0.1:" + std::to_string(config.api_port))
+    ApiFixture()
+        : ServerFixture(thewatcher::test::ServerFixtureOptions::with_curve())
     {
-        client.set_connection_timeout(5, 0);
-        client.set_read_timeout(5, 0);
-
-        thread = std::thread([this] {
-            try
-            {
-                server.run(&startup);
-            }
-            catch (...)
-            {
-                error = std::current_exception();
-                startup.fail(error);
-            }
-        });
-    }
-
-    ~ServerFixture()
-    {
-        server.stop();
-        if (thread.joinable())
-            thread.join();
-        std::error_code ec;
-        std::filesystem::remove(config.db_path, ec);
-        std::filesystem::remove(config.db_path + "-shm", ec);
-        std::filesystem::remove(config.db_path + "-wal", ec);
-    }
-
-    bool login()
-    {
-        return eventually(
-            [this] {
-                return login_as_default_admin(client);
-            },
-            5s);
-    }
-
-private:
-    thewatcher::server::ServerConfig make_config()
-    {
-        thewatcher::crypto::init();
-        const auto keys = thewatcher::crypto::generate_curve_keypair();
-        const auto ts = std::to_string(now_ms());
-        const auto base = std::filesystem::temp_directory_path() / ("thewatcher-api-test-" + ts);
-
-        thewatcher::server::ServerConfig cfg;
-        cfg.bind_address = free_zmq_endpoint();
-        cfg.enrollment_address = free_zmq_endpoint();
-        cfg.api_host = "127.0.0.1";
-        cfg.api_port = free_http_port();
-        cfg.db_path = base.string() + ".db";
-        cfg.server_public_key = keys.public_key_z85;
-        cfg.server_secret_key = keys.secret_key_z85;
-        config = cfg;
-        return cfg;
     }
 };
-
-bool login_as(httplib::Client& client, const std::string& username, const std::string& password)
-{
-    auto res = client.Post("/api/login",
-                           json{
-                               {"username", username},
-                               {"password", password}
-    }
-                               .dump(),
-                           "application/json");
-    if (!res || res->status != 200)
-        return false;
-    const auto set_cookie = res->get_header_value("Set-Cookie");
-    const auto end = set_cookie.find(';');
-    if (set_cookie.empty() || end == std::string::npos)
-        return false;
-    client.set_default_headers({
-        {"Cookie", set_cookie.substr(0, end)}
-    });
-    return true;
-}
 
 // POST expecting HTTP 201 Created (used by the views endpoint).
 std::optional<json> post_json_created(httplib::Client& client, const std::string& path, const json& body)
@@ -512,7 +376,7 @@ SCENARIO("Server settings can be read and updated via the HTTP API")
 {
     GIVEN("a running server with default settings and an authenticated admin")
     {
-        ServerFixture fx;
+        ApiFixture fx;
         REQUIRE(fx.startup.wait().started);
         REQUIRE(fx.login());
 
@@ -599,7 +463,7 @@ SCENARIO("Alert silence rules can be created, listed, and deleted via the HTTP A
 {
     GIVEN("a running server and an authenticated operator")
     {
-        ServerFixture fx;
+        ApiFixture fx;
         REQUIRE(fx.startup.wait().started);
         REQUIRE(fx.login());
 
@@ -703,7 +567,7 @@ SCENARIO("Maintenance windows can be scheduled and cancelled via the HTTP API")
 {
     GIVEN("a running server and an authenticated operator")
     {
-        ServerFixture fx;
+        ApiFixture fx;
         REQUIRE(fx.startup.wait().started);
         REQUIRE(fx.login());
 
@@ -788,7 +652,7 @@ SCENARIO("User management API supports create, list, disable, enable, password c
 {
     GIVEN("a running server with an authenticated admin")
     {
-        ServerFixture fx;
+        ApiFixture fx;
         REQUIRE(fx.startup.wait().started);
         REQUIRE(fx.login());
 
@@ -921,7 +785,7 @@ SCENARIO("Group management API supports create and list with name validation")
 {
     GIVEN("a running server with an authenticated admin")
     {
-        ServerFixture fx;
+        ApiFixture fx;
         REQUIRE(fx.startup.wait().started);
         REQUIRE(fx.login());
 
@@ -997,7 +861,7 @@ SCENARIO("Group scoped accounts only see their assigned group and views")
 {
     GIVEN("a running server with two groups and an authenticated group operator in one group")
     {
-        ServerFixture fx;
+        ApiFixture fx;
         REQUIRE(fx.startup.wait().started);
         REQUIRE(fx.login());
 
@@ -1090,7 +954,7 @@ SCENARIO("Views API supports full CRUD and enforces public/private visibility be
 {
     GIVEN("a running server with an authenticated admin")
     {
-        ServerFixture fx;
+        ApiFixture fx;
         REQUIRE(fx.startup.wait().started);
         REQUIRE(fx.login());
 
@@ -1283,7 +1147,7 @@ SCENARIO("Alert API returns well-formed responses and enforces authentication on
 {
     GIVEN("a running server with no agents enrolled")
     {
-        ServerFixture fx;
+        ApiFixture fx;
         REQUIRE(fx.startup.wait().started);
         REQUIRE(fx.login());
 
@@ -1376,7 +1240,7 @@ SCENARIO("Session and login API enforces authentication and provides accurate se
 {
     GIVEN("a running server")
     {
-        ServerFixture fx;
+        ApiFixture fx;
         REQUIRE(fx.startup.wait().started);
 
         WHEN("an unauthenticated client calls GET /api/session")
@@ -1564,7 +1428,7 @@ SCENARIO(
 {
     GIVEN("a running server with an authenticated admin")
     {
-        ServerFixture fx;
+        ApiFixture fx;
         REQUIRE(fx.startup.wait().started);
         REQUIRE(fx.login());
 
@@ -1768,7 +1632,7 @@ SCENARIO("Runbooks API supports CRUD and enforces role-based access")
 {
     GIVEN("a running server with the default admin user logged in")
     {
-        ServerFixture fx;
+        ApiFixture fx;
         REQUIRE(fx.startup.wait().started);
         REQUIRE(fx.login());
 

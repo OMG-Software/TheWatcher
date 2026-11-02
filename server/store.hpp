@@ -204,11 +204,16 @@ public:
                                 const std::string& role) = 0;
     virtual void set_user_groups(int64_t user_id, const std::vector<int64_t>& group_ids) = 0;
     virtual std::vector<int64_t> get_user_groups(int64_t user_id) = 0;
-    virtual void disable_user(int64_t user_id) = 0;
+    // disable_user/delete_user return the number of affected rows: 0 means
+    // the id was unknown or the built_in guard refused the change, which
+    // the API layer maps to 404.
+    virtual int disable_user(int64_t user_id) = 0;
     virtual void enable_user(int64_t user_id) = 0;
-    virtual void delete_user(int64_t user_id) = 0;
+    virtual int delete_user(int64_t user_id) = 0;
     virtual void update_user_password(int64_t user_id, const std::string& password_hash) = 0;
     virtual void create_session(const SessionRecord& session) = 0;
+    // Returns the session for token, or nullopt when the token is unknown,
+    // expired at now_ms, or belongs to a disabled user.
     virtual std::optional<SessionRecord> get_session(const std::string& token, int64_t now_ms) = 0;
     virtual void delete_session(const std::string& token) = 0;
 
@@ -267,8 +272,11 @@ public:
     virtual int64_t create_runbook(const RunbookRecord& rec) = 0;
     virtual std::vector<RunbookRecord> list_runbooks() = 0;
     virtual void delete_runbook(int64_t runbook_id) = 0;
-    // Returns the best match for (indicator, status): exact > wildcard indicator.
-    virtual std::optional<RunbookRecord> get_runbook(const std::string& indicator, const std::string& status) = 0;
+    // Returns the best runbook for an alert on `agent_id`: only that agent's
+    // runbooks or generic ones (empty agent_id) match (SEC-11). Order: exact
+    // indicator > '*', then agent-specific > generic, then newest.
+    virtual std::optional<RunbookRecord> get_runbook(const std::string& agent_id, const std::string& indicator,
+                                                     const std::string& status) = 0;
 };
 
 std::unique_ptr<Store> make_store(const std::string& db_type, const std::string& db_path_or_dsn);

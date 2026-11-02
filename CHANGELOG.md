@@ -5,6 +5,128 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-11-02
+
+### Security
+
+This release closes the critical and high-severity findings from the 0.7.6
+security review. Several fixes change operator-visible behaviour — the
+entries below call those out explicitly.
+
+- Fixed an unauthenticated remote crash of the server: a multipart message
+  on the enrollment socket left the REP state machine mid-request and the
+  resulting EFSM exception killed the process. Multipart requests are now
+  drained and answered with an error, every handler has a catch-all so a
+  reply is always attempted, and enrollment receives are non-blocking so a
+  malformed envelope can no longer wedge the data-plane thread (SEC-01).
+- All ZMQ sockets now cap inbound message size (`ZMQ_MAXMSGSIZE` — 64 KiB
+  enrollment, 4 MiB data plane) and bound the connection handshake
+  (`ZMQ_HANDSHAKE_IVL`); the enrollment reply uses a send timeout
+  (SEC-02).
+- CBOR payloads are structurally pre-validated before decoding: nesting
+  depth is capped and declared definite-container sizes must fit the
+  remaining bytes, so a 9-byte payload can no longer demand a
+  multi-gigabyte allocation or overflow the stack on free (SEC-03).
+- The data-plane agent identity is now bound to the CURVE key: ZAP reports
+  the agent_id each approved key belongs to, every frame's claimed
+  `agent_id` must match it, command ACKs are accepted only from the agent
+  a command was dispatched to, and config replies are routed to the actual
+  peer identity (SEC-04, SEC-41).
+- Enrollment validates all fields (agent_id charset and length, hostname
+  and platform bounds), rate-limits per agent_id and per source address
+  with pruned tracking maps, caps the pending-approval queue, sanitises
+  control characters before logging, and supports an optional pre-shared
+  `ENROLLMENT_TOKEN`. A pending record's public key is immutable — a
+  different key no longer overwrites it before approval — and re-enrolling
+  an approved agent no longer refreshes its `last_seen` (which could
+  suppress dead-agent detection) (SEC-05, SEC-06).
+- Metric rows, evaluation times, alert timestamps and retention pruning now
+  run on the server's receive clock; an agent-supplied future timestamp can
+  no longer delete other agents' history (SEC-07).
+- **Behaviour change:** agent enrollment fails closed. A reply contradicting
+  a configured server key is rejected, and an approved reply without a
+  server key pin is a hard error unless the operator passes `--insecure`
+  (or sets `ALLOW_INSECURE=1`). `--insecure` applies to that process only
+  and is never written to the config file; `--install-service --insecure`
+  forwards it to the Windows service command line. The data plane never
+  silently connects without CURVE any more (SEC-08).
+- The server still accepts the 4-element enrollment request sent by 0.7.x
+  agents (no enrollment token), so existing agents keep enrolling after a
+  server upgrade. When `ENROLLMENT_TOKEN` is set, those requests are
+  rejected because the token is missing (SEC-05).
+- A CURVE public key can belong to one agent only: enrollment refuses a key
+  that another agent already holds, and approval refuses a key that is
+  already bound to another approved agent (HTTP 409). Data-plane log lines
+  sanitise the peer-supplied `agent_id` and command ACK text (SEC-04,
+  SEC-05).
+- **Behaviour change:** approval and revocation are enforced per frame on
+  the data plane — rejected, deleted or still-pending agents' frames are
+  dropped immediately instead of being honoured on existing sessions
+  (SEC-09).
+- **Behaviour change:** log monitoring is now restricted end to end. The
+  server validates log monitor entries and only global admins may configure
+  log paths; on the agent, log monitoring is disabled until the operator
+  sets `LOG_ALLOWED_DIRS`, and reads are additionally capped (line length,
+  bytes and matches per tick) and refuse anything but regular files inside
+  the allowlist. Each file is opened once without following a final
+  symlink and without blocking on FIFOs; all checks and reads use that
+  descriptor, and the opened file's real location is re-checked against
+  the allowlist where the OS reports it. Only newline-terminated lines are
+  matched, so a line still being written is matched once it is complete.
+  Operators may resubmit an agent's collector config with the existing log
+  monitors unchanged; adding, changing or removing log monitors needs a
+  global admin (SEC-10).
+- Per-agent history, agent-scoped runbooks and view `agent_ids` now enforce
+  group scoping like the rest of the per-agent API. Alerts attach only the
+  alerting agent's own runbook or a generic one, never a runbook scoped to
+  another agent (SEC-11).
+- Login rate limiting now uses a fixed window that resets on expiry — the
+  lockout re-arms instead of allowing unlimited guessing after the first
+  15 minutes. The per-account lockout is keyed by client address and
+  username, so one source can no longer lock an account for everyone; a
+  per-source-address throttle covers all usernames, and an account-wide
+  ceiling of 50 failures limits distributed guessing. New `TRUSTED_PROXIES`
+  server setting: X-Forwarded-For / X-Real-IP are used for the client
+  address only when the connection comes from a listed proxy (SEC-12).
+- PostgreSQL deployments: `get_session` now filters disabled users, and
+  `disable_user`/`delete_user` carry the same `built_in` guard as SQLite,
+  so the bootstrap admin cannot be deleted and recreated with the public
+  default password. Both backends now report affected rows and the API
+  returns 404 for unknown or built-in ids instead of `{"ok":true}`
+  (SEC-13, SEC-14).
+- The server config is written atomically: a uniquely named owner-only
+  temp file is written and renamed over the target (on Windows, replaced
+  without deleting the old file first). Only directories that the save
+  creates are restricted to the owner; existing directories are left
+  unchanged. The load path warns when an existing config is group/world
+  readable (SEC-15).
+- Bumped cpp-httplib from 0.43.2 to 0.63.0, which upstream fixed several
+  server advisories in (CRLF injection via header parsing, X-Forwarded-For
+  crash under trusted proxy configs, negative chunk size DoS, trailer
+  header CRLF injection) (SEC-44).
+- **Behaviour change (Windows):** the installer no longer grants
+  `Users:modify` on the config directory; it now resets the ACL to SYSTEM
+  and Administrators only, removes the Users, Authenticated Users and
+  Everyone grants left by older installers, resets existing files to
+  inherit that ACL, and aborts the install if the ACL cannot be applied or
+  verified. Existing installs keep the old ACL until the 0.8.0 installer is
+  re-run (SEC-45).
+
+### Fixed
+
+- The data-plane ROUTER drops a message with fewer parts than
+  `[identity][empty][payload]` instead of blocking on a receive for the
+  missing part, which stalled enrollment, command dispatch and offline
+  checks until the next message arrived.
+- The API server binds its port before `start()` returns, so the first
+  request after startup no longer races the listener. If the bind fails,
+  server startup now fails instead of reporting a REST API that is not
+  listening.
+
+### Changed
+
+- Bumped project version to 0.8.0.
+
 ## [0.7.6] - 2026-05-18
 
 ### Added

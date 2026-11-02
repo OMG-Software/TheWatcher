@@ -22,11 +22,11 @@ ZapHandler::ZapHandler(zmq::context_t& ctx)
     thread_.request_stop();
 }
 
-void ZapHandler::add_key(const std::string& z85_key)
+void ZapHandler::add_key(const std::string& z85_key, const std::string& agent_id)
 {
     std::unique_lock lock(keys_mutex_);
-    approved_keys_.insert(z85_key);
-    LOGF_DEBUG("ZAP key added approved_key_count=%zu", approved_keys_.size());
+    approved_keys_[z85_key] = agent_id;
+    LOGF_DEBUG("ZAP key added approved_key_count=%zu bound_agent_id=%s", approved_keys_.size(), agent_id.c_str());
 }
 
 void ZapHandler::remove_key(const std::string& z85_key)
@@ -42,6 +42,23 @@ bool ZapHandler::has_key(const std::string& z85_key) const
     return approved_keys_.count(z85_key) > 0;
 }
 
+// Returns the agent_id bound to an approved key, or nullopt when the key is
+// unknown or has no bound identity.
+std::optional<std::string> ZapHandler::user_id_for_key(const std::string& z85_key) const
+{
+    std::shared_lock lock(keys_mutex_);
+    auto it = approved_keys_.find(z85_key);
+    if (it == approved_keys_.end())
+        return std::nullopt;
+    if (it->second.empty())
+        return std::nullopt;
+    return it->second;
+}
+
+// Binds inproc://zeromq.zap.01 and answers ZAP requests until stopped. Allows a
+// CURVE peer whose key is approved and replies with its agent_id as user_id.
+// Allows NULL peers (the enrollment socket). Denies others, and replies with an
+// empty request id when the request is malformed.
 void ZapHandler::run(std::stop_token st)
 {
     LOG_FUNCTION_TRACE
@@ -73,8 +90,14 @@ void ZapHandler::run(std::stop_token st)
             more = zap.get(zmq::sockopt::rcvmore) != 0;
         }
 
+        // Nothing was received (e.g. the context is terminating): there is no
+        // request to answer.
+        if (parts.empty())
+            continue;
+
         // Minimum 7 frames for CURVE: version,req_id,domain,addr,identity,mechanism,key
         bool allow = false;
+        std::string user_id; // SEC-04: identity reported to libzmq for this peer
         if (parts.size() >= 7)
         {
             auto& mech_frame = parts[5];
@@ -87,8 +110,11 @@ void ZapHandler::run(std::stop_token st)
                 zmq_z85_encode(z85buf.data(), static_cast<const uint8_t*>(parts[6].data()), 32);
                 std::string z85(z85buf.data(), 40);
                 std::shared_lock lock(keys_mutex_);
-                allow = approved_keys_.count(z85) > 0;
-                LOGF_TRACE("ZAP CURVE lookup approved=%d", allow ? 1 : 0);
+                auto it = approved_keys_.find(z85);
+                allow = it != approved_keys_.end();
+                if (allow)
+                    user_id = it->second; // the agent_id this key authenticates
+                LOGF_TRACE("ZAP CURVE lookup approved=%d bound_agent_id=%s", allow ? 1 : 0, user_id.c_str());
             }
             else if (mechanism == "NULL")
             {
@@ -107,7 +133,14 @@ void ZapHandler::run(std::stop_token st)
         }
 
         // ZAP reply: version, request_id, status_code, status_text, user_id, metadata
-        auto& req_id = parts[1];
+        // SEC-04: user_id carries the agent_id the CURVE key is bound to; the
+        // server reads it back as the "User-Id" metadata on every message
+        // from this peer and treats it as the authoritative identity.
+        // A malformed request may have no request_id frame; reply with an
+        // empty one instead of reading past the end of `parts`, so the REP
+        // socket still completes its request/reply cycle.
+        const zmq::message_t no_req_id;
+        const zmq::message_t& req_id = parts.size() > 1 ? parts[1] : no_req_id;
         zap.send(zmq::message_t("1.0", 3), zmq::send_flags::sndmore);
         zap.send(zmq::message_t(req_id.data(), req_id.size()), zmq::send_flags::sndmore);
         if (allow)
@@ -121,8 +154,8 @@ void ZapHandler::run(std::stop_token st)
             zap.send(zmq::message_t("400", 3), zmq::send_flags::sndmore);
             zap.send(zmq::message_t("Not authorized", 14), zmq::send_flags::sndmore);
         }
-        zap.send(zmq::message_t("", 0), zmq::send_flags::sndmore); // user_id
-        zap.send(zmq::message_t("", 0), zmq::send_flags::none);    // metadata
+        zap.send(zmq::message_t(user_id.data(), user_id.size()), zmq::send_flags::sndmore); // user_id
+        zap.send(zmq::message_t("", 0), zmq::send_flags::none);                             // metadata
     }
 }
 

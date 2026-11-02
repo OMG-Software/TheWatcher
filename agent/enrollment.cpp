@@ -3,6 +3,7 @@
 #include "common/SingleLog.hpp"
 #include "common/crypto.hpp"
 #include "common/protocol.hpp"
+#include "common/zmq_limits.hpp"
 #include "config.hpp"
 
 #include <chrono>
@@ -122,6 +123,10 @@ double get_uptime_seconds()
 #endif
 }
 
+// Sends an EnrollRequest and polls until approved or stop_flag is set. Retries on
+// send failure and receive timeout. Throws std::runtime_error if rejected, if an
+// approved reply lacks a valid server key pin (unless insecure mode is on), or if
+// a fingerprint or configured key pin does not match. Stores the server key on success.
 void enroll(AgentConfig& config, zmq::context_t& ctx, const std::atomic<bool>& stop_flag, int poll_interval_seconds,
             int recv_timeout_ms)
 {
@@ -132,6 +137,10 @@ void enroll(AgentConfig& config, zmq::context_t& ctx, const std::atomic<bool>& s
     zmq::socket_t req(ctx, ZMQ_REQ);
     req.set(zmq::sockopt::linger, 0);
     req.set(zmq::sockopt::rcvtimeo, recv_timeout_ms);
+    // SEC-02: enrollment replies are tiny; reject anything oversize at the
+    // socket layer and bound the handshake against a stalling server.
+    req.set(zmq::sockopt::maxmsgsize, kEnrollMaxMessageBytes);
+    req.set(zmq::sockopt::handshake_ivl, kHandshakeIvlMs);
     req.connect(config.enrollment_address);
 
     EnrollRequest er;
@@ -139,6 +148,7 @@ void enroll(AgentConfig& config, zmq::context_t& ctx, const std::atomic<bool>& s
     er.hostname = get_hostname();
     er.platform = get_platform_string();
     er.curve_public_key_z85 = config.agent_public_key;
+    er.enrollment_token = config.enrollment_token;
     LOGF_DEBUG("Enrollment request prepared hostname=%s platform=%s public_key=%s", er.hostname.c_str(),
                er.platform.c_str(), er.curve_public_key_z85.c_str());
 
@@ -183,17 +193,23 @@ void enroll(AgentConfig& config, zmq::context_t& ctx, const std::atomic<bool>& s
 
         if (er_resp.approved)
         {
-            if (er_resp.server_public_key_z85.empty() && er_resp.server_public_key_fingerprint.empty())
-            {
-                LOG_WARNING(
-                    "Approved enrollment response did not include server key; data socket encryption remains disabled");
-                LOG_INFO("Enrollment approved");
-                return;
-            }
+            // SEC-08: the enrollment reply travels on the unauthenticated REP
+            // socket, so nothing in it is trusted by default. An approved
+            // reply must present a key plus a matching fingerprint; a keyless
+            // reply is a hard error unless the operator explicitly opted into
+            // insecure mode — the data plane is never silently downgraded to
+            // plaintext.
             if (er_resp.server_public_key_z85.empty() || er_resp.server_public_key_fingerprint.empty())
             {
-                LOG_WARNING("Approved enrollment response did not include server key and fingerprint");
-                throw std::runtime_error("Approved enrollment response missing server key pin");
+                if (!config.allow_insecure && !config.allow_insecure_cli)
+                {
+                    LOG_WARNING("Approved enrollment response did not include a server key pin");
+                    throw std::runtime_error("Approved enrollment response missing server key pin");
+                }
+                LOG_WARNING(
+                    "Insecure mode: enrollment approved without server key; data socket encryption is disabled");
+                LOG_INFO("Enrollment approved");
+                return;
             }
 
             const auto calculated_fingerprint =
@@ -203,6 +219,15 @@ void enroll(AgentConfig& config, zmq::context_t& ctx, const std::atomic<bool>& s
                 LOGF_WARNING("Enrollment server key fingerprint mismatch calculated=%s received=%s",
                              calculated_fingerprint.c_str(), er_resp.server_public_key_fingerprint.c_str());
                 throw std::runtime_error("Enrollment server key fingerprint does not match public key");
+            }
+
+            // SEC-08: a configured server key is a pin, not a default — the
+            // unauthenticated reply must confirm it, never replace it.
+            if (!config.server_public_key.empty() && config.server_public_key != er_resp.server_public_key_z85)
+            {
+                LOGF_WARNING("Pinned server key mismatch pinned=%s received=%s", config.server_public_key.c_str(),
+                             er_resp.server_public_key_z85.c_str());
+                throw std::runtime_error("Enrollment server key does not match configured key");
             }
 
             if (!config.server_public_key_fingerprint.empty() &&

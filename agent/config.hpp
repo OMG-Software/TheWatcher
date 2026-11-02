@@ -15,12 +15,27 @@ struct AgentConfig
     std::string server_public_key_fingerprint;
     std::string agent_public_key; // z85, 40 chars
     std::string agent_secret_key; // z85, 40 chars
+    // SEC-08: when false (default), an enrollment reply without a server key
+    // pin is a hard error — the data plane never connects without CURVE
+    // silently. Set via ALLOW_INSECURE=1 in the config or --insecure.
+    bool allow_insecure = false;
+    // Process-local --insecure opt-in. Never persisted by save(), so a one-off
+    // CLI flag does not become a permanent ALLOW_INSECURE=1 in the config file.
+    bool allow_insecure_cli = false;
     int collection_interval = 30;
     int heartbeat_interval = 5;
     int process_limit = 25;
     std::string config_path;
+    // SEC-05: pre-shared enrollment token, required by servers that
+    // configure ENROLLMENT_TOKEN. Empty when unused.
+    std::string enrollment_token;
 
     static AgentConfig load_or_create(const std::filesystem::path& path);
+    // Writes the config as KEY=VALUE lines. Throws std::runtime_error if the file
+    // cannot be opened. ALLOW_INSECURE is written only when allow_insecure is
+    // set; allow_insecure_cli is never persisted. ENROLLMENT_TOKEN is written
+    // only when non-empty. On POSIX the file is then restricted to owner
+    // read/write because it holds the CURVE secret key.
     void save(const std::filesystem::path& path) const;
 
     static std::filesystem::path default_path();

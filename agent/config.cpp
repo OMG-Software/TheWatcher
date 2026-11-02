@@ -103,6 +103,10 @@ namespace
         return host_from_server_value(endpoint);
     }
 
+    // Copies recognised KEY=VALUE entries onto cfg; absent keys keep their
+    // defaults. ALLOW_INSECURE is true only for "1", "true" or "yes" (SEC-08).
+    // Throws std::invalid_argument or std::out_of_range if a numeric
+    // value is not a valid integer.
     void apply_key_value(AgentConfig& cfg, const std::unordered_map<std::string, std::string>& values)
     {
         if (auto it = values.find("THEWATCHER_SERVER"); it != values.end())
@@ -118,6 +122,10 @@ namespace
             cfg.server_public_key = it->second;
         if (auto it = values.find("SERVER_PUBLIC_KEY_FINGERPRINT"); it != values.end())
             cfg.server_public_key_fingerprint = it->second;
+        if (auto it = values.find("ALLOW_INSECURE"); it != values.end())
+            cfg.allow_insecure = (it->second == "1" || it->second == "true" || it->second == "yes");
+        if (auto it = values.find("ENROLLMENT_TOKEN"); it != values.end())
+            cfg.enrollment_token = it->second;
         if (auto it = values.find("AGENT_ID"); it != values.end())
             cfg.agent_id = it->second;
         if (auto it = values.find("AGENT_PUBLIC_KEY"); it != values.end())
@@ -202,6 +210,9 @@ AgentConfig AgentConfig::load_or_create(const std::filesystem::path& path)
     return cfg;
 }
 
+// Writes the config as KEY=VALUE lines, creating missing parent directories.
+// On POSIX it limits the file to the owner (it holds the CURVE secret key).
+// Throws std::runtime_error if the file cannot be opened for writing.
 void AgentConfig::save(const std::filesystem::path& path) const
 {
     LOG_FUNCTION_TRACE
@@ -216,6 +227,10 @@ void AgentConfig::save(const std::filesystem::path& path) const
     f << "ENROLLMENT_ADDRESS=" << enrollment_address << '\n';
     f << "SERVER_PUBLIC_KEY=" << server_public_key << '\n';
     f << "SERVER_PUBLIC_KEY_FINGERPRINT=" << server_public_key_fingerprint << '\n';
+    if (allow_insecure)
+        f << "ALLOW_INSECURE=1" << '\n';
+    if (!enrollment_token.empty())
+        f << "ENROLLMENT_TOKEN=" << enrollment_token << '\n';
     f << "AGENT_ID=" << agent_id << '\n';
     f << "AGENT_PUBLIC_KEY=" << agent_public_key << '\n';
     f << "AGENT_SECRET_KEY=" << agent_secret_key << '\n';

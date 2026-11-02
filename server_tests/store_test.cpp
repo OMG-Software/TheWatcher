@@ -1,4 +1,5 @@
 #include "../server/store_sqlite.hpp"
+#include "test_support/temp_dir.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -12,7 +13,7 @@ namespace
 {
 std::filesystem::path unique_store_path(const char* name)
 {
-    auto dir = std::filesystem::temp_directory_path() / "thewatcher-store-tests";
+    auto dir = thewatcher::test::process_temp_dir().path() / "store";
     std::filesystem::create_directories(dir);
     auto path = dir / name;
     std::filesystem::remove(path);
@@ -2873,21 +2874,21 @@ SCENARIO("get_runbook returns exact indicator match before wildcard")
 
         THEN("get_runbook for cpu/red returns the exact match")
         {
-            auto result = store.get_runbook("cpu", "red");
+            auto result = store.get_runbook("agent-1", "cpu", "red");
             REQUIRE(result.has_value());
             REQUIRE(result->url == "https://wiki.example.com/cpu-red");
         }
 
         THEN("get_runbook for memory/red (no exact) returns the wildcard")
         {
-            auto result = store.get_runbook("memory", "red");
+            auto result = store.get_runbook("agent-1", "memory", "red");
             REQUIRE(result.has_value());
             REQUIRE(result->url == "https://wiki.example.com/generic-red");
         }
 
         THEN("get_runbook for cpu/yellow (no match at all) returns nullopt")
         {
-            auto result = store.get_runbook("cpu", "yellow");
+            auto result = store.get_runbook("agent-1", "cpu", "yellow");
             REQUIRE_FALSE(result.has_value());
         }
     }
@@ -2934,6 +2935,60 @@ SCENARIO("insert_alert persists runbook_url and list_alerts returns it")
                 REQUIRE(list[0].alert_id == id);
                 REQUIRE(list[0].runbook_url == "https://wiki.example.com/cpu-runbook");
             }
+        }
+    }
+}
+
+SCENARIO("get_runbook never returns another agent's runbook")
+{
+    GIVEN("a store with a runbook scoped to agent-a and a generic runbook")
+    {
+        SqliteStore store(":memory:");
+
+        RunbookRecord scoped;
+        scoped.agent_id = "agent-a";
+        scoped.indicator = "cpu";
+        scoped.status = "red";
+        scoped.url = "https://wiki.example.com/agent-a-cpu-red";
+        scoped.created_at = 2000;
+        store.create_runbook(scoped);
+
+        RunbookRecord generic;
+        generic.indicator = "cpu";
+        generic.status = "red";
+        generic.url = "https://wiki.example.com/generic-cpu-red";
+        generic.created_at = 1000;
+        store.create_runbook(generic);
+
+        THEN("an alert on agent-a gets its own runbook")
+        {
+            auto result = store.get_runbook("agent-a", "cpu", "red");
+            REQUIRE(result.has_value());
+            REQUIRE(result->url == "https://wiki.example.com/agent-a-cpu-red");
+        }
+
+        THEN("an alert on agent-b gets the generic runbook, not agent-a's")
+        {
+            auto result = store.get_runbook("agent-b", "cpu", "red");
+            REQUIRE(result.has_value());
+            REQUIRE(result->url == "https://wiki.example.com/generic-cpu-red");
+        }
+    }
+
+    GIVEN("a store with only a runbook scoped to agent-a")
+    {
+        SqliteStore store(":memory:");
+
+        RunbookRecord scoped;
+        scoped.agent_id = "agent-a";
+        scoped.indicator = "*";
+        scoped.status = "red";
+        scoped.url = "https://wiki.example.com/agent-a-any-red";
+        store.create_runbook(scoped);
+
+        THEN("an alert on agent-b gets no runbook")
+        {
+            REQUIRE_FALSE(store.get_runbook("agent-b", "cpu", "red").has_value());
         }
     }
 }

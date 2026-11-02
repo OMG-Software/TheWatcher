@@ -5,8 +5,6 @@
 #include "common/protocol.hpp"
 #include "report_generator.hpp"
 
-#include <nlohmann/json.hpp>
-
 #include <algorithm>
 #include <array>
 #include <cctype>
@@ -20,6 +18,7 @@
 #include <unordered_set>
 
 #include <httplib.h>
+#include <nlohmann/json.hpp>
 #include <sodium.h>
 
 namespace thewatcher::server
@@ -29,12 +28,15 @@ using json = nlohmann::json;
 
 // ── Construction ──────────────────────────────────────────────────────────────
 
-ApiServer::ApiServer(Store& store, ZapHandler& zap, const std::string& host, int port)
+ApiServer::ApiServer(Store& store, ZapHandler& zap, const std::string& host, int port, int64_t login_lockout_ms,
+                     int64_t login_ip_window_ms)
     : store_(store)
     , zap_(zap)
     , host_(host)
     , port_(port)
     , http_(std::make_unique<httplib::Server>())
+    , login_lockout_ms_(login_lockout_ms)
+    , login_ip_window_ms_(login_ip_window_ms)
 {
     LOG_FUNCTION_TRACE
     LOGF_DEBUG("Constructing API server host=%s port=%d", host_.c_str(), port_);
@@ -46,12 +48,25 @@ ApiServer::~ApiServer()
     stop();
 }
 
+// Binds the port synchronously, then runs the accept loop on a worker thread.
+// Throws std::runtime_error if the bind fails. Logs an error if listening stops.
 void ApiServer::start()
 {
     LOG_FUNCTION_TRACE
+    // Bind (and listen() on the socket) synchronously so the port accepts
+    // connections by the time start() returns; only the accept loop runs on
+    // the worker thread. Previously the bind raced with callers that treat
+    // start() as "ready" (connection refused on the first request).
+    if (!http_->bind_to_port(host_.c_str(), port_))
+    {
+        LOGF_ERROR("Failed to listen on %s:%d", host_.c_str(), port_);
+        // Throw like the ZMQ socket binds in Server::run() do, so a busy or
+        // invalid API address fails startup instead of being reported as up.
+        throw std::runtime_error("Failed to bind REST API on " + host_ + ":" + std::to_string(port_));
+    }
     thread_ = std::thread([this] {
         LOGF_INFO("Listening on %s:%d", host_.c_str(), port_);
-        if (!http_->listen(host_.c_str(), port_))
+        if (!http_->listen_after_bind())
             LOGF_ERROR("Failed to listen on %s:%d", host_.c_str(), port_);
     });
 }
@@ -65,6 +80,76 @@ void ApiServer::stop()
         thread_.join();
         LOG_DEBUG("API server thread joined");
     }
+}
+
+void ApiServer::set_trusted_proxies(std::vector<std::string> proxies)
+{
+    std::lock_guard<std::mutex> lk(login_mutex_);
+    trusted_proxies_ = std::move(proxies);
+}
+
+namespace
+{
+
+// Strips leading and trailing spaces and tabs. The view aliases the input.
+std::string_view trim_ws(std::string_view v)
+{
+    while (!v.empty() && (v.front() == ' ' || v.front() == '\t'))
+        v.remove_prefix(1);
+    while (!v.empty() && (v.back() == ' ' || v.back() == '\t'))
+        v.remove_suffix(1);
+    return v;
+}
+
+// Plausible IPv4/IPv6 literal: bounded length, digits / hex / '.' / ':' only.
+bool plausible_ip_literal(std::string_view v)
+{
+    if (v.empty() || v.size() > 45)
+        return false;
+    return std::all_of(v.begin(), v.end(), [](char c) {
+        return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F') || c == '.' || c == ':';
+    });
+}
+
+} // namespace
+
+// Returns the address used for login throttling. The TCP peer is used unless it
+// is a trusted proxy; then the first untrusted X-Forwarded-For entry (or X-Real-IP
+// when the former is absent) is used. Falls back to the peer if it is not a plausible IP.
+std::string ApiServer::client_ip(const httplib::Request& req)
+{
+    const std::string remote = req.remote_addr;
+    std::vector<std::string> proxies;
+    {
+        std::lock_guard<std::mutex> lk(login_mutex_);
+        proxies = trusted_proxies_;
+    }
+    const auto is_trusted = [&proxies](std::string_view addr) {
+        return std::find(proxies.begin(), proxies.end(), addr) != proxies.end();
+    };
+    if (!is_trusted(remote))
+        return remote;
+
+    std::string candidate;
+    const std::string xff = req.get_header_value("X-Forwarded-For");
+    // Walk right to left: the rightmost entries were appended by our own
+    // proxies; the first untrusted one is the real client. Anything further
+    // left is client-supplied and spoofable.
+    std::string_view rest = xff;
+    while (!rest.empty())
+    {
+        const auto comma = rest.rfind(',');
+        const auto entry = trim_ws(comma == std::string_view::npos ? rest : rest.substr(comma + 1));
+        rest = comma == std::string_view::npos ? std::string_view{} : rest.substr(0, comma);
+        if (entry.empty() || is_trusted(entry))
+            continue;
+        candidate = std::string(entry);
+        break;
+    }
+    if (candidate.empty() && trim_ws(xff).empty())
+        candidate = std::string(trim_ws(req.get_header_value("X-Real-IP")));
+
+    return plausible_ip_literal(candidate) ? candidate : remote;
 }
 
 void ApiServer::drain_commands(std::vector<PendingCommand>& out)
@@ -156,6 +241,10 @@ namespace
         validate_thresholds(thresholds.warning_mbps, thresholds.degraded_mbps, thresholds.critical_mbps, label);
     }
 
+    // Rejects an invalid collector config by throwing std::runtime_error.
+    // Checks thresholds, reading counts and required names. SEC-10: log monitors
+    // need a path (<= 4096 chars), a pattern (<= 256), an indicator name (<= 64)
+    // and a severity of yellow, amber or red.
     void validate_collector_config(const CollectorConfig& config)
     {
         validate_percent_thresholds(config.cpu, "cpu");
@@ -182,6 +271,21 @@ namespace
                 throw std::runtime_error("process name is required");
             if (process.expected_count <= 0)
                 throw std::runtime_error("process expected_count must be greater than zero");
+        }
+        // SEC-10: log-monitor entries name files the agent will read whose
+        // contents then surface on the dashboard — validate them strictly.
+        for (const auto& log : config.logs)
+        {
+            if (log.path.empty())
+                throw std::runtime_error("log path is required");
+            if (log.path.size() > 4096)
+                throw std::runtime_error("log path is too long");
+            if (log.pattern.empty() || log.pattern.size() > 256)
+                throw std::runtime_error("log pattern must be 1-256 characters");
+            if (log.indicator_name.empty() || log.indicator_name.size() > 64)
+                throw std::runtime_error("log indicator_name must be 1-64 characters");
+            if (log.severity != "yellow" && log.severity != "amber" && log.severity != "red")
+                throw std::runtime_error("log severity must be yellow, amber, or red");
         }
     }
 
@@ -736,6 +840,9 @@ std::string ApiServer::enqueue_simple_command(const std::string& id, CommandType
 
 // ── Routes ────────────────────────────────────────────────────────────────────
 
+// Registers the default security headers, CORS handling and every REST route on
+// http_. Each handler checks the session role and returns a JSON error on
+// failure (400 for bad input, 403 for permission denied, 404 for unknown ids).
 void ApiServer::setup_routes()
 {
     LOG_FUNCTION_TRACE
@@ -781,15 +888,71 @@ void ApiServer::setup_routes()
                 return;
             }
 
-            // M-1: Rate-limit failed logins — lock after 5 failures for 15 minutes.
+            // M-1 + SEC-12: login rate limiting. Fixed windows that RESET on
+            // expiry (previously the lockout could never re-arm, allowing
+            // unlimited guessing after the first 15 minutes):
+            //  - per (client IP, username): 5 failures, so one client cannot
+            //    lock an account out for everybody else;
+            //  - per client IP across all usernames: 10 failures (spraying);
+            //  - per username across all IPs: 50 failures, a high ceiling
+            //    against distributed guessing.
+            // The client IP honours X-Forwarded-For / X-Real-IP only from
+            // trusted proxies (see client_ip). Expired entries are pruned so
+            // all maps stay bounded.
             constexpr int max_failures = 5;
-            constexpr int64_t lockout_ms = 15LL * 60LL * 1000LL;
+            constexpr int max_ip_failures = 10;
+            constexpr int max_account_failures = 50;
             const auto now = now_ms();
+            const std::string remote = client_ip(req);
+            const std::string pair_key = remote + "|" + username;
             {
                 std::lock_guard<std::mutex> lk(login_mutex_);
-                auto& [count, window_start] = login_failures_[username];
-                if (count >= max_failures && now - window_start < lockout_ms)
+
+                // Prune expired windows: an entry whose window has elapsed
+                // is removed, which also implements the fixed-window reset.
+                const auto prune = [now](auto& map, int64_t window_ms) {
+                    for (auto it = map.begin(); it != map.end();)
+                    {
+                        if (now - it->second.second >= window_ms)
+                            it = map.erase(it);
+                        else
+                            ++it;
+                    }
+                };
+                prune(login_failures_, login_lockout_ms_);
+                prune(login_account_failures_, login_lockout_ms_);
+                prune(login_ip_failures_, login_ip_window_ms_);
+
+                const auto pair_it = login_failures_.find(pair_key);
+                if (pair_it != login_failures_.end() && pair_it->second.first >= max_failures)
                 {
+                    LOGF_WARNING("Login locked out for repeated failures from %s", remote.c_str());
+                    res.status = 429;
+                    res.set_header("Retry-After", "900");
+                    set_json(res, json{
+                                      {"error", "too many failed login attempts; try again later"}
+                    });
+                    return;
+                }
+
+                // SEC-12: throttle by source IP across all usernames so a
+                // single host cannot spray many accounts (or lock them out).
+                const auto ip_it = login_ip_failures_.find(remote);
+                if (ip_it != login_ip_failures_.end() && ip_it->second.first >= max_ip_failures)
+                {
+                    LOGF_WARNING("Login throttled for source address %s", remote.c_str());
+                    res.status = 429;
+                    res.set_header("Retry-After", "60");
+                    set_json(res, json{
+                                      {"error", "too many login attempts from this address; try again later"}
+                    });
+                    return;
+                }
+
+                const auto acct_it = login_account_failures_.find(username);
+                if (acct_it != login_account_failures_.end() && acct_it->second.first >= max_account_failures)
+                {
+                    LOGF_WARNING("Account-wide login limit reached (last source %s)", remote.c_str());
                     res.status = 429;
                     res.set_header("Retry-After", "900");
                     set_json(res, json{
@@ -805,10 +968,15 @@ void ApiServer::setup_routes()
             {
                 {
                     std::lock_guard<std::mutex> lk(login_mutex_);
-                    auto& [count, window_start] = login_failures_[username];
-                    if (count == 0)
-                        window_start = now;
-                    ++count;
+                    const auto record_failure = [now](auto& map, const std::string& key) {
+                        auto& [count, window_start] = map[key];
+                        if (count == 0)
+                            window_start = now;
+                        ++count;
+                    };
+                    record_failure(login_failures_, pair_key);
+                    record_failure(login_account_failures_, username);
+                    record_failure(login_ip_failures_, remote);
                 }
                 res.status = 401;
                 set_json(res, json{
@@ -819,7 +987,7 @@ void ApiServer::setup_routes()
 
             {
                 std::lock_guard<std::mutex> lk(login_mutex_);
-                login_failures_.erase(username);
+                login_failures_.erase(pair_key);
             }
 
             SessionRecord session;
@@ -1312,6 +1480,26 @@ void ApiServer::setup_routes()
         try
         {
             auto id = req.path_params.at("id");
+            // A CURVE key may be bound to one approved agent only: approving a
+            // second record with the same key would rebind it in ZAP and cut
+            // the original agent off. Enrollment already refuses duplicates;
+            // this also covers records stored before that check existed.
+            if (auto pending = store_.get_agent(id); pending && !pending->curve_public_key_z85.empty())
+            {
+                for (const auto& other : store_.list_approved_agents())
+                {
+                    if (other.agent_id != id && other.curve_public_key_z85 == pending->curve_public_key_z85)
+                    {
+                        LOGF_WARNING("Refusing to approve agent id=%s: key already bound to agent_id=%s", id.c_str(),
+                                     other.agent_id.c_str());
+                        res.status = 409;
+                        set_json(res, json{
+                                          {"error", "public key already belongs to another approved agent"}
+                        });
+                        return;
+                    }
+                }
+            }
             LOGF_INFO("Approving agent id=%s", id.c_str());
             store_.approve_agent(id);
             std::vector<int64_t> group_ids;
@@ -1337,7 +1525,9 @@ void ApiServer::setup_routes()
             auto rec = store_.get_agent(id);
             if (rec)
             {
-                zap_.add_key(rec->curve_public_key_z85);
+                // SEC-04: bind the key to the agent it belongs to so ZAP can
+                // report the authenticated identity for the data plane.
+                zap_.add_key(rec->curve_public_key_z85, rec->agent_id);
                 LOGF_DEBUG("Approved agent key added to ZAP id=%s", id.c_str());
             }
             res.set_content(
@@ -1782,6 +1972,23 @@ void ApiServer::setup_routes()
 
             auto config = body.at("collector_config").get<CollectorConfig>();
             validate_collector_config(config);
+
+            // SEC-10: a log path makes the agent read a local file and put
+            // its contents on the dashboard — only global admins may set
+            // them. Operators keep full access to every other collector
+            // setting, and may resubmit the stored log monitors unchanged
+            // (the endpoint replaces the whole config); any difference
+            // (added, edited, or removed monitors) needs a global admin.
+            if (session->role != "global_admin" && json(config.logs) != json(rec->collector_config.logs))
+            {
+                LOGF_WARNING("Non-admin attempted to configure log monitor paths user=%s role=%s",
+                             session->username.c_str(), session->role.c_str());
+                res.status = 403;
+                set_json(res, json{
+                                  {"error", "log monitor paths can only be configured by a global admin"}
+                });
+                return;
+            }
 
             rec->collection_interval = interval;
             rec->heartbeat_interval = heartbeat_interval;
@@ -2296,7 +2503,17 @@ void ApiServer::setup_routes()
         try
         {
             const auto user_id = std::stoll(req.path_params.at("id"));
-            store_.disable_user(user_id);
+            const auto affected = store_.disable_user(user_id);
+            if (affected == 0)
+            {
+                // SEC-14: unknown id or the built_in guard refused the change;
+                // a silent {"ok":true} hid both cases.
+                res.status = 404;
+                set_json(res, json{
+                                  {"error", "user not found or built-in"}
+                });
+                return;
+            }
             LOGF_INFO("Disabled user user_id=%lld", static_cast<long long>(user_id));
             set_json(res, json{
                               {"ok", true}
@@ -2358,7 +2575,16 @@ void ApiServer::setup_routes()
         try
         {
             const auto user_id = std::stoll(req.path_params.at("id"));
-            store_.delete_user(user_id);
+            const auto affected = store_.delete_user(user_id);
+            if (affected == 0)
+            {
+                // SEC-14: unknown id or the built_in guard refused the change.
+                res.status = 404;
+                set_json(res, json{
+                                  {"error", "user not found or built-in"}
+                });
+                return;
+            }
             LOGF_INFO("Deleted user user_id=%lld", static_cast<long long>(user_id));
             set_json(res, json{
                               {"ok", true}
@@ -2543,11 +2769,14 @@ void ApiServer::setup_routes()
 
     // GET /api/agents/:id/history?limit=N — status history for one agent (viewer+)
     http_->Get("/api/agents/:id/history", [this](const httplib::Request& req, httplib::Response& res) {
-        if (!require_role(req, res, "viewer"))
-            return;
         try
         {
             const auto id = req.path_params.at("id");
+            // SEC-11: history carries indicator transitions and alert
+            // messages for one agent — enforce the same group scoping as
+            // every other per-agent endpoint.
+            if (!require_agent_access(req, res, "viewer", id))
+                return;
             int limit = 100;
             if (req.has_param("limit"))
                 limit = std::min(200, std::max(1, std::stoi(req.get_param_value("limit"))));
@@ -2630,6 +2859,15 @@ void ApiServer::setup_routes()
             }
             if (body.contains("agent_ids") && body["agent_ids"].is_array())
                 rec.agent_ids = body["agent_ids"].get<std::vector<std::string>>();
+            // SEC-11: a view may only reference agents its creator can see.
+            if (!is_global_role(session->role))
+            {
+                for (const auto& agent_id : rec.agent_ids)
+                {
+                    if (!can_access_agent(*session, agent_id))
+                        throw std::runtime_error("view references an agent outside your access");
+                }
+            }
             rec.created_at = now_ms();
             const auto id = store_.create_view(rec);
             rec.view_id = id;
@@ -2722,6 +2960,15 @@ void ApiServer::setup_routes()
             }
             if (body.contains("agent_ids") && body["agent_ids"].is_array())
                 existing->agent_ids = body["agent_ids"].get<std::vector<std::string>>();
+            // SEC-11: a view may only reference agents its editor can see.
+            if (!is_global_role(session->role))
+            {
+                for (const auto& agent_id : existing->agent_ids)
+                {
+                    if (!can_access_agent(*session, agent_id))
+                        throw std::runtime_error("view references an agent outside your access");
+                }
+            }
             store_.update_view(*existing);
             set_json(res, view_to_json(*existing));
         }
@@ -2776,7 +3023,7 @@ void ApiServer::setup_routes()
 
     // ── Runbooks ──────────────────────────────────────────────────────────────
 
-    // GET /api/runbooks — list all runbooks (viewer+)
+    // GET /api/runbooks — list runbooks visible to the session (viewer+)
     http_->Get("/api/runbooks", [this](const httplib::Request& req, httplib::Response& res) {
         try
         {
@@ -2786,7 +3033,13 @@ void ApiServer::setup_routes()
             auto rows = store_.list_runbooks();
             json arr = json::array();
             for (const auto& r : rows)
-                arr.push_back(runbook_to_json(r));
+            {
+                // SEC-11: generic runbooks (no agent_id) are shared knowledge;
+                // agent-specific ones are only visible to sessions that can
+                // already see that agent.
+                if (r.agent_id.empty() || is_global_role(session->role) || can_access_agent(*session, r.agent_id))
+                    arr.push_back(runbook_to_json(r));
+            }
             set_json(res, arr);
         }
         catch (const std::exception& e)
@@ -2823,6 +3076,9 @@ void ApiServer::setup_routes()
             }
             const auto body = json::parse(req.body);
             RunbookRecord rec;
+            // SEC-11: an optional agent_id scopes the runbook to one agent;
+            // it is only shown to sessions that can see that agent.
+            rec.agent_id = body.value("agent_id", std::string(""));
             rec.indicator = body.value("indicator", std::string("*"));
             rec.status = body.at("status").get<std::string>();
             rec.url = body.at("url").get<std::string>();

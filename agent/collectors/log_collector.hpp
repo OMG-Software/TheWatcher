@@ -5,6 +5,7 @@
 #include "common/protocol.hpp"
 
 #include <cstdint>
+#include <filesystem>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -13,6 +14,12 @@
 
 namespace thewatcher::agent
 {
+
+// Parses LOG_ALLOWED_DIRS (path-list separator: ';' on Windows, ':'
+// elsewhere) into resolved allowlist directories. Entries that cannot be
+// resolved are dropped. Returns an empty list when unset — which disables log
+// monitoring entirely (fail closed).
+std::vector<std::filesystem::path> parse_log_allowed_dirs_from_env();
 
 class LogCollector final : public Collector
 {
@@ -29,9 +36,22 @@ public:
     {
     }
 
+    // Replaces the monitored-file list and drops read state for paths that are
+    // no longer configured. Thread-safe.
     void set_configs(std::vector<LogMonitorConfig> configs);
 
+    // SEC-10: agent-local allowlist of directories the log monitor may read.
+    // Wired from the LOG_ALLOWED_DIRS environment variable by the Agent —
+    // the server has no way to change it. While empty (the default) every
+    // configured path is denied: fail closed. Entries are canonicalized here
+    // (symlinks, "..", macOS /var -> /private/var, ...) so they compare
+    // against resolved file paths; entries that cannot be resolved are dropped.
+    void set_allowed_dirs(std::vector<std::filesystem::path> dirs);
+
     // Poll each configured file for new lines, apply patterns, accumulate matches.
+    // SEC-10: does nothing while the allowlist is empty (fail closed). Skips
+    // disabled or incomplete configs and over-long patterns. An error on one
+    // file is logged and does not stop the others.
     void tick();
 
     // Drain and return all accumulated matches since the last call.
@@ -40,15 +60,25 @@ public:
 private:
     struct FileState
     {
-        int64_t inode = -1; // -1 = file not yet seen
-        int64_t offset = 0;
+        int64_t inode = -1; // file identity (inode / NTFS file index); -1 = file not yet seen
+        int64_t offset = 0; // start of the first byte not yet fully processed
+        // True while the rest of an over-long line is being dropped: the
+        // truncated prefix was already evaluated, so only skip to the next '\n'.
+        bool discarding = false;
     };
 
     std::vector<LogMonitorConfig> configs_;
+    std::vector<std::filesystem::path> allowed_dirs_;
     std::unordered_map<std::string, FileState> file_states_;
     std::vector<proto::LogMatch> pending_;
     std::mutex mutex_;
 
+    // Reads new complete lines from one file and queues pattern matches in
+    // pending_. The caller holds mutex_. SEC-10: fails closed. A path that does
+    // not resolve, sits outside the allowlist or is not a regular file is
+    // skipped and its read state reset. Reads are capped per tick, and a partial
+    // line is re-read on the next tick. Rotation resets the offset. An invalid
+    // regex is logged and the file is skipped. Other exceptions reach tick().
     void tail_file(const LogMonitorConfig& cfg);
 };
 

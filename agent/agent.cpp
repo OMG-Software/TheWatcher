@@ -7,6 +7,7 @@
 #include "collectors/network_collector.hpp"
 #include "collectors/process_collector.hpp"
 #include "common/SingleLog.hpp"
+#include "common/zmq_limits.hpp"
 #include "enrollment.hpp"
 
 #include <chrono>
@@ -120,6 +121,9 @@ Agent::Agent(AgentConfig config)
     collectors_.emplace_back(std::make_unique<NetworkCollector>());
     {
         auto lc = std::make_unique<LogCollector>();
+        // SEC-10: the log monitor only reads files inside LOG_ALLOWED_DIRS —
+        // an agent-local list the server has no way to extend.
+        lc->set_allowed_dirs(parse_log_allowed_dirs_from_env());
         log_collector_ = lc.get();
         collectors_.emplace_back(std::move(lc));
     }
@@ -133,6 +137,9 @@ Agent::~Agent()
 
 // ── Threading ─────────────────────────────────────────────────────────────────
 
+// Enrolls with the server, then connects the DEALER socket and starts the IO,
+// collection and heartbeat threads. Returns early if enrollment is stopped.
+// Throws if enrollment or the socket connect fails.
 void Agent::start()
 {
     LOG_FUNCTION_TRACE
@@ -155,6 +162,10 @@ void Agent::start()
 
     dealer_.set(zmq::sockopt::linger, 0);
     dealer_.set(zmq::sockopt::routing_id, config_.agent_id);
+    // SEC-02: reject oversize server replies at the socket layer and bound
+    // the connection handshake.
+    dealer_.set(zmq::sockopt::maxmsgsize, proto::kDataPlaneMaxMessageBytes);
+    dealer_.set(zmq::sockopt::handshake_ivl, proto::kHandshakeIvlMs);
     if (!config_.server_public_key.empty())
     {
         LOG_DEBUG("Configuring DEALER socket with CURVE keys");
@@ -415,6 +426,10 @@ void Agent::handle_frame(const proto::Frame& f)
     }
 }
 
+// Runs one server command (interval, process limit, restart, pause, resume,
+// status, disconnect) and sends a COMMAND_ACK. An unknown command type is acked
+// with ok=false. Malformed arguments make proto::unpack throw. Restarting
+// collectors re-applies the LOG_ALLOWED_DIRS allowlist to the new LogCollector.
 void Agent::handle_command(const CommandMessage& cmd)
 {
     LOGF_DEBUG("Handling command type=%u command_id=%s args_size=%zu", static_cast<unsigned>(cmd.command_type),
@@ -483,6 +498,9 @@ void Agent::handle_command(const CommandMessage& cmd)
         collectors_.emplace_back(std::make_unique<NetworkCollector>());
         {
             auto lc = std::make_unique<LogCollector>();
+            // SEC-10: without the allowlist the new collector would stay
+            // fail-closed and log monitoring would silently stop.
+            lc->set_allowed_dirs(parse_log_allowed_dirs_from_env());
             log_collector_ = lc.get();
             collectors_.emplace_back(std::move(lc));
         }

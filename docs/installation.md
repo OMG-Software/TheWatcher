@@ -237,6 +237,22 @@ C:\ProgramData\TheWatcher\TheWatcherAgent.log
 The server creates `server.json` on first run if it does not exist. The agent
 creates `TheWatcherAgent.conf` on first run if it does not exist.
 
+The config directory holds the server and agent CURVE secret keys. On POSIX
+installs the generated config files are owner-only (`0600`). On Windows,
+restrict the directory to SYSTEM and Administrators (the 0.8.0 installer
+does this automatically; for manual layouts run the equivalent of):
+
+```powershell
+icacls C:\ProgramData\TheWatcher /inheritance:r /remove:g "*S-1-5-32-545" "*S-1-5-11" "*S-1-1-0" /grant:r "*S-1-5-32-544:(OI)(CI)F" "*S-1-5-18:(OI)(CI)F"
+icacls "C:\ProgramData\TheWatcher\*" /reset /T /C
+icacls C:\ProgramData\TheWatcher /T
+```
+
+The first command removes the `Users` grant that installers before 0.8.0
+added. `/grant:r` alone does not remove it. The second command makes existing
+files inherit only the restricted ACL; skip it when the directory is empty. Use
+the third command to confirm that only `Administrators` and `SYSTEM` remain.
+
 ## Foreground Install
 
 Foreground mode is the simplest local setup. No service registration is needed.
@@ -328,7 +344,10 @@ C:\Program Files\TheWatcher
 
 It creates `C:\ProgramData\TheWatcher`, installs `TheWatcherServer` and
 `TheWatcherAgent` as Windows services using their existing service install
-flags, and removes both services on uninstall. Edit
+flags, and removes both services on uninstall. Since 0.8.0 the installer
+resets the config directory ACL to SYSTEM and Administrators only — earlier
+installers granted `Users:modify`, so upgrades should re-run the 0.8.0
+installer to pick up the restricted ACL. Edit
 `C:\ProgramData\TheWatcher\TheWatcherAgent.conf` after installation so
 `THEWATCHER_SERVER` points at the correct server before starting the agent
 service. The agent writes `SERVER_PUBLIC_KEY` and
