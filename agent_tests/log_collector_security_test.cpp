@@ -5,15 +5,13 @@
 // allowlist the server cannot change, symlink resolution, regular-files-
 // only, and hard caps on reads and matches per tick.
 #include "../agent/collectors/log_collector.hpp"
+#include "test_support/temp_dir.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
-#include <random>
-#include <sstream>
-#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -27,42 +25,10 @@ using namespace thewatcher::agent;
 namespace
 {
 
-// Per-process scratch directory: unique random name (mkdtemp on POSIX) and
-// owner-only permissions, so the tests never trust a fixed, guessable path in
-// the publicly writable system temp directory. Removed at process exit.
+// Per-process scratch directory (unique, owner-only, removed at process exit).
 const std::filesystem::path& scratch_root()
 {
-    struct Scratch
-    {
-        std::filesystem::path dir;
-
-        Scratch()
-        {
-#ifdef _WIN32
-            std::random_device rd;
-            std::ostringstream name;
-            name << "thewatcher-log-sec-tests-" << std::hex << rd() << rd();
-            dir = std::filesystem::temp_directory_path() / name.str();
-            std::filesystem::create_directories(dir);
-#else
-            auto tmpl = (std::filesystem::temp_directory_path() / "thewatcher-log-sec-tests-XXXXXX").string();
-            if (::mkdtemp(tmpl.data()) == nullptr)
-                throw std::runtime_error("mkdtemp failed");
-            dir = tmpl;
-#endif
-            std::filesystem::permissions(dir, std::filesystem::perms::owner_all, std::filesystem::perm_options::replace);
-            // Canonical so expectations hold where the temp dir is itself a symlink (macOS /var).
-            dir = std::filesystem::canonical(dir);
-        }
-
-        ~Scratch()
-        {
-            std::error_code ec;
-            std::filesystem::remove_all(dir, ec);
-        }
-    };
-    static const Scratch scratch;
-    return scratch.dir;
+    return thewatcher::test::process_temp_dir().path();
 }
 
 std::filesystem::path make_dir(const char* name)

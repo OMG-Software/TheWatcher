@@ -9,8 +9,10 @@
 #include "../server/api.hpp"
 #include "../server/store.hpp"
 #include "../server/zap_handler.hpp"
+#include "test_support/net_helpers.hpp"
 
 #include <catch2/catch_test_macros.hpp>
+#include <nlohmann/json.hpp>
 
 #include <chrono>
 #include <memory>
@@ -19,27 +21,14 @@
 #include <vector>
 
 #include <httplib.h>
-#include <nlohmann/json.hpp>
 #include <zmq.hpp>
 
 using namespace std::chrono_literals;
 using json = nlohmann::json;
+using thewatcher::test::free_http_port;
 
 namespace
 {
-
-int free_http_port()
-{
-    // OS-assigned free port: fixed ports collide when meson runs test
-    // executables in parallel.
-    zmq::context_t ctx{1};
-    zmq::socket_t socket{ctx, ZMQ_REP};
-    socket.bind("tcp://127.0.0.1:*");
-    const auto endpoint = socket.get(zmq::sockopt::last_endpoint);
-    socket.close();
-    const auto colon = endpoint.rfind(':');
-    return std::stoi(endpoint.substr(colon + 1));
-}
 
 // An isolated API server with shortened rate-limit windows (defaults are
 // 15 min / 60 s) so window expiry can be observed in test time. The default

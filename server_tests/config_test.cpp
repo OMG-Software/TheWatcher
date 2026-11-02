@@ -1,4 +1,5 @@
 #include "../server/config.hpp"
+#include "test_support/temp_dir.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -14,7 +15,7 @@ namespace
 {
 std::filesystem::path unique_temp_dir(const char* name)
 {
-    auto dir = std::filesystem::temp_directory_path() / "thewatcher-tests" / name;
+    auto dir = thewatcher::test::process_temp_dir().path() / name;
     std::filesystem::remove_all(dir);
     std::filesystem::create_directories(dir);
     return dir;

@@ -9,21 +9,14 @@
 // they check mode BITS and use failure injection that does not depend on
 // permission denial.
 #include "../server/config.hpp"
+#include "test_support/temp_dir.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
-#include <cstdio>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
-#include <random>
-#include <stdexcept>
 #include <string>
-#include <system_error>
-
-#ifndef _WIN32
-#include <cstdlib>
-#endif
 
 using namespace thewatcher::server;
 
@@ -31,52 +24,6 @@ namespace fs = std::filesystem;
 
 namespace
 {
-
-// A unique, owner-only scratch directory removed on destruction. Using a
-// fixed name under the shared temp directory would let other local users
-// pre-create or swap it.
-class ScratchDir
-{
-  public:
-    ScratchDir()
-    {
-#ifdef _WIN32
-        std::random_device rd;
-        std::mt19937_64 rng((static_cast<unsigned long long>(rd()) << 32) ^ rd());
-        for (int attempt = 0; attempt < 16; ++attempt)
-        {
-            char suffix[17];
-            std::snprintf(suffix, sizeof(suffix), "%016llx", static_cast<unsigned long long>(rng()));
-            const auto candidate = fs::temp_directory_path() / (std::string("thewatcher-config-perm-") + suffix);
-            if (fs::create_directory(candidate))
-            {
-                dir_ = candidate;
-                return;
-            }
-        }
-        throw std::runtime_error("cannot create scratch directory");
-#else
-        std::string tmpl = (fs::temp_directory_path() / "thewatcher-config-perm-XXXXXX").string();
-        if (::mkdtemp(tmpl.data()) == nullptr) // creates the directory with mode 0700
-            throw std::runtime_error("mkdtemp failed");
-        dir_ = tmpl;
-#endif
-    }
-
-    ~ScratchDir()
-    {
-        std::error_code ec;
-        fs::remove_all(dir_, ec);
-    }
-
-    ScratchDir(const ScratchDir&) = delete;
-    ScratchDir& operator=(const ScratchDir&) = delete;
-
-    const fs::path& path() const { return dir_; }
-
-  private:
-    fs::path dir_;
-};
 
 std::string read_all(const fs::path& p)
 {
@@ -107,7 +54,7 @@ SCENARIO("ServerConfig::save writes an owner-only config file")
 {
     GIVEN("a fresh config path")
     {
-        ScratchDir scratch;
+        thewatcher::test::ScopedTempDir scratch;
         const auto path = scratch.path() / "perm-test.conf";
 
         WHEN("a config holding a server secret is saved")
@@ -138,7 +85,7 @@ SCENARIO("A successful save leaves no temporary files behind")
 {
     GIVEN("a directory with an existing config that is saved twice")
     {
-        ScratchDir scratch;
+        thewatcher::test::ScopedTempDir scratch;
         const auto path = scratch.path() / "server.conf";
 
         ServerConfig cfg;
@@ -169,11 +116,12 @@ SCENARIO("ServerConfig::save does not change the mode of an existing directory")
 #else
     GIVEN("an existing shared-style directory with mode 0755")
     {
-        ScratchDir scratch;
+        thewatcher::test::ScopedTempDir scratch;
         const auto shared = scratch.path() / "shared";
         fs::create_directory(shared);
-        fs::permissions(shared, fs::perms::owner_all | fs::perms::group_read | fs::perms::group_exec |
-                                    fs::perms::others_read | fs::perms::others_exec,
+        fs::permissions(shared,
+                        fs::perms::owner_all | fs::perms::group_read | fs::perms::group_exec | fs::perms::others_read |
+                            fs::perms::others_exec,
                         fs::perm_options::replace);
         REQUIRE(mode_bits(shared) == 0755u);
 
@@ -199,7 +147,7 @@ SCENARIO("ServerConfig::save creates a missing parent directory owner-only")
 #else
     GIVEN("a config path whose parent directories do not exist")
     {
-        ScratchDir scratch;
+        thewatcher::test::ScopedTempDir scratch;
         // Widen the scratch root so we can tell it was left alone.
         fs::permissions(scratch.path(), fs::perms::owner_all | fs::perms::group_read | fs::perms::group_exec,
                         fs::perm_options::replace);
@@ -241,7 +189,7 @@ SCENARIO("A failed save leaves the previous config intact")
 #else
     GIVEN("a config path occupied by a non-empty directory (rename over it fails, even for root)")
     {
-        ScratchDir scratch;
+        thewatcher::test::ScopedTempDir scratch;
         const auto path = scratch.path() / "server.conf";
         fs::create_directory(path);
         const auto sentinel = path / "sentinel.txt";

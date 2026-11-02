@@ -4,118 +4,28 @@
 // previously GET /api/agents/:id/history skipped the agent-access check,
 // GET /api/runbooks returned every runbook to every viewer, and view
 // agent_ids were never validated.
-#include "../server/server.hpp"
-#include "../server/startup_signal.hpp"
-#include "common/crypto.hpp"
-#include "common/protocol.hpp"
+#include "test_support/server_fixture.hpp"
 
 #include <catch2/catch_test_macros.hpp>
+#include <nlohmann/json.hpp>
 
 #include <chrono>
-#include <filesystem>
 #include <optional>
 #include <string>
 #include <thread>
+#include <vector>
 
 #include <httplib.h>
-#include <nlohmann/json.hpp>
-#include <zmq.hpp>
 
 using namespace std::chrono_literals;
+using namespace thewatcher::test;
 using json = nlohmann::json;
 
 namespace
 {
 
-int64_t now_ms()
+struct ScopeFixture : ServerFixture
 {
-    return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch())
-        .count();
-}
-
-std::string free_zmq_endpoint()
-{
-    zmq::context_t ctx{1};
-    zmq::socket_t socket{ctx, ZMQ_REP};
-    socket.bind("tcp://127.0.0.1:*");
-    auto endpoint = socket.get(zmq::sockopt::last_endpoint);
-    socket.close();
-    return endpoint;
-}
-
-int free_http_port()
-{
-    // OS-assigned free port: clock-derived ports collide when meson runs
-    // test executables in parallel.
-    zmq::context_t ctx{1};
-    zmq::socket_t socket{ctx, ZMQ_REP};
-    socket.bind("tcp://127.0.0.1:*");
-    const auto endpoint = socket.get(zmq::sockopt::last_endpoint);
-    socket.close();
-    const auto colon = endpoint.rfind(':');
-    return std::stoi(endpoint.substr(colon + 1));
-}
-
-struct ServerFixture
-{
-    thewatcher::server::ServerConfig config;
-    thewatcher::server::Server server;
-    thewatcher::server::StartupSignal startup;
-    std::exception_ptr error;
-    std::thread thread;
-    httplib::Client client;
-
-    ServerFixture()
-        : server(make_config())
-        , client("http://127.0.0.1:" + std::to_string(config.api_port))
-    {
-        client.set_connection_timeout(5, 0);
-        client.set_read_timeout(5, 0);
-        thread = std::thread([this] {
-            try
-            {
-                server.run(&startup);
-            }
-            catch (...)
-            {
-                error = std::current_exception();
-                startup.fail(error);
-            }
-        });
-    }
-
-    ~ServerFixture()
-    {
-        server.stop();
-        if (thread.joinable())
-            thread.join();
-        std::error_code ec;
-        std::filesystem::remove(config.db_path, ec);
-        std::filesystem::remove(config.db_path + "-shm", ec);
-        std::filesystem::remove(config.db_path + "-wal", ec);
-    }
-
-    bool login(const std::string& username, const std::string& password)
-    {
-        auto res = client.Post("/api/login",
-                               json{
-                                   {"username", username},
-                                   {"password", password}
-        }
-                                   .dump(),
-                               "application/json");
-        if (!res || res->status != 200)
-            return false;
-        const auto set_cookie = res->get_header_value("Set-Cookie");
-        const auto end = set_cookie.find(';');
-        if (set_cookie.empty() || end == std::string::npos)
-            return false;
-        client.set_default_headers({
-            {"Cookie", set_cookie.substr(0, end)}
-        });
-        return true;
-    }
-
     std::optional<int64_t> create_group(const std::string& name)
     {
         auto res = client.Post("/api/groups",
@@ -144,61 +54,30 @@ struct ServerFixture
         return res && res->status == 200;
     }
 
+    // Creates groups "<prefix>-group-a" and "<prefix>-group-b", a user in
+    // group B, and one approved agent "<prefix>-agent-a/b" in each group.
+    // Returns group B's id.
+    int64_t seed_two_groups(const std::string& prefix, const std::string& username, const std::string& role)
+    {
+        const auto group_a = create_group(prefix + "-group-a");
+        const auto group_b = create_group(prefix + "-group-b");
+        REQUIRE(group_a.has_value());
+        REQUIRE(group_b.has_value());
+        REQUIRE(create_user(username, role, {*group_b}));
+        REQUIRE(enroll_and_approve(prefix + "-agent-a", {*group_a}));
+        std::this_thread::sleep_for(1100ms); // per-source enrollment rate limit
+        REQUIRE(enroll_and_approve(prefix + "-agent-b", {*group_b}));
+        return *group_b;
+    }
+
     // Enrolls an agent and approves it into the given groups.
     bool enroll_and_approve(const std::string& agent_id, const std::vector<int64_t>& group_ids)
     {
-        thewatcher::crypto::init();
-        const auto keys = thewatcher::crypto::generate_curve_keypair();
-
-        zmq::context_t ctx{1};
-        zmq::socket_t req{ctx, ZMQ_REQ};
-        req.set(zmq::sockopt::linger, 0);
-        req.set(zmq::sockopt::rcvtimeo, 2000);
-        req.connect(config.enrollment_address);
-
-        thewatcher::proto::EnrollRequest enroll;
-        enroll.agent_id = agent_id;
-        enroll.hostname = "scope-test-host";
-        enroll.platform = "windows";
-        enroll.curve_public_key_z85 = keys.public_key_z85;
-
-        thewatcher::proto::Frame frame;
-        frame.type = static_cast<uint8_t>(thewatcher::proto::FrameType::ENROLL_REQUEST);
-        frame.agent_id = agent_id;
-        frame.timestamp_ms = now_ms();
-        frame.payload = thewatcher::proto::pack(enroll);
-
-        const auto encoded = thewatcher::proto::encode_frame(frame);
-        req.send(zmq::message_t(encoded.data(), encoded.size()), zmq::send_flags::none);
-        zmq::message_t reply;
-        if (!req.recv(reply, zmq::recv_flags::none).has_value())
-            return false;
-
-        auto res = client.Post("/api/agents/" + agent_id + "/approve",
-                               json{
-                                   {"group_ids", group_ids}
+        return ServerFixture::enroll_and_approve(agent_id, "scope-test-host",
+                                                 json{
+                                                     {"group_ids", group_ids}
         }
-                                   .dump(),
-                               "application/json");
-        return res && res->status == 200;
-    }
-
-private:
-    thewatcher::server::ServerConfig make_config()
-    {
-        thewatcher::crypto::init();
-        const auto ts = std::to_string(now_ms());
-        const auto base = std::filesystem::temp_directory_path() / ("thewatcher-scope-test-" + ts);
-
-        thewatcher::server::ServerConfig cfg;
-        cfg.bind_address = free_zmq_endpoint();
-        cfg.enrollment_address = free_zmq_endpoint();
-        cfg.api_host = "127.0.0.1";
-        cfg.api_port = free_http_port();
-        // The (unique) API port keeps concurrent runs from sharing one DB file.
-        cfg.db_path = base.string() + "-" + std::to_string(cfg.api_port) + ".db";
-        config = cfg;
-        return cfg;
+                                                     .dump());
     }
 };
 
@@ -208,19 +87,10 @@ SCENARIO("Per-agent history enforces group scoping")
 {
     GIVEN("a server with group A and group B, an agent in each, and a viewer in group B")
     {
-        ServerFixture fx;
-        REQUIRE(fx.startup.wait().started);
-        REQUIRE(fx.error == nullptr);
-        REQUIRE(fx.login("thewatcher", "look_at_me"));
+        ScopeFixture fx;
+        fx.start_and_login();
 
-        const auto group_a = fx.create_group("scope-group-a");
-        const auto group_b = fx.create_group("scope-group-b");
-        REQUIRE(group_a.has_value());
-        REQUIRE(group_b.has_value());
-        REQUIRE(fx.create_user("scope_viewer", "group_viewer", {*group_b}));
-        REQUIRE(fx.enroll_and_approve("scope-agent-a", {*group_a}));
-        std::this_thread::sleep_for(1100ms); // per-source enrollment rate limit
-        REQUIRE(fx.enroll_and_approve("scope-agent-b", {*group_b}));
+        fx.seed_two_groups("scope", "scope_viewer", "group_viewer");
 
         REQUIRE(fx.login("scope_viewer", "sc0pepw!"));
 
@@ -252,19 +122,10 @@ SCENARIO("Runbooks are scoped to the sessions that can see their agent")
 {
     GIVEN("a server with group A and group B, an agent in each, and a viewer in group B")
     {
-        ServerFixture fx;
-        REQUIRE(fx.startup.wait().started);
-        REQUIRE(fx.error == nullptr);
-        REQUIRE(fx.login("thewatcher", "look_at_me"));
+        ScopeFixture fx;
+        fx.start_and_login();
 
-        const auto group_a = fx.create_group("rb-group-a");
-        const auto group_b = fx.create_group("rb-group-b");
-        REQUIRE(group_a.has_value());
-        REQUIRE(group_b.has_value());
-        REQUIRE(fx.create_user("rb_viewer", "group_viewer", {*group_b}));
-        REQUIRE(fx.enroll_and_approve("rb-agent-a", {*group_a}));
-        std::this_thread::sleep_for(1100ms); // per-source enrollment rate limit
-        REQUIRE(fx.enroll_and_approve("rb-agent-b", {*group_b}));
+        fx.seed_two_groups("rb", "rb_viewer", "group_viewer");
 
         // The admin creates a generic runbook and an agent-scoped runbook for
         // group A's agent.
@@ -334,19 +195,10 @@ SCENARIO("Views cannot reference agents outside the creator's scope")
 {
     GIVEN("a server with group A and group B, an agent in each, and an operator in group B")
     {
-        ServerFixture fx;
-        REQUIRE(fx.startup.wait().started);
-        REQUIRE(fx.error == nullptr);
-        REQUIRE(fx.login("thewatcher", "look_at_me"));
+        ScopeFixture fx;
+        fx.start_and_login();
 
-        const auto group_a = fx.create_group("view-group-a");
-        const auto group_b = fx.create_group("view-group-b");
-        REQUIRE(group_a.has_value());
-        REQUIRE(group_b.has_value());
-        REQUIRE(fx.create_user("view_operator", "group_operator", {*group_b}));
-        REQUIRE(fx.enroll_and_approve("view-agent-a", {*group_a}));
-        std::this_thread::sleep_for(1100ms); // per-source enrollment rate limit
-        REQUIRE(fx.enroll_and_approve("view-agent-b", {*group_b}));
+        const auto group_b = fx.seed_two_groups("view", "view_operator", "group_operator");
 
         REQUIRE(fx.login("view_operator", "sc0pepw!"));
 
@@ -356,7 +208,7 @@ SCENARIO("Views cannot reference agents outside the creator's scope")
                                       json{
                                           {"name",      "Cross-group leak"           },
                                           {"is_public", true                         },
-                                          {"group_id",  *group_b                     },
+                                          {"group_id",  group_b                      },
                                           {"agent_ids", json::array({"view-agent-a"})}
             }
                                           .dump(),
@@ -375,7 +227,7 @@ SCENARIO("Views cannot reference agents outside the creator's scope")
                                       json{
                                           {"name",      "Own-group view"             },
                                           {"is_public", true                         },
-                                          {"group_id",  *group_b                     },
+                                          {"group_id",  group_b                      },
                                           {"agent_ids", json::array({"view-agent-b"})}
             }
                                           .dump(),

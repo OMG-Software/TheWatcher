@@ -1,4 +1,5 @@
 #include "../server/store_sqlite.hpp"
+#include "test_support/temp_dir.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -12,7 +13,7 @@ namespace
 {
 std::filesystem::path unique_store_path(const char* name)
 {
-    auto dir = std::filesystem::temp_directory_path() / "thewatcher-store-tests";
+    auto dir = thewatcher::test::process_temp_dir().path() / "store";
     std::filesystem::create_directories(dir);
     auto path = dir / name;
     std::filesystem::remove(path);

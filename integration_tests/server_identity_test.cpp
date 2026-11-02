@@ -1,173 +1,47 @@
-// Data-plane identity enforcement tests.
-//
-// Covers SEC-04 (data-plane agent identity is not bound to the CURVE key:
-// any approved agent could impersonate any other) and SEC-09 (revoked /
-// rejected agents keep working on their existing session).
-//
-// These tests drive real CURVE connections against a real Server so the
-// ZAP -> User-Id metadata -> frame.agent_id binding is exercised end to end.
-#include "../server/server.hpp"
-#include "../server/startup_signal.hpp"
 #include "common/crypto.hpp"
 #include "common/metrics.hpp"
 #include "common/protocol.hpp"
+#include "test_support/enrollment_client.hpp"
+#include "test_support/server_fixture.hpp"
 
 #include <catch2/catch_test_macros.hpp>
+#include <nlohmann/json.hpp>
 
 #include <chrono>
-#include <filesystem>
-#include <optional>
+#include <memory>
 #include <string>
 #include <thread>
 
 #include <httplib.h>
-#include <nlohmann/json.hpp>
 #include <zmq.hpp>
 
 using namespace std::chrono_literals;
+using namespace thewatcher::test;
 using json = nlohmann::json;
 
 namespace
 {
 
-int64_t now_ms()
+// A CURVE-enabled server (unless disabled) with an HTTP client for the REST API.
+struct IdentityFixture : ServerFixture
 {
-    return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch())
-        .count();
-}
-
-std::string free_zmq_endpoint()
-{
-    zmq::context_t ctx{1};
-    zmq::socket_t socket{ctx, ZMQ_REP};
-    socket.bind("tcp://127.0.0.1:*");
-    auto endpoint = socket.get(zmq::sockopt::last_endpoint);
-    socket.close();
-    return endpoint;
-}
-
-int free_http_port()
-{
-    // OS-assigned free port: clock-derived ports collide when meson runs
-    // test executables in parallel.
-    zmq::context_t ctx{1};
-    zmq::socket_t socket{ctx, ZMQ_REP};
-    socket.bind("tcp://127.0.0.1:*");
-    const auto endpoint = socket.get(zmq::sockopt::last_endpoint);
-    socket.close();
-    const auto colon = endpoint.rfind(':');
-    return std::stoi(endpoint.substr(colon + 1));
-}
-
-template <typename Predicate>
-bool eventually(Predicate predicate, std::chrono::milliseconds timeout, std::chrono::milliseconds interval = 100ms)
-{
-    const auto deadline = std::chrono::steady_clock::now() + timeout;
-    while (std::chrono::steady_clock::now() < deadline)
+    explicit IdentityFixture(bool with_curve = true)
+        : ServerFixture(ServerFixtureOptions::with_curve(with_curve))
     {
-        if (predicate())
-            return true;
-        std::this_thread::sleep_for(interval);
-    }
-    return predicate();
-}
-
-// A running server bound to isolated local endpoints, with an HTTP client
-// logged in as the default admin.
-struct ServerFixture
-{
-    thewatcher::server::ServerConfig config;
-    thewatcher::server::Server server;
-    thewatcher::server::StartupSignal startup;
-    std::exception_ptr error;
-    std::thread thread;
-    httplib::Client client;
-
-    explicit ServerFixture(bool with_curve = true)
-        : server(make_config(with_curve))
-        , client("http://127.0.0.1:" + std::to_string(config.api_port))
-    {
-        client.set_connection_timeout(5, 0);
-        client.set_read_timeout(5, 0);
-
-        thread = std::thread([this] {
-            try
-            {
-                server.run(&startup);
-            }
-            catch (...)
-            {
-                error = std::current_exception();
-                startup.fail(error);
-            }
-        });
     }
 
-    ~ServerFixture()
+    // Enrolls an agent over the enrollment socket (no CURVE there by design).
+    void enroll_with_key(const std::string& agent_id, const std::string& public_key_z85)
     {
-        server.stop();
-        if (thread.joinable())
-            thread.join();
-        std::error_code ec;
-        std::filesystem::remove(config.db_path, ec);
-        std::filesystem::remove(config.db_path + "-shm", ec);
-        std::filesystem::remove(config.db_path + "-wal", ec);
+        REQUIRE(exchange_enrollment(config.enrollment_address, encode_enrollment(make_enroll_request(
+                                                                   agent_id, public_key_z85, "identity-test-host")))
+                    .has_value());
     }
 
-    bool login()
+    void enroll_and_approve_with_key(const std::string& agent_id, const std::string& public_key_z85)
     {
-        return eventually(
-            [this] {
-                auto res = client.Post("/api/login", R"({"username":"thewatcher","password":"look_at_me"})",
-                                       "application/json");
-                if (!res || res->status != 200)
-                    return false;
-                const auto set_cookie = res->get_header_value("Set-Cookie");
-                const auto end = set_cookie.find(';');
-                if (set_cookie.empty() || end == std::string::npos)
-                    return false;
-                client.set_default_headers({
-                    {"Cookie", set_cookie.substr(0, end)}
-                });
-                return true;
-            },
-            5s);
-    }
-
-    bool approve(const std::string& agent_id)
-    {
-        auto res = client.Post("/api/agents/" + agent_id + "/approve", "", "application/json");
-        return res && res->status == 200;
-    }
-
-    bool reject(const std::string& agent_id)
-    {
-        auto res = client.Post("/api/agents/" + agent_id + "/reject", "", "application/json");
-        return res && res->status == 200;
-    }
-
-private:
-    thewatcher::server::ServerConfig make_config(bool with_curve)
-    {
-        thewatcher::crypto::init();
-        const auto keys =
-            with_curve ? thewatcher::crypto::generate_curve_keypair() : thewatcher::crypto::CurveKeyPair{};
-        const auto ts = std::to_string(now_ms());
-        const auto base = std::filesystem::temp_directory_path() / ("thewatcher-identity-test-" + ts);
-
-        thewatcher::server::ServerConfig cfg;
-        cfg.bind_address = free_zmq_endpoint();
-        cfg.enrollment_address = free_zmq_endpoint();
-        cfg.api_host = "127.0.0.1";
-        cfg.api_port = free_http_port();
-        cfg.db_path = base.string() + ".db";
-        if (with_curve)
-        {
-            cfg.server_public_key = keys.public_key_z85;
-            cfg.server_secret_key = keys.secret_key_z85;
-        }
-        config = cfg;
-        return cfg;
+        enroll_with_key(agent_id, public_key_z85);
+        REQUIRE(approve(agent_id));
     }
 };
 
@@ -183,36 +57,6 @@ std::size_t metric_row_count(httplib::Client& client, const std::string& agent_i
         if (row.value("agent_id", "") == agent_id)
             ++count;
     return count;
-}
-
-// Enrolls an agent over the enrollment socket (no CURVE there by design).
-void enroll_agent(const thewatcher::server::ServerConfig& cfg, const std::string& agent_id,
-                  const std::string& public_key_z85)
-{
-    zmq::context_t ctx{1};
-    zmq::socket_t req{ctx, ZMQ_REQ};
-    req.set(zmq::sockopt::linger, 0);
-    req.set(zmq::sockopt::rcvtimeo, 2000);
-    req.connect(cfg.enrollment_address);
-
-    thewatcher::proto::EnrollRequest enroll;
-    enroll.agent_id = agent_id;
-    enroll.hostname = "identity-test-host";
-    enroll.platform = "windows";
-    enroll.curve_public_key_z85 = public_key_z85;
-
-    thewatcher::proto::Frame frame;
-    frame.type = static_cast<uint8_t>(thewatcher::proto::FrameType::ENROLL_REQUEST);
-    frame.agent_id = agent_id;
-    frame.timestamp_ms = now_ms();
-    frame.payload = thewatcher::proto::pack(enroll);
-
-    const auto encoded = thewatcher::proto::encode_frame(frame);
-    req.send(zmq::message_t(encoded.data(), encoded.size()), zmq::send_flags::none);
-
-    zmq::message_t reply;
-    auto received = req.recv(reply, zmq::recv_flags::none);
-    REQUIRE(received.has_value());
 }
 
 // A persistent CURVE DEALER speaking the data-plane protocol.
@@ -265,20 +109,16 @@ SCENARIO("An approved agent cannot spoof another agent's identity")
     GIVEN("a CURVE server with two separately approved agents")
     {
         thewatcher::crypto::init();
-        ServerFixture fx(/*with_curve=*/true);
-        REQUIRE(fx.startup.wait().started);
-        REQUIRE(fx.error == nullptr);
-        REQUIRE(fx.login());
+        IdentityFixture fx(/*with_curve=*/true);
+        fx.start_and_login();
 
         const auto keys_a = thewatcher::crypto::generate_curve_keypair();
         const auto keys_b = thewatcher::crypto::generate_curve_keypair();
         // The server rate-limits enrollment per source IP (SEC-05), so space
         // the two enrollments out.
-        enroll_agent(fx.config, "agent-victim", keys_b.public_key_z85);
-        REQUIRE(fx.approve("agent-victim"));
+        fx.enroll_and_approve_with_key("agent-victim", keys_b.public_key_z85);
         std::this_thread::sleep_for(1100ms);
-        enroll_agent(fx.config, "agent-rogue", keys_a.public_key_z85);
-        REQUIRE(fx.approve("agent-rogue"));
+        fx.enroll_and_approve_with_key("agent-rogue", keys_a.public_key_z85);
 
         WHEN("the rogue agent's key connects as the victim's routing id and sends METRICS claiming the victim's id")
         {
@@ -303,14 +143,11 @@ SCENARIO("A rejected agent cannot keep submitting data on its live session")
     GIVEN("a CURVE server with an approved agent that has already delivered metrics")
     {
         thewatcher::crypto::init();
-        ServerFixture fx(/*with_curve=*/true);
-        REQUIRE(fx.startup.wait().started);
-        REQUIRE(fx.error == nullptr);
-        REQUIRE(fx.login());
+        IdentityFixture fx(/*with_curve=*/true);
+        fx.start_and_login();
 
         const auto keys = thewatcher::crypto::generate_curve_keypair();
-        enroll_agent(fx.config, "agent-doomed", keys.public_key_z85);
-        REQUIRE(fx.approve("agent-doomed"));
+        fx.enroll_and_approve_with_key("agent-doomed", keys.public_key_z85);
 
         AgentPeer peer(fx.config, "agent-doomed", keys.public_key_z85, keys.secret_key_z85);
         peer.send_metrics("agent-doomed", 10.0);
@@ -341,13 +178,11 @@ SCENARIO("Only approved agents' frames are processed when CURVE is unavailable")
     GIVEN("a server without CURVE keys and a pending (not yet approved) agent")
     {
         thewatcher::crypto::init();
-        ServerFixture fx(/*with_curve=*/false);
-        REQUIRE(fx.startup.wait().started);
-        REQUIRE(fx.error == nullptr);
-        REQUIRE(fx.login());
+        IdentityFixture fx(/*with_curve=*/false);
+        fx.start_and_login();
 
         const auto keys = thewatcher::crypto::generate_curve_keypair();
-        enroll_agent(fx.config, "agent-pending", keys.public_key_z85);
+        fx.enroll_with_key("agent-pending", keys.public_key_z85);
 
         // Without CURVE the peer connects to the plain ROUTER.
         zmq::context_t ctx{1};
@@ -408,19 +243,15 @@ SCENARIO("An agent-supplied future timestamp cannot wipe metric history")
     GIVEN("a CURVE server with two approved agents that have both delivered metrics")
     {
         thewatcher::crypto::init();
-        ServerFixture fx(/*with_curve=*/true);
-        REQUIRE(fx.startup.wait().started);
-        REQUIRE(fx.error == nullptr);
-        REQUIRE(fx.login());
+        IdentityFixture fx(/*with_curve=*/true);
+        fx.start_and_login();
 
         const auto keys_a = thewatcher::crypto::generate_curve_keypair();
         const auto keys_b = thewatcher::crypto::generate_curve_keypair();
         // Space the enrollments out to clear the per-source rate limit.
-        enroll_agent(fx.config, "agent-future", keys_a.public_key_z85);
-        REQUIRE(fx.approve("agent-future"));
+        fx.enroll_and_approve_with_key("agent-future", keys_a.public_key_z85);
         std::this_thread::sleep_for(1100ms);
-        enroll_agent(fx.config, "agent-stable", keys_b.public_key_z85);
-        REQUIRE(fx.approve("agent-stable"));
+        fx.enroll_and_approve_with_key("agent-stable", keys_b.public_key_z85);
 
         AgentPeer peer_a(fx.config, "agent-future", keys_a.public_key_z85, keys_a.secret_key_z85);
         AgentPeer peer_b(fx.config, "agent-stable", keys_b.public_key_z85, keys_b.secret_key_z85);

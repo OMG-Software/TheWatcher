@@ -3,96 +3,45 @@
 // Covers SEC-01 (unauthenticated remote crash via multipart enrollment
 // message) and the enrollment side of SEC-02 (ZMQ_MAXMSGSIZE on the
 // enrollment REP socket).
-#include "../server/server.hpp"
-#include "../server/startup_signal.hpp"
+#include "test_support/enrollment_client.hpp"
+#include "test_support/server_runner.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
-#include <chrono>
-#include <exception>
-#include <optional>
 #include <string>
-#include <thread>
 #include <vector>
 
 #include <zmq.hpp>
 
-using namespace thewatcher::server;
 using namespace thewatcher::proto;
+using namespace thewatcher::test;
 
 namespace
 {
 
-std::string free_zmq_tcp_endpoint()
-{
-    zmq::context_t ctx{1};
-    zmq::socket_t socket{ctx, ZMQ_REP};
-    socket.bind("tcp://127.0.0.1:*");
-    auto endpoint = socket.get(zmq::sockopt::last_endpoint);
-    socket.close();
-    return endpoint;
-}
-
-int64_t test_now_ms()
-{
-    return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch())
-        .count();
-}
-
-// Minimal server configuration bound to free local ports with no CURVE keys,
-// an in-memory store, and the REST API disabled (port 0).
-ServerConfig make_transport_config()
-{
-    ServerConfig config;
-    config.bind_address = free_zmq_tcp_endpoint();
-    config.enrollment_address = free_zmq_tcp_endpoint();
-    config.api_host = "127.0.0.1";
-    config.api_port = 0;
-    config.db_path = ":memory:";
-    config.server_public_key.clear();
-    config.server_secret_key.clear();
-    return config;
-}
-
 EnrollRequest make_valid_enroll_request(const std::string& agent_id)
 {
-    EnrollRequest enroll;
-    enroll.agent_id = agent_id;
-    enroll.hostname = "transport-test-host";
-    enroll.platform = "windows";
-    enroll.curve_public_key_z85 = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
-    return enroll;
+    return make_enroll_request(agent_id, "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", "transport-test-host");
 }
 
-// Encodes an EnrollRequest as a wire frame.
-std::vector<uint8_t> encode_enrollment(const EnrollRequest& enroll)
+zmq::socket_t connect_dealer(zmq::context_t& ctx, const std::string& endpoint)
 {
-    Frame frame;
-    frame.type = static_cast<uint8_t>(FrameType::ENROLL_REQUEST);
-    frame.agent_id = enroll.agent_id;
-    frame.timestamp_ms = test_now_ms();
-    frame.payload = pack(enroll);
-    return encode_frame(frame);
+    zmq::socket_t dealer{ctx, ZMQ_DEALER};
+    dealer.set(zmq::sockopt::linger, 0);
+    dealer.set(zmq::sockopt::rcvtimeo, 2000);
+    dealer.connect(endpoint);
+    return dealer;
 }
 
-// Sends one enrollment request and waits up to timeout_ms for a reply.
-// Returns the decoded EnrollResponse, or std::nullopt when no reply arrived.
-std::optional<EnrollResponse> send_enrollment(const std::string& endpoint, const std::vector<uint8_t>& encoded,
-                                              int timeout_ms = 2000)
+// Asserts the server still answers a well-formed enrollment with "pending approval".
+void require_valid_enrollment_answered(const ServerRunner& runner, const std::string& agent_id)
 {
-    zmq::context_t ctx{1};
-    zmq::socket_t req{ctx, ZMQ_REQ};
-    req.set(zmq::sockopt::linger, 0);
-    req.set(zmq::sockopt::rcvtimeo, timeout_ms);
-    req.connect(endpoint);
-    req.send(zmq::message_t(encoded.data(), encoded.size()), zmq::send_flags::none);
-
-    zmq::message_t reply;
-    auto received = req.recv(reply, zmq::recv_flags::none);
-    if (!received.has_value())
-        return std::nullopt;
-    auto reply_frame = decode_frame(reply.data(), reply.size());
-    return unpack<EnrollResponse>(reply_frame.payload);
+    auto response =
+        send_enrollment(runner.config.enrollment_address, encode_enrollment(make_valid_enroll_request(agent_id)));
+    REQUIRE(response.has_value());
+    REQUIRE(response->approved == false);
+    REQUIRE(response->message == "pending approval");
+    REQUIRE(runner.error == nullptr);
 }
 
 } // namespace
@@ -101,34 +50,15 @@ SCENARIO("Multipart enrollment messages cannot crash the server")
 {
     GIVEN("a running server with an empty store")
     {
-        ServerConfig config = make_transport_config();
-        Server server(config);
-        StartupSignal startup;
-        std::exception_ptr server_error;
-
-        std::thread server_thread([&] {
-            try
-            {
-                server.run(&startup);
-            }
-            catch (...)
-            {
-                server_error = std::current_exception();
-                startup.fail(server_error);
-            }
-        });
-
-        auto result = startup.wait();
-        REQUIRE(result.started);
-        REQUIRE(server_error == nullptr);
+        ServerRunner runner(make_in_memory_server_config());
+        const auto& config = runner.config;
+        REQUIRE(runner.startup.wait().started);
+        REQUIRE(runner.error == nullptr);
 
         WHEN("a DEALER sends a delimited multipart enrollment message")
         {
             zmq::context_t ctx{1};
-            zmq::socket_t dealer{ctx, ZMQ_DEALER};
-            dealer.set(zmq::sockopt::linger, 0);
-            dealer.set(zmq::sockopt::rcvtimeo, 2000);
-            dealer.connect(config.enrollment_address);
+            auto dealer = connect_dealer(ctx, config.enrollment_address);
 
             // Wire shape [""][payload][extra]: a REQ-compatible envelope whose
             // payload has two parts. REP delivers both parts to the app with
@@ -160,27 +90,19 @@ SCENARIO("Multipart enrollment messages cannot crash the server")
                 auto reply_frame = decode_frame(reply_payload.data(), reply_payload.size());
                 auto response = unpack<EnrollResponse>(reply_frame.payload);
                 REQUIRE(response.approved == false);
-                REQUIRE(server_error == nullptr);
+                REQUIRE(runner.error == nullptr);
             }
 
             AND_THEN("a subsequent valid enrollment is still answered")
             {
-                auto response = send_enrollment(config.enrollment_address,
-                                                encode_enrollment(make_valid_enroll_request("valid-agent")));
-                REQUIRE(response.has_value());
-                REQUIRE(response->approved == false);
-                REQUIRE(response->message == "pending approval");
-                REQUIRE(server_error == nullptr);
+                require_valid_enrollment_answered(runner, "valid-agent");
             }
         }
 
         WHEN("a DEALER sends a multipart message without a leading delimiter")
         {
             zmq::context_t ctx{1};
-            zmq::socket_t dealer{ctx, ZMQ_DEALER};
-            dealer.set(zmq::sockopt::linger, 0);
-            dealer.set(zmq::sockopt::rcvtimeo, 2000);
-            dealer.connect(config.enrollment_address);
+            auto dealer = connect_dealer(ctx, config.enrollment_address);
 
             // No empty delimiter: REP treats the whole message as a malformed
             // envelope and rolls it back at the socket layer. The server never
@@ -195,24 +117,17 @@ SCENARIO("Multipart enrollment messages cannot crash the server")
             THEN("no reply is delivered and the server keeps running")
             {
                 REQUIRE_FALSE(received.has_value());
-                REQUIRE(server_error == nullptr);
+                REQUIRE(runner.error == nullptr);
             }
 
             AND_THEN("a subsequent valid enrollment is still answered")
             {
-                auto response = send_enrollment(config.enrollment_address,
-                                                encode_enrollment(make_valid_enroll_request("valid-agent-2")));
-                REQUIRE(response.has_value());
-                REQUIRE(response->approved == false);
-                REQUIRE(response->message == "pending approval");
-                REQUIRE(server_error == nullptr);
+                require_valid_enrollment_answered(runner, "valid-agent-2");
             }
         }
 
-        server.stop();
-        if (server_thread.joinable())
-            server_thread.join();
-        REQUIRE(server_error == nullptr);
+        runner.stop();
+        REQUIRE(runner.error == nullptr);
     }
 }
 
@@ -220,26 +135,10 @@ SCENARIO("Oversize enrollment messages are rejected without harm")
 {
     GIVEN("a running server with an empty store")
     {
-        ServerConfig config = make_transport_config();
-        Server server(config);
-        StartupSignal startup;
-        std::exception_ptr server_error;
-
-        std::thread server_thread([&] {
-            try
-            {
-                server.run(&startup);
-            }
-            catch (...)
-            {
-                server_error = std::current_exception();
-                startup.fail(server_error);
-            }
-        });
-
-        auto result = startup.wait();
-        REQUIRE(result.started);
-        REQUIRE(server_error == nullptr);
+        ServerRunner runner(make_in_memory_server_config());
+        const auto& config = runner.config;
+        REQUIRE(runner.startup.wait().started);
+        REQUIRE(runner.error == nullptr);
 
         WHEN("a client sends an enrollment message far larger than the enrollment size cap")
         {
@@ -250,7 +149,7 @@ SCENARIO("Oversize enrollment messages are rejected without harm")
             THEN("no reply is delivered and the server keeps running")
             {
                 REQUIRE_FALSE(response.has_value());
-                REQUIRE(server_error == nullptr);
+                REQUIRE(runner.error == nullptr);
             }
 
             AND_THEN("a subsequent valid enrollment is still answered")
@@ -259,13 +158,11 @@ SCENARIO("Oversize enrollment messages are rejected without harm")
                                              encode_enrollment(make_valid_enroll_request("valid-agent")));
                 REQUIRE(reply.has_value());
                 REQUIRE(reply->approved == false);
-                REQUIRE(server_error == nullptr);
+                REQUIRE(runner.error == nullptr);
             }
         }
 
-        server.stop();
-        if (server_thread.joinable())
-            server_thread.join();
-        REQUIRE(server_error == nullptr);
+        runner.stop();
+        REQUIRE(runner.error == nullptr);
     }
 }

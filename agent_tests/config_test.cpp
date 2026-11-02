@@ -1,5 +1,6 @@
 #include "../agent/config.hpp"
 #include "../agent/enrollment.hpp"
+#include "test_support/temp_dir.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -17,7 +18,7 @@ SCENARIO("AgentConfig is auto-created when no config file exists")
 {
     GIVEN("a path to a config file that does not exist")
     {
-        auto path = fs::temp_directory_path() / "thewatcher_test_agent.json";
+        auto path = thewatcher::test::process_temp_dir().path() / "thewatcher_test_agent.json";
         fs::remove(path); // ensure clean state
 
         WHEN("load_or_create is called")
@@ -71,7 +72,7 @@ SCENARIO("AgentConfig derives enrollment and data endpoints from THEWATCHER_SERV
 {
     GIVEN("a TheWatcherAgent.conf file with a server host")
     {
-        auto path = fs::temp_directory_path() / "TheWatcherAgent-test.conf";
+        auto path = thewatcher::test::process_temp_dir().path() / "TheWatcherAgent-test.conf";
         fs::remove(path);
         {
             std::ofstream f(path);
@@ -100,7 +101,7 @@ SCENARIO("AgentConfig survives a save and reload cycle")
 {
     GIVEN("a config written to a temp file")
     {
-        auto path = fs::temp_directory_path() / "TheWatcherAgent-roundtrip.conf";
+        auto path = thewatcher::test::process_temp_dir().path() / "TheWatcherAgent-roundtrip.conf";
         fs::remove(path);
 
         AgentConfig original = AgentConfig::load_or_create(path);
@@ -141,7 +142,7 @@ SCENARIO("The CLI insecure opt-in is never persisted but a configured ALLOW_INSE
 {
     GIVEN("a config with only the process-local allow_insecure_cli set")
     {
-        auto path = fs::temp_directory_path() / "TheWatcherAgent-insecure-cli.conf";
+        auto path = thewatcher::test::process_temp_dir().path() / "TheWatcherAgent-insecure-cli.conf";
         fs::remove(path);
 
         AgentConfig cfg = AgentConfig::load_or_create(path);
@@ -168,7 +169,7 @@ SCENARIO("The CLI insecure opt-in is never persisted but a configured ALLOW_INSE
 
     GIVEN("a config with allow_insecure persisted by the operator")
     {
-        auto path = fs::temp_directory_path() / "TheWatcherAgent-insecure-persisted.conf";
+        auto path = thewatcher::test::process_temp_dir().path() / "TheWatcherAgent-insecure-persisted.conf";
         fs::remove(path);
 
         AgentConfig cfg = AgentConfig::load_or_create(path);
@@ -210,7 +211,7 @@ SCENARIO("Loading an existing config file does not regenerate the agent id or ke
 {
     GIVEN("a config created on first run")
     {
-        auto path = fs::temp_directory_path() / "thewatcher_test_stable.json";
+        auto path = thewatcher::test::process_temp_dir().path() / "thewatcher_test_stable.json";
         fs::remove(path);
 
         auto first = AgentConfig::load_or_create(path);
@@ -242,7 +243,7 @@ SCENARIO("AgentConfig rejects oversized KEY=VALUE config input")
 {
     GIVEN("an existing agent config with a line above the supported size")
     {
-        auto path = fs::temp_directory_path() / "TheWatcherAgent-too-long-line.conf";
+        auto path = thewatcher::test::process_temp_dir().path() / "TheWatcherAgent-too-long-line.conf";
         fs::remove(path);
         {
             std::ofstream f(path);
@@ -262,7 +263,7 @@ SCENARIO("AgentConfig rejects oversized KEY=VALUE config input")
 
     GIVEN("an existing agent config file above the supported size")
     {
-        auto path = fs::temp_directory_path() / "TheWatcherAgent-too-large.conf";
+        auto path = thewatcher::test::process_temp_dir().path() / "TheWatcherAgent-too-large.conf";
         fs::remove(path);
         {
             std::ofstream f(path);
