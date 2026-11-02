@@ -243,8 +243,15 @@ restrict the directory to SYSTEM and Administrators (the 0.8.0 installer
 does this automatically; for manual layouts run the equivalent of):
 
 ```powershell
-icacls C:\ProgramData\TheWatcher /inheritance:r /grant:r "*S-1-5-32-544:(OI)(CI)F" "*S-1-5-18:(OI)(CI)F"
+icacls C:\ProgramData\TheWatcher /inheritance:r /remove:g "*S-1-5-32-545" "*S-1-5-11" "*S-1-1-0" /grant:r "*S-1-5-32-544:(OI)(CI)F" "*S-1-5-18:(OI)(CI)F"
+icacls "C:\ProgramData\TheWatcher\*" /reset /T /C
+icacls C:\ProgramData\TheWatcher /T
 ```
+
+The first command removes the `Users` grant that installers before 0.8.0
+added. `/grant:r` alone does not remove it. The second command makes existing
+files inherit only the restricted ACL; skip it when the directory is empty. Use
+the third command to confirm that only `Administrators` and `SYSTEM` remain.
 
 ## Foreground Install
 
