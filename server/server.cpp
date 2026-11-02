@@ -360,7 +360,8 @@ void Server::handle_router_frame(zmq::socket_t& router)
 
     const std::string& agent_id = frame.agent_id;
     LOGF_TRACE("Received frame identity_size=%zu agent_id=%s type=%s raw_type=%u payload_size=%zu frame_timestamp=%lld",
-               identity_msg.size(), agent_id.c_str(), frame_type_name(frame.type), static_cast<unsigned>(frame.type),
+               identity_msg.size(), sanitize_log_text(agent_id).c_str(), frame_type_name(frame.type),
+               static_cast<unsigned>(frame.type),
                frame.payload.size(), static_cast<long long>(frame.timestamp_ms));
 
     // SEC-04: when CURVE is enabled, the ZAP-authenticated identity is
@@ -383,7 +384,8 @@ void Server::handle_router_frame(zmq::socket_t& router)
         if (authenticated_id != agent_id)
         {
             LOGF_WARNING("Dropping frame from authenticated agent_id=%s claiming agent_id=%s type=%s",
-                         authenticated_id.c_str(), agent_id.c_str(), frame_type_name(frame.type));
+                         sanitize_log_text(authenticated_id).c_str(), sanitize_log_text(agent_id).c_str(),
+                         frame_type_name(frame.type));
             return;
         }
     }
@@ -394,7 +396,7 @@ void Server::handle_router_frame(zmq::socket_t& router)
     auto rec = store_->get_agent(agent_id);
     if (!rec || !rec->approved || rec->rejected)
     {
-        LOGF_WARNING("Dropping frame from non-approved agent_id=%s type=%s", agent_id.c_str(),
+        LOGF_WARNING("Dropping frame from non-approved agent_id=%s type=%s", sanitize_log_text(agent_id).c_str(),
                      frame_type_name(frame.type));
         return;
     }
@@ -533,8 +535,9 @@ void Server::handle_router_frame(zmq::socket_t& router)
                     dispatched_commands_.erase(command);
                 }
             }
-            LOGF_INFO("ACK from %s cmd=%s ok=%d msg=%s", agent_id.c_str(), ack.command_id.c_str(), ack.success ? 1 : 0,
-                      ack.message.c_str());
+            LOGF_INFO("ACK from %s cmd=%s ok=%d msg=%s", sanitize_log_text(agent_id).c_str(),
+                      sanitize_log_text(ack.command_id).c_str(), ack.success ? 1 : 0,
+                      sanitize_log_text(ack.message).c_str());
         }
         catch (const std::exception& e)
         {
@@ -824,6 +827,24 @@ void Server::handle_enrollment(zmq::socket_t& enroll)
                 LOGF_WARNING("Enrollment rejected: pending agent queue is full max=%zu", max_pending_agents);
                 send_error("pending queue full");
                 return;
+            }
+
+            // A CURVE key identifies exactly one agent: ZAP binds each key to
+            // a single agent_id. A second record with the same key could be
+            // approved and rebind that key away from its owner, and revoking
+            // the duplicate would cut the owner off.
+            if (!req.curve_public_key_z85.empty())
+            {
+                for (const auto& other : store_->list_agents())
+                {
+                    if (other.agent_id != req.agent_id && other.curve_public_key_z85 == req.curve_public_key_z85)
+                    {
+                        LOGF_WARNING("Enrollment rejected: public key already enrolled by agent_id=%s",
+                                     other.agent_id.c_str());
+                        send_error("public key already enrolled by another agent");
+                        return;
+                    }
+                }
             }
 
             AgentRecord rec;

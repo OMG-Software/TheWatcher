@@ -58,7 +58,9 @@ void ApiServer::start()
     if (!http_->bind_to_port(host_.c_str(), port_))
     {
         LOGF_ERROR("Failed to listen on %s:%d", host_.c_str(), port_);
-        return;
+        // Throw like the ZMQ socket binds in Server::run() do, so a busy or
+        // invalid API address fails startup instead of being reported as up.
+        throw std::runtime_error("Failed to bind REST API on " + host_ + ":" + std::to_string(port_));
     }
     thread_ = std::thread([this] {
         LOGF_INFO("Listening on %s:%d", host_.c_str(), port_);
@@ -1470,6 +1472,26 @@ void ApiServer::setup_routes()
         try
         {
             auto id = req.path_params.at("id");
+            // A CURVE key may be bound to one approved agent only: approving a
+            // second record with the same key would rebind it in ZAP and cut
+            // the original agent off. Enrollment already refuses duplicates;
+            // this also covers records stored before that check existed.
+            if (auto pending = store_.get_agent(id); pending && !pending->curve_public_key_z85.empty())
+            {
+                for (const auto& other : store_.list_approved_agents())
+                {
+                    if (other.agent_id != id && other.curve_public_key_z85 == pending->curve_public_key_z85)
+                    {
+                        LOGF_WARNING("Refusing to approve agent id=%s: key already bound to agent_id=%s", id.c_str(),
+                                     other.agent_id.c_str());
+                        res.status = 409;
+                        set_json(res, json{
+                                          {"error", "public key already belongs to another approved agent"}
+                        });
+                        return;
+                    }
+                }
+            }
             LOGF_INFO("Approving agent id=%s", id.c_str());
             store_.approve_agent(id);
             std::vector<int64_t> group_ids;

@@ -258,3 +258,34 @@ SCENARIO("Re-enrolling an approved agent does not refresh last_seen")
         }
     }
 }
+SCENARIO("Enrollment refuses a public key that another agent already holds")
+{
+    GIVEN("a running server with a pending agent enrolled under key K")
+    {
+        EnrollmentFixture fx;
+        fx.start_and_login();
+
+        thewatcher::crypto::init();
+        const auto keys = thewatcher::crypto::generate_curve_keypair();
+
+        auto first = enroll(fx.config.enrollment_address, valid_request("key-owner", keys.public_key_z85));
+        REQUIRE(first.has_value());
+        REQUIRE(first->message == "pending approval");
+
+        WHEN("a different agent_id enrolls with the same key")
+        {
+            // Clear the 1 s per-source rate limit so the request reaches the key check.
+            std::this_thread::sleep_for(1100ms);
+            auto copy = enroll(fx.config.enrollment_address, valid_request("key-copier", keys.public_key_z85));
+
+            THEN("the request is rejected and no record is created for it")
+            {
+                REQUIRE(copy.has_value());
+                REQUIRE(copy->approved == false);
+                REQUIRE(copy->message.find("public key already enrolled") != std::string::npos);
+                REQUIRE_FALSE(fx.pending_contains("key-copier"));
+                REQUIRE(fx.pending_contains("key-owner"));
+            }
+        }
+    }
+}

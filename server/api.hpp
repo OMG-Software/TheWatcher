@@ -51,8 +51,8 @@ public:
     ~ApiServer();
 
     // Non-blocking start. Binds the port before returning, then runs the accept
-    // loop on a worker thread. If the bind fails it logs an error and returns
-    // without starting the thread; it does not throw.
+    // loop on a worker thread. Throws std::runtime_error if the bind fails, so
+    // Server::run() reports a startup failure instead of a running server.
     void start();
 
     void stop();

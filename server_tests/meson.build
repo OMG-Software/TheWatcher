@@ -80,6 +80,14 @@ login_rate_limit_test = executable(
 )
 test('login_rate_limit', login_rate_limit_test, is_parallel: false)
 
+api_server_test = executable(
+  'api_server_test',
+  ['api_server_test.cpp'],
+  include_directories: root_inc,
+  dependencies: [server_dep, common_dep, catch2_dep, http_dep, cppzmq_dep, sqlite_dep, platform_deps],
+)
+test('api_server', api_server_test, is_parallel: false)
+
 store_user_guard_test = executable(
   'store_user_guard_test',
   ['store_user_guard_test.cpp'],

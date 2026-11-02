@@ -54,6 +54,11 @@ entries below call those out explicitly.
   agents (no enrollment token), so existing agents keep enrolling after a
   server upgrade. When `ENROLLMENT_TOKEN` is set, those requests are
   rejected because the token is missing (SEC-05).
+- A CURVE public key can belong to one agent only: enrollment refuses a key
+  that another agent already holds, and approval refuses a key that is
+  already bound to another approved agent (HTTP 409). Data-plane log lines
+  sanitise the peer-supplied `agent_id` and command ACK text (SEC-04,
+  SEC-05).
 - **Behaviour change:** approval and revocation are enforced per frame on
   the data plane — rejected, deleted or still-pending agents' frames are
   dropped immediately instead of being honoured on existing sessions
@@ -108,7 +113,9 @@ entries below call those out explicitly.
 ### Fixed
 
 - The API server binds its port before `start()` returns, so the first
-  request after startup no longer races the listener.
+  request after startup no longer races the listener. If the bind fails,
+  server startup now fails instead of reporting a REST API that is not
+  listening.
 
 ### Changed
 
