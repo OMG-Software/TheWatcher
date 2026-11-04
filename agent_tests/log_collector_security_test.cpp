@@ -557,3 +557,32 @@ SCENARIO("LogCollector refuses patterns that nest groups too deeply (issue #140)
         }
     }
 }
+
+SCENARIO("The group nesting limit accepts 16 levels and rejects 17 (issue #140)")
+{
+    for (const int depth : {16, 17})
+    {
+        GIVEN("a pattern with " + std::to_string(depth) + " nested groups that matches the line")
+        {
+            LogCollector collector;
+            auto dir = make_dir("regex-depth-boundary");
+            auto path = dir / ("depth" + std::to_string(depth) + ".log");
+            write_file(path, "ab\n");
+            const std::string pattern = std::string(static_cast<std::size_t>(depth), '(') + "a" +
+                                        std::string(static_cast<std::size_t>(depth), ')') + "b";
+
+            collector.set_allowed_dirs({dir});
+            collector.set_configs({make_config(path, pattern)});
+
+            WHEN("tick() is called")
+            {
+                collector.tick();
+
+                THEN("16 levels match and 17 levels are skipped")
+                {
+                    REQUIRE(collector.take_matches().size() == (depth <= 16 ? 1U : 0U));
+                }
+            }
+        }
+    }
+}
