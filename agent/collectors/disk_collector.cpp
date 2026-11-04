@@ -2,6 +2,7 @@
 
 #include "common/SingleLog.hpp"
 
+#include <algorithm>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
@@ -18,6 +19,23 @@
 
 namespace thewatcher::agent
 {
+
+// Fills disk's size fields from space as df does: free_bytes is the space
+// available to unprivileged writers, and usage is used / (used + available).
+// Clamps inconsistent filesystem values so used_bytes cannot underflow.
+void apply_space_info(DiskMetrics& disk, const std::filesystem::space_info& space)
+{
+    const auto capacity = space.capacity;
+    // available <= free <= capacity on every platform; clamp in case a
+    // filesystem reports inconsistent values.
+    const auto free = std::min(space.free, capacity);
+    const auto available = std::min(space.available, free);
+    disk.total_bytes = capacity;
+    disk.free_bytes = available;
+    disk.used_bytes = capacity - free;
+    const auto usable = disk.used_bytes + available;
+    disk.usage_percent = usable > 0 ? 100.0 * static_cast<double>(disk.used_bytes) / static_cast<double>(usable) : 0.0;
+}
 
 namespace
 {
@@ -89,12 +107,7 @@ namespace
             disk.device = device;
             disk.mount_point = mount_point;
             disk.filesystem = filesystem;
-            disk.total_bytes = space.capacity;
-            disk.free_bytes = space.free;
-            disk.used_bytes = space.capacity > space.free ? space.capacity - space.free : 0;
-            disk.usage_percent =
-                space.capacity > 0 ? 100.0 * static_cast<double>(disk.used_bytes) / static_cast<double>(space.capacity)
-                                   : 0.0;
+            apply_space_info(disk, space);
             disks.push_back(std::move(disk));
         }
 
@@ -142,12 +155,7 @@ namespace
             disk.device = root;
             disk.mount_point = root;
             disk.filesystem = fs_name[0] != '\0' ? std::string(fs_name) : std::string("unknown");
-            disk.total_bytes = space.capacity;
-            disk.free_bytes = space.free;
-            disk.used_bytes = space.capacity > space.free ? space.capacity - space.free : 0;
-            disk.usage_percent =
-                space.capacity > 0 ? 100.0 * static_cast<double>(disk.used_bytes) / static_cast<double>(space.capacity)
-                                   : 0.0;
+            apply_space_info(disk, space);
             disks.push_back(std::move(disk));
         }
 
@@ -176,12 +184,7 @@ namespace
         disk.device = root.string();
         disk.mount_point = root.string();
         disk.filesystem = "unknown";
-        disk.total_bytes = space.capacity;
-        disk.free_bytes = space.free;
-        disk.used_bytes = space.capacity > space.free ? space.capacity - space.free : 0;
-        disk.usage_percent = space.capacity > 0
-                                 ? 100.0 * static_cast<double>(disk.used_bytes) / static_cast<double>(space.capacity)
-                                 : 0.0;
+        apply_space_info(disk, space);
         disks.push_back(std::move(disk));
         return disks;
     }

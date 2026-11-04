@@ -205,21 +205,14 @@ int main(int argc, char* argv[])
         return 1;
     }
 
+    // Issue #150: overrides apply to this process only and are not saved.
     if (!override_server.empty())
-    {
         LOGF_DEBUG("Overriding server address from CLI: %s", override_server.c_str());
-        config.server_address = override_server;
-    }
     if (!override_enrollment.empty())
-    {
         LOGF_DEBUG("Overriding enrollment address from CLI: %s", override_enrollment.c_str());
-        config.enrollment_address = override_enrollment;
-    }
     if (!override_server_key.empty())
-    {
         LOG_DEBUG("Overriding server public key from CLI");
-        config.server_public_key = override_server_key;
-    }
+    config.apply_cli_overrides(override_server, override_enrollment, override_server_key);
     if (allow_insecure)
     {
         // SEC-08: explicit operator opt-in to run without CURVE; without this

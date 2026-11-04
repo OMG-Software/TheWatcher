@@ -257,7 +257,7 @@ Options:
 | `SERVER_PUBLIC_KEY_FINGERPRINT` | empty | BLAKE2b-256 hex fingerprint of `SERVER_PUBLIC_KEY`. The agent writes this after approval and rejects future approved enrollment responses whose fingerprint does not match. |
 | `ALLOW_INSECURE` | `0` | Explicit opt-in to connect without CURVE. When `0` (default), an approved enrollment reply without a server key pin is a hard error — the agent never silently runs an unencrypted data plane. |
 | `ENROLLMENT_TOKEN` | empty | Pre-shared enrollment token matching the server's `ENROLLMENT_TOKEN`. Required when the server configures one. |
-| `AGENT_ID` | generated UUID | Stable agent identity used for enrollment, routing, and dashboard rows. Valid characters are letters, digits, `.`, `_`, and `-` (max 64). |
+| `AGENT_ID` | generated UUID | Stable agent identity used for enrollment, data-plane frames, and dashboard rows. Valid characters are letters, digits, `.`, `_`, and `-` (max 64). |
 | `AGENT_PUBLIC_KEY` | generated | Agent CURVE public key sent during enrollment and approved by the server. |
 | `AGENT_SECRET_KEY` | generated | Agent CURVE secret key. Keep this private. |
 | `COLLECTION_INTERVAL` | `30` | Seconds between periodic metrics submissions. The server can update this through the dashboard. |
@@ -269,6 +269,14 @@ variable: a list of directories (separated by `;` on Windows, `:` elsewhere)
 inside which the configured log paths must resolve. While unset, log
 monitoring is disabled entirely — the agent fails closed rather than reading
 arbitrary files chosen on the dashboard.
+
+A log monitor pattern is matched against the first 4 KiB of each line only.
+A match that lies entirely after the first 4 KiB of a line produces no log
+match and no alert, and `$` does not match at that 4 KiB cut. Lines are read
+up to 64 KiB, and the reported line is not cut to 4 KiB. A pattern that nests
+groups more than 16 levels deep is skipped with a warning. These limits keep
+the regex engine's stack use bounded (#140). Patterns with heavy backtracking
+can still use a lot of CPU (#169).
 
 ## Agent CLI Overrides
 
@@ -287,6 +295,10 @@ Agent command-line options override loaded config values for that process:
 --genkey
 --help
 ```
+
+`--server`, `--enrollment` and `--server-key` are not written to the config
+file: when the agent saves its config after enrollment, it keeps the file's
+own values for those settings.
 
 `--genkey` prints a new CURVE keypair and exits. `--insecure` is the CLI
 equivalent of `ALLOW_INSECURE=1` and must be set explicitly to allow an

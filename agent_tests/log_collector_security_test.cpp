@@ -410,3 +410,179 @@ SCENARIO("parse_log_allowed_dirs_from_env parses the platform path list")
 #endif
     }
 }
+SCENARIO("LogCollector survives long lines with recursion-heavy patterns (issue #140)")
+{
+    // std::regex recurses about once per character. Before the fix a ~40 KB
+    // line with "ERROR.*timeout" overflowed the 8 MB thread stack (SIGSEGV).
+    for (const std::string pattern : {"ERROR.*timeout", "(a|b)*c"})
+    {
+        GIVEN("a 64 KiB line that does not match the pattern: " + pattern)
+        {
+            LogCollector collector;
+            auto dir = make_dir("regex-depth");
+            auto path = dir / "deep.log";
+            // The long line does not match; the short line after it does, so
+            // one match in total proves the long line was consumed (a reader
+            // stuck on the long line would never reach the second one).
+            write_file(path, "ERROR " + std::string(64 * 1024 - 7, 'a') + "\nERROR timeout c\n");
+
+            collector.set_allowed_dirs({dir});
+            collector.set_configs({make_config(path, pattern)});
+
+            WHEN("tick() is called twice")
+            {
+                collector.tick();
+                auto matches = collector.take_matches();
+                collector.tick();
+                const auto more = collector.take_matches();
+                matches.insert(matches.end(), more.begin(), more.end());
+
+                THEN("the agent does not crash and only the short line matches")
+                {
+                    REQUIRE(matches.size() == 1);
+                    REQUIRE(matches[0].matched_line == "ERROR timeout c");
+                }
+            }
+        }
+    }
+
+    GIVEN("a 60 KiB line whose only match lies after the first 4 KiB")
+    {
+        LogCollector collector;
+        auto dir = make_dir("regex-beyond-limit");
+        auto path = dir / "beyond.log";
+        write_file(path, std::string(8 * 1024, 'x') + " ERROR db timeout " + std::string(50 * 1024, 'x') + "\n");
+
+        collector.set_allowed_dirs({dir});
+        collector.set_configs({make_config(path, "ERROR.*timeout")});
+
+        WHEN("tick() is called")
+        {
+            collector.tick();
+
+            THEN("no match is reported: only the first 4 KiB of a line is matched")
+            {
+                REQUIRE(collector.take_matches().empty());
+            }
+        }
+    }
+
+    GIVEN("a 60 KiB line whose first 4 KiB end with the pattern of an end-anchored monitor")
+    {
+        LogCollector collector;
+        auto dir = make_dir("regex-anchor-cut");
+        auto path = dir / "anchor.log";
+        write_file(path, std::string(4 * 1024 - 5, 'x') + "ERROR" + std::string(56 * 1024, 'y') + "\n");
+
+        collector.set_allowed_dirs({dir});
+        collector.set_configs({make_config(path, "ERROR$")});
+
+        WHEN("tick() is called")
+        {
+            collector.tick();
+
+            THEN("\"$\" does not match at the 4 KiB cut")
+            {
+                REQUIRE(collector.take_matches().empty());
+            }
+        }
+    }
+
+    GIVEN("a 60 KiB line whose match lies in the first 4 KiB")
+    {
+        LogCollector collector;
+        auto dir = make_dir("regex-prefix");
+        auto path = dir / "prefix.log";
+        write_file(path, "ERROR db timeout " + std::string(60 * 1024, 'x') + "\n");
+
+        collector.set_allowed_dirs({dir});
+        collector.set_configs({make_config(path, "ERROR.*timeout")});
+
+        WHEN("tick() is called")
+        {
+            collector.tick();
+            auto matches = collector.take_matches();
+
+            THEN("the line still matches once")
+            {
+                REQUIRE(matches.size() == 1);
+            }
+        }
+    }
+}
+
+SCENARIO("LogCollector refuses patterns that nest groups too deeply (issue #140)")
+{
+    GIVEN("a 4 KiB line and a pattern with 100 nested groups (within the 256-character cap)")
+    {
+        LogCollector collector;
+        auto dir = make_dir("regex-nesting");
+        auto path = dir / "nested.log";
+        write_file(path, std::string(4 * 1024, 'a') + "\n");
+        // 100 nested groups overflowed the 64 MB matching stack on this line.
+        const std::string pattern = std::string(100, '(') + "a" + std::string(100, ')') + "*b";
+
+        collector.set_allowed_dirs({dir});
+        collector.set_configs({make_config(path, pattern)});
+
+        WHEN("tick() is called")
+        {
+            collector.tick();
+
+            THEN("the pattern is skipped instead of crashing the agent")
+            {
+                REQUIRE(collector.take_matches().empty());
+            }
+        }
+    }
+
+    GIVEN("a pattern with shallow groups, a class containing \"(\" and an escaped \"(\"")
+    {
+        LogCollector collector;
+        auto dir = make_dir("regex-shallow");
+        auto path = dir / "shallow.log";
+        write_file(path, "ERROR (disk) [sda] timeout\n");
+
+        collector.set_allowed_dirs({dir});
+        collector.set_configs({make_config(path, "(ERROR|WARN) \\((disk|net)\\) [[(]sda[)\\]] (time(out))")});
+
+        WHEN("tick() is called")
+        {
+            collector.tick();
+
+            THEN("the pattern is used normally")
+            {
+                REQUIRE(collector.take_matches().size() == 1);
+            }
+        }
+    }
+}
+
+SCENARIO("The group nesting limit accepts 16 levels and rejects 17 (issue #140)")
+{
+    for (const int depth : {16, 17})
+    {
+        GIVEN("a pattern with " + std::to_string(depth) + " nested groups that matches the line")
+        {
+            LogCollector collector;
+            auto dir = make_dir("regex-depth-boundary");
+            auto path = dir / ("depth" + std::to_string(depth) + ".log");
+            write_file(path, "ab\n");
+            const std::string pattern = std::string(static_cast<std::size_t>(depth), '(') + "a" +
+                                        std::string(static_cast<std::size_t>(depth), ')') + "b";
+
+            collector.set_allowed_dirs({dir});
+            collector.set_configs({make_config(path, pattern)});
+
+            WHEN("tick() is called")
+            {
+                collector.tick();
+
+                THEN("16 levels match and 17 levels are skipped")
+                {
+                    REQUIRE(collector.take_matches().size() == (depth <= 16 ? 1U : 0U));
+                }
+            }
+        }
+    }
+}

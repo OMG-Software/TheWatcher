@@ -5,6 +5,8 @@
 // so a tiny hostile payload could force a huge allocation or a stack
 // overflow. These tests pin the pre-validation that rejects such payloads
 // before cbor_load ever runs.
+#include "common/collector_config.hpp"
+#include "common/metrics.hpp"
 #include "common/protocol.hpp"
 
 #include <catch2/catch_test_macros.hpp>
@@ -162,6 +164,106 @@ SCENARIO("Hostile CBOR payloads are rejected end-to-end by decode_frame")
             {
                 REQUIRE_THROWS_AS(decode_frame(payload.data(), payload.size()), std::runtime_error);
             }
+        }
+    }
+}
+
+namespace
+{
+
+// TemperatureMetrics is ["sensor", "label", <double>]; the last item is
+// replaced by the raw CBOR bytes under test.
+std::vector<uint8_t> temperature_payload(const std::vector<uint8_t>& value)
+{
+    std::vector<uint8_t> bytes{0x83, 0x61, 'a', 0x61, 'b'};
+    bytes.insert(bytes.end(), value.begin(), value.end());
+    return bytes;
+}
+
+// PercentThresholds is [<double>, <double>, <double>]; the first item is
+// replaced by the raw CBOR bytes under test.
+std::vector<uint8_t> thresholds_payload(const std::vector<uint8_t>& value)
+{
+    std::vector<uint8_t> bytes{0x83};
+    bytes.insert(bytes.end(), value.begin(), value.end());
+    const std::vector<uint8_t> two_doubles{0xFB, 0x40, 0x59, 0, 0, 0, 0, 0, 0,  // 100.0
+                                           0xFB, 0x40, 0x59, 0, 0, 0, 0, 0, 0}; // 100.0
+    bytes.insert(bytes.end(), two_doubles.begin(), two_doubles.end());
+    return bytes;
+}
+
+} // namespace
+
+SCENARIO("CBOR simple values in a double position are rejected (issue #139)")
+{
+    // null, undefined, true, false share major type 7 with floats but have
+    // no float payload; reading them as float8 dereferenced NULL.
+    const std::vector<std::vector<uint8_t>> simple_values{{0xF6}, {0xF7}, {0xF5}, {0xF4}};
+
+    GIVEN("a metrics payload with a simple value where a double is expected")
+    {
+        for (const auto& value : simple_values)
+        {
+            const auto payload = temperature_payload(value);
+            // DYNAMIC_SECTION: a plain THEN in a loop runs only for the first
+            // value, because Catch2 identifies sections by name and line.
+            DYNAMIC_SECTION("unpack throws instead of crashing for simple value 0x" << std::hex
+                                                                                    << static_cast<int>(value[0]))
+            {
+                REQUIRE_THROWS_AS(unpack<thewatcher::TemperatureMetrics>(payload), std::runtime_error);
+            }
+        }
+    }
+
+    GIVEN("a collector-config payload with a simple value where a double is expected")
+    {
+        for (const auto& value : simple_values)
+        {
+            const auto payload = thresholds_payload(value);
+            DYNAMIC_SECTION("unpack throws instead of crashing for simple value 0x" << std::hex
+                                                                                    << static_cast<int>(value[0]))
+            {
+                REQUIRE_THROWS_AS(unpack<thewatcher::PercentThresholds>(payload), std::runtime_error);
+            }
+        }
+    }
+}
+
+SCENARIO("Half and single precision CBOR floats decode as doubles (issue #139)")
+{
+    GIVEN("a half-precision 1.0 (f9 3c00) in a metrics payload")
+    {
+        const auto payload = temperature_payload({0xF9, 0x3C, 0x00});
+        THEN("it decodes to 1.0 without reading past the item")
+        {
+            REQUIRE(unpack<thewatcher::TemperatureMetrics>(payload).temperature_celsius == 1.0);
+        }
+    }
+
+    GIVEN("a single-precision 1.5 (fa 3fc00000) in a collector-config payload")
+    {
+        const auto payload = thresholds_payload({0xFA, 0x3F, 0xC0, 0x00, 0x00});
+        THEN("it decodes to 1.5 without reading past the item")
+        {
+            REQUIRE(unpack<thewatcher::PercentThresholds>(payload).warning_percent == 1.5);
+        }
+    }
+
+    GIVEN("a half-precision 1.0 (f9 3c00) in a collector-config payload")
+    {
+        const auto payload = thresholds_payload({0xF9, 0x3C, 0x00});
+        THEN("it decodes to 1.0 without reading past the item")
+        {
+            REQUIRE(unpack<thewatcher::PercentThresholds>(payload).warning_percent == 1.0);
+        }
+    }
+
+    GIVEN("a single-precision 1.5 (fa 3fc00000) in a metrics payload")
+    {
+        const auto payload = temperature_payload({0xFA, 0x3F, 0xC0, 0x00, 0x00});
+        THEN("it decodes to 1.5 without reading past the item")
+        {
+            REQUIRE(unpack<thewatcher::TemperatureMetrics>(payload).temperature_celsius == 1.5);
         }
     }
 }

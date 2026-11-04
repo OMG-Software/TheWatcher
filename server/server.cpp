@@ -243,6 +243,7 @@ void Server::run(StartupSignal* startup)
                 const auto cutoff = now - (static_cast<int64_t>(config_.offline_after_seconds) * 1000);
                 LOGF_TRACE("Scanning for offline agents cutoff_ms=%lld", static_cast<long long>(cutoff));
                 store_->mark_agents_offline_before(cutoff);
+                expire_routes();
                 const auto ts = now_ms();
                 for (const auto& agent_id : store_->get_offline_unalerted_agent_ids())
                 {
@@ -336,7 +337,9 @@ void Server::stop()
 // and LOG_MATCH frames; other types are ignored.
 void Server::handle_router_frame(zmq::socket_t& router)
 {
-    // ROUTER prepends the sender's routing-id (set by agent to its agent_id).
+    // ROUTER prepends the sender's routing-id. Since issue #141 the agent no
+    // longer sets it (libzmq generates one); 0.8.0 agents set it to their
+    // agent_id. Either way it is only an address: identity comes from ZAP.
     // The agent DEALER explicitly sends [empty delimiter][payload], so the
     // server receives exactly: [identity][empty][payload].
     // Check RCVMORE before each further receive: a peer that sends fewer
@@ -422,8 +425,13 @@ void Server::handle_router_frame(zmq::socket_t& router)
     {
         LOGF_WARNING("Dropping frame from non-approved agent_id=%s type=%s", sanitize_log_text(agent_id).c_str(),
                      frame_type_name(frame.type));
+        forget_route(agent_id);
         return;
     }
+
+    // Issue #141: learn where this agent is reachable. With CURVE the frame
+    // passed the ZAP identity check, so this connection belongs to agent_id.
+    learn_route(agent_id, std::string(static_cast<const char*>(identity_msg.data()), identity_msg.size()));
 
     // Update last_seen timestamp for every inbound frame.
     const bool was_offline = !rec->connected;
@@ -946,11 +954,23 @@ void Server::dispatch_commands(zmq::socket_t& router)
 
         auto encoded = encode_frame(f);
 
+        // Issue #141: send only to the route learned from this agent's own
+        // authenticated frames. Until the agent has sent one, it is not
+        // reachable and the command is dropped (as for any offline agent).
+        const auto route = agent_routes_.find(pc.agent_id);
+        if (route == agent_routes_.end() || route->second.routing_id.empty())
+        {
+            LOGF_WARNING("Dropping command for agent_id=%s with no known connection command_id=%s",
+                         sanitize_log_text(pc.agent_id).c_str(), pc.cmd.command_id.c_str());
+            continue;
+        }
+
         // ROUTER send: [identity][empty delimiter][payload]
         // The agent DEALER receives [empty][payload] (identity is stripped).
         try
         {
-            router.send(zmq::message_t(pc.agent_id.data(), pc.agent_id.size()), zmq::send_flags::sndmore);
+            const auto& routing_id = route->second.routing_id;
+            router.send(zmq::message_t(routing_id.data(), routing_id.size()), zmq::send_flags::sndmore);
             router.send(zmq::message_t{}, zmq::send_flags::sndmore);
             router.send(zmq::message_t(encoded.data(), encoded.size()), zmq::send_flags::none);
             dispatched_commands_[pc.cmd.command_id] = {static_cast<CommandType>(pc.cmd.command_type), now_ms(),
@@ -961,6 +981,61 @@ void Server::dispatch_commands(zmq::socket_t& router)
         catch (const std::exception& e)
         {
             LOGF_ERROR("Failed to dispatch command to %s: %s", pc.agent_id.c_str(), e.what());
+        }
+    }
+}
+
+// Records routing_id as agent_id's route (issue #141). Moving a routing id to
+// this agent drops any other agent's claim on it and this agent's old route.
+void Server::learn_route(const std::string& agent_id, const std::string& routing_id)
+{
+    const auto now = std::chrono::steady_clock::now();
+    if (const auto known = agent_routes_.find(agent_id);
+        known != agent_routes_.end() && known->second.routing_id == routing_id)
+    {
+        known->second.last_frame = now; // usual case: same connection as before
+        return;
+    }
+
+    // The routing id moves to this agent: drop another agent's claim on it and
+    // this agent's claim on its previous routing id.
+    if (const auto owner = route_owners_.find(routing_id); owner != route_owners_.end())
+        agent_routes_.erase(owner->second);
+    forget_route(agent_id);
+    agent_routes_[agent_id] = AgentRoute{routing_id, now};
+    route_owners_[routing_id] = agent_id;
+}
+
+// Removes agent_id's route and its reverse-index entry, if present.
+void Server::forget_route(const std::string& agent_id)
+{
+    const auto route = agent_routes_.find(agent_id);
+    if (route == agent_routes_.end())
+        return;
+    route_owners_.erase(route->second.routing_id);
+    agent_routes_.erase(route);
+}
+
+// Drops routes whose agent has sent no frame for offline_after_seconds, so a
+// closed connection's routing id cannot receive that agent's commands.
+// Does nothing when offline detection is disabled (offline_after_seconds <= 0).
+void Server::expire_routes()
+{
+    if (config_.offline_after_seconds <= 0)
+        return;
+    const auto cutoff = std::chrono::steady_clock::now() - std::chrono::seconds{config_.offline_after_seconds};
+    for (auto it = agent_routes_.begin(); it != agent_routes_.end();)
+    {
+        if (it->second.last_frame < cutoff)
+        {
+            LOGF_DEBUG("Forgetting route of agent_id=%s with no frame since the offline threshold",
+                       sanitize_log_text(it->first).c_str());
+            route_owners_.erase(it->second.routing_id);
+            it = agent_routes_.erase(it);
+        }
+        else
+        {
+            ++it;
         }
     }
 }

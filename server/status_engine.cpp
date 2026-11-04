@@ -94,7 +94,9 @@ namespace
         httplib::Client client(target->host, target->port);
         client.set_connection_timeout(2, 0);
         client.set_read_timeout(2, 0);
-        auto response = client.Post(target->path, payload.dump(), "application/json");
+        // Invalid UTF-8 from an agent (#56) must not throw out of evaluation.
+        auto response =
+            client.Post(target->path, payload.dump(-1, ' ', false, json::error_handler_t::replace), "application/json");
         if (!response)
         {
             LOGF_WARNING("Webhook notification failed alert_id=%lld url=%s", static_cast<long long>(alert_id),

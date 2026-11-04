@@ -122,7 +122,9 @@ bool generate_and_send_report(Store& store, int64_t now_ms)
     httplib::Client client(target->host, target->port);
     client.set_connection_timeout(5, 0);
     client.set_read_timeout(5, 0);
-    auto response = client.Post(target->path, payload.dump(), "application/json");
+    // Invalid UTF-8 from an agent (#56) must not throw out of the report.
+    auto response =
+        client.Post(target->path, payload.dump(-1, ' ', false, json::error_handler_t::replace), "application/json");
     if (!response)
     {
         LOGF_WARNING("Reports: webhook POST failed url=%s", webhook_url.c_str());

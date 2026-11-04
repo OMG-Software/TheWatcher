@@ -52,7 +52,9 @@ Install:
 .\builddir-release\agent\TheWatcherAgent.exe --install-service --config C:\ProgramData\TheWatcher\TheWatcherAgent.conf
 ```
 
-You can also pass one-time overrides at install time:
+You can also pass overrides at install time. They are added to the service
+command line, so they apply each time the service starts, but they are not
+written to the config file:
 
 ```powershell
 .\builddir-release\agent\TheWatcherAgent.exe --install-service --config C:\ProgramData\TheWatcher\TheWatcherAgent.conf --server tcp://monitor.local:5555 --enrollment tcp://monitor.local:5556

@@ -165,14 +165,18 @@ inline int read_int(cbor_item_t* item)
     return static_cast<int>(value);
 }
 
+// Reads a CBOR float of any width (half, single or double). Simple values
+// (null, undefined, true, false) share the float/ctrl major type but carry no
+// float payload, so they are rejected: cbor_float_get_float8() on them, or on a
+// narrower float, reads past the item's data (issue #139).
 inline double read_double(cbor_item_t* item)
 {
-    if (!cbor_isa_float_ctrl(item))
+    if (!cbor_is_float(item))
     {
         throw std::runtime_error("Expected CBOR floating point value");
     }
 
-    return cbor_float_get_float8(item);
+    return cbor_float_get_float(item);
 }
 
 template <>

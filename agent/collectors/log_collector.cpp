@@ -7,6 +7,8 @@
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
+#include <functional>
 #include <regex>
 #include <string>
 #include <system_error>
@@ -21,10 +23,12 @@
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
+#include <process.h>
 #include <windows.h>
 #else
 #include <fcntl.h>
 #include <limits.h>
+#include <pthread.h>
 #include <unistd.h>
 #endif
 
@@ -44,6 +48,138 @@ namespace
     constexpr int64_t max_bytes_per_tick = 1024 * 1024;
 
     constexpr std::size_t read_chunk_size = 64 * 1024;
+
+    // Issue #140: std::regex (libstdc++ and MSVC) matches by recursion, using
+    // hundreds of bytes of stack per input character for patterns such as
+    // "ERROR.*timeout" or "(a|b)*c". A 40 KB line overflowed the 8 MB thread
+    // stack (and ~2 KB is enough on a 1 MB Windows or 512 KB macOS thread).
+    // Two bounds keep matching inside a known stack budget:
+    //  - only the first max_match_len bytes of a line are matched (this also
+    //    keeps regex_search's quadratic retry-at-every-offset cost small), and
+    //  - matching runs on a helper thread with a fixed match_stack_bytes stack
+    //    (reserved, not committed, so unused pages cost no memory).
+    // 64 MB / 4 KiB leaves ~16 KB of stack per character, far above the worst
+    // usage measured with libstdc++ (~0.5 KB). Patterns with exponential
+    // backtracking (e.g. "(a|aa)*c") can still burn CPU; only global admins
+    // can configure patterns (SEC-10).
+    constexpr std::size_t max_match_len = 4 * 1024;
+    constexpr std::size_t match_stack_bytes = 64 * 1024 * 1024;
+    // Stack use per character also grows with group nesting: 100 nested
+    // groups overflowed 64 MB on a 4 KiB line, 50 did not. 16 levels keeps a
+    // wide margin; real log patterns rarely nest more than 2 or 3 levels.
+    // Patterns with exponential backtracking are a CPU problem (#169).
+    constexpr int max_group_depth = 16;
+
+    // Returns the deepest group nesting in an ECMAScript pattern: "(" that is
+    // not escaped and not inside a [...] class. Unbalanced ")" is ignored here;
+    // std::regex rejects it when the pattern is compiled.
+    int group_depth(const std::string& pattern)
+    {
+        int depth = 0;
+        int deepest = 0;
+        bool in_class = false;
+        for (std::size_t i = 0; i < pattern.size(); ++i)
+        {
+            const char ch = pattern[i];
+            if (ch == '\\')
+            {
+                ++i; // the next character is literal
+                continue;
+            }
+            if (in_class)
+            {
+                if (ch == ']')
+                    in_class = false;
+                continue;
+            }
+            if (ch == '[')
+            {
+                // ECMAScript: a "]" right after "[" or "[^" closes the class
+                // ("[]" matches nothing), so no POSIX-style special case.
+                in_class = true;
+            }
+            else if (ch == '(')
+            {
+                deepest = std::max(deepest, ++depth);
+            }
+            else if (ch == ')' && depth > 0)
+            {
+                --depth;
+            }
+        }
+        return deepest;
+    }
+
+    // Runs fn on a new thread with a stack of stack_bytes and waits for it.
+    // An exception thrown by fn is rethrown in the caller. Throws
+    // std::runtime_error when the thread cannot be created; fn is then not
+    // run, because running it on the caller's smaller stack is the crash this
+    // helper exists to prevent.
+    void run_with_stack(std::size_t stack_bytes, const std::function<void()>& fn)
+    {
+        struct Job
+        {
+            const std::function<void()>* fn;
+            std::exception_ptr error;
+        } job{&fn, nullptr};
+
+#ifdef _WIN32
+        struct Thunk
+        {
+            // _beginthreadex entry point: runs the Job and stores any exception.
+            static unsigned __stdcall run(void* arg)
+            {
+                auto* j = static_cast<Job*>(arg);
+                try
+                {
+                    (*j->fn)();
+                }
+                catch (...)
+                {
+                    j->error = std::current_exception();
+                }
+                return 0;
+            }
+        };
+        const auto handle = _beginthreadex(nullptr, static_cast<unsigned>(stack_bytes), &Thunk::run, &job,
+                                           STACK_SIZE_PARAM_IS_A_RESERVATION, nullptr);
+        if (handle == 0)
+            throw std::runtime_error("cannot start log matching thread");
+        WaitForSingleObject(reinterpret_cast<HANDLE>(handle), INFINITE);
+        CloseHandle(reinterpret_cast<HANDLE>(handle));
+#else
+        struct Thunk
+        {
+            // pthread entry point: runs the Job and stores any exception.
+            static void* run(void* arg)
+            {
+                auto* j = static_cast<Job*>(arg);
+                try
+                {
+                    (*j->fn)();
+                }
+                catch (...)
+                {
+                    j->error = std::current_exception();
+                }
+                return nullptr;
+            }
+        };
+        pthread_attr_t attr;
+        if (pthread_attr_init(&attr) != 0)
+            throw std::runtime_error("cannot start log matching thread");
+        pthread_t thread{};
+        int rc = pthread_attr_setstacksize(&attr, stack_bytes);
+        if (rc == 0)
+            rc = pthread_create(&thread, &attr, &Thunk::run, &job);
+        pthread_attr_destroy(&attr);
+        if (rc != 0)
+            throw std::runtime_error("cannot start log matching thread");
+        pthread_join(thread, nullptr);
+#endif
+        if (job.error)
+            std::rethrow_exception(job.error);
+    }
 
     // Path components compare case-insensitively on Windows (NTFS), where
     // GetFinalPathNameByHandleW may report a different case than the allowlist.
@@ -433,9 +569,20 @@ void LogCollector::tick()
             LOGF_WARNING("LogCollector pattern too long path=%s pattern_len=%zu", cfg.path.c_str(), cfg.pattern.size());
             continue;
         }
+        if (const auto depth = group_depth(cfg.pattern); depth > max_group_depth)
+        {
+            LOGF_WARNING("LogCollector pattern nests groups too deeply path=%s depth=%d max=%d", cfg.path.c_str(),
+                         depth, max_group_depth);
+            continue;
+        }
         try
         {
-            tail_file(cfg);
+            // Issue #140: tail_file runs std::regex; give it a known stack.
+            // This thread keeps mutex_ held and blocks until the helper ends,
+            // so tail_file's "caller holds mutex_" contract still holds.
+            run_with_stack(match_stack_bytes, [this, &cfg] {
+                tail_file(cfg);
+            });
         }
         catch (const std::exception& e)
         {
@@ -532,9 +679,14 @@ void LogCollector::tail_file(const LogMonitorConfig& cfg)
     }
 
     std::size_t matches = 0;
-    const auto emit_if_match = [&](const std::string& text)
-    {
-        if (text.empty() || !std::regex_search(text, pattern))
+    const auto emit_if_match = [&](const std::string& text) {
+        // Issue #140: bound the recursion depth of std::regex. When the line
+        // is cut, match_not_eol stops "$" from matching at the cut, which is
+        // not the end of the line.
+        const bool cut = text.size() > max_match_len;
+        const auto match_end = cut ? text.begin() + static_cast<std::ptrdiff_t>(max_match_len) : text.end();
+        const auto flags = cut ? std::regex_constants::match_not_eol : std::regex_constants::match_default;
+        if (text.empty() || !std::regex_search(text.begin(), match_end, pattern, flags))
             return;
         proto::LogMatch m;
         m.indicator_name = cfg.indicator_name;

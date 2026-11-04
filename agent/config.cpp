@@ -210,6 +210,42 @@ AgentConfig AgentConfig::load_or_create(const std::filesystem::path& path)
     return cfg;
 }
 
+// Applies the non-empty command-line overrides for this process and keeps the
+// file values they replace, so save() does not persist them (issue #150).
+void AgentConfig::apply_cli_overrides(const std::string& server, const std::string& enrollment,
+                                      const std::string& server_key)
+{
+    // The server key pin belongs to the file's server. Any override can make
+    // this process enroll with (and learn the key of) a different server, so
+    // the file's key and fingerprint are kept for save() as well.
+    if ((!server.empty() || !enrollment.empty() || !server_key.empty()) && !file_server_public_key)
+    {
+        file_server_public_key = server_public_key;
+        file_server_public_key_fingerprint = server_public_key_fingerprint;
+    }
+    if (!server.empty())
+    {
+        if (!file_server_address)
+            file_server_address = server_address;
+        server_address = server;
+    }
+    if (!enrollment.empty())
+    {
+        if (!file_enrollment_address)
+            file_enrollment_address = enrollment_address;
+        enrollment_address = enrollment;
+    }
+    if (!server_key.empty())
+    {
+        // The file's fingerprint pins the file's key, not this one. Clear the
+        // active fingerprint so enrollment checks the reply against the
+        // override key alone (and learns the matching fingerprint); the file's
+        // value is kept above for save().
+        server_public_key = server_key;
+        server_public_key_fingerprint.clear();
+    }
+}
+
 // Writes the config as KEY=VALUE lines, creating missing parent directories.
 // On POSIX it limits the file to the owner (it holds the CURVE secret key).
 // Throws std::runtime_error if the file cannot be opened for writing.
@@ -222,11 +258,16 @@ void AgentConfig::save(const std::filesystem::path& path) const
     std::ofstream f(path);
     if (!f)
         throw std::runtime_error("Cannot write " + path.string());
-    f << "THEWATCHER_SERVER=" << server_host_from_endpoint(server_address) << '\n';
-    f << "SERVER_ADDRESS=" << server_address << '\n';
-    f << "ENROLLMENT_ADDRESS=" << enrollment_address << '\n';
-    f << "SERVER_PUBLIC_KEY=" << server_public_key << '\n';
-    f << "SERVER_PUBLIC_KEY_FINGERPRINT=" << server_public_key_fingerprint << '\n';
+    // Issue #150: command-line overrides are not persisted.
+    const auto& saved_server_address = file_server_address.value_or(server_address);
+    const auto& saved_enrollment_address = file_enrollment_address.value_or(enrollment_address);
+    const auto& saved_server_key = file_server_public_key.value_or(server_public_key);
+    const auto& saved_fingerprint = file_server_public_key_fingerprint.value_or(server_public_key_fingerprint);
+    f << "THEWATCHER_SERVER=" << server_host_from_endpoint(saved_server_address) << '\n';
+    f << "SERVER_ADDRESS=" << saved_server_address << '\n';
+    f << "ENROLLMENT_ADDRESS=" << saved_enrollment_address << '\n';
+    f << "SERVER_PUBLIC_KEY=" << saved_server_key << '\n';
+    f << "SERVER_PUBLIC_KEY_FINGERPRINT=" << saved_fingerprint << '\n';
     if (allow_insecure)
         f << "ALLOW_INSECURE=1" << '\n';
     if (!enrollment_token.empty())
