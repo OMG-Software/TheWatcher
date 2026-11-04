@@ -210,6 +210,8 @@ AgentConfig AgentConfig::load_or_create(const std::filesystem::path& path)
     return cfg;
 }
 
+// Applies the non-empty command-line overrides for this process and keeps the
+// file values they replace, so save() does not persist them (issue #150).
 void AgentConfig::apply_cli_overrides(const std::string& server, const std::string& enrollment,
                                       const std::string& server_key)
 {

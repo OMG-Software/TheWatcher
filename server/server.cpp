@@ -985,6 +985,8 @@ void Server::dispatch_commands(zmq::socket_t& router)
     }
 }
 
+// Records routing_id as agent_id's route (issue #141). Moving a routing id to
+// this agent drops any other agent's claim on it and this agent's old route.
 void Server::learn_route(const std::string& agent_id, const std::string& routing_id)
 {
     const auto now = std::chrono::steady_clock::now();
@@ -1004,6 +1006,7 @@ void Server::learn_route(const std::string& agent_id, const std::string& routing
     route_owners_[routing_id] = agent_id;
 }
 
+// Removes agent_id's route and its reverse-index entry, if present.
 void Server::forget_route(const std::string& agent_id)
 {
     const auto route = agent_routes_.find(agent_id);
@@ -1013,6 +1016,9 @@ void Server::forget_route(const std::string& agent_id)
     agent_routes_.erase(route);
 }
 
+// Drops routes whose agent has sent no frame for offline_after_seconds, so a
+// closed connection's routing id cannot receive that agent's commands.
+// Does nothing when offline detection is disabled (offline_after_seconds <= 0).
 void Server::expire_routes()
 {
     if (config_.offline_after_seconds <= 0)

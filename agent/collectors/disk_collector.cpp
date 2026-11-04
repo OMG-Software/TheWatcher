@@ -20,6 +20,9 @@
 namespace thewatcher::agent
 {
 
+// Fills disk's size fields from space as df does: free_bytes is the space
+// available to unprivileged writers, and usage is used / (used + available).
+// Clamps inconsistent filesystem values so used_bytes cannot underflow.
 void apply_space_info(DiskMetrics& disk, const std::filesystem::space_info& space)
 {
     const auto capacity = space.capacity;

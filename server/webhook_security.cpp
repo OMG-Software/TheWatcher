@@ -159,6 +159,8 @@ namespace
                });
     }
 
+    // Returns the four bytes of an IPv6 address starting at offset as an IPv4
+    // address, for prefixes that embed one (NAT64, 6to4).
     std::array<int, 4> ipv4_at(const std::array<std::uint8_t, 16>& bytes, std::size_t offset)
     {
         return {static_cast<int>(bytes[offset]), static_cast<int>(bytes[offset + 1]),

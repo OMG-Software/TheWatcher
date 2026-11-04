@@ -126,6 +126,7 @@ namespace
 #ifdef _WIN32
         struct Thunk
         {
+            // _beginthreadex entry point: runs the Job and stores any exception.
             static unsigned __stdcall run(void* arg)
             {
                 auto* j = static_cast<Job*>(arg);
@@ -149,6 +150,7 @@ namespace
 #else
         struct Thunk
         {
+            // pthread entry point: runs the Job and stores any exception.
             static void* run(void* arg)
             {
                 auto* j = static_cast<Job*>(arg);
