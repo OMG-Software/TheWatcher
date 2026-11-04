@@ -21,6 +21,12 @@
 #include <nlohmann/json.hpp>
 #include <sodium.h>
 
+#ifdef _WIN32
+#include <WS2tcpip.h>
+#else
+#include <arpa/inet.h>
+#endif
+
 namespace thewatcher::server
 {
 
@@ -169,6 +175,23 @@ void ApiServer::drain_commands(std::vector<PendingCommand>& out)
 
 namespace
 {
+
+    // Longest alert note stored, in bytes.
+    constexpr std::size_t max_note_bytes = 4096;
+
+    // Shortens value to at most max_bytes without splitting a UTF-8
+    // character (issue #147). A byte cut could leave a lead byte without its
+    // continuation bytes, and json::dump() then throws for every reader.
+    void truncate_utf8(std::string& value, std::size_t max_bytes)
+    {
+        if (value.size() <= max_bytes)
+            return;
+        std::size_t end = max_bytes;
+        // Step back over continuation bytes (10xxxxxx) to a character start.
+        while (end > 0 && (static_cast<unsigned char>(value[end]) & 0xC0) == 0x80)
+            --end;
+        value.resize(end);
+    }
 
     int64_t now_ms()
     {
@@ -623,9 +646,21 @@ namespace
         };
     }
 
+    // Issue #164: 127.0.0.0/8 is matched as a parsed IPv4 address. A string
+    // prefix test also matched DNS names such as "127.attacker.example".
     bool is_loopback_host(const std::string& host)
     {
-        return host == "localhost" || host == "localhost." || host == "::1" || host.rfind("127.", 0) == 0;
+        if (host == "localhost" || host == "localhost." || host == "::1")
+            return true;
+        unsigned char addr[4]{};
+#ifdef _WIN32
+        if (InetPtonA(AF_INET, host.c_str(), addr) != 1)
+            return false;
+#else
+        if (inet_pton(AF_INET, host.c_str(), addr) != 1)
+            return false;
+#endif
+        return addr[0] == 127;
     }
 
     bool allows_browser_origin(const httplib::Request& req, const std::string& origin)
@@ -737,9 +772,12 @@ namespace
         return user_group_set(store, session.user_id).contains(group_id);
     }
 
+    // Serialises body as the response. Issue #147: invalid UTF-8 already in
+    // the database (for example a note cut by an older version) is replaced
+    // with U+FFFD instead of throwing and failing the whole list for everyone.
     void set_json(httplib::Response& res, const json& body)
     {
-        res.set_content(body.dump(), "application/json");
+        res.set_content(body.dump(-1, ' ', false, json::error_handler_t::replace), "application/json");
     }
 
 } // namespace
@@ -1259,8 +1297,7 @@ void ApiServer::setup_routes()
                 if (body.contains("note") && body["note"].is_string())
                 {
                     note = body["note"].get<std::string>();
-                    if (note.size() > 4096)
-                        note.resize(4096);
+                    truncate_utf8(note, max_note_bytes);
                 }
             }
             catch (...)
@@ -1308,8 +1345,7 @@ void ApiServer::setup_routes()
             return;
         }
         std::string note = (body.contains("note") && body["note"].is_string()) ? body["note"].get<std::string>() : "";
-        if (note.size() > 4096)
-            note.resize(4096);
+        truncate_utf8(note, max_note_bytes);
         const auto all_alerts = store_.list_alerts(false);
         std::vector<int64_t> allowed_ids;
         for (const auto& id_val : body["alert_ids"])
@@ -1995,7 +2031,15 @@ void ApiServer::setup_routes()
             rec->process_limit = process_limit;
             rec->collector_config = config;
             if (body.contains("runbook_markdown"))
-                rec->runbook_markdown = body.at("runbook_markdown").get<std::string>().substr(0, 65536);
+            {
+                // Issue #147: reject, as POST /api/agents/:id/runbook does; a
+                // byte cut could split a UTF-8 character and break every list
+                // that embeds the runbook.
+                auto markdown = body.at("runbook_markdown").get<std::string>();
+                if (markdown.size() > 65536)
+                    throw std::runtime_error("runbook_markdown must be 65536 bytes or fewer");
+                rec->runbook_markdown = std::move(markdown);
+            }
             store_.upsert_agent(*rec);
             store_.set_agent_collector_config(id, config);
             if (body.contains("group_ids"))
@@ -2450,8 +2494,13 @@ void ApiServer::setup_routes()
                 store_.set_setting("reports.day_of_week", std::to_string(v));
             }
             if (body.contains("reports_webhook_url"))
-                store_.set_setting("reports.webhook_url",
-                                   body.at("reports_webhook_url").get<std::string>().substr(0, 2048));
+            {
+                // Issue #147: a truncated URL is a different URL; reject it.
+                auto url = body.at("reports_webhook_url").get<std::string>();
+                if (url.size() > 2048)
+                    throw std::runtime_error("reports_webhook_url must be 2048 bytes or fewer");
+                store_.set_setting("reports.webhook_url", url);
+            }
             set_json(res, json{
                               {"ok", true}
             });

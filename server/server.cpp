@@ -336,7 +336,9 @@ void Server::stop()
 // and LOG_MATCH frames; other types are ignored.
 void Server::handle_router_frame(zmq::socket_t& router)
 {
-    // ROUTER prepends the sender's routing-id (set by agent to its agent_id).
+    // ROUTER prepends the sender's routing-id. Since issue #141 the agent no
+    // longer sets it (libzmq generates one); 0.8.0 agents set it to their
+    // agent_id. Either way it is only an address: identity comes from ZAP.
     // The agent DEALER explicitly sends [empty delimiter][payload], so the
     // server receives exactly: [identity][empty][payload].
     // Check RCVMORE before each further receive: a peer that sends fewer
@@ -422,7 +424,23 @@ void Server::handle_router_frame(zmq::socket_t& router)
     {
         LOGF_WARNING("Dropping frame from non-approved agent_id=%s type=%s", sanitize_log_text(agent_id).c_str(),
                      frame_type_name(frame.type));
+        agent_routes_.erase(agent_id);
         return;
+    }
+
+    // Issue #141: learn where this agent is reachable. The frame passed the
+    // ZAP identity check, so this connection really belongs to agent_id. A
+    // routing id now used by this agent no longer reaches any other agent.
+    {
+        std::string route(static_cast<const char*>(identity_msg.data()), identity_msg.size());
+        for (auto it = agent_routes_.begin(); it != agent_routes_.end();)
+        {
+            if (it->first != agent_id && it->second == route)
+                it = agent_routes_.erase(it);
+            else
+                ++it;
+        }
+        agent_routes_[agent_id] = std::move(route);
     }
 
     // Update last_seen timestamp for every inbound frame.
@@ -946,11 +964,22 @@ void Server::dispatch_commands(zmq::socket_t& router)
 
         auto encoded = encode_frame(f);
 
+        // Issue #141: send only to the route learned from this agent's own
+        // authenticated frames. Until the agent has sent one, it is not
+        // reachable and the command is dropped (as for any offline agent).
+        const auto route = agent_routes_.find(pc.agent_id);
+        if (route == agent_routes_.end())
+        {
+            LOGF_WARNING("Dropping command for agent_id=%s with no known connection command_id=%s",
+                         sanitize_log_text(pc.agent_id).c_str(), pc.cmd.command_id.c_str());
+            continue;
+        }
+
         // ROUTER send: [identity][empty delimiter][payload]
         // The agent DEALER receives [empty][payload] (identity is stripped).
         try
         {
-            router.send(zmq::message_t(pc.agent_id.data(), pc.agent_id.size()), zmq::send_flags::sndmore);
+            router.send(zmq::message_t(route->second.data(), route->second.size()), zmq::send_flags::sndmore);
             router.send(zmq::message_t{}, zmq::send_flags::sndmore);
             router.send(zmq::message_t(encoded.data(), encoded.size()), zmq::send_flags::none);
             dispatched_commands_[pc.cmd.command_id] = {static_cast<CommandType>(pc.cmd.command_type), now_ms(),

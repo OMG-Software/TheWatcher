@@ -88,3 +88,65 @@ SCENARIO("On Windows, DiskCollector enumerates every fixed drive the system expo
 }
 
 #endif // _WIN32
+
+SCENARIO("Disk usage counts root-reserved space as used, as df does (issue #158)")
+{
+    GIVEN("a 100-unit volume with 50 units free, of which 45 are available to normal users")
+    {
+        std::filesystem::space_info space{};
+        space.capacity = 100;
+        space.free = 50;
+        space.available = 45;
+        DiskMetrics disk;
+
+        WHEN("the space info is applied")
+        {
+            apply_space_info(disk, space);
+
+            THEN("free is what normal users can write and usage is used / (used + available)")
+            {
+                REQUIRE(disk.total_bytes == 100);
+                REQUIRE(disk.free_bytes == 45);
+                REQUIRE(disk.used_bytes == 50);
+                REQUIRE(disk.usage_percent > 52.6);
+                REQUIRE(disk.usage_percent < 52.7); // 50 / 95
+            }
+        }
+    }
+
+    GIVEN("a volume that is full for normal users but still has root-reserved blocks")
+    {
+        std::filesystem::space_info space{};
+        space.capacity = 1000;
+        space.free = 50;
+        space.available = 0;
+        DiskMetrics disk;
+
+        WHEN("the space info is applied")
+        {
+            apply_space_info(disk, space);
+
+            THEN("usage is 100% and nothing is reported free")
+            {
+                REQUIRE(disk.free_bytes == 0);
+                REQUIRE(disk.usage_percent == 100.0);
+            }
+        }
+    }
+
+    GIVEN("an empty or unreadable volume")
+    {
+        std::filesystem::space_info space{};
+        DiskMetrics disk;
+
+        WHEN("the space info is applied")
+        {
+            apply_space_info(disk, space);
+
+            THEN("usage is 0% instead of a division by zero")
+            {
+                REQUIRE(disk.usage_percent == 0.0);
+            }
+        }
+    }
+}

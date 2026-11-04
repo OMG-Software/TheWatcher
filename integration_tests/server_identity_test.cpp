@@ -9,6 +9,7 @@
 
 #include <chrono>
 #include <memory>
+#include <optional>
 #include <string>
 #include <thread>
 
@@ -67,7 +68,10 @@ struct AgentPeer
     {
         socket = std::make_unique<zmq::socket_t>(ctx, ZMQ_DEALER);
         socket->set(zmq::sockopt::linger, 0);
-        socket->set(zmq::sockopt::routing_id, routing_id);
+        // An empty routing_id lets the server's ROUTER generate one, as the
+        // agent does since issue #141.
+        if (!routing_id.empty())
+            socket->set(zmq::sockopt::routing_id, routing_id);
         socket->set(zmq::sockopt::curve_serverkey, std::string_view(cfg.server_public_key));
         socket->set(zmq::sockopt::curve_publickey, std::string_view(public_key_z85));
         socket->set(zmq::sockopt::curve_secretkey, std::string_view(secret_key_z85));
@@ -96,6 +100,20 @@ struct AgentPeer
         socket->send(zmq::message_t{}, zmq::send_flags::sndmore);
         socket->send(zmq::message_t(encoded.data(), encoded.size()), zmq::send_flags::none);
         std::this_thread::sleep_for(500ms);
+    }
+
+    // Waits up to `timeout` for one data-plane frame from the server. The
+    // DEALER receives [empty][payload]. Returns nullopt on timeout.
+    std::optional<thewatcher::proto::Frame> receive(std::chrono::milliseconds timeout)
+    {
+        socket->set(zmq::sockopt::rcvtimeo, static_cast<int>(timeout.count()));
+        zmq::message_t delimiter;
+        if (!socket->recv(delimiter, zmq::recv_flags::none))
+            return std::nullopt;
+        zmq::message_t payload;
+        if (!socket->get(zmq::sockopt::rcvmore) || !socket->recv(payload, zmq::recv_flags::none))
+            return std::nullopt;
+        return thewatcher::proto::decode_frame(payload.data(), payload.size());
     }
 
     zmq::context_t ctx{1};
@@ -133,6 +151,44 @@ SCENARIO("An approved agent cannot spoof another agent's identity")
                 const auto agents = fx.client.Get("/api/agents");
                 REQUIRE(agents);
                 REQUIRE(agents->status == 200);
+            }
+        }
+    }
+}
+
+SCENARIO("Commands reach the agent that owns the agent_id, not a peer using it as routing id (issue #141)")
+{
+    GIVEN("a CURVE server with a victim agent and a rogue agent whose routing id is the victim's agent_id")
+    {
+        thewatcher::crypto::init();
+        IdentityFixture fx(/*with_curve=*/true);
+        fx.start_and_login();
+
+        const auto keys_victim = thewatcher::crypto::generate_curve_keypair();
+        const auto keys_rogue = thewatcher::crypto::generate_curve_keypair();
+        fx.enroll_and_approve_with_key("agent-victim", keys_victim.public_key_z85);
+        std::this_thread::sleep_for(1100ms); // SEC-05 per-source enrollment rate limit
+        fx.enroll_and_approve_with_key("agent-rogue", keys_rogue.public_key_z85);
+
+        AgentPeer victim(fx.config, "", keys_victim.public_key_z85, keys_victim.secret_key_z85);
+        victim.send_metrics("agent-victim", 10.0);
+        AgentPeer rogue(fx.config, "agent-victim", keys_rogue.public_key_z85, keys_rogue.secret_key_z85);
+        rogue.send_metrics("agent-rogue", 10.0);
+
+        WHEN("an operator sends a command to the victim")
+        {
+            auto res = fx.client.Post("/api/agents/agent-victim/get_status", "", "application/json");
+            REQUIRE(res);
+            REQUIRE(res->status == 200);
+
+            THEN("the victim receives it and the rogue does not")
+            {
+                const auto at_victim = victim.receive(5s);
+                REQUIRE(at_victim.has_value());
+                REQUIRE(at_victim->type == static_cast<uint8_t>(thewatcher::proto::FrameType::COMMAND));
+                REQUIRE(at_victim->agent_id == "agent-victim");
+                REQUIRE_FALSE(rogue.receive(1s).has_value());
+                REQUIRE(fx.error == nullptr);
             }
         }
     }

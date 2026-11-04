@@ -5,6 +5,49 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ## [Unreleased]
 
+### Security
+
+- Fixed a server crash (NULL dereference) and heap over-read when a metrics
+  or collector-config payload has a CBOR `null`/`true`/`false`/`undefined`
+  or a half/single-precision float where a double is expected. All float
+  widths now decode; simple values are rejected (#139).
+- Fixed an agent crash when a monitored log has a long line: `std::regex`
+  recursion overflowed the thread stack (about 40 KB was enough). Only the
+  first 4 KiB of a line is matched, and matching runs on a helper thread
+  with a fixed 64 MB stack (#140).
+- **Behaviour change:** the data plane no longer trusts the ROUTER routing
+  id. Agents no longer set it (libzmq generates one), and the server sends
+  commands only to the connection that last sent an authenticated frame for
+  that agent. Before, another approved agent could connect with a victim's
+  agent_id as its routing id and receive the victim's commands or block its
+  connection. A command for an agent that has not sent a frame since the
+  server started is now dropped and logged (#141).
+- The webhook URL check rejects non-canonical IPv4 forms that the resolver
+  still reads as addresses (octal `0251.0376.0251.0376`, hex `0x7f000001`,
+  decimal `2130706433`, short `127.1`, `0`, trailing dot) and IPv6 forms
+  that embed or translate to IPv4 (`::a.b.c.d`, `::ffff:0:a.b.c.d`, NAT64
+  `64:ff9b::/96` and `64:ff9b:1::/48`, 6to4 `2002::/16`), plus `fec0::/10`
+  and `100::/64` (#142).
+- The browser Origin check accepts the loopback exception only for real
+  `127.0.0.0/8` addresses; DNS names such as `127.attacker.example` no
+  longer match (#164).
+
+### Fixed
+
+- Alert notes longer than 4,096 bytes are cut on a UTF-8 character
+  boundary. Oversize `runbook_markdown` (collector config) and
+  `reports_webhook_url` (settings) are rejected with 400 instead of being
+  cut. JSON responses replace invalid UTF-8 already stored with U+FFFD, so
+  one bad value no longer makes `GET /api/alerts` or `/api/agents` fail for
+  every user (#147).
+- Agent `--server`, `--enrollment` and `--server-key` overrides are no
+  longer written to the config file when the agent saves it after
+  enrollment (#150).
+- Disk usage now matches `df`: `free_bytes` is the space available to
+  unprivileged writers, and root-reserved blocks count as used (#158).
+- Encoding a frame with an empty payload no longer passes a null pointer to
+  libcbor (undefined behaviour reported by UBSan on every heartbeat) (#162).
+
 ## [0.8.0] - 2026-11-02
 
 ### Security

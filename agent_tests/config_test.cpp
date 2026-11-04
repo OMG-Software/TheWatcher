@@ -331,3 +331,57 @@ SCENARIO("get_uptime_seconds returns a positive value")
         }
     }
 }
+
+SCENARIO("Command-line overrides apply to the running process only (issue #150)")
+{
+    GIVEN("a saved config with a server address, enrollment address and pinned key")
+    {
+        auto path = thewatcher::test::process_temp_dir().path() / "cli_override_agent.conf";
+        fs::remove(path);
+        auto original = AgentConfig::load_or_create(path);
+        original.server_address = "tcp://prod.example:5555";
+        original.enrollment_address = "tcp://prod.example:5556";
+        original.server_public_key = std::string(40, 'P');
+        original.server_public_key_fingerprint = "prod-fingerprint";
+        original.save(path);
+
+        WHEN("the agent runs with --server, --enrollment and --server-key and then saves its config")
+        {
+            auto cfg = AgentConfig::load_or_create(path);
+            cfg.apply_cli_overrides("tcp://test.example:5555", "tcp://test.example:5556", std::string(40, 'T'));
+
+            REQUIRE(cfg.server_address == "tcp://test.example:5555");
+            REQUIRE(cfg.enrollment_address == "tcp://test.example:5556");
+            REQUIRE(cfg.server_public_key == std::string(40, 'T'));
+
+            // Enrollment learns the fingerprint for the overridden key.
+            cfg.server_public_key_fingerprint = "test-fingerprint";
+            cfg.save(path);
+
+            THEN("the file keeps the original values")
+            {
+                const auto reloaded = AgentConfig::load_or_create(path);
+                REQUIRE(reloaded.server_address == "tcp://prod.example:5555");
+                REQUIRE(reloaded.enrollment_address == "tcp://prod.example:5556");
+                REQUIRE(reloaded.server_public_key == std::string(40, 'P'));
+                REQUIRE(reloaded.server_public_key_fingerprint == "prod-fingerprint");
+                REQUIRE(reloaded.agent_id == original.agent_id);
+            }
+        }
+
+        WHEN("the agent runs without overrides and enrollment updates the pin")
+        {
+            auto cfg = AgentConfig::load_or_create(path);
+            cfg.apply_cli_overrides("", "", "");
+            cfg.server_public_key_fingerprint = "rotated-fingerprint";
+            cfg.save(path);
+
+            THEN("the learned value is saved as before")
+            {
+                const auto reloaded = AgentConfig::load_or_create(path);
+                REQUIRE(reloaded.server_address == "tcp://prod.example:5555");
+                REQUIRE(reloaded.server_public_key_fingerprint == "rotated-fingerprint");
+            }
+        }
+    }
+}

@@ -61,8 +61,9 @@ private:
     void handle_enrollment(zmq::socket_t& enroll);
 
     // Pull commands out of the API queue and send them to agents via ROUTER.
-    // Each sent command is recorded with its target agent (SEC-04). A send
-    // failure is logged and that command is dropped.
+    // Each sent command is recorded with its target agent (SEC-04). Commands
+    // go to the agent's learned route (issue #141); a command for an agent
+    // with no learned route, or whose send fails, is logged and dropped.
     void dispatch_commands(zmq::socket_t& router);
 
     // Send a scheduled digest report if one is due.
@@ -75,6 +76,11 @@ private:
     std::unique_ptr<ApiServer> api_;
     // command_id -> dispatched command; evicted on matching ACK or TTL expiry
     std::unordered_map<std::string, DispatchedCommand> dispatched_commands_;
+    // Issue #141: agent_id -> ROUTER routing id of the connection that last
+    // sent an authenticated, approved frame for that agent. Commands go only
+    // to this learned route, never to a routing id equal to the agent_id: the
+    // peer chooses its own routing id, so another agent could claim it.
+    std::unordered_map<std::string, std::string> agent_routes_;
     // agent_id -> last enrollment request time (ms); used for rate limiting
     std::unordered_map<std::string, int64_t> enrollment_last_request_ms_;
     // SEC-05: peer address -> last enrollment request time (ms); a second,

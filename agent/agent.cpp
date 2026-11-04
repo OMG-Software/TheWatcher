@@ -161,7 +161,10 @@ void Agent::start()
     }
 
     dealer_.set(zmq::sockopt::linger, 0);
-    dealer_.set(zmq::sockopt::routing_id, config_.agent_id);
+    // Issue #141: no explicit routing id. The server's ROUTER generates one
+    // that other peers cannot predict and learns it from this agent's
+    // authenticated frames; a fixed id equal to agent_id could be claimed
+    // first by another peer.
     // SEC-02: reject oversize server replies at the socket layer and bound
     // the connection handshake.
     dealer_.set(zmq::sockopt::maxmsgsize, proto::kDataPlaneMaxMessageBytes);
@@ -179,7 +182,7 @@ void Agent::start()
     }
     dealer_.connect(config_.server_address);
     connected_.store(true);
-    LOGF_DEBUG("Dealer connected with routing_id=%s", config_.agent_id.c_str());
+    LOGF_DEBUG("Dealer connected agent_id=%s", config_.agent_id.c_str());
 
     io_thread_ = std::jthread([this](std::stop_token st) {
         io_loop(st);

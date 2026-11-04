@@ -410,3 +410,55 @@ SCENARIO("parse_log_allowed_dirs_from_env parses the platform path list")
 #endif
     }
 }
+SCENARIO("LogCollector survives long lines with recursion-heavy patterns (issue #140)")
+{
+    // std::regex recurses about once per character. Before the fix a ~40 KB
+    // line with "ERROR.*timeout" overflowed the 8 MB thread stack (SIGSEGV).
+    for (const std::string pattern : {"ERROR.*timeout", "(a|b)*c"})
+    {
+        GIVEN("a 64 KiB line that does not match the pattern: " + pattern)
+        {
+            LogCollector collector;
+            auto dir = make_dir("regex-depth");
+            auto path = dir / "deep.log";
+            write_file(path, "ERROR " + std::string(64 * 1024 - 7, 'a') + "\n");
+
+            collector.set_allowed_dirs({dir});
+            collector.set_configs({make_config(path, pattern)});
+
+            WHEN("tick() is called")
+            {
+                collector.tick();
+
+                THEN("the agent does not crash and the line is consumed")
+                {
+                    (void)collector.take_matches();
+                    collector.tick();
+                    REQUIRE(collector.take_matches().empty());
+                }
+            }
+        }
+    }
+
+    GIVEN("a 60 KiB line whose match lies in the first 4 KiB")
+    {
+        LogCollector collector;
+        auto dir = make_dir("regex-prefix");
+        auto path = dir / "prefix.log";
+        write_file(path, "ERROR db timeout " + std::string(60 * 1024, 'x') + "\n");
+
+        collector.set_allowed_dirs({dir});
+        collector.set_configs({make_config(path, "ERROR.*timeout")});
+
+        WHEN("tick() is called")
+        {
+            collector.tick();
+            auto matches = collector.take_matches();
+
+            THEN("the line still matches once")
+            {
+                REQUIRE(matches.size() == 1);
+            }
+        }
+    }
+}

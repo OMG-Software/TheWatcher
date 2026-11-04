@@ -13,6 +13,7 @@
 #include "test_support/server_fixture.hpp"
 
 #include <catch2/catch_test_macros.hpp>
+#include <nlohmann/json.hpp>
 
 #include <memory>
 #include <stdexcept>
@@ -130,6 +131,123 @@ SCENARIO("Approval refuses a CURVE key that another approved agent holds")
                 REQUIRE(res);
                 REQUIRE(res->status == 200);
                 REQUIRE(fx.zap.user_id_for_key(unique) == std::optional<std::string>("unique-agent"));
+            }
+        }
+    }
+}
+
+SCENARIO("Alert notes are cut on a UTF-8 boundary and lists survive invalid stored text (issue #147)")
+{
+    GIVEN("an approved agent with one open alert")
+    {
+        ApiFixture fx;
+        fx.store->upsert_agent(agent("utf8-agent", "", true));
+        thewatcher::server::AlertRecord alert;
+        alert.agent_id = "utf8-agent";
+        alert.indicator = "cpu";
+        alert.old_status = "green";
+        alert.new_status = "red";
+        alert.message = "cpu high";
+        alert.created_at = 1;
+        const auto alert_id = fx.store->insert_alert(alert);
+        REQUIRE(login_as_default_admin(fx.client));
+
+        WHEN("the alert is acknowledged with a 4,097-byte note whose last character is two bytes")
+        {
+            const std::string note = std::string(4095, 'a') + "\xC3\xA9"; // ... + "é"
+            const auto body = nlohmann::json{
+                {"note", note}
+            }.dump();
+            auto ack = fx.client.Post("/api/alerts/" + std::to_string(alert_id) + "/ack", body, "application/json");
+            REQUIRE(ack);
+            REQUIRE(ack->status == 200);
+
+            THEN("the stored note drops the whole character and GET /api/alerts still works")
+            {
+                const auto alerts = fx.store->list_alerts(false);
+                REQUIRE(alerts.size() == 1);
+                REQUIRE(alerts[0].note == std::string(4095, 'a'));
+                auto list = fx.client.Get("/api/alerts");
+                REQUIRE(list);
+                REQUIRE(list->status == 200);
+            }
+        }
+
+        WHEN("a note with invalid UTF-8 is already in the database")
+        {
+            fx.store->acknowledge_alert(alert_id, "thewatcher", 2, std::string("bad \xC3", 5));
+            auto list = fx.client.Get("/api/alerts");
+
+            THEN("GET /api/alerts returns 200 with the bad byte replaced")
+            {
+                REQUIRE(list);
+                REQUIRE(list->status == 200);
+                const auto alerts = nlohmann::json::parse(list->body);
+                REQUIRE(alerts.size() == 1);
+                REQUIRE(alerts[0]["note"].get<std::string>() == "bad \xEF\xBF\xBD");
+            }
+        }
+    }
+}
+
+SCENARIO("Oversize settings values are rejected, not truncated (issue #147)")
+{
+    GIVEN("a logged-in global admin")
+    {
+        ApiFixture fx;
+        REQUIRE(login_as_default_admin(fx.client));
+
+        WHEN("reports_webhook_url is longer than 2048 bytes")
+        {
+            const auto url = "http://hooks.example.com/" + std::string(2048, 'a');
+            const auto body = nlohmann::json{
+                {"reports_webhook_url",
+                 url}
+            }.dump();
+            auto res = fx.client.Put("/api/settings", body, "application/json");
+
+            THEN("the request fails with 400 and nothing is stored")
+            {
+                REQUIRE(res);
+                REQUIRE(res->status == 400);
+                REQUIRE(fx.store->get_setting("reports.webhook_url", "").empty());
+            }
+        }
+    }
+}
+
+SCENARIO("Only real loopback addresses get the loopback origin exception (issue #164)")
+{
+    GIVEN("a logged-in admin talking to the API on 127.0.0.1")
+    {
+        ApiFixture fx;
+        REQUIRE(login_as_default_admin(fx.client));
+
+        WHEN("an unsafe request carries an Origin whose DNS name starts with \"127.\"")
+        {
+            httplib::Headers headers{
+                {"Origin", "http://127.attacker.example"}
+            };
+            auto res = fx.client.Post("/api/groups", headers, R"({"name":"Spoofed"})", "application/json");
+
+            THEN("the request is refused")
+            {
+                REQUIRE(res);
+                REQUIRE(res->status == 403);
+            }
+        }
+
+        WHEN("the same request comes from a loopback dashboard on another port")
+        {
+            httplib::Headers headers{
+                {"Origin", "http://127.0.0.1:5173"}
+            };
+            auto res = fx.client.Post("/api/groups", headers, R"({"name":"Dev Dashboard"})", "application/json");
+
+            THEN("it is allowed")
+            {
+                REQUIRE(res);
+                REQUIRE(res->status == 200);
             }
         }
     }

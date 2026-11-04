@@ -73,6 +73,13 @@ namespace
                 return std::nullopt;
             }
 
+            // Issue #142: getaddrinfo() reads a leading-zero part as octal
+            // ("012.0.0.1" is 10.0.0.1), so such a host is not a canonical
+            // dotted quad. Returning nullopt sends it to the numeric-host
+            // check, which rejects it.
+            if (end - start > 1 && host[start] == '0')
+                return std::nullopt;
+
             int octet = 0;
             const auto* first = host.data() + start;
             const auto* last = host.data() + end;
@@ -126,6 +133,38 @@ namespace
         return bytes;
     }
 
+    // Issue #142: true when the resolver would read host as an IPv4 address
+    // in a legacy form - a single number ("2130706433", "0"), fewer than four
+    // parts ("127.1"), hex ("0x7f000001") or octal - instead of as a DNS name.
+    // Mirrors the WHATWG URL "ends in a number" rule: the last label (ignoring
+    // one trailing dot) is all digits, or "0x" followed by hex digits. No real
+    // top-level domain looks like that.
+    bool looks_like_numeric_ipv4_host(const std::string& host)
+    {
+        std::string_view view = host;
+        if (!view.empty() && view.back() == '.')
+            view.remove_suffix(1);
+        const auto dot = view.rfind('.');
+        const auto last = dot == std::string_view::npos ? view : view.substr(dot + 1);
+        if (last.empty())
+            return false;
+        const auto is_digit = [](unsigned char ch) {
+            return std::isdigit(ch) != 0;
+        };
+        if (std::all_of(last.begin(), last.end(), is_digit))
+            return true;
+        return last.size() >= 2 && last[0] == '0' && (last[1] == 'x' || last[1] == 'X') &&
+               std::all_of(last.begin() + 2, last.end(), [](unsigned char ch) {
+                   return std::isxdigit(ch) != 0;
+               });
+    }
+
+    std::array<int, 4> ipv4_at(const std::array<std::uint8_t, 16>& bytes, std::size_t offset)
+    {
+        return {static_cast<int>(bytes[offset]), static_cast<int>(bytes[offset + 1]),
+                static_cast<int>(bytes[offset + 2]), static_cast<int>(bytes[offset + 3])};
+    }
+
     bool is_restricted_ipv6_literal(const std::string& host)
     {
         const auto bytes = parse_ipv6_literal(host);
@@ -148,6 +187,9 @@ namespace
             return true;
         if (bytes->at(0) == 0xfe && (bytes->at(1) & 0xc0) == 0x80)
             return true;
+        // Issue #142: fec0::/10 (deprecated site-local) is internal too.
+        if (bytes->at(0) == 0xfe && (bytes->at(1) & 0xc0) == 0xc0)
+            return true;
         if (bytes->at(0) == 0xff)
             return true;
         if (bytes->at(0) == 0x20 && bytes->at(1) == 0x01 && bytes->at(2) == 0x0d && bytes->at(3) == 0xb8)
@@ -157,6 +199,44 @@ namespace
         {
             return true;
         }
+
+        const auto zero_prefix = [&](std::size_t count) {
+            return std::all_of(bytes->begin(), bytes->begin() + static_cast<std::ptrdiff_t>(count),
+                               [](std::uint8_t value) {
+                                   return value == 0;
+                               });
+        };
+        // Issue #142: forms that embed or translate to an IPv4 address.
+        // ::a.b.c.d (deprecated IPv4-compatible, ::/96) - never a public target.
+        if (zero_prefix(12))
+            return true;
+        // ::ffff:0:a.b.c.d (IPv4-translated, ::ffff:0:0/96).
+        if (zero_prefix(8) && bytes->at(8) == 0xff && bytes->at(9) == 0xff && bytes->at(10) == 0 && bytes->at(11) == 0)
+        {
+            return true;
+        }
+        // 100::/64 (discard-only).
+        if (bytes->at(0) == 0x01 && bytes->at(1) == 0x00 &&
+            std::all_of(bytes->begin() + 2, bytes->begin() + 8, [](std::uint8_t value) {
+                return value == 0;
+            }))
+        {
+            return true;
+        }
+        // 64:ff9b::/96 (NAT64 well-known prefix): check the embedded IPv4.
+        if (bytes->at(0) == 0x00 && bytes->at(1) == 0x64 && bytes->at(2) == 0xff && bytes->at(3) == 0x9b)
+        {
+            const bool well_known = std::all_of(bytes->begin() + 4, bytes->begin() + 12, [](std::uint8_t value) {
+                return value == 0;
+            });
+            // 64:ff9b:1::/48 is the local-use NAT64 prefix: always internal.
+            if (!well_known)
+                return bytes->at(4) == 0x00 && bytes->at(5) == 0x01;
+            return is_restricted_ipv4_literal(ipv4_at(*bytes, 12));
+        }
+        // 2002::/16 (6to4): the IPv4 address sits in bytes 2-5.
+        if (bytes->at(0) == 0x20 && bytes->at(1) == 0x02)
+            return is_restricted_ipv4_literal(ipv4_at(*bytes, 2));
 
         const auto ipv4_mapped = std::all_of(bytes->begin(), bytes->begin() + 10,
                                              [](std::uint8_t value) {
@@ -194,6 +274,10 @@ namespace
             return is_restricted_ipv4_literal(*ipv4);
         if (host.find(':') != std::string::npos)
             return is_restricted_ipv6_literal(host);
+        // Issue #142: any other numeric form is not a canonical dotted quad
+        // and getaddrinfo() would still read it as IPv4; reject it.
+        if (looks_like_numeric_ipv4_host(host))
+            return true;
         return is_restricted_hostname(host);
     }
 

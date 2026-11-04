@@ -4,11 +4,19 @@
 
 #include <chrono>
 #include <cstdint>
+#include <filesystem>
 #include <string>
 #include <unordered_map>
 
 namespace thewatcher::agent
 {
+
+// Fills disk's total/free/used bytes and usage_percent from space, as df does
+// (issue #158). free_bytes is space.available: the space that unprivileged
+// writers can still use. Blocks reserved for root (5% by default on ext4) and
+// quota limits count as used, so usage reaches 100% when a normal process
+// gets ENOSPC. usage_percent = used / (used + available).
+void apply_space_info(DiskMetrics& disk, const std::filesystem::space_info& space);
 
 class DiskCollector final : public Collector
 {

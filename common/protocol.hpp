@@ -158,7 +158,11 @@ namespace detail
 
     inline cbor_item_t* make_bytes(const std::vector<uint8_t>& value)
     {
-        return cbor_build_bytestring(reinterpret_cast<cbor_data>(const_cast<uint8_t*>(value.data())), value.size());
+        // An empty vector's data() may be nullptr; libcbor memcpy()s from the
+        // pointer even for size 0, which is undefined behaviour (issue #162).
+        static const uint8_t empty = 0;
+        const uint8_t* data = value.empty() ? &empty : value.data();
+        return cbor_build_bytestring(reinterpret_cast<cbor_data>(const_cast<uint8_t*>(data)), value.size());
     }
 
     inline cbor_item_t* make_bool(bool value)

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <filesystem>
+#include <optional>
 #include <string>
 
 namespace thewatcher::agent
@@ -30,10 +31,26 @@ struct AgentConfig
     // configure ENROLLMENT_TOKEN. Empty when unused.
     std::string enrollment_token;
 
+    // Issue #150: the file values of fields replaced by a command-line
+    // override. save() writes these, not the overrides, so --server,
+    // --enrollment and --server-key apply to the running process only.
+    // nullopt means "not overridden": save() writes the current value.
+    std::optional<std::string> file_server_address;
+    std::optional<std::string> file_enrollment_address;
+    std::optional<std::string> file_server_public_key;
+    std::optional<std::string> file_server_public_key_fingerprint;
+
+    // Applies the non-empty command-line overrides for this process and
+    // remembers the file values they replace (issue #150). A --server-key
+    // override also keeps the file's fingerprint pin: the key and its pin are
+    // restored together on save.
+    void apply_cli_overrides(const std::string& server, const std::string& enrollment, const std::string& server_key);
+
     static AgentConfig load_or_create(const std::filesystem::path& path);
     // Writes the config as KEY=VALUE lines. Throws std::runtime_error if the file
     // cannot be opened. ALLOW_INSECURE is written only when allow_insecure is
-    // set; allow_insecure_cli is never persisted. ENROLLMENT_TOKEN is written
+    // set; allow_insecure_cli is never persisted. Fields overridden on the
+    // command line are written with their file values (issue #150). ENROLLMENT_TOKEN is written
     // only when non-empty. On POSIX the file is then restricted to owner
     // read/write because it holds the CURVE secret key.
     void save(const std::filesystem::path& path) const;

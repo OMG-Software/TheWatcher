@@ -288,6 +288,10 @@ Agent command-line options override loaded config values for that process:
 --help
 ```
 
+`--server`, `--enrollment` and `--server-key` are not written to the config
+file: when the agent saves its config after enrollment, it keeps the file's
+own values for those settings.
+
 `--genkey` prints a new CURVE keypair and exits. `--insecure` is the CLI
 equivalent of `ALLOW_INSECURE=1` and must be set explicitly to allow an
 enrollment reply without a server key pin.
