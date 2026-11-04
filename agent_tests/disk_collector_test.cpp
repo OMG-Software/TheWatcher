@@ -89,7 +89,7 @@ SCENARIO("On Windows, DiskCollector enumerates every fixed drive the system expo
 
 #endif // _WIN32
 
-SCENARIO("Disk usage counts root-reserved space as used, as df does (issue #158)")
+SCENARIO("Disk usage leaves root-reserved space out of free and usage, as df does (issue #158)")
 {
     GIVEN("a 100-unit volume with 50 units free, of which 45 are available to normal users")
     {
@@ -146,6 +146,48 @@ SCENARIO("Disk usage counts root-reserved space as used, as df does (issue #158)
             THEN("usage is 0% instead of a division by zero")
             {
                 REQUIRE(disk.usage_percent == 0.0);
+            }
+        }
+    }
+
+    GIVEN("a filesystem that reports free above capacity")
+    {
+        std::filesystem::space_info space{};
+        space.capacity = 100;
+        space.free = 120;
+        space.available = 110;
+        DiskMetrics disk;
+
+        WHEN("the space info is applied")
+        {
+            apply_space_info(disk, space);
+
+            THEN("free and used are clamped to capacity instead of underflowing")
+            {
+                REQUIRE(disk.free_bytes == 100);
+                REQUIRE(disk.used_bytes == 0);
+                REQUIRE(disk.usage_percent == 0.0);
+            }
+        }
+    }
+
+    GIVEN("a filesystem that reports available above free")
+    {
+        std::filesystem::space_info space{};
+        space.capacity = 100;
+        space.free = 50;
+        space.available = 80;
+        DiskMetrics disk;
+
+        WHEN("the space info is applied")
+        {
+            apply_space_info(disk, space);
+
+            THEN("available is clamped to free")
+            {
+                REQUIRE(disk.free_bytes == 50);
+                REQUIRE(disk.used_bytes == 50);
+                REQUIRE(disk.usage_percent == 50.0);
             }
         }
     }

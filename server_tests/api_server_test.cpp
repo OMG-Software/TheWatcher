@@ -190,6 +190,32 @@ SCENARIO("Alert notes are cut on a UTF-8 boundary and lists survive invalid stor
     }
 }
 
+SCENARIO("GET /api/agents survives an agent hostname with invalid UTF-8 (issue #147)")
+{
+    GIVEN("an approved agent whose stored hostname ends in a lone UTF-8 lead byte")
+    {
+        ApiFixture fx;
+        auto rec = agent("bad-host-agent", "", true);
+        rec.hostname = std::string("host\xC3", 5);
+        fx.store->upsert_agent(rec);
+        REQUIRE(login_as_default_admin(fx.client));
+
+        WHEN("the agent list is requested")
+        {
+            auto res = fx.client.Get("/api/agents");
+
+            THEN("it returns 200 with the bad byte replaced")
+            {
+                REQUIRE(res);
+                REQUIRE(res->status == 200);
+                const auto agents = nlohmann::json::parse(res->body);
+                REQUIRE(agents.size() == 1);
+                REQUIRE(agents[0]["hostname"].get<std::string>() == "host\xEF\xBF\xBD");
+            }
+        }
+    }
+}
+
 SCENARIO("Oversize settings values are rejected, not truncated (issue #147)")
 {
     GIVEN("a logged-in global admin")
@@ -211,6 +237,24 @@ SCENARIO("Oversize settings values are rejected, not truncated (issue #147)")
                 REQUIRE(res);
                 REQUIRE(res->status == 400);
                 REQUIRE(fx.store->get_setting("reports.webhook_url", "").empty());
+            }
+        }
+
+        WHEN("the same request also enables reports")
+        {
+            const auto url = "http://hooks.example.com/" + std::string(2048, 'a');
+            const auto body = nlohmann::json{
+                {"reports_enabled",     true},
+                {"reports_webhook_url",
+                 url                        }
+            }.dump();
+            auto res = fx.client.Put("/api/settings", body, "application/json");
+
+            THEN("reports stay disabled")
+            {
+                REQUIRE(res);
+                REQUIRE(res->status == 400);
+                REQUIRE(fx.store->get_setting("reports.enabled", "false") == "false");
             }
         }
     }

@@ -194,6 +194,38 @@ SCENARIO("Commands reach the agent that owns the agent_id, not a peer using it a
     }
 }
 
+SCENARIO("A command for an agent with no learned route is not sent to a peer using its id (issue #141)")
+{
+    GIVEN("an approved victim that has not sent a frame and a rogue whose routing id is the victim's agent_id")
+    {
+        thewatcher::crypto::init();
+        IdentityFixture fx(/*with_curve=*/true);
+        fx.start_and_login();
+
+        const auto keys_victim = thewatcher::crypto::generate_curve_keypair();
+        const auto keys_rogue = thewatcher::crypto::generate_curve_keypair();
+        fx.enroll_and_approve_with_key("agent-victim", keys_victim.public_key_z85);
+        std::this_thread::sleep_for(1100ms); // SEC-05 per-source enrollment rate limit
+        fx.enroll_and_approve_with_key("agent-rogue", keys_rogue.public_key_z85);
+
+        AgentPeer rogue(fx.config, "agent-victim", keys_rogue.public_key_z85, keys_rogue.secret_key_z85);
+        rogue.send_metrics("agent-rogue", 10.0);
+
+        WHEN("an operator sends a command to the victim")
+        {
+            auto res = fx.client.Post("/api/agents/agent-victim/get_status", "", "application/json");
+            REQUIRE(res);
+            REQUIRE(res->status == 200);
+
+            THEN("the rogue does not receive it")
+            {
+                REQUIRE_FALSE(rogue.receive(2s).has_value());
+                REQUIRE(fx.error == nullptr);
+            }
+        }
+    }
+}
+
 SCENARIO("A rejected agent cannot keep submitting data on its live session")
 {
     GIVEN("a CURVE server with an approved agent that has already delivered metrics")

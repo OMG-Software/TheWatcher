@@ -205,7 +205,10 @@ SCENARIO("CBOR simple values in a double position are rejected (issue #139)")
         for (const auto& value : simple_values)
         {
             const auto payload = temperature_payload(value);
-            THEN("unpack throws instead of crashing")
+            // DYNAMIC_SECTION: a plain THEN in a loop runs only for the first
+            // value, because Catch2 identifies sections by name and line.
+            DYNAMIC_SECTION("unpack throws instead of crashing for simple value 0x" << std::hex
+                                                                                    << static_cast<int>(value[0]))
             {
                 REQUIRE_THROWS_AS(unpack<thewatcher::TemperatureMetrics>(payload), std::runtime_error);
             }
@@ -217,7 +220,8 @@ SCENARIO("CBOR simple values in a double position are rejected (issue #139)")
         for (const auto& value : simple_values)
         {
             const auto payload = thresholds_payload(value);
-            THEN("unpack throws instead of crashing")
+            DYNAMIC_SECTION("unpack throws instead of crashing for simple value 0x" << std::hex
+                                                                                    << static_cast<int>(value[0]))
             {
                 REQUIRE_THROWS_AS(unpack<thewatcher::PercentThresholds>(payload), std::runtime_error);
             }
@@ -242,6 +246,24 @@ SCENARIO("Half and single precision CBOR floats decode as doubles (issue #139)")
         THEN("it decodes to 1.5 without reading past the item")
         {
             REQUIRE(unpack<thewatcher::PercentThresholds>(payload).warning_percent == 1.5);
+        }
+    }
+
+    GIVEN("a half-precision 1.0 (f9 3c00) in a collector-config payload")
+    {
+        const auto payload = thresholds_payload({0xF9, 0x3C, 0x00});
+        THEN("it decodes to 1.0 without reading past the item")
+        {
+            REQUIRE(unpack<thewatcher::PercentThresholds>(payload).warning_percent == 1.0);
+        }
+    }
+
+    GIVEN("a single-precision 1.5 (fa 3fc00000) in a metrics payload")
+    {
+        const auto payload = temperature_payload({0xFA, 0x3F, 0xC0, 0x00, 0x00});
+        THEN("it decodes to 1.5 without reading past the item")
+        {
+            REQUIRE(unpack<thewatcher::TemperatureMetrics>(payload).temperature_celsius == 1.5);
         }
     }
 }

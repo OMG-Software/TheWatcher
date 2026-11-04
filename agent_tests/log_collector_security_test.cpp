@@ -421,21 +421,69 @@ SCENARIO("LogCollector survives long lines with recursion-heavy patterns (issue 
             LogCollector collector;
             auto dir = make_dir("regex-depth");
             auto path = dir / "deep.log";
-            write_file(path, "ERROR " + std::string(64 * 1024 - 7, 'a') + "\n");
+            // The long line does not match; the short line after it does, so
+            // one match in total proves the long line was consumed (a reader
+            // stuck on the long line would never reach the second one).
+            write_file(path, "ERROR " + std::string(64 * 1024 - 7, 'a') + "\nERROR timeout c\n");
 
             collector.set_allowed_dirs({dir});
             collector.set_configs({make_config(path, pattern)});
 
-            WHEN("tick() is called")
+            WHEN("tick() is called twice")
             {
                 collector.tick();
+                auto matches = collector.take_matches();
+                collector.tick();
+                const auto more = collector.take_matches();
+                matches.insert(matches.end(), more.begin(), more.end());
 
-                THEN("the agent does not crash and the line is consumed")
+                THEN("the agent does not crash and only the short line matches")
                 {
-                    (void)collector.take_matches();
-                    collector.tick();
-                    REQUIRE(collector.take_matches().empty());
+                    REQUIRE(matches.size() == 1);
+                    REQUIRE(matches[0].matched_line == "ERROR timeout c");
                 }
+            }
+        }
+    }
+
+    GIVEN("a 60 KiB line whose only match lies after the first 4 KiB")
+    {
+        LogCollector collector;
+        auto dir = make_dir("regex-beyond-limit");
+        auto path = dir / "beyond.log";
+        write_file(path, std::string(8 * 1024, 'x') + " ERROR db timeout " + std::string(50 * 1024, 'x') + "\n");
+
+        collector.set_allowed_dirs({dir});
+        collector.set_configs({make_config(path, "ERROR.*timeout")});
+
+        WHEN("tick() is called")
+        {
+            collector.tick();
+
+            THEN("no match is reported: only the first 4 KiB of a line is matched")
+            {
+                REQUIRE(collector.take_matches().empty());
+            }
+        }
+    }
+
+    GIVEN("a 60 KiB line whose first 4 KiB end with the pattern of an end-anchored monitor")
+    {
+        LogCollector collector;
+        auto dir = make_dir("regex-anchor-cut");
+        auto path = dir / "anchor.log";
+        write_file(path, std::string(4 * 1024 - 5, 'x') + "ERROR" + std::string(56 * 1024, 'y') + "\n");
+
+        collector.set_allowed_dirs({dir});
+        collector.set_configs({make_config(path, "ERROR$")});
+
+        WHEN("tick() is called")
+        {
+            collector.tick();
+
+            THEN("\"$\" does not match at the 4 KiB cut")
+            {
+                REQUIRE(collector.take_matches().empty());
             }
         }
     }

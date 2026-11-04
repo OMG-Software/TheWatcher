@@ -213,6 +213,14 @@ AgentConfig AgentConfig::load_or_create(const std::filesystem::path& path)
 void AgentConfig::apply_cli_overrides(const std::string& server, const std::string& enrollment,
                                       const std::string& server_key)
 {
+    // The server key pin belongs to the file's server. Any override can make
+    // this process enroll with (and learn the key of) a different server, so
+    // the file's key and fingerprint are kept for save() as well.
+    if ((!server.empty() || !enrollment.empty() || !server_key.empty()) && !file_server_public_key)
+    {
+        file_server_public_key = server_public_key;
+        file_server_public_key_fingerprint = server_public_key_fingerprint;
+    }
     if (!server.empty())
     {
         if (!file_server_address)
@@ -226,14 +234,7 @@ void AgentConfig::apply_cli_overrides(const std::string& server, const std::stri
         enrollment_address = enrollment;
     }
     if (!server_key.empty())
-    {
-        if (!file_server_public_key)
-        {
-            file_server_public_key = server_public_key;
-            file_server_public_key_fingerprint = server_public_key_fingerprint;
-        }
         server_public_key = server_key;
-    }
 }
 
 // Writes the config as KEY=VALUE lines, creating missing parent directories.

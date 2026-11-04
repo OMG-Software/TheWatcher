@@ -41,9 +41,10 @@ struct AgentConfig
     std::optional<std::string> file_server_public_key_fingerprint;
 
     // Applies the non-empty command-line overrides for this process and
-    // remembers the file values they replace (issue #150). A --server-key
-    // override also keeps the file's fingerprint pin: the key and its pin are
-    // restored together on save.
+    // remembers the file values they replace (issue #150). Any override also
+    // keeps the file's server key and fingerprint pin: enrollment may learn
+    // another server's key in this process, and that must not be saved next
+    // to the file's own endpoints.
     void apply_cli_overrides(const std::string& server, const std::string& enrollment, const std::string& server_key);
 
     static AgentConfig load_or_create(const std::filesystem::path& path);

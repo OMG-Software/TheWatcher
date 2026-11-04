@@ -14,7 +14,10 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Fixed an agent crash when a monitored log has a long line: `std::regex`
   recursion overflowed the thread stack (about 40 KB was enough). Only the
   first 4 KiB of a line is matched, and matching runs on a helper thread
-  with a fixed 64 MB stack (#140).
+  with a fixed 64 MB stack (#140). A match that lies only after the first
+  4 KiB of a line is no longer reported, and `$` does not match at the cut.
+  Patterns with exponential backtracking can still use a lot of CPU
+  (#169).
 - **Behaviour change:** the data plane no longer trusts the ROUTER routing
   id. Agents no longer set it (libzmq generates one), and the server sends
   commands only to the connection that last sent an authenticated frame for
@@ -22,6 +25,12 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   agent_id as its routing id and receive the victim's commands or block its
   connection. A command for an agent that has not sent a frame since the
   server started is now dropped and logged (#141).
+  **Upgrade order:** upgrade the server before the agents. A server older
+  than this release sends commands to the routing id `agent_id`, which this
+  agent no longer sets, so its commands do not reach upgraded agents. A
+  server from this release still works with 0.8.0 agents.
+  The server also forgets an agent's route when the agent is marked
+  offline.
 - The webhook URL check rejects non-canonical IPv4 forms that the resolver
   still reads as addresses (octal `0251.0376.0251.0376`, hex `0x7f000001`,
   decimal `2130706433`, short `127.1`, `0`, trailing dot) and IPv6 forms
@@ -39,7 +48,8 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   `reports_webhook_url` (settings) are rejected with 400 instead of being
   cut. JSON responses replace invalid UTF-8 already stored with U+FFFD, so
   one bad value no longer makes `GET /api/alerts` or `/api/agents` fail for
-  every user (#147).
+  every user. The agent, metrics and agent-metrics lists use the same
+  serialisation (#147).
 - Agent `--server`, `--enrollment` and `--server-key` overrides are no
   longer written to the config file when the agent saves it after
   enrollment (#150).

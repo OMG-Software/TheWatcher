@@ -627,9 +627,13 @@ void LogCollector::tail_file(const LogMonitorConfig& cfg)
 
     std::size_t matches = 0;
     const auto emit_if_match = [&](const std::string& text) {
-        // Issue #140: bound the recursion depth of std::regex.
-        const auto match_end = text.begin() + static_cast<std::ptrdiff_t>(std::min(text.size(), max_match_len));
-        if (text.empty() || !std::regex_search(text.begin(), match_end, pattern))
+        // Issue #140: bound the recursion depth of std::regex. When the line
+        // is cut, match_not_eol stops "$" from matching at the cut, which is
+        // not the end of the line.
+        const bool cut = text.size() > max_match_len;
+        const auto match_end = cut ? text.begin() + static_cast<std::ptrdiff_t>(max_match_len) : text.end();
+        const auto flags = cut ? std::regex_constants::match_not_eol : std::regex_constants::match_default;
+        if (text.empty() || !std::regex_search(text.begin(), match_end, pattern, flags))
             return;
         proto::LogMatch m;
         m.indicator_name = cfg.indicator_name;

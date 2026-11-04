@@ -385,3 +385,34 @@ SCENARIO("Command-line overrides apply to the running process only (issue #150)"
         }
     }
 }
+
+SCENARIO("An endpoint-only override does not save the other server's key pin (issue #150)")
+{
+    GIVEN("a saved config with no key pinned yet")
+    {
+        auto path = thewatcher::test::process_temp_dir().path() / "cli_endpoint_override_agent.conf";
+        fs::remove(path);
+        auto original = AgentConfig::load_or_create(path);
+        original.server_address = "tcp://prod.example:5555";
+        original.enrollment_address = "tcp://prod.example:5556";
+        original.save(path);
+
+        WHEN("the agent runs with --server and --enrollment only and enrollment learns that server's key")
+        {
+            auto cfg = AgentConfig::load_or_create(path);
+            cfg.apply_cli_overrides("tcp://test.example:5555", "tcp://test.example:5556", "");
+            cfg.server_public_key = std::string(40, 'T');
+            cfg.server_public_key_fingerprint = "test-fingerprint";
+            cfg.save(path);
+
+            THEN("the file keeps its endpoints and no key pin, so the next normal start enrolls with prod")
+            {
+                const auto reloaded = AgentConfig::load_or_create(path);
+                REQUIRE(reloaded.server_address == "tcp://prod.example:5555");
+                REQUIRE(reloaded.enrollment_address == "tcp://prod.example:5556");
+                REQUIRE(reloaded.server_public_key.empty());
+                REQUIRE(reloaded.server_public_key_fingerprint.empty());
+            }
+        }
+    }
+}

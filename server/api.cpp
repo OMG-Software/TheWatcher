@@ -1485,7 +1485,7 @@ void ApiServer::setup_routes()
                 item["group_ids"] = store_.get_agent_groups(a.agent_id);
                 arr.push_back(item);
             }
-            res.set_content(arr.dump(), "application/json");
+            set_json(res, arr);
         }
         catch (const std::exception& e)
         {
@@ -1721,7 +1721,7 @@ void ApiServer::setup_routes()
                     {"metrics",      json(thewatcher::proto::unpack<SystemMetrics>(r.metrics_cbor))}
                 });
             }
-            res.set_content(arr.dump(), "application/json");
+            set_json(res, arr);
         }
         catch (const std::exception& e)
         {
@@ -1758,7 +1758,7 @@ void ApiServer::setup_routes()
                     {"metrics",      json(thewatcher::proto::unpack<SystemMetrics>(r.metrics_cbor))}
                 });
             }
-            res.set_content(arr.dump(), "application/json");
+            set_json(res, arr);
         }
         catch (const std::exception& e)
         {
@@ -2167,7 +2167,7 @@ void ApiServer::setup_routes()
                     {"created_at",     r.created_at    },
                 });
             }
-            res.set_content(arr.dump(), "application/json");
+            set_json(res, arr);
         }
         catch (const std::exception& e)
         {
@@ -2447,6 +2447,11 @@ void ApiServer::setup_routes()
         try
         {
             const auto body = json::parse(req.body);
+            // Issue #147: a truncated URL is a different URL, so an oversize one
+            // is rejected. Checked before any setting is written, so this
+            // rejection does not leave earlier fields of the request applied.
+            if (body.contains("reports_webhook_url") && body.at("reports_webhook_url").get<std::string>().size() > 2048)
+                throw std::runtime_error("reports_webhook_url must be 2048 bytes or fewer");
             if (body.contains("webhook_url"))
                 store_.set_setting("notifications.webhook_url", body.at("webhook_url").get<std::string>());
             if (body.contains("offline_after_seconds"))
@@ -2494,13 +2499,7 @@ void ApiServer::setup_routes()
                 store_.set_setting("reports.day_of_week", std::to_string(v));
             }
             if (body.contains("reports_webhook_url"))
-            {
-                // Issue #147: a truncated URL is a different URL; reject it.
-                auto url = body.at("reports_webhook_url").get<std::string>();
-                if (url.size() > 2048)
-                    throw std::runtime_error("reports_webhook_url must be 2048 bytes or fewer");
-                store_.set_setting("reports.webhook_url", url);
-            }
+                store_.set_setting("reports.webhook_url", body.at("reports_webhook_url").get<std::string>());
             set_json(res, json{
                               {"ok", true}
             });
