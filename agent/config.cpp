@@ -234,7 +234,14 @@ void AgentConfig::apply_cli_overrides(const std::string& server, const std::stri
         enrollment_address = enrollment;
     }
     if (!server_key.empty())
+    {
+        // The file's fingerprint pins the file's key, not this one. Clear the
+        // active fingerprint so enrollment checks the reply against the
+        // override key alone (and learns the matching fingerprint); the file's
+        // value is kept above for save().
         server_public_key = server_key;
+        server_public_key_fingerprint.clear();
+    }
 }
 
 // Writes the config as KEY=VALUE lines, creating missing parent directories.

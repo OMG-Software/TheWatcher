@@ -51,10 +51,12 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   cut. JSON responses replace invalid UTF-8 already stored with U+FFFD, so
   one bad value no longer makes `GET /api/alerts` or `/api/agents` fail for
   every user. The agent, metrics and agent-metrics lists use the same
-  serialisation (#147).
+  serialisation, and so do the alert and report webhook payloads (#147,
+  part of #56).
 - Agent `--server`, `--enrollment` and `--server-key` overrides are no
   longer written to the config file when the agent saves it after
-  enrollment (#150).
+  enrollment (#150). A `--server-key` override no longer fails enrollment
+  against the file's old fingerprint pin.
 - Disk usage now matches `df`: `free_bytes` is the space available to
   unprivileged writers, and root-reserved blocks count as used (#158).
 - Encoding a frame with an empty payload no longer passes a null pointer to

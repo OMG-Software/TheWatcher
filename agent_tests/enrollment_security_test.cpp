@@ -188,3 +188,41 @@ SCENARIO("Enrollment still learns the server key on first run")
         }
     }
 }
+
+SCENARIO("A --server-key override enrolls against the new key, not the file's old fingerprint pin")
+{
+    GIVEN("a config pinned to an old server key and fingerprint, and a server with a new key")
+    {
+        thewatcher::crypto::init();
+        const auto old_kp = thewatcher::crypto::generate_curve_keypair();
+        const auto new_kp = thewatcher::crypto::generate_curve_keypair();
+
+        EnrollReplyServer server;
+        auto cfg = make_agent_config("enroll-sec-override", server);
+        cfg.server_public_key = old_kp.public_key_z85;
+        cfg.server_public_key_fingerprint = thewatcher::crypto::server_public_key_fingerprint(old_kp.public_key_z85);
+        server.reply_once(cfg.agent_id, true, new_kp.public_key_z85);
+
+        WHEN("the agent runs with --server-key set to the new key and enrolls")
+        {
+            cfg.apply_cli_overrides("", "", new_kp.public_key_z85);
+            const auto error = enroll_error(cfg);
+            server.join();
+
+            THEN("enrollment succeeds and learns the new key's fingerprint")
+            {
+                REQUIRE(error.empty());
+                REQUIRE(cfg.server_public_key == new_kp.public_key_z85);
+                REQUIRE(cfg.server_public_key_fingerprint ==
+                        thewatcher::crypto::server_public_key_fingerprint(new_kp.public_key_z85));
+            }
+
+            AND_THEN("the file's old pin is what would be saved")
+            {
+                REQUIRE(cfg.file_server_public_key == old_kp.public_key_z85);
+                REQUIRE(cfg.file_server_public_key_fingerprint ==
+                        thewatcher::crypto::server_public_key_fingerprint(old_kp.public_key_z85));
+            }
+        }
+    }
+}
