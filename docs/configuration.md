@@ -273,8 +273,10 @@ arbitrary files chosen on the dashboard.
 A log monitor pattern is matched against the first 4 KiB of each line only.
 A match that lies entirely after the first 4 KiB of a line produces no log
 match and no alert, and `$` does not match at that 4 KiB cut. Lines are read
-up to 64 KiB, and the reported line is not cut to 4 KiB. The limit keeps the
-regex engine's stack use bounded (#140).
+up to 64 KiB, and the reported line is not cut to 4 KiB. A pattern that nests
+groups more than 16 levels deep is skipped with a warning. These limits keep
+the regex engine's stack use bounded (#140). Patterns with heavy backtracking
+can still use a lot of CPU (#169).
 
 ## Agent CLI Overrides
 

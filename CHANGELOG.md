@@ -16,6 +16,8 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   first 4 KiB of a line is matched, and matching runs on a helper thread
   with a fixed 64 MB stack (#140). A match that lies only after the first
   4 KiB of a line is no longer reported, and `$` does not match at the cut.
+  A pattern that nests groups more than 16 levels deep is skipped with a
+  warning; 100 nested groups overflowed the 64 MB stack.
   Patterns with exponential backtracking can still use a lot of CPU
   (#169).
 - **Behaviour change:** the data plane no longer trusts the ROUTER routing

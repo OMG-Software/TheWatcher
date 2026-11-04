@@ -510,3 +510,50 @@ SCENARIO("LogCollector survives long lines with recursion-heavy patterns (issue 
         }
     }
 }
+
+SCENARIO("LogCollector refuses patterns that nest groups too deeply (issue #140)")
+{
+    GIVEN("a 4 KiB line and a pattern with 100 nested groups (within the 256-character cap)")
+    {
+        LogCollector collector;
+        auto dir = make_dir("regex-nesting");
+        auto path = dir / "nested.log";
+        write_file(path, std::string(4 * 1024, 'a') + "\n");
+        // 100 nested groups overflowed the 64 MB matching stack on this line.
+        const std::string pattern = std::string(100, '(') + "a" + std::string(100, ')') + "*b";
+
+        collector.set_allowed_dirs({dir});
+        collector.set_configs({make_config(path, pattern)});
+
+        WHEN("tick() is called")
+        {
+            collector.tick();
+
+            THEN("the pattern is skipped instead of crashing the agent")
+            {
+                REQUIRE(collector.take_matches().empty());
+            }
+        }
+    }
+
+    GIVEN("a pattern with shallow groups, a class containing \"(\" and an escaped \"(\"")
+    {
+        LogCollector collector;
+        auto dir = make_dir("regex-shallow");
+        auto path = dir / "shallow.log";
+        write_file(path, "ERROR (disk) [sda] timeout\n");
+
+        collector.set_allowed_dirs({dir});
+        collector.set_configs({make_config(path, "(ERROR|WARN) \\((disk|net)\\) [[(]sda[)\\]] (time(out))")});
+
+        WHEN("tick() is called")
+        {
+            collector.tick();
+
+            THEN("the pattern is used normally")
+            {
+                REQUIRE(collector.take_matches().size() == 1);
+            }
+        }
+    }
+}

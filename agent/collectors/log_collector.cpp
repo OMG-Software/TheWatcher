@@ -64,6 +64,51 @@ namespace
     // can configure patterns (SEC-10).
     constexpr std::size_t max_match_len = 4 * 1024;
     constexpr std::size_t match_stack_bytes = 64 * 1024 * 1024;
+    // Stack use per character also grows with group nesting: 100 nested
+    // groups overflowed 64 MB on a 4 KiB line, 50 did not. 16 levels keeps a
+    // wide margin; real log patterns rarely nest more than 2 or 3 levels.
+    // Patterns with exponential backtracking are a CPU problem (#169).
+    constexpr int max_group_depth = 16;
+
+    // Returns the deepest group nesting in an ECMAScript pattern: "(" that is
+    // not escaped and not inside a [...] class. Unbalanced ")" is ignored here;
+    // std::regex rejects it when the pattern is compiled.
+    int group_depth(const std::string& pattern)
+    {
+        int depth = 0;
+        int deepest = 0;
+        bool in_class = false;
+        for (std::size_t i = 0; i < pattern.size(); ++i)
+        {
+            const char ch = pattern[i];
+            if (ch == '\\')
+            {
+                ++i; // the next character is literal
+                continue;
+            }
+            if (in_class)
+            {
+                if (ch == ']')
+                    in_class = false;
+                continue;
+            }
+            if (ch == '[')
+            {
+                // ECMAScript: a "]" right after "[" or "[^" closes the class
+                // ("[]" matches nothing), so no POSIX-style special case.
+                in_class = true;
+            }
+            else if (ch == '(')
+            {
+                deepest = std::max(deepest, ++depth);
+            }
+            else if (ch == ')' && depth > 0)
+            {
+                --depth;
+            }
+        }
+        return deepest;
+    }
 
     // Runs fn on a new thread with a stack of stack_bytes and waits for it.
     // An exception thrown by fn is rethrown in the caller. Throws
@@ -520,6 +565,12 @@ void LogCollector::tick()
         if (cfg.pattern.size() > max_pattern_len)
         {
             LOGF_WARNING("LogCollector pattern too long path=%s pattern_len=%zu", cfg.path.c_str(), cfg.pattern.size());
+            continue;
+        }
+        if (const auto depth = group_depth(cfg.pattern); depth > max_group_depth)
+        {
+            LOGF_WARNING("LogCollector pattern nests groups too deeply path=%s depth=%d max=%d", cfg.path.c_str(),
+                         depth, max_group_depth);
             continue;
         }
         try
