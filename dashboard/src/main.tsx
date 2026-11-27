@@ -16,7 +16,6 @@ import {
   createRunbook,
   createView,
   deleteAgent,
-  deleteAlert,
   deleteMaintenanceWindow,
   deleteRunbook,
   deleteSilence,
