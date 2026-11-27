@@ -164,6 +164,12 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   runbooks configured." before its first load; a failed reload after a successful
   change is now actually reported (`refresh()` returns the load error); modal
   backdrops are marked `role="presentation"` (#104, #105, #106, #166).
+- Dashboard: an action stays busy until its post-action refresh has settled, so
+  a control cannot repeat a create or acknowledge while the result loads;
+  `refresh()` coalesces into at most one in-flight request plus one queued
+  follow-up instead of starting concurrent requests; and a failed settings
+  reload after a successful save keeps the saved values visible with a warning
+  (#104, #105).
 
 ### Changed
 
