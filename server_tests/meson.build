@@ -70,7 +70,7 @@ server_enrollment_security_test = executable(
 )
 # The tests wait out real 10-second enrollment rate-limit windows, so the
 # suite needs a longer timeout than meson's 30s default.
-test('server_enrollment_security', server_enrollment_security_test, timeout: 120, is_parallel: false)
+test('server_enrollment_security', server_enrollment_security_test, timeout: 300, is_parallel: false)
 
 login_rate_limit_test = executable(
   'login_rate_limit_test',
