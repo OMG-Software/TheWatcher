@@ -91,10 +91,14 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   installer refuse to run before it stops or changes anything, so the server
   never starts without its keypair or without CURVE. The copy is checked again
   and removed if it is incomplete. Config preparation and migration run in
-  `PrepareToInstall` and abort the install on failure, starting again the
-  services that were running; service registration checks exit codes,
-  retries while the old service is marked for deletion, and on failure shows
-  the manual commands and makes setup exit with code 10 (#131).
+  `PrepareToInstall` and abort the install on failure. Services that were
+  running before the upgrade are started again in every outcome: on a
+  preparation failure, when the file copy fails or is cancelled, and on the
+  new registrations once the install finishes (installers used to leave them
+  stopped until they were started by hand or the host rebooted). Service
+  registration checks exit codes and retries while the old service is marked
+  for deletion; a registration or restart failure shows what to run by hand
+  and makes setup exit with code 10 (#131).
 - The CPU collector reports a real usage value on its first `update()` and
   after a collector restart. The constructor takes a baseline and the first
   update waits until it is at least 100 ms old. Calls closer than 100 ms to

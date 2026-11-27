@@ -46,7 +46,15 @@ const
 
 var
   RegistrationError: String;
-  RegistrationFailureText: String;
+  // Services that were running before the upgrade but did not start again.
+  StartError: String;
+  PostInstallFailureText: String;
+  // Set by PrepareToInstall for each service it stopped, so the service is
+  // started again after the upgrade, or when the install is aborted.
+  AgentWasRunning, ServerWasRunning: Boolean;
+  // True once the files are installed (ssPostInstall). DeinitializeSetup uses
+  // it to tell an aborted install from a finished one.
+  PostInstallReached: Boolean;
 
 // True when sc query reports the service as STOPPED.
 function ServiceIsStopped(const Name: String): Boolean;
@@ -69,7 +77,7 @@ end;
 // to report STOPPED. `net stop`'s own exit code is not used: it is also
 // non-zero when the service was already stopped.
 // WasRunning is set when the service existed and was not already stopped, so
-// PrepareToInstall can start it again if the install is aborted later.
+// it can be started again after the upgrade or an aborted install.
 function StopServiceIfPresent(const Name: String; var WasRunning: Boolean): String;
 var
   ResultCode, I: Integer;
@@ -103,18 +111,24 @@ begin
   Result := 'The ' + Name + ' service did not stop. Stop it manually and run the installer again.';
 end;
 
+// `net start` waits until the service reports RUNNING, or fails.
+function StartServiceAgain(const Name: String): Boolean;
+var
+  ResultCode: Integer;
+begin
+  Result := Exec(ExpandConstant('{sys}\net.exe'), 'start ' + Name, '', SW_HIDE, ewWaitUntilTerminated, ResultCode)
+            and (ResultCode = 0);
+end;
+
 // Starts a service again after an aborted install, if StopServiceIfPresent
 // stopped it and it is still stopped. Returns a sentence for the abort
 // message.
 function RestartStoppedService(const Name: String; WasRunning: Boolean): String;
-var
-  ResultCode: Integer;
 begin
   Result := '';
   if not WasRunning or not ServiceIsStopped(Name) then
     Exit;
-  if Exec(ExpandConstant('{sys}\net.exe'), 'start ' + Name, '', SW_HIDE, ewWaitUntilTerminated, ResultCode)
-     and (ResultCode = 0) then
+  if StartServiceAgain(Name) then
     Result := ' The ' + Name + ' service was started again.'
   else
     Result := ' The ' + Name + ' service could not be started again; start it manually.';
@@ -408,12 +422,12 @@ end;
 // the service is registered, otherwise the server could start on a missing
 // TheWatcherServer.conf and generate a new CURVE keypair, which breaks every
 // enrolled agent.
-// When a step after a service was stopped fails, no file has been replaced
-// and the old registrations still point at the old configs, so the services
-// that were running are started again instead of being left down.
+// The services stopped here are started again in every outcome:
+// - a later step here fails: no file has been replaced and the old
+//   registrations still point at the old configs, so they are started here;
+// - the file copy fails or is cancelled: DeinitializeSetup starts them;
+// - the install finishes: RegisterAll starts them on the new registrations.
 function PrepareToInstall(var NeedsRestart: Boolean): String;
-var
-  AgentWasRunning, ServerWasRunning: Boolean;
 begin
   AgentWasRunning := False;
   ServerWasRunning := False;
@@ -430,61 +444,125 @@ begin
       Result := 'Could not prepare the configuration directory: ' + GetExceptionMessage();
     end;
   end;
-  // The server first, so the agent finds it when it reconnects.
+  // The server first, so the agent finds it when it reconnects. The flags are
+  // cleared so DeinitializeSetup does not try again.
   if Result <> '' then
+  begin
     Result := Result + RestartStoppedService('TheWatcherServer', ServerWasRunning) +
               RestartStoppedService('TheWatcherAgent', AgentWasRunning);
+    ServerWasRunning := False;
+    AgentWasRunning := False;
+  end;
 end;
 
-// Registration needs the installed executables, so it runs after the files are
-// copied (ssPostInstall) and cannot abort the install. Failures are recorded,
-// shown (SuppressibleMsgBox, so silent installs log them), reflected in the
-// finished page and returned as the setup exit code.
-procedure RegisterAll();
+procedure AddStartError(const Name: String);
+begin
+  if StartError <> '' then
+    StartError := StartError + ', ';
+  StartError := StartError + Name;
+end;
+
+// Shows registration and start failures (SuppressibleMsgBox, so silent installs
+// log them) and keeps the text for the finished page.
+procedure ReportPostInstallProblems();
 var
   Msg: String;
 begin
+  Msg := '';
+  if RegistrationError <> '' then
+    Msg := 'The files were installed but service registration failed:' + #13#10 + RegistrationError + #13#10#13#10 +
+           'Fix the problem, then run as Administrator:' + #13#10 +
+           ExpandConstant('"{app}\server\TheWatcherServer.exe" --install-service --config "{commonappdata}\TheWatcher\TheWatcherServer.conf"') + #13#10 +
+           ExpandConstant('"{app}\agent\TheWatcherAgent.exe" --install-service --config "{commonappdata}\TheWatcher\TheWatcherAgent.conf"');
+  if StartError <> '' then
+  begin
+    if Msg <> '' then
+      Msg := Msg + #13#10#13#10;
+    Msg := Msg + 'These services were running before the upgrade but did not start again: ' + StartError + '.' +
+           #13#10 + 'Check the service log and the Windows event log, then start them with: sc.exe start <name>';
+  end;
+  if Msg <> '' then
+  begin
+    PostInstallFailureText := Msg;
+    SuppressibleMsgBox(Msg, mbError, MB_OK, IDOK);
+  end;
+end;
+
+// Registration needs the installed executables, so it runs after the files are
+// copied (ssPostInstall) and cannot abort the install. The services that were
+// running before the upgrade are then started on their new registrations; a
+// fresh install starts nothing, as before. Failures are recorded, reported
+// and returned as the setup exit code.
+procedure RegisterAll();
+var
+  ServerRegistered, AgentRegistered: Boolean;
+begin
+  ServerRegistered := False;
+  AgentRegistered := False;
   try
     RegisterService('TheWatcherServer', ExpandConstant('{app}\server\TheWatcherServer.exe'),
                     ExpandConstant('{commonappdata}\TheWatcher\TheWatcherServer.conf'));
+    ServerRegistered := True;
   except
     RegistrationError := GetExceptionMessage();
   end;
   try
     RegisterService('TheWatcherAgent', ExpandConstant('{app}\agent\TheWatcherAgent.exe'),
                     ExpandConstant('{commonappdata}\TheWatcher\TheWatcherAgent.conf'));
+    AgentRegistered := True;
   except
     if RegistrationError <> '' then
       RegistrationError := RegistrationError + #13#10;
     RegistrationError := RegistrationError + GetExceptionMessage();
   end;
-  if RegistrationError <> '' then
-  begin
-    Msg := 'The files were installed but service registration failed:' + #13#10 + RegistrationError + #13#10#13#10 +
-           'Fix the problem, then run as Administrator:' + #13#10 +
-           ExpandConstant('"{app}\server\TheWatcherServer.exe" --install-service --config "{commonappdata}\TheWatcher\TheWatcherServer.conf"') + #13#10 +
-           ExpandConstant('"{app}\agent\TheWatcherAgent.exe" --install-service --config "{commonappdata}\TheWatcher\TheWatcherAgent.conf"');
-    RegistrationFailureText := Msg;
-    SuppressibleMsgBox(Msg, mbError, MB_OK, IDOK);
-  end;
+
+  // The server first, so the agent finds it when it reconnects. A service whose
+  // registration failed is not started: the message above covers it.
+  if ServerWasRunning and ServerRegistered and not StartServiceAgain('TheWatcherServer') then
+    AddStartError('TheWatcherServer');
+  if AgentWasRunning and AgentRegistered and not StartServiceAgain('TheWatcherAgent') then
+    AddStartError('TheWatcherAgent');
+
+  ReportPostInstallProblems();
 end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
 begin
   if CurStep = ssPostInstall then
+  begin
+    PostInstallReached := True;
     RegisterAll();
+  end;
 end;
 
 procedure CurPageChanged(CurPageID: Integer);
 begin
-  if (CurPageID = wpFinished) and (RegistrationError <> '') then
-    WizardForm.FinishedLabel.Caption := RegistrationFailureText;
+  if (CurPageID = wpFinished) and (PostInstallFailureText <> '') then
+    WizardForm.FinishedLabel.Caption := PostInstallFailureText;
 end;
 
-// Non-zero when service registration failed, so silent installs report it.
+// Called whenever Setup exits. If the install stopped after PrepareToInstall
+// stopped the services but before the files were installed (a file copy
+// error, or Cancel), start them again: their registrations were not touched
+// and still point at the old configs. There is no wizard page left, so the
+// outcome goes to the setup log (/LOG).
+procedure DeinitializeSetup();
+var
+  Note: String;
+begin
+  if PostInstallReached then
+    Exit;
+  Note := RestartStoppedService('TheWatcherServer', ServerWasRunning) +
+          RestartStoppedService('TheWatcherAgent', AgentWasRunning);
+  if Note <> '' then
+    Log('The install was aborted after the services were stopped.' + Note);
+end;
+
+// Non-zero when the files were installed but a service could not be
+// registered or started again, so silent installs report it.
 function GetCustomSetupExitCode(): Integer;
 begin
-  if RegistrationError <> '' then
+  if (RegistrationError <> '') or (StartError <> '') then
     Result := 10
   else
     Result := 0;

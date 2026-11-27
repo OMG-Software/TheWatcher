@@ -263,17 +263,31 @@ the third command to confirm that only `Administrators` and `SYSTEM` remain.
 Older Windows installers registered the server service with
 `--config C:\ProgramData\TheWatcher\server.json`. The server wrote a
 `KEY=VALUE` file at that path, the same format as `TheWatcherServer.conf`. The
-current installer moves it to the new name as described below.
+current installer copies it to the new name and keeps the original as a
+backup, as described below.
 
 Steps 0 to 2 run in `PrepareToInstall`, before any file is touched. Inno Setup
 carries on after an error raised later in the install, but a failure here
 aborts the install cleanly with a message, so the server can never be
 registered against a missing or keyless `TheWatcherServer.conf` (the server
 would generate a new CURVE keypair, or run without CURVE, and every enrolled
-agent would break). If a step fails after a service was stopped, the
-installer starts the services that were running again before it exits (no
-file has been replaced yet, so they run the old version on the old config),
-and the message says whether that worked:
+agent would break).
+
+The services that were running before the upgrade are started again whatever
+happens next, server first:
+
+- a later step in `PrepareToInstall` fails: no file has been replaced yet, so
+  they start on their old registrations, and the abort message says whether
+  that worked;
+- the file copy fails or you cancel it: they start on their old registrations
+  when Setup exits, and the setup log (`/LOG`) says whether that worked;
+- the install finishes: they start on their new registrations after step 3.
+  A service that does not start is reported as in step 3 (exit code 10).
+
+A service that was stopped before the upgrade, or a fresh install, is not
+started; see [Windows Services](#windows-services).
+
+The steps are:
 
 0. checks, before stopping anything, that a `server.json` without a
    `TheWatcherServer.conf` next to it can be migrated (see below). If it
@@ -289,8 +303,12 @@ and the message says whether that worked:
    and `server.json` is kept as a backup), and `server.json` has non-comment
    `SERVER_PUBLIC_KEY=<key>` and `SERVER_SECRET_KEY=<key>` lines whose values
    are 40-character Z85 keys (spaces around `=` are fine and a repeated key
-   keeps its last value, as in the server parser). The server therefore keeps
-   its CURVE identity and agents keep working. The copy is read back and must
+   keeps its last value, as in the server parser). The file is copied
+   unchanged, so the server keeps the CURVE identity it had and agents keep
+   working. The installer checks the form of each key but cannot check that
+   the two keys are a pair; the server checks that when it starts with the
+   new config, and a pair that does not match makes the start fail, which is
+   reported as below. The copy is read back and must
    pass the same check; a failed or incomplete copy is deleted, so the next run
    migrates again instead of finding a broken `.conf`. An unreadable
    `server.json` aborts the install;
@@ -306,7 +324,10 @@ and the message says whether that worked:
    finished page repeats them, and the setup process exits with code 10 (so
    silent installs can detect it; `/LOG` records the message). Close
    `services.msc` and run the installer again if the old service is still marked
-   for deletion.
+   for deletion. The services that were running before the upgrade are then
+   started; one that does not start is reported the same way (message,
+   finished page, exit code 10), so check its log and the Windows event log
+   and start it with `sc.exe start <name>`.
 
 If `server.json` lacks either key line or a key is not a valid Z85 key (for
 example JSON you wrote by hand, even if it mentions both keys, or a file with
