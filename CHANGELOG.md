@@ -45,12 +45,12 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   `127.0.0.0/8` addresses; DNS names such as `127.attacker.example` no
   longer match (#164).
 
+### Fixed
+
 - Dashboard: `tsc` no longer writes `.js`/`.d.ts` files into `dashboard/src`
   (`noEmit`), the 21 committed compiled twins are removed, and vitest runs
   only `*.test.ts(x)`. Before, Vite served the stale twins and every test ran
   twice (8 files / 172 tests became 4 / 86) (#103).
-### Fixed
-
 - Alert notes longer than 4,096 bytes are cut on a UTF-8 character
   boundary. Oversize `runbook_markdown` (collector config) and
   `reports_webhook_url` (settings) are rejected with 400 instead of being
