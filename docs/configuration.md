@@ -250,7 +250,7 @@ Options:
 
 | Option | Default | Description |
 | --- | --- | --- |
-| `THEWATCHER_SERVER` | `127.0.0.1` derived defaults | Hostname or IP of the server. The agent derives `tcp://<host>:5555` for data and `tcp://<host>:5556` for enrollment. |
+| `THEWATCHER_SERVER` | `127.0.0.1` derived defaults | Hostname or IP of the server; an IPv6 address must be bracketed (`[2001:db8::1]` or `[2001:db8::1]:5555`, a port is ignored), and an unbracketed one is rejected at load. The agent derives `tcp://<host>:5555` for data and `tcp://<host>:5556` for enrollment. |
 | `SERVER_ADDRESS` | `tcp://127.0.0.1:5555` | Explicit data endpoint. Overrides the endpoint derived from `THEWATCHER_SERVER`. |
 | `ENROLLMENT_ADDRESS` | `tcp://127.0.0.1:5556` | Explicit enrollment endpoint. Overrides the endpoint derived from `THEWATCHER_SERVER`. |
 | `SERVER_PUBLIC_KEY` | empty | Server CURVE public key. Normal first enrollment learns this from the approved enrollment response. Set it manually only when pre-pinning a known server key or using `--server-key`. Once set it is a pin: an enrollment reply presenting a different key is rejected. |

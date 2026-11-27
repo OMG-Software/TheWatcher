@@ -1,14 +1,25 @@
 #!/usr/bin/env python3
 """Check that built binaries report the Meson project version.
 
-Usage: check_binary_version.py <expected-version> <binary> [<binary> ...]
+Usage: check_binary_version.py <expected-version> <target> [<target> ...]
 
-Runs `<binary> --version` and fails unless it exits 0 and prints the expected
-version as a whole word on its first line. Used as a `meson test`.
+<target> is a fixed name (server or agent); the script maps it to a path
+relative to the current directory, which Meson sets to the build root through
+`workdir`. No command-line value is ever used as a program path. Each binary is
+run as `<binary> --version` and must exit 0 and print the expected version as a
+whole word on its first line. Used as a `meson test`.
 """
+import pathlib
 import re
 import subprocess
 import sys
+
+# Build-root-relative locations of the binaries Meson builds.
+TARGETS = {
+    "server": pathlib.Path("server") / "TheWatcherServer",
+    "agent": pathlib.Path("agent") / "TheWatcherAgent",
+}
+SUFFIX = ".exe" if sys.platform == "win32" else ""
 
 
 def main(argv):
@@ -16,13 +27,21 @@ def main(argv):
         print(__doc__, file=sys.stderr)
         return 2
     expected = argv[1]
+    names = argv[2:]
+    unknown = [name for name in names if name not in TARGETS]
+    if unknown:
+        print(f"unknown target(s) {unknown}; choose from {sorted(TARGETS)}", file=sys.stderr)
+        return 2
+    pattern = re.compile(r"(?<![\w.])" + re.escape(expected) + r"(?![\w.])")
     failed = False
-    for binary in argv[2:]:
-        result = subprocess.run([binary, "--version"], capture_output=True, text=True, timeout=60)
+    for name in names:
+        binary = pathlib.Path.cwd() / (str(TARGETS[name]) + SUFFIX)
+        # List form, no shell; the path comes from the constant table above.
+        result = subprocess.run([str(binary), "--version"], capture_output=True, text=True, timeout=60, check=False)
         lines = result.stdout.splitlines()
         first = lines[0] if lines else ""
-        ok = result.returncode == 0 and re.search(r"(?<![\w.])" + re.escape(expected) + r"(?![\w.])", first)
-        print(f"{binary} --version -> rc={result.returncode} {first!r}")
+        ok = result.returncode == 0 and pattern.search(first) is not None
+        print(f"{name} --version -> rc={result.returncode} {first!r}")
         if not ok:
             print(f"FAIL: expected exit 0 and version {expected} on the first line", file=sys.stderr)
             failed = True

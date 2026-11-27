@@ -191,11 +191,14 @@ if python_exe.found()
   test(
     'version_consistency',
     python_exe,
-    args: [files('scripts/check_version_consistency.py'), meson.project_source_root()],
+    args: [files('scripts/check_version_consistency.py')],
   )
   test(
     'cli_version',
     python_exe,
-    args: [files('scripts/check_binary_version.py'), meson.project_version(), server_exe, agent_exe],
+    args: [files('scripts/check_binary_version.py'), meson.project_version(), 'server', 'agent'],
+    # The script resolves fixed names relative to the build root.
+    workdir: meson.project_build_root(),
+    depends: [server_exe, agent_exe],
   )
 endif

@@ -36,6 +36,26 @@ On Windows, the network collector reports IP Helper adapters that line up with
 layer filters, Hyper-V virtual switch plumbing, 6to4/tunnel adapters, and bridge
 devices are filtered before metrics are emitted.
 
+### CPU and memory collector behaviour
+
+- `CpuCollector` takes a baseline tick sample in its constructor. The first
+  `update()` waits until that baseline is at least 100 ms old, so a new or
+  restarted collector reports a real usage value instead of 0%. An `update()`
+  less than 100 ms after the previous sample reports the previous result.
+  Tick sources: `/proc/stat` (Linux), `GetSystemTimes` (Windows),
+  `kern.cp_time`/`kern.cp_times` (FreeBSD), `KERN_CPTIME`/`KERN_CPTIME2`
+  (OpenBSD), `kern.cp_time` (NetBSD). Load averages come from `/proc/loadavg`
+  or `getloadavg`. `cpu_percent_from_delta()` returns 0 for counters that
+  did not advance or went backwards.
+- `MemoryCollector` never lets a subtraction wrap (`saturating_sub`,
+  `swap_usage_from_used`, `swap_usage_from_free`). Swap always satisfies
+  `used + free == total`, and a host with no swap reports 0/0/0. Swap
+  sources: `/proc/meminfo` (Linux), the page files via `EnumPageFilesW`
+  (Windows), `vm.swap_info` (FreeBSD), `struct uvmexp` (OpenBSD) and
+  `struct uvmexp_sysctl` (NetBSD). DragonFly reports no swap.
+  OpenBSD and NetBSD code is written against the man pages and not yet
+  compiled in CI.
+
 The agent also fills static system fields in `Agent::fill_static_info()`:
 
 ```text

@@ -20,7 +20,7 @@ fi
 
 # Only an already-configured directory can be reconfigured: one left
 # half-created by an interrupted setup has no coredata and needs a plain setup.
-if [ -f "${BUILD_DIR}/meson-private/coredata.dat" ]; then
+if [[ -f "${BUILD_DIR}/meson-private/coredata.dat" ]]; then
     log "Reconfiguring ${BUILD_DIR} ..."
     meson setup "${BUILD_DIR}" --reconfigure --buildtype=release --default-library=static --backend=ninja "$@"
 else

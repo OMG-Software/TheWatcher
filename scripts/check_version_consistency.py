@@ -6,7 +6,9 @@ meson.build is the single source of truth. Checked against it:
   packaging/windows/TheWatcher.iss (default AppVersion), and the newest
   released section of CHANGELOG.md.
 
-Usage: check_version_consistency.py [repo-root]
+Usage: check_version_consistency.py
+
+The repository root is derived from this file's location, not from arguments.
 """
 import json
 import pathlib
@@ -18,8 +20,8 @@ def read(root, rel):
     return (root / rel).read_text(encoding="utf-8")
 
 
-def main(argv):
-    root = pathlib.Path(argv[1] if len(argv) > 1 else pathlib.Path(__file__).resolve().parent.parent)
+def main():
+    root = pathlib.Path(__file__).resolve().parents[1]
     match = re.search(r"project\((?:[^)]*?)version:\s*'([^']+)'", read(root, "meson.build"), re.S)
     if not match:
         print("could not find the project version in meson.build", file=sys.stderr)
@@ -52,4 +54,4 @@ def main(argv):
 
 
 if __name__ == "__main__":
-    sys.exit(main(sys.argv))
+    sys.exit(main())
