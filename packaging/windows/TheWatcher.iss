@@ -49,6 +49,22 @@ Filename: "{app}\server\TheWatcherServer.exe"; Parameters: "--uninstall-service"
 Name: "{group}\TheWatcher Dashboard"; Filename: "{app}\dashboard\index.html"; Check: DashboardExists
 
 [Code]
+// Upgrades: stop the running services before any file is replaced, so the
+// executables are not locked and the service registration can be deleted and
+// recreated immediately afterwards. `net stop` waits until the service has
+// stopped. Its exit code is ignored: on a fresh install the services do not
+// exist, so it fails harmlessly.
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+var
+  ResultCode: Integer;
+begin
+  Exec(ExpandConstant('{sys}
+et.exe'), 'stop TheWatcherAgent', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  Exec(ExpandConstant('{sys}
+et.exe'), 'stop TheWatcherServer', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  Result := '';
+end;
+
 function DashboardExists(): Boolean;
 begin
   Result := FileExists(ExpandConstant('{app}\dashboard\index.html'));
@@ -83,6 +99,8 @@ begin
   end;
 end;
 
+// The server parser trims keys and values, so 'SERVER_SECRET_KEY = value' is
+// valid; the migration therefore only looks for the key name.
 // Older installers registered the server service with server.json. The server
 // wrote a KEY=VALUE file there (the same format as TheWatcherServer.conf), so
 // on upgrade the file is COPIED to TheWatcherServer.conf. If that were not
@@ -102,7 +120,7 @@ begin
   NewConf := AddBackslash(Dir) + 'TheWatcherServer.conf';
   if FileExists(NewConf) or not FileExists(OldConf) then
     Exit;
-  if not LoadStringFromFile(OldConf, Raw) or (Pos('SERVER_SECRET_KEY=', String(Raw)) = 0) then
+  if not LoadStringFromFile(OldConf, Raw) or (Pos('SERVER_SECRET_KEY', String(Raw)) = 0) then
   begin
     Log('server.json is not a KEY=VALUE server config; not migrated');
     Exit;

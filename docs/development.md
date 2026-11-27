@@ -100,7 +100,17 @@ usage, services, packages, or custom application health.
    previous length and defaults the new fields (protocol versioning work in
    #57 and #102), a new `SystemMetrics` field needs a coordinated upgrade of
    server and all agents, and old stored rows will not decode. Do not add a
-   field without addressing that. The REST API serialises the same structs as JSON; add the
+   field without addressing that.
+
+   To add the field itself, in `common/metrics.hpp`: (a) in
+   `to_cbor<SystemMetrics>`, `push` the new value (build it first, as the
+   other members are, and `release()` it into the array) at the position you
+   choose and raise `cbor_new_definite_array(11)` to the new count; (b) in
+   `from_cbor<SystemMetrics>`, read it with `array_get(item, <index>)` at the
+   same position, shift the later indices if you inserted in the middle
+   (appending at the end avoids that), and raise the
+   `cbor_array_size(item) != 11` check to the same count. The count and the
+   indices must match in both functions. The REST API serialises the same structs as JSON; add the
    `NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT` mapping for the new
    struct, and the new `SystemMetrics` field, in `server/api_json.hpp`.
 
