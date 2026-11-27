@@ -3,6 +3,7 @@
 #include "store_postgres.hpp"
 
 #include "common/SingleLog.hpp"
+#include "indicators.hpp"
 
 #include <nlohmann/json.hpp>
 
@@ -1651,17 +1652,18 @@ void PostgresStore::delete_runbook(int64_t runbook_id)
 std::optional<RunbookRecord> PostgresStore::get_runbook(const std::string& agent_id, const std::string& indicator,
                                                         const std::string& status)
 {
-    // SEC-11: same selection rules as SqliteStore::get_runbook.
-    const char* params[] = {agent_id.c_str(), indicator.c_str(), status.c_str()};
+    // SEC-11 and #53: same selection rules as SqliteStore::get_runbook.
+    const auto kind = indicators::kind_of(indicator);
+    const char* params[] = {agent_id.c_str(), indicator.c_str(), kind.c_str(), status.c_str()};
     Res res(PQexecParams(conn_, R"(
         SELECT runbook_id,agent_id,indicator,status,url,markdown,notes,created_by,created_at
         FROM runbooks
-        WHERE (agent_id=$1 OR agent_id='') AND (indicator=$2 OR indicator='*') AND status=$3
-        ORDER BY CASE WHEN indicator='*' THEN 1 ELSE 0 END,
-                 CASE WHEN agent_id='' THEN 1 ELSE 0 END, runbook_id DESC
+        WHERE (agent_id=$1 OR agent_id='') AND (indicator=$2 OR indicator=$3 OR indicator='*') AND status=$4
+        ORDER BY CASE WHEN agent_id='' THEN 1 ELSE 0 END,
+                 CASE WHEN indicator=$2 THEN 0 WHEN indicator=$3 THEN 1 ELSE 2 END, runbook_id DESC
         LIMIT 1;
     )",
-                         3, nullptr, params, nullptr, nullptr, 0));
+                         4, nullptr, params, nullptr, nullptr, 0));
     check_res(res.r, "get_runbook");
     if (PQntuples(res.r) == 0)
         return std::nullopt;

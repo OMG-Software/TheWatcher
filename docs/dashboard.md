@@ -263,7 +263,9 @@ which case it is red. Monitoring alert notifications and Alert rows show the
 known hostname as primary text and the agent id as smaller secondary text.
 Alert rows can display the agent's markdown runbook.
 The Runbook action opens a modal that renders the agent markdown as headings,
-paragraphs, lists, code blocks, and safe links.
+paragraphs, lists, code blocks, and safe links. When a runbook link matched the
+alert (see Runbooks), a "Runbook link" opens it in a new tab; only `http` and
+`https` URLs are rendered as links.
 
 ### Users & Groups
 
@@ -306,6 +308,41 @@ Visible to operators and admins. A silence suppresses alerts for one agent (or
 all agents, global accounts only) and one indicator (or all indicators) for a
 number of hours, with a reason. The table lists agent, indicator, reason,
 expiry and creator; operators can delete a silence.
+
+The Indicator picker is filled from `GET /api/indicators`, the list of indicator
+kinds the server raises alerts on (`cpu`, `memory`, `disk`, `network`,
+`process`, `Heartbeat`), so it cannot drift from real alerts. Real alert
+indicators are `cpu`, `memory`, `disk:<mount point>`, `network:<interface>`,
+`process:<name>` and `Heartbeat`. A silence on a kind (`disk`) covers every
+indicator of that kind (`disk:/`, `disk:/data`); the optional mount point,
+interface or process field narrows it to one (`disk:/data`). Rules saved by older
+dashboards under `heartbeat` or `processes` still match.
+
+### Runbooks
+
+Visible to operators and admins. A runbook link attaches a documentation URL to
+an indicator and status (`yellow`, `amber` or `red`). Global admins add global
+links (agent "All agents"); operators add links for agents in their groups.
+The indicator may be an exact name (`disk:/`), a kind (`disk`) or `*`.
+
+When an alert is raised its link is chosen by this precedence, first match wins:
+
+1. this agent's link for the exact indicator
+2. this agent's link for the indicator kind
+3. this agent's `*` link
+4. a global link for the exact indicator
+5. a global link for the kind
+6. the global `*` link
+
+An agent's own link therefore always beats a global one. The link is stored on
+the alert (`runbook_url`). Independently, the agent's markdown runbook (edited in
+the Configure modal, `POST /api/agents/:id/runbook`, operators in the agent's
+groups) is returned as `runbook_markdown` on alerts and in webhook payloads.
+The legacy global `runbooks` table is kept as the store for these links: it
+already holds the indicator/status/URL data the issue asks for, existing rows
+keep working unchanged, and per-agent rows use its `agent_id` column.
+URLs must be absolute `http://` or `https://` URLs without whitespace, at most
+2048 bytes; `javascript:`, `data:` and other schemes are rejected.
 
 ### Maintenance
 
@@ -362,9 +399,10 @@ The dashboard consumes:
 | `GET /api/views/:id` | Read a visible view. |
 | `PUT /api/views/:id` | Update a view's name, agents, visibility, or group. |
 | `DELETE /api/views/:id` | Delete an editable view. |
-| `GET /api/runbooks` | List legacy global runbook links. |
-| `POST /api/runbooks` | Create a legacy global runbook link; `global_admin` only. |
-| `DELETE /api/runbooks/:id` | Delete a legacy global runbook link; `global_admin` only. |
+| `GET /api/runbooks` | List runbook links visible to the user (global ones, plus agent-scoped ones for visible agents). |
+| `POST /api/runbooks` | Create a runbook link (`indicator`, `status`, `url`, `notes`, optional `agent_id`). Global (no `agent_id`): `global_admin`. Agent-scoped: operator with access to the agent (403 outside their groups, 404 unknown agent, 400 invalid URL). |
+| `DELETE /api/runbooks/:id` | Delete a runbook link; same permissions as creating it. 404 when it does not exist. |
+| `GET /api/indicators` | List the indicator kinds alerts are raised on: `name`, `label`, `qualifier`. |
 
 Agent rows include:
 

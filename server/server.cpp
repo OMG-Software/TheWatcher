@@ -5,6 +5,7 @@
 #include "common/crypto.hpp"
 #include "common/metrics.hpp"
 #include "common/zmq_limits.hpp"
+#include "indicators.hpp"
 #include "report_generator.hpp"
 #include "status_engine.hpp"
 
@@ -249,7 +250,7 @@ void Server::run(StartupSignal* startup)
                 {
                     AlertRecord alert;
                     alert.agent_id = agent_id;
-                    alert.indicator = "Heartbeat";
+                    alert.indicator = std::string(indicators::kHeartbeat);
                     alert.old_status = "green";
                     alert.new_status = "red";
                     alert.message = "Agent has gone offline (no heartbeat received)";
@@ -593,7 +594,7 @@ void Server::handle_router_frame(zmq::socket_t& router)
             store_->insert_log_match(log_match_record);
 
             // Raise an alert on the named indicator so it shows up on the dashboard.
-            if (!store_->is_silenced(agent_id, match.indicator_name, server_now))
+            if (!is_alert_silenced(*store_, agent_id, match.indicator_name, server_now))
             {
                 AlertRecord alert;
                 alert.agent_id = agent_id;

@@ -55,6 +55,15 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 
+- Silences on `disk`, `network` and `process` never matched real alerts, which
+  are named `disk:<mount>`, `network:<interface>` and `process:<name>`. A
+  silence on a kind now covers all its indicators, indicator names live in one
+  header (`server/indicators.hpp`) that a test checks against the status engine,
+  and the old `heartbeat` and `processes` spellings still match (#151).
+- Runbook URLs are validated (http and https only) when created and again before
+  they are attached to an alert, so `javascript:` links cannot be stored or
+  rendered (#11).
+
 - Dashboard: `tsc` no longer writes `.js`/`.d.ts` files into `dashboard/src`
   (`noEmit`), the 21 committed compiled twins are removed, and vitest runs
   only `*.test.ts(x)`. Before, Vite served the stale twins and every test ran
@@ -136,6 +145,16 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   runbooks configured." before its first load (#104, #105, #106, #166).
 
 ### Changed
+
+- Alert runbook links now follow a documented precedence: an agent's own
+  runbook beats a global one, and within each the exact indicator beats its
+  kind (`disk` for `disk:/`), which beats `*`. Alerts and webhook payloads carry
+  the matched `runbook_url`, and webhook payloads also carry the agent's
+  `runbook_markdown`. Operators can create and delete runbook links for agents in
+  their groups; global links stay admin-only. The runbooks table is kept as the
+  link store, so existing rows keep working (#53, #11).
+- The dashboard has a Runbooks page, shows an alert's runbook link, and builds
+  the Silences indicator picker from the new `GET /api/indicators` (#53, #11, #151).
 
 - The server config save now uses the shared `common::write_private_file_atomic`
   helper (atomic, owner-only write) that the agent config also uses; the

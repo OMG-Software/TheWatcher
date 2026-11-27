@@ -9,6 +9,7 @@
 #include <catch2/catch_test_macros.hpp>
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <chrono>
 #include <optional>
 #include <string>
@@ -241,6 +242,163 @@ SCENARIO("Views cannot reference agents outside the creator's scope")
             {
                 REQUIRE(res);
                 REQUIRE(res->status == 201);
+            }
+        }
+    }
+}
+SCENARIO("Runbook URLs are validated and operators manage their own agents' runbooks")
+{
+    GIVEN("a server with group A and group B, an agent in each, and an operator in group B")
+    {
+        ScopeFixture fx;
+        fx.start_and_login();
+
+        fx.seed_two_groups("rbop", "rbop_operator", "group_operator");
+
+        auto post_runbook = [&](const json& body) {
+            return fx.client.Post("/api/runbooks", body.dump(), "application/json");
+        };
+
+        WHEN("the admin posts a runbook with a javascript: URL")
+        {
+            auto res = post_runbook({
+                {"indicator", "cpu"                },
+                {"status",    "red"                },
+                {"url",       "javascript:alert(1)"}
+            });
+
+            THEN("it is rejected with 400")
+            {
+                REQUIRE(res);
+                REQUIRE(res->status == 400);
+            }
+        }
+
+        WHEN("the admin posts a runbook for an agent that does not exist")
+        {
+            auto res = post_runbook({
+                {"agent_id",  "no-such-agent"             },
+                {"indicator", "cpu"                       },
+                {"status",    "red"                       },
+                {"url",       "https://wiki.example.com/x"}
+            });
+
+            THEN("it is rejected with 404")
+            {
+                REQUIRE(res);
+                REQUIRE(res->status == 404);
+            }
+        }
+
+        AND_WHEN("the group B operator signs in")
+        {
+            REQUIRE(fx.login("rbop_operator", "sc0pepw!"));
+
+            THEN("they can add a runbook for an agent in their group")
+            {
+                auto res = post_runbook({
+                    {"agent_id",  "rbop-agent-b"                 },
+                    {"indicator", "disk"                         },
+                    {"status",    "red"                          },
+                    {"url",       "https://wiki.example.com/disk"}
+                });
+                REQUIRE(res);
+                REQUIRE(res->status == 201);
+                const auto id = json::parse(res->body).at("runbook_id").get<int64_t>();
+
+                AND_THEN("they can delete it again")
+                {
+                    auto del = fx.client.Delete("/api/runbooks/" + std::to_string(id));
+                    REQUIRE(del);
+                    REQUIRE(del->status == 200);
+                }
+            }
+
+            THEN("they cannot add a runbook for an agent outside their group")
+            {
+                auto res = post_runbook({
+                    {"agent_id",  "rbop-agent-a"                 },
+                    {"indicator", "disk"                         },
+                    {"status",    "red"                          },
+                    {"url",       "https://wiki.example.com/disk"}
+                });
+                REQUIRE(res);
+                REQUIRE(res->status == 403);
+            }
+
+            THEN("they cannot add a global runbook")
+            {
+                auto res = post_runbook({
+                    {"indicator", "disk"                         },
+                    {"status",    "red"                          },
+                    {"url",       "https://wiki.example.com/disk"}
+                });
+                REQUIRE(res);
+                REQUIRE(res->status == 403);
+            }
+
+            THEN("they can save the markdown runbook of an agent in their group")
+            {
+                auto res = fx.client.Post("/api/agents/rbop-agent-b/runbook",
+                                          json{
+                                              {"markdown", "# Steps"}
+                }
+                                              .dump(),
+                                          "application/json");
+                REQUIRE(res);
+                REQUIRE(res->status == 200);
+            }
+        }
+    }
+}
+
+SCENARIO("The indicator kinds endpoint lists the names alerts use")
+{
+    GIVEN("a signed-in server")
+    {
+        ScopeFixture fx;
+        fx.start_and_login();
+
+        WHEN("GET /api/indicators is requested")
+        {
+            auto res = fx.client.Get("/api/indicators");
+
+            THEN("the kinds the status engine raises are returned")
+            {
+                REQUIRE(res);
+                REQUIRE(res->status == 200);
+                const auto kinds = json::parse(res->body);
+                std::vector<std::string> names;
+                for (const auto& kind : kinds)
+                    names.push_back(kind.at("name").get<std::string>());
+                for (const char* wanted : {"cpu", "memory", "disk", "network", "process", "Heartbeat"})
+                    REQUIRE(std::find(names.begin(), names.end(), wanted) != names.end());
+            }
+        }
+
+        WHEN("a silence is created for the old lower-case 'heartbeat' name")
+        {
+            auto res = fx.client.Post("/api/silences",
+                                      json{
+                                          {"agent_id",  "*"                                                               },
+                                          {"indicator", "heartbeat"                                                       },
+                                          {"until_ms",  std::chrono::duration_cast<std::chrono::milliseconds>(
+                                                           std::chrono::system_clock::now().time_since_epoch())
+                                                               .count() +
+                                                           3'600'000}
+            }
+                                          .dump(),
+                                      "application/json");
+            REQUIRE(res);
+            REQUIRE(res->status == 200);
+
+            THEN("it is stored under the canonical name the engine raises")
+            {
+                auto list = fx.client.Get("/api/silences");
+                REQUIRE(list);
+                const auto rules = json::parse(list->body);
+                REQUIRE(rules.size() == 1);
+                REQUIRE(rules[0].at("indicator") == "Heartbeat");
             }
         }
     }

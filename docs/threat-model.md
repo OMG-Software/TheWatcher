@@ -136,8 +136,13 @@ working document for audit, design review, and regression testing.
   `Origin` or absolute `Referer` header is present. The comparison uses the
   browser origin tuple of scheme, host, and default-normalized port; local
   loopback dashboard ports are the only allowed different-port exception.
-- Legacy global runbook mutations require `global_admin` because those runbooks
-  are consumed by all alert generation.
+- Global runbook links require `global_admin` because they are attached to every
+  agent's alerts; agent-scoped links need an operator with access to that agent.
+- Runbook URLs are validated on write (absolute http/https, no whitespace or
+  control characters, 2048 bytes) and re-checked when attached to an alert or
+  rendered, so a `javascript:` URL in an old database is neither sent to webhook
+  receivers nor shown as a link. Residual risk: a link may point to any http(s)
+  site an authorised operator chooses.
 - Log-monitor paths make an agent read local files and surface their contents
   on the dashboard, so configuring them requires `global_admin`; the agent
   additionally only reads regular files inside its local `LOG_ALLOWED_DIRS`.

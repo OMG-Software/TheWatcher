@@ -5,6 +5,7 @@
 #endif
 
 #include "common/SingleLog.hpp"
+#include "indicators.hpp"
 
 #include <nlohmann/json.hpp>
 
@@ -1704,22 +1705,26 @@ std::optional<RunbookRecord> SqliteStore::get_runbook(const std::string& agent_i
                                                       const std::string& status)
 {
     // SEC-11: only this agent's runbooks or generic ones (agent_id='') may be
-    // attached, so an alert never carries another agent's runbook URL. Prefer
-    // an exact indicator over '*', then an agent-specific runbook over a
-    // generic one, then the newest; limit to 1.
+    // attached, so an alert never carries another agent's runbook URL. An
+    // agent's own runbook beats a generic one (#53); within each, the exact
+    // indicator beats its kind ("disk" for "disk:/"), which beats '*'; then the
+    // newest wins. Limit to 1.
+    const auto kind = indicators::kind_of(indicator);
     Stmt st;
     check(sqlite3_prepare_v2(db_,
                              "SELECT runbook_id,agent_id,indicator,status,url,markdown,notes,created_by,created_at "
                              "FROM runbooks "
-                             "WHERE (agent_id=? OR agent_id='') AND (indicator=? OR indicator='*') AND status=? "
-                             "ORDER BY CASE WHEN indicator='*' THEN 1 ELSE 0 END, "
-                             "CASE WHEN agent_id='' THEN 1 ELSE 0 END, runbook_id DESC "
+                             "WHERE (agent_id=?1 OR agent_id='') AND (indicator=?2 OR indicator=?3 OR indicator='*') "
+                             "AND status=?4 "
+                             "ORDER BY CASE WHEN agent_id='' THEN 1 ELSE 0 END, "
+                             "CASE WHEN indicator=?2 THEN 0 WHEN indicator=?3 THEN 1 ELSE 2 END, runbook_id DESC "
                              "LIMIT 1;",
                              -1, &st.s, nullptr),
           db_, "prepare get_runbook");
     sqlite3_bind_text(st.s, 1, agent_id.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(st.s, 2, indicator.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(st.s, 3, status.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st.s, 3, kind.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st.s, 4, status.c_str(), -1, SQLITE_TRANSIENT);
     if (sqlite3_step(st.s) == SQLITE_ROW)
         return row_to_runbook(st.s);
     return std::nullopt;

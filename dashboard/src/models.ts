@@ -170,6 +170,14 @@ export interface AlertRecord {
   runbook_markdown?: string;
 }
 
+/** An indicator kind the server raises alerts on (GET /api/indicators). */
+export interface IndicatorKind {
+  name: string;
+  label: string;
+  /** What follows the colon in a per-item indicator ("mount point"); empty when the kind has none. */
+  qualifier: string;
+}
+
 export interface RunbookRecord {
   runbook_id: number;
   agent_id: string;

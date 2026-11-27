@@ -3,6 +3,8 @@
 #include "common/SingleLog.hpp"
 #include "common/metrics.hpp"
 #include "common/protocol.hpp"
+#include "indicators.hpp"
+#include "runbook.hpp"
 #include "webhook_security.hpp"
 
 #include <nlohmann/json.hpp>
@@ -80,16 +82,7 @@ namespace
             return;
         }
 
-        json payload = {
-            {"alert_id",    alert_id         },
-            {"agent_id",    alert.agent_id   },
-            {"indicator",   alert.indicator  },
-            {"old_status",  alert.old_status },
-            {"new_status",  alert.new_status },
-            {"message",     alert.message    },
-            {"created_at",  alert.created_at },
-            {"runbook_url", alert.runbook_url},
-        };
+        const auto payload = build_webhook_payload(store, alert, alert_id);
 
         httplib::Client client(target->host, target->port);
         client.set_connection_timeout(2, 0);
@@ -178,7 +171,7 @@ void StatusEngine::evaluate_metrics(const std::string& agent_id, const SystemMet
     const auto config = agent ? agent->collector_config : default_collector_config();
 
     {
-        const auto indicator = std::string("cpu");
+        const auto indicator = std::string(indicators::kCpu);
         const auto raw = classify_percent(metrics.cpu.usage_percent, config.cpu);
         const auto previous_row = store_.latest_status_for_indicator(agent_id, indicator);
         const auto previous = previous_row ? status_from_string(previous_row->new_status) : IndicatorStatus::Grey;
@@ -192,7 +185,7 @@ void StatusEngine::evaluate_metrics(const std::string& agent_id, const SystemMet
     }
 
     {
-        const auto indicator = std::string("memory");
+        const auto indicator = std::string(indicators::kMemory);
         const auto raw = classify_percent(metrics.memory.usage_percent, config.memory);
         const auto previous_row = store_.latest_status_for_indicator(agent_id, indicator);
         const auto previous = previous_row ? status_from_string(previous_row->new_status) : IndicatorStatus::Grey;
@@ -217,7 +210,7 @@ void StatusEngine::evaluate_metrics(const std::string& agent_id, const SystemMet
         const auto thresholds = disk_config ? disk_config->thresholds : PercentThresholds{};
         const AnomalyConfig no_anomaly{};
         const auto& anomaly_cfg = disk_config ? disk_config->anomaly : no_anomaly;
-        const auto indicator = "disk:" + disk.mount_point;
+        const auto indicator = indicators::make(indicators::kDisk, disk.mount_point);
         const auto raw = classify_percent(disk.usage_percent, thresholds);
         const auto previous_row = store_.latest_status_for_indicator(agent_id, indicator);
         const auto previous = previous_row ? status_from_string(previous_row->new_status) : IndicatorStatus::Grey;
@@ -249,7 +242,7 @@ void StatusEngine::evaluate_metrics(const std::string& agent_id, const SystemMet
         if (!network.is_up)
             raw = IndicatorStatus::Red;
 
-        const auto indicator = "network:" + network.interface_name;
+        const auto indicator = indicators::make(indicators::kNetwork, network.interface_name);
         const auto previous_row = store_.latest_status_for_indicator(agent_id, indicator);
         const auto previous = previous_row ? status_from_string(previous_row->new_status) : IndicatorStatus::Grey;
         const auto confirmed = confirm_numeric_status(agent_id, indicator, previous, raw, config.network_readings);
@@ -276,7 +269,7 @@ void StatusEngine::evaluate_metrics(const std::string& agent_id, const SystemMet
                 ++seen;
         }
 
-        const auto indicator = "process:" + watch.name;
+        const auto indicator = indicators::make(indicators::kProcess, watch.name);
         IndicatorStatus next = IndicatorStatus::Green;
         if (seen < watch.expected_count)
         {
@@ -500,6 +493,30 @@ IndicatorStatus StatusEngine::maybe_stale_status(IndicatorStatus threshold_statu
     return threshold_status;
 }
 
+bool is_alert_silenced(Store& store, const std::string& agent_id, const std::string& indicator, int64_t now_ms)
+{
+    const auto candidates = indicators::silence_candidates(indicator);
+    return std::any_of(candidates.begin(), candidates.end(), [&](const std::string& name) {
+        return store.is_silenced(agent_id, name, now_ms);
+    });
+}
+
+json build_webhook_payload(Store& store, const AlertRecord& alert, int64_t alert_id)
+{
+    const auto agent = store.get_agent(alert.agent_id);
+    return {
+        {"alert_id",         alert_id                                       },
+        {"agent_id",         alert.agent_id                                 },
+        {"indicator",        alert.indicator                                },
+        {"old_status",       alert.old_status                               },
+        {"new_status",       alert.new_status                               },
+        {"message",          alert.message                                  },
+        {"created_at",       alert.created_at                               },
+        {"runbook_url",      alert.runbook_url                              },
+        {"runbook_markdown", agent ? agent->runbook_markdown : std::string()},
+    };
+}
+
 void StatusEngine::record_transition(const std::string& agent_id, const std::string& indicator, IndicatorStatus next,
                                      const std::string& message, int64_t timestamp_ms)
 {
@@ -514,7 +531,7 @@ void StatusEngine::record_transition(const std::string& agent_id, const std::str
 
     if (previous_row && is_worse_status(previous, next))
     {
-        if (store_.is_silenced(agent_id, indicator, timestamp_ms))
+        if (is_alert_silenced(store_, agent_id, indicator, timestamp_ms))
         {
             LOGF_DEBUG("Alert suppressed by silence rule agent_id=%s indicator=%s", agent_id.c_str(),
                        indicator.c_str());
@@ -528,9 +545,7 @@ void StatusEngine::record_transition(const std::string& agent_id, const std::str
             alert.new_status = status_to_string(next);
             alert.message = final_message;
             alert.created_at = timestamp_ms;
-            const auto runbook = store_.get_runbook(agent_id, indicator, alert.new_status);
-            if (runbook)
-                alert.runbook_url = runbook->url;
+            alert.runbook_url = resolve_runbook_url(store_, agent_id, indicator, alert.new_status);
             const auto alert_id = store_.insert_alert(alert);
             LOGF_WARNING("Generated alert id=%lld agent_id=%s indicator=%s old=%s new=%s",
                          static_cast<long long>(alert_id), agent_id.c_str(), indicator.c_str(),

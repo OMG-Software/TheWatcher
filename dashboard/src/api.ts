@@ -9,6 +9,7 @@ import type {
   RunbookRecord,
   ServerSettings,
   SessionInfo,
+  IndicatorKind,
   SilenceRecord,
   StatusHistoryRow,
   UserRecord,
@@ -368,8 +369,13 @@ export async function fetchRunbooks(): Promise<RunbookRecord[]> {
   return fetchJson<RunbookRecord[]>('/api/runbooks');
 }
 
-export async function createRunbook(indicator: string, status: string, url: string, notes: string): Promise<RunbookRecord> {
-  return jsonPost<RunbookRecord>('/api/runbooks', { indicator, status, url, notes });
+export async function fetchIndicatorKinds(): Promise<IndicatorKind[]> {
+  return fetchJson<IndicatorKind[]>('/api/indicators');
+}
+
+/** `agentId` empty makes a global runbook (global admin only); otherwise it belongs to that agent. */
+export async function createRunbook(indicator: string, status: string, url: string, notes: string, agentId = ''): Promise<RunbookRecord> {
+  return jsonPost<RunbookRecord>('/api/runbooks', { agent_id: agentId, indicator, status, url, notes });
 }
 
 export async function deleteRunbook(runbookId: number): Promise<void> {

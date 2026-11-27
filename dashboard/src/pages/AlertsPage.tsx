@@ -11,7 +11,7 @@ import { usePolling } from '../hooks/usePolling';
 import type { RunAction } from '../hooks/useRunAction';
 import type { DashboardAgent } from '../models';
 import { toDisplayAlerts } from '../status';
-import { colorLabel } from '../uiLogic';
+import { colorLabel, safeRunbookUrl } from '../uiLogic';
 
 const ARCHIVED_POLL_MS = 5000;
 
@@ -145,6 +145,7 @@ export function AlertsPage({
             const isArchived = alert.deleted_at > 0;
             const agent = agents.find((candidate) => candidate.id === alert.agentId);
             const runbookMarkdown = alert.runbook_markdown || agent?.runbookMarkdown || '';
+            const runbookUrl = safeRunbookUrl(alert.runbook_url);
             return (
               <tr key={alert.alert_id} className={isArchived ? 'row-archived' : ''}>
                 <td className="col-check">
@@ -158,6 +159,11 @@ export function AlertsPage({
                 <td className="uptime">{new Date(alert.created_at).toLocaleString()}</td>
                 <td>
                   {alert.message}
+                  {runbookUrl ? (
+                    <a className="runbook-link" href={runbookUrl} rel="noopener noreferrer" target="_blank">
+                      <BookOpen size={12} /> Runbook link
+                    </a>
+                  ) : null}
                   {runbookMarkdown.trim() ? (
                     <button
                       className="runbook-link"

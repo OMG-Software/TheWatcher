@@ -3,7 +3,9 @@
 #include "api_json.hpp"
 #include "common/SingleLog.hpp"
 #include "common/protocol.hpp"
+#include "indicators.hpp"
 #include "report_generator.hpp"
+#include "runbook.hpp"
 
 #include <nlohmann/json.hpp>
 
@@ -2718,6 +2720,24 @@ void ApiServer::setup_routes()
         set_json(res, arr);
     });
 
+    // GET /api/indicators — the indicator kinds alerts are raised on (viewer+).
+    // A silence or runbook for a kind ("disk") also covers its per-item
+    // indicators ("disk:/"); the dashboard builds its pickers from this list.
+    http_->Get("/api/indicators", [this](const httplib::Request& req, httplib::Response& res) {
+        if (!require_role(req, res, "viewer"))
+            return;
+        json arr = json::array();
+        for (const auto& kind : indicators::kinds())
+        {
+            arr.push_back(json{
+                {"name",      std::string(kind.name)     },
+                {"label",     std::string(kind.label)    },
+                {"qualifier", std::string(kind.qualifier)}
+            });
+        }
+        set_json(res, arr);
+    });
+
     // POST /api/silences — create a silence rule (operator+)
     http_->Post("/api/silences", [this](const httplib::Request& req, httplib::Response& res) {
         auto session = require_role(req, res, "operator");
@@ -2736,7 +2756,10 @@ void ApiServer::setup_routes()
             const auto body = json::parse(req.body);
             SilenceRecord rec;
             rec.agent_id = body.value("agent_id", std::string("*"));
-            rec.indicator = body.value("indicator", std::string("*"));
+            // Store the engine's spelling so the rule matches real alerts.
+            rec.indicator = indicators::canonical(body.value("indicator", std::string("*")));
+            if (rec.indicator.empty() || rec.indicator.size() > 256)
+                throw std::runtime_error("indicator must be 1 to 256 characters");
             rec.reason = body.value("reason", std::string(""));
             if (!is_global_role(session->role))
             {
@@ -3100,21 +3123,15 @@ void ApiServer::setup_routes()
         }
     });
 
-    // POST /api/runbooks — create a runbook (admin only)
+    // POST /api/runbooks — create a runbook link. A global runbook (no
+    // agent_id) needs a global admin; one scoped to an agent needs an operator
+    // who can access that agent.
     http_->Post("/api/runbooks", [this](const httplib::Request& req, httplib::Response& res) {
         try
         {
-            auto session = require_role(req, res, "viewer");
+            auto session = require_role(req, res, "operator");
             if (!session)
                 return;
-            if (normalize_role(session->role) != "global_admin")
-            {
-                res.status = 403;
-                set_json(res, json{
-                                  {"error", "permission denied"}
-                });
-                return;
-            }
             if (!is_json_content_type(req))
             {
                 res.status = 415;
@@ -3128,16 +3145,50 @@ void ApiServer::setup_routes()
             // SEC-11: an optional agent_id scopes the runbook to one agent;
             // it is only shown to sessions that can see that agent.
             rec.agent_id = body.value("agent_id", std::string(""));
-            rec.indicator = body.value("indicator", std::string("*"));
+            if (rec.agent_id.empty())
+            {
+                if (normalize_role(session->role) != "global_admin")
+                {
+                    res.status = 403;
+                    set_json(res, json{
+                                      {"error", "permission denied"}
+                    });
+                    return;
+                }
+            }
+            else
+            {
+                if (!store_.get_agent(rec.agent_id))
+                {
+                    res.status = 404;
+                    set_json(res, json{
+                                      {"error", "agent not found"}
+                    });
+                    return;
+                }
+                if (!can_access_agent(*session, rec.agent_id))
+                {
+                    res.status = 403;
+                    set_json(res, json{
+                                      {"error", "agent is outside the user's groups"}
+                    });
+                    return;
+                }
+            }
+            rec.indicator = indicators::canonical(body.value("indicator", std::string("*")));
             rec.status = body.at("status").get<std::string>();
             rec.url = body.at("url").get<std::string>();
             rec.notes = body.value("notes", std::string(""));
             rec.created_by = session->username;
             rec.created_at = now_ms();
+            if (rec.indicator.empty() || rec.indicator.size() > 256)
+                throw std::runtime_error("indicator must be 1 to 256 characters");
+            if (rec.notes.size() > 1024)
+                throw std::runtime_error("notes must be 1024 characters or fewer");
             if (rec.url.empty())
                 throw std::runtime_error("url is required");
-            if (rec.url.rfind("https://", 0) != 0 && rec.url.rfind("http://", 0) != 0)
-                throw std::runtime_error("url must start with https:// or http://");
+            if (!is_valid_runbook_url(rec.url))
+                throw std::runtime_error("url must be an http:// or https:// URL without spaces, at most 2048 bytes");
             if (rec.status != "yellow" && rec.status != "amber" && rec.status != "red")
                 throw std::runtime_error("status must be yellow, amber, or red");
             const auto id = store_.create_runbook(rec);
@@ -3154,14 +3205,31 @@ void ApiServer::setup_routes()
         }
     });
 
-    // DELETE /api/runbooks/:id — delete a runbook (admin only)
+    // DELETE /api/runbooks/:id — delete a runbook. Same permissions as creating
+    // it: global admin for a global runbook, an operator with access to the
+    // agent for an agent-scoped one.
     http_->Delete("/api/runbooks/:id", [this](const httplib::Request& req, httplib::Response& res) {
         try
         {
-            auto session = require_role(req, res, "viewer");
+            auto session = require_role(req, res, "operator");
             if (!session)
                 return;
-            if (normalize_role(session->role) != "global_admin")
+            const auto id = std::stoll(req.path_params.at("id"));
+            const auto rows = store_.list_runbooks();
+            const auto it = std::find_if(rows.begin(), rows.end(), [id](const RunbookRecord& r) {
+                return r.runbook_id == id;
+            });
+            if (it == rows.end())
+            {
+                res.status = 404;
+                set_json(res, json{
+                                  {"error", "runbook not found"}
+                });
+                return;
+            }
+            const bool allowed = it->agent_id.empty() ? normalize_role(session->role) == "global_admin"
+                                                      : can_access_agent(*session, it->agent_id);
+            if (!allowed)
             {
                 res.status = 403;
                 set_json(res, json{
@@ -3169,7 +3237,6 @@ void ApiServer::setup_routes()
                 });
                 return;
             }
-            const auto id = std::stoll(req.path_params.at("id"));
             store_.delete_runbook(id);
             set_json(res, json{
                               {"ok", true}
