@@ -38,13 +38,14 @@ export function App() {
 /** Everything behind the login: top bar, summary cards and the page router. Unmounting it stops all polling. */
 function Dashboard({ session, onSignOut }: { session: SessionInfo; onSignOut: () => void }) {
   const [view, setView] = React.useState<DashboardView>('monitoring');
-  const { activeViewId, setActiveViewId } = useActiveView();
   const [expanded, setExpanded] = React.useState<Set<string>>(new Set());
   const [configAgentId, setConfigAgentId] = React.useState<string | null>(null);
   const [overviewGroupFilter, setOverviewGroupFilter] = React.useState<OverviewGroupFilter>('all');
 
   const { agents, pending, groups, alerts, allAlerts, users, maintenanceWindows, silences, customViews, sectionErrors, loadedAt, error, loading, refresh } = useDashboardData();
   const { busyAction, runAction, failure, clearFailure } = useRunAction(refresh);
+  // The filter is only trusted once the views list is known: not while it is loading or failed.
+  const { activeViewId, setActiveViewId, view: activeView, resolved: viewResolved } = useActiveView(customViews, loadedAt !== null && !sectionErrors.views);
 
   const counts = summaryCounts(agents);
   const displayAlerts = toDisplayAlerts(alerts, agents);
@@ -127,16 +128,21 @@ function Dashboard({ session, onSignOut }: { session: SessionInfo; onSignOut: ()
               ))}
             </div>
           ) : null}
-          {activeViewId != null ? (
+          {activeView ? (
             <div className="banner">
-              Filtered to view: <strong>{customViews.find((v) => v.view_id === activeViewId)?.name ?? 'Unknown'}</strong>
+              Filtered to view: <strong>{activeView.name}</strong>
               <button className="text-button banner-action" onClick={() => setActiveViewId(null)}>Clear</button>
             </div>
           ) : null}
+          {activeViewId != null && !activeView && sectionErrors.views ? (
+            <div className="banner">
+              The selected view could not be loaded, so all agents are shown.
+              <button className="text-button banner-action" onClick={() => setActiveViewId(null)}>Clear</button>
+            </div>
+          ) : null}
+          {viewResolved || sectionErrors.views ? (
           <MonitoringPage
-            agents={activeViewId != null
-              ? agents.filter((a) => customViews.find((v) => v.view_id === activeViewId)?.agent_ids.includes(a.id) ?? false)
-              : agents}
+            agents={activeView ? agents.filter((a) => activeView.agent_ids.includes(a.id)) : agents}
             expanded={expanded}
             groupFilter={overviewGroupFilter}
             groups={groups}
@@ -144,6 +150,7 @@ function Dashboard({ session, onSignOut }: { session: SessionInfo; onSignOut: ()
             setExpanded={setExpanded}
             setGroupFilter={setOverviewGroupFilter}
           />
+          ) : <div className="banner">Loading view...</div>}
         </>
       ) : null}
       {!unloaded && view === 'views' ? (

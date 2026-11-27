@@ -137,6 +137,35 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   change is now actually reported (`refresh()` returns the load error); modal
   backdrops are marked `role="presentation"` (#104, #105, #106, #166).
 
+- Dashboard: destructive actions (delete agent, user, view, maintenance
+  window; bulk archive) now ask for confirmation in a dialog that names the
+  target (#109).
+- Dashboard: Alerts bulk actions only count and act on alerts that are on
+  screen, and the agent filter lists agents that only have archived alerts
+  (#110).
+- Dashboard: an expanded Monitoring row refreshes its metric history and log
+  matches on the poll interval, with cancellation and per-part errors (#111).
+  Archived alerts no longer refetch on every render; the polling hook fixed
+  that earlier.
+- Dashboard: runbooks render numbered lists, inline code, bold, italic, line
+  breaks and links with parentheses in the URL, still without injecting HTML
+  (#113).
+- Dashboard: health shows the status engine's verdict instead of classifying
+  the latest sample, so a one-sample spike is not red when no alert is raised;
+  an offline host reads Offline in the row as in the counter (#114).
+- Dashboard: accessibility: a shared accessible dialog, keyboard row
+  expansion, status in words on component dots, labelled icon buttons and
+  selects, `aria-current` tabs, visible focus, `autocomplete` on login, and an
+  accessible info tooltip replacing `title=` help (#115).
+- Dashboard: a view filter whose view was deleted or is not visible is dropped
+  instead of showing an empty fleet (#165).
+- Dashboard: components with nothing monitored (no disks, interfaces or process
+  watches) no longer hold a healthy host in Warning (#167).
+- Dashboard: the maintenance button no longer sends a hard-coded reason; the
+  operator can enter one (optional).
+- Dashboard: time is read through a clock hook, not during render, and the
+  `react-hooks` warnings in the files touched are fixed.
+
 ### Changed
 
 - The server config save now uses the shared `common::write_private_file_atomic`
@@ -184,6 +213,12 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   devDependency versions): role gating, action and load errors, 401 to login,
   polling guard and hidden-tab pause, Settings after a failed load, and forms
   after a failed save (#118).
+- `GET /api/agents` returns `indicator_status`, the status engine's latest
+  status per indicator, so the dashboard can show what alerting acted on
+  (#114).
+- Dashboard Settings: status history, alerts and log matches retention fields
+  (enabled when the server reports them), and a notice when an Alerts list
+  reaches the server's 1000-alert cap.
 
 ## [0.8.0] - 2026-11-02
 

@@ -1,8 +1,10 @@
 import React from 'react';
-import { Pause, Play, Plus, SlidersHorizontal, Trash2, X } from 'lucide-react';
+import { Pause, Play, Plus, SlidersHorizontal, Trash2 } from 'lucide-react';
 import { changeUserPassword, createGroup, createUser, deleteUser, disableUser, enableUser } from '../api';
 import { ActionError } from '../components/ActionError';
 import { ActionButton } from '../components/ActionButton';
+import { ConfirmDialog } from '../components/ConfirmDialog';
+import { Modal } from '../components/Modal';
 import { ActionFailureContext, type RunAction } from '../hooks/useRunAction';
 import type { GroupRecord, SessionInfo, UserRecord } from '../models';
 import { canManageGroups, canManageUsers, isGlobal } from '../permissions';
@@ -28,6 +30,7 @@ export function UsersPage({
   const [groupChoice, setGroupId] = React.useState<number>(groups[0]?.group_id ?? 0);
   const [pwUserId, setPwUserId] = React.useState<number | null>(null);
   const [pwValue, setPwValue] = React.useState('');
+  const [deletingUser, setDeletingUser] = React.useState<UserRecord | null>(null);
   const { clear } = React.useContext(ActionFailureContext);
   const pwKey = `user:${pwUserId}:pw`;
   const pwBusy = busyAction === pwKey;
@@ -48,16 +51,12 @@ export function UsersPage({
   return (
     <main className="table-wrap management-wrap">
       {pwUserId !== null ? (
-        <div className="modal-backdrop" role="presentation" onClick={closePw}>
-          <div className="modal-panel" onClick={(e) => e.stopPropagation()}>
-            <div className="modal-header">
-              <h2>Change Password</h2>
-              <button className="icon-button" disabled={pwBusy} onClick={closePw} aria-label="Close"><X size={14} /></button>
-            </div>
+        <Modal dismissible={!pwBusy} onClose={closePw} title="Change Password">
             <label>
               New password
               <input
                 type="password"
+                autoComplete="new-password"
                 autoFocus
                 value={pwValue}
                 onChange={(e) => setPwValue(e.target.value)}
@@ -82,8 +81,19 @@ export function UsersPage({
                 Save
               </button>
             </div>
-          </div>
-        </div>
+        </Modal>
+      ) : null}
+      {deletingUser ? (
+        <ConfirmDialog
+          busy={busyAction === `user:${deletingUser.user_id}:delete`}
+          confirmLabel="Delete user"
+          danger
+          errorKey={`user:${deletingUser.user_id}:delete`}
+          message={<>Delete user <strong>{deletingUser.username}</strong>? Their sessions end and the account cannot be recovered.</>}
+          onCancel={() => setDeletingUser(null)}
+          onConfirm={() => runAction(`user:${deletingUser.user_id}:delete`, () => deleteUser(deletingUser.user_id), { inline: true })}
+          title="Delete user"
+        />
       ) : null}
       <div className="management-header"><h1>Users & Groups</h1></div>
       <ActionError actionKey="group:create" />
@@ -115,7 +125,7 @@ export function UsersPage({
           }}
         >
           <input aria-label="Username" placeholder="Username" value={username} onChange={(event) => setUsername(event.target.value)} />
-          <input aria-label="Password" placeholder="Password" type="password" value={password} onChange={(event) => setPassword(event.target.value)} />
+          <input aria-label="Password" autoComplete="new-password" placeholder="Password" type="password" value={password} onChange={(event) => setPassword(event.target.value)} />
           <select aria-label="Account type" value={role} onChange={(event) => setRole(event.target.value as UserRecord['role'])}>
             {globalAccount ? <option value="global_admin">{accountTypeLabel('global_admin')}</option> : null}
             {globalAccount ? <option value="global_operator">{accountTypeLabel('global_operator')}</option> : null}
@@ -177,7 +187,7 @@ export function UsersPage({
                         danger
                         icon={<Trash2 size={14} />}
                         label="Delete"
-                        onClick={() => runAction(`user:${user.user_id}:delete`, () => deleteUser(user.user_id))}
+                        onClick={() => setDeletingUser(user)}
                       />
                     ) : null}
                   </div>

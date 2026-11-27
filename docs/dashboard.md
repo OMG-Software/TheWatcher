@@ -201,9 +201,32 @@ The top counters are:
 Healthy | Warning | Degraded | Critical | Maintenance | Offline
 ```
 
-Status priority is red, amber, yellow, grey, then green. A host with no data is
-shown as yellow in the derived Status column while its missing component dots
-are grey. Maintenance turns all component dots blue.
+Component dots show the status the server's status engine last recorded for
+each indicator (`cpu`, `memory`, `disk:<mount>`, `network:<interface>`,
+`process:<name>`), delivered as `indicator_status` on `GET /api/agents`. The
+dashboard does not classify the latest sample itself, so a dot turns red only
+when alerting has confirmed it (after the configured consecutive readings). The
+value and detail text still come from the latest metrics sample. Which disks,
+interfaces and processes belong to a component follows the agent's collector
+config. A component with nothing monitored, or an indicator the server has not
+evaluated yet, is grey and is ignored when the host status is worked out, so it
+cannot hold a healthy host in Warning. Disk, Network and Proc are grey on a host
+with no monitored disks, interfaces or process watches. The host Status is the
+worst of the other component statuses (red, amber, yellow, green). Maintenance
+turns all component dots blue and the host status blue. An offline host is grey
+and labelled Offline in the row, matching the Offline counter. A connected host
+with no evaluated indicator at all is grey ("No Data") and counts as Warning.
+Against a server that does not send `indicator_status`, component dots are grey.
+
+Each component dot is keyboard focusable and carries its status in words (for
+example "CPU: Critical, 96%"), which also opens as a tooltip on focus. Rows
+expand with the toggle button next to the server name (`aria-expanded`). An
+expanded row reloads its metric history and log matches every 5 seconds; a
+failed reload keeps the last data and shows the error.
+
+A `#view-<id>` filter is dropped, with its hash, once the views have loaded and
+the id is not among them (deleted, or not visible to the user). If the views
+fail to load, all agents are shown with a notice, and the filter is kept.
 
 The server identity cell shows the hostname and primary non-loopback IP address
 when the agent reports one. The Heartbeat dot is the final component dot. It is
@@ -245,9 +268,13 @@ Agent Management handles approved agents:
 - network thresholds are combined receive plus transmit megabits per second per
   selected interface;
 - process watches use exact executable names plus an expected process count;
-- the Maintenance button enters maintenance with the fixed reason
-  `operator request` and no expiry; for a reason or an end time use the
-  Maintenance page. The button reads Resume while the agent is in maintenance;
+- the Maintenance button opens a dialog with an optional reason (sent as typed,
+  empty if left blank) and enters maintenance with no expiry; for an end time use
+  the Maintenance page. The button reads Resume while the agent is in
+  maintenance, and Resume needs no confirmation;
+- Delete asks for confirmation in a dialog that names the agent; nothing is sent
+  until it is confirmed. The same applies to deleting a user, a view or a
+  maintenance window, and to bulk-archiving alerts (the dialog states the count);
 - approved agents can restart collectors or request status (there is no
   Disconnect button);
 - Restart, Status, Maintenance, Configure and Delete are enabled only for
@@ -265,7 +292,16 @@ which case it is red. Monitoring alert notifications and Alert rows show the
 known hostname as primary text and the agent id as smaller secondary text.
 Alert rows can display the agent's markdown runbook.
 The Runbook action opens a modal that renders the agent markdown as headings,
-paragraphs, lists, code blocks, and safe links.
+paragraphs, bullet and numbered lists, code blocks, inline `code`, bold, italic,
+line breaks and safe links (http, https, mailto; URLs may contain parentheses).
+Raw HTML is shown as text, never injected.
+
+Bulk selection only counts alerts that are on screen: changing a filter drops
+hidden alerts from the selection, and the bulk buttons show and act on the
+visible selection. The agent filter also lists agents that only have archived
+alerts once Show archived is on. The server returns at most 1000 alerts per
+list; when a list reaches that size the page says it is truncated (it does not
+page yet).
 
 ### Users & Groups
 
@@ -320,9 +356,12 @@ local time zone.
 ### Settings
 
 Visible to global operators and admins only. Edits the webhook URL, offline
-threshold (seconds), escalation timeout (seconds), metrics retention (days) and
+threshold (seconds), escalation timeout (seconds), the retention periods in days
+(metrics 1 to 365; status history, alerts and log matches 1 to 3650) and
 the scheduled digest report (enabled, daily or weekly schedule, day of week,
-report webhook URL). Save Settings persists them; Send Report Now sends the
+report webhook URL). The status history, alerts and log matches retention fields
+are enabled only when the server reports them (servers with the retention
+lifecycle); otherwise they are disabled and never sent. Save Settings persists them; Send Report Now sends the
 report immediately.
 
 ## API Contract
@@ -334,7 +373,7 @@ The dashboard consumes:
 | `POST /api/login` | Create a session for a local SQLite user. |
 | `POST /api/logout` | Delete the current session. |
 | `GET /api/session` | Return the current authenticated session. |
-| `GET /api/agents` | Approved agent identity, connection, maintenance, settings, groups, and timestamps. |
+| `GET /api/agents` | Approved agent identity, connection, maintenance, settings, groups, timestamps, and `indicator_status` (the status engine's latest status per indicator, from its newest 200 history rows). |
 | `GET /api/pending-enrollments` | Pending enrollment records for global operators and admins. |
 | `GET /api/metrics` | Latest metrics snapshot per agent. |
 | `GET /api/groups` | List groups. |
@@ -442,3 +481,21 @@ When server API fields change:
    `dashboard/src/components/` if rendering or controls change.
 4. Add/update Vitest coverage.
 5. Run `npm.cmd run build` and `npm.cmd test`.
+
+## Accessibility
+
+- Dialogs use the shared `Modal` (`components/Modal.tsx`): `role="dialog"`,
+  `aria-modal`, a name, focus moved in and returned, Tab kept inside, Escape and
+  backdrop click to close. While a request runs they cannot be closed. The
+  Configure modal uses the same `useDialog` behaviour.
+- `ConfirmDialog` is the shared confirmation; use it for any destructive action.
+  It names the target, closes only when the action succeeded and shows the
+  failure otherwise. With `reasonLabel` it also collects an optional reason.
+- `InfoTip` is the accessible help tooltip (focusable button, toggles on click,
+  Escape closes, linked with `aria-describedby`). Number fields use it for
+  their help text.
+- Icon-only buttons have an accessible name; action buttons keep their label
+  while busy; the active tab has `aria-current="page"`; focus is always visible
+  (`:focus-visible`).
+- Time is read through `useNow` (state, refreshed on an interval), never during
+  render.

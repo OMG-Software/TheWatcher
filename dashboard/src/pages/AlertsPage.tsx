@@ -3,6 +3,7 @@ import { Archive, BookOpen, Check, CheckSquare, Square } from 'lucide-react';
 import { acknowledgeAlert, archiveAlert, bulkAcknowledgeAlerts, bulkArchiveAlerts, fetchAlerts } from '../api';
 import { AcknowledgeModal } from '../components/AcknowledgeModal';
 import { ActionButton } from '../components/ActionButton';
+import { ConfirmDialog } from '../components/ConfirmDialog';
 import { AgentIdentity } from '../components/AgentIdentity';
 import { LoadFailed } from '../components/LoadFailed';
 import { RunbookModal } from '../components/RunbookModal';
@@ -14,6 +15,9 @@ import { toDisplayAlerts } from '../status';
 import { colorLabel } from '../uiLogic';
 
 const ARCHIVED_POLL_MS = 5000;
+
+/** The server returns at most this many alerts per list (newest first). */
+export const ALERT_LIST_CAP = 1000;
 
 export function AlertsPage({
   agents,
@@ -33,6 +37,7 @@ export function AlertsPage({
   const [agentFilter, setAgentFilter] = React.useState('');
   const [statusFilter, setStatusFilter] = React.useState('');
   const [ackTarget, setAckTarget] = React.useState<number | 'bulk' | null>(null);
+  const [confirmArchive, setConfirmArchive] = React.useState(false);
   const [runbookTarget, setRunbookTarget] = React.useState<{ agentName: string; markdown: string } | null>(null);
 
   // Archived alerts poll on their own timer, and only while they are shown.
@@ -49,12 +54,16 @@ export function AlertsPage({
   });
 
   const displayedIds = displayed.map((a) => a.alert_id);
-  const allSelected = displayedIds.length > 0 && displayedIds.every((id) => selected.has(id));
+  // Only what is on screen counts: ids selected before a filter hid them are neither counted nor sent.
+  const selectedIds = displayedIds.filter((id) => selected.has(id));
+  const allSelected = displayedIds.length > 0 && selectedIds.length === displayedIds.length;
+  const truncated = baseAlerts.length >= ALERT_LIST_CAP;
 
   const toggleSelect = (id: number) =>
     setSelected((prev) => { const n = new Set(prev); if (n.has(id)) n.delete(id); else n.add(id); return n; });
   const toggleSelectAll = () =>
     setSelected(allSelected ? new Set() : new Set(displayedIds));
+  const archiveKey = 'bulk:archive';
 
   const afterAction = () => setSelected(new Set());
 
@@ -64,7 +73,7 @@ export function AlertsPage({
   const handleAckSubmit = async (note: string, andArchive: boolean) => {
     let saved = false;
     if (ackTarget === 'bulk') {
-      const ids = [...selected];
+      const ids = selectedIds;
       saved = await runAction(ackKey, async () => {
         await bulkAcknowledgeAlerts(ids, note);
         if (andArchive) await bulkArchiveAlerts(ids);
@@ -82,13 +91,31 @@ export function AlertsPage({
     }
   };
 
-  const uniqueAgents = [...new Map(alerts.map((a) => [a.agentId, a.agentName])).entries()];
-  const selectedCount = selected.size;
+  // Agents with only archived alerts are listed too, once the archived alerts have loaded.
+  const uniqueAgents = [...new Map([...alerts, ...archivedAlerts].map((a) => [a.agentId, a.agentName])).entries()];
+  const selectedCount = selectedIds.length;
 
   return (
     <main className="table-wrap management-wrap">
       {ackTarget !== null ? (
         <AcknowledgeModal busy={busyAction === ackKey} bulk={ackTarget === 'bulk'} errorKey={ackKey} onClose={() => setAckTarget(null)} onSubmit={handleAckSubmit} />
+      ) : null}
+      {confirmArchive ? (
+        <ConfirmDialog
+          busy={busyAction === archiveKey}
+          confirmLabel={`Archive ${selectedCount} alert${selectedCount === 1 ? '' : 's'}`}
+          danger
+          errorKey={archiveKey}
+          message={`Archive ${selectedCount} selected alert${selectedCount === 1 ? '' : 's'}? Archived alerts leave the active list.`}
+          onCancel={() => setConfirmArchive(false)}
+          onConfirm={async () => {
+            const ids = selectedIds;
+            const done = await runAction(archiveKey, () => bulkArchiveAlerts(ids), { inline: true });
+            if (done) afterAction();
+            return done;
+          }}
+          title="Archive alerts"
+        />
       ) : null}
       {runbookTarget ? (
         <RunbookModal
@@ -100,11 +127,11 @@ export function AlertsPage({
       <div className="management-header">
         <h1>Alerts</h1>
         <div className="header-controls">
-          <select value={agentFilter} onChange={(e) => setAgentFilter(e.target.value)}>
+          <select aria-label="Filter by agent" value={agentFilter} onChange={(e) => setAgentFilter(e.target.value)}>
             <option value="">All agents</option>
             {uniqueAgents.map(([id, name]) => <option key={id} value={id}>{name}</option>)}
           </select>
-          <select value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)}>
+          <select aria-label="Filter by status" value={statusFilter} onChange={(e) => setStatusFilter(e.target.value)}>
             <option value="">All statuses</option>
             <option value="red">Critical</option>
             <option value="amber">Degraded</option>
@@ -122,10 +149,11 @@ export function AlertsPage({
           <span>{selectedCount} selected</span>
           <div className="button-row">
             <ActionButton busy={busyAction === 'bulk:ack'} icon={<Check size={14} />} label={`Acknowledge (${selectedCount})`} onClick={() => setAckTarget('bulk')} />
-            <ActionButton busy={busyAction === 'bulk:archive'} danger icon={<Archive size={14} />} label={`Archive (${selectedCount})`} onClick={() => runAction('bulk:archive', async () => { await bulkArchiveAlerts([...selected]); afterAction(); })} />
+            <ActionButton busy={busyAction === 'bulk:archive'} danger icon={<Archive size={14} />} label={`Archive (${selectedCount})`} onClick={() => setConfirmArchive(true)} />
           </div>
         </div>
       ) : null}
+      {truncated ? <div className="banner" role="status">Showing the newest {ALERT_LIST_CAP} alerts. Older alerts are not listed; acknowledge or archive some to see them.</div> : null}
       {showArchived && archived.loading ? <div className="banner">Loading archived alerts...</div> : null}
       {showArchived && archived.error ? <LoadFailed what="archived alerts" message={archived.error} stale={!archivedUnavailable} onRetry={() => void archived.refresh()} /> : null}
       <div className="table-container">
@@ -133,7 +161,7 @@ export function AlertsPage({
           <thead>
             <tr>
               <th className="col-check">
-                <button className="icon-button" onClick={toggleSelectAll} disabled={displayedIds.length === 0}>
+                <button aria-label="Select all alerts" aria-pressed={allSelected} className="icon-button" onClick={toggleSelectAll} disabled={displayedIds.length === 0}>
                   {allSelected ? <CheckSquare size={14} /> : <Square size={14} />}
                 </button>
               </th>
@@ -148,7 +176,7 @@ export function AlertsPage({
             return (
               <tr key={alert.alert_id} className={isArchived ? 'row-archived' : ''}>
                 <td className="col-check">
-                  <button className="icon-button" onClick={() => toggleSelect(alert.alert_id)}>
+                  <button aria-label={`Select alert for ${alert.agentName}: ${alert.indicator}`} aria-pressed={selected.has(alert.alert_id)} className="icon-button" onClick={() => toggleSelect(alert.alert_id)}>
                     {selected.has(alert.alert_id) ? <CheckSquare size={14} /> : <Square size={14} />}
                   </button>
                 </td>

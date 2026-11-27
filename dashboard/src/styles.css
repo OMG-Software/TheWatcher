@@ -1452,3 +1452,112 @@ td {
   padding: 0;
   min-width: 0;
 }
+
+/* ── Accessibility ──────────────────────────────────────────────────────── */
+
+/* Inputs keep a visible focus ring (the border change alone is too faint). */
+:focus-visible {
+  outline: 2px solid var(--text);
+  outline-offset: 2px;
+}
+
+input:focus-visible,
+textarea:focus-visible,
+select:focus-visible {
+  outline: 2px solid var(--text);
+  outline-offset: 1px;
+}
+
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* The status cell tooltip also opens on keyboard focus. */
+.dot-wrap:focus .tooltip,
+.dot-wrap:focus-visible .tooltip {
+  opacity: 1;
+  transform: translateX(-50%) translateY(0);
+}
+
+.row-toggle {
+  display: inline-flex;
+  align-items: center;
+  padding: 0 4px;
+  border: 0;
+  background: none;
+  color: inherit;
+  cursor: pointer;
+}
+
+.nav-tabs button[aria-current='page'] {
+  color: var(--text);
+}
+
+.field-with-tip {
+  position: relative;
+}
+
+.field-with-tip > label {
+  width: 100%;
+}
+
+.field-with-tip > .info-tip {
+  position: absolute;
+  top: 0;
+  right: 0;
+}
+
+.info-tip {
+  display: inline-block;
+}
+
+.info-tip-button {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px;
+  border: 0;
+  border-radius: 50%;
+  background: none;
+  color: var(--muted);
+  cursor: help;
+}
+
+.info-tip-text {
+  display: none;
+  position: absolute;
+  z-index: 30;
+  top: 100%;
+  right: 0;
+  width: max-content;
+  max-width: 260px;
+  padding: 8px 10px;
+  border: 1px solid var(--border2);
+  border-radius: 4px;
+  background: var(--bg3);
+  color: var(--text);
+  font-size: 11px;
+  line-height: 1.4;
+  font-weight: 400;
+  text-align: left;
+}
+
+.info-tip:hover .info-tip-text,
+.info-tip:focus-within .info-tip-text,
+.info-tip.open .info-tip-text {
+  display: block;
+}
+
+.confirm-message {
+  margin: 0;
+  padding: 14px 16px;
+  font-size: 12px;
+  line-height: 1.5;
+}

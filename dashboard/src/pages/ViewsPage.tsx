@@ -3,6 +3,7 @@ import { Check, Search, SlidersHorizontal, Trash2, X } from 'lucide-react';
 import { createView, deleteView, updateView } from '../api';
 import { ActionError } from '../components/ActionError';
 import { ActionButton } from '../components/ActionButton';
+import { ConfirmDialog } from '../components/ConfirmDialog';
 import { ActionFailureContext, type RunAction } from '../hooks/useRunAction';
 import type { DashboardAgent, GroupRecord, SessionInfo, ViewRecord } from '../models';
 import { isGlobal } from '../permissions';
@@ -39,6 +40,7 @@ export function ViewsPage({
   const [editGroupChoice, setEditGroupId] = React.useState(0);
   const [editAgentIds, setEditAgentIds] = React.useState<string[]>([]);
   const globalAccount = isGlobal(session.role);
+  const [deleting, setDeleting] = React.useState<ViewRecord | null>(null);
 
   // A group user must pick one of their groups, so fall back to the first when the choice is gone.
   const fallbackGroup = (choice: number) => (!globalAccount && groups.length > 0 && !groups.some((group) => group.group_id === choice) ? groups[0].group_id : choice);
@@ -58,6 +60,18 @@ export function ViewsPage({
 
   return (
     <main className="table-wrap">
+      {deleting ? (
+        <ConfirmDialog
+          busy={busyAction === `view:delete:${deleting.view_id}`}
+          confirmLabel="Delete view"
+          danger
+          errorKey={`view:delete:${deleting.view_id}`}
+          message={<>Delete view <strong>{deleting.name}</strong>? Anyone using it loses it. The agents in it are not affected.</>}
+          onCancel={() => setDeleting(null)}
+          onConfirm={() => runAction(`view:delete:${deleting.view_id}`, () => deleteView(deleting.view_id), { inline: true })}
+          title="Delete view"
+        />
+      ) : null}
       <div className="table-container">
         <table>
           <thead>
@@ -78,17 +92,17 @@ export function ViewsPage({
                   <>
                     <td colSpan={5}>
                       <div className="view-form view-form-inline">
-                        <input value={editName} placeholder="View name" onChange={(e) => setEditName(e.target.value)} />
+                        <input aria-label="View name" value={editName} placeholder="View name" onChange={(e) => setEditName(e.target.value)} />
                         <label className="view-form-check">
                           <input type="checkbox" checked={editPublic} onChange={(e) => setEditPublic(e.target.checked)} />
                           Public
                         </label>
-                        <select multiple size={Math.min(agents.length, 6)} className="view-agent-select"
+                        <select multiple aria-label="Agents in view" size={Math.min(agents.length, 6)} className="view-agent-select"
                           value={editAgentIds}
                           onChange={(e) => setEditAgentIds(Array.from(e.target.selectedOptions, (o) => o.value))}>
                           {agents.map((a) => <option key={a.id} value={a.id}>{a.name}</option>)}
                         </select>
-                        <select value={editGroupId} onChange={(e) => setEditGroupId(Number(e.target.value))}>
+                        <select aria-label="Group" value={editGroupId} onChange={(e) => setEditGroupId(Number(e.target.value))}>
                           {globalAccount ? <option value={0}>No group</option> : null}
                           {groups.map((group) => <option key={group.group_id} value={group.group_id}>{group.name}</option>)}
                         </select>
@@ -119,7 +133,7 @@ export function ViewsPage({
                       {canEdit(v) ? (
                         <ActionButton busy={busyAction === `view:delete:${v.view_id}`} danger label="Delete"
                           icon={<Trash2 size={14} />}
-                          onClick={() => void runAction(`view:delete:${v.view_id}`, () => deleteView(v.view_id))} />
+                          onClick={() => setDeleting(v)} />
                       ) : null}
                     </td>
                   </>
@@ -146,17 +160,17 @@ export function ViewsPage({
               });
             }}
           >
-            <input required value={newName} placeholder="New view name" onChange={(e) => setNewName(e.target.value)} className="view-name-input" />
+            <input required aria-label="New view name" value={newName} placeholder="New view name" onChange={(e) => setNewName(e.target.value)} className="view-name-input" />
             <label className="view-form-check">
               <input type="checkbox" checked={newPublic} onChange={(e) => setNewPublic(e.target.checked)} />
               Public
             </label>
-            <select multiple size={Math.min(agents.length, 6)} className="view-agent-select"
+            <select multiple aria-label="Agents in new view" size={Math.min(agents.length, 6)} className="view-agent-select"
               value={newAgentIds}
               onChange={(e) => setNewAgentIds(Array.from(e.target.selectedOptions, (o) => o.value))}>
               {agents.map((a) => <option key={a.id} value={a.id}>{a.name}</option>)}
             </select>
-            <select value={newGroupId} onChange={(e) => setNewGroupId(Number(e.target.value))}>
+            <select aria-label="Group" value={newGroupId} onChange={(e) => setNewGroupId(Number(e.target.value))}>
               {globalAccount ? <option value={0}>No group</option> : null}
               {groups.map((group) => <option key={group.group_id} value={group.group_id}>{group.name}</option>)}
             </select>

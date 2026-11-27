@@ -1,4 +1,5 @@
 import type { AnomalyConfig } from '../models';
+import { InfoTip } from './InfoTip';
 import { DEFAULT_NETWORK_THRESHOLDS, DEFAULT_PERCENT_THRESHOLDS } from '../status';
 
 export function NumberField({
@@ -19,10 +20,13 @@ export function NumberField({
   value: number;
 }) {
   return (
-    <label title={help}>
-      {label}
-      <input max={max} min={min} step={step} type="number" value={value} onChange={(event) => onChange(Number(event.target.value))} />
-    </label>
+    <div className="field-with-tip">
+      <label>
+        {label}
+        <input max={max} min={min} step={step} type="number" value={value} onChange={(event) => onChange(Number(event.target.value))} />
+      </label>
+      {help ? <InfoTip label={label} text={help} /> : null}
+    </div>
   );
 }
 
