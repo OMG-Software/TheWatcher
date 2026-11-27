@@ -34,6 +34,10 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   revocation are atomic, and the dummy hash is generated randomly at startup.
   New store methods `create_session_if_credentials_current` and
   `update_user_password_and_revoke_sessions` (#145, #153, #154).
+- Login throttle follow-ups: an attempt that outlives its throttle window no
+  longer decrements a newer window's slot (reservations remember the window
+  they were counted in), and an empty first `X-Forwarded-For` header line is
+  malformed instead of being skipped when the lines are joined (#153, #154).
 - The agent no longer trusts the server key in an enrollment reply: it must
   be 40 Z85 characters decoding to a 32-byte key, and the config writer
   refuses any value containing CR or LF. Before, a crafted key could inject

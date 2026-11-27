@@ -258,6 +258,13 @@ void ApiServer::set_trusted_proxies(std::vector<std::string> proxies)
     trusted_proxies_ = std::move(ranges);
 }
 
+void ApiServer::set_login_test_hooks(std::function<int64_t()> clock,
+                                     std::function<void(const std::string&)> after_reservation)
+{
+    login_clock_ = std::move(clock);
+    after_reservation_hook_ = std::move(after_reservation);
+}
+
 // Returns the address used for login throttling. The TCP peer is used unless
 // it is a trusted proxy. For a trusted proxy the single X-Real-IP value wins
 // (the proxy must set or overwrite it); otherwise every X-Forwarded-For line
@@ -292,7 +299,7 @@ std::string ApiServer::client_ip(const httplib::Request& req)
     const auto xff_lines = req.get_header_value_count("X-Forwarded-For");
     for (std::size_t i = 0; i < xff_lines; ++i)
     {
-        if (!xff.empty())
+        if (i > 0) // by line index: an empty first line must still leave an empty entry
             xff += ',';
         xff += req.get_header_value("X-Forwarded-For", "", i);
     }
@@ -387,17 +394,20 @@ void ApiServer::LoginReservation::release()
         return;
     armed_ = false;
     std::lock_guard<std::mutex> lk(api_.login_mutex_);
-    const auto give_back = [](auto& map, const std::string& key) {
+    // Touches an entry only while it is still the window this attempt was
+    // counted in (window_start identifies the window: a key can only be
+    // recreated after its old window expired, so the values never repeat).
+    const auto give_back = [](auto& map, const std::string& key, int64_t window) {
         const auto it = map.find(key);
-        if (it == map.end())
+        if (it == map.end() || it->second.second != window)
             return;
         --it->second.first;
         if (it->second.first <= 0)
             map.erase(it);
     };
-    give_back(api_.login_failures_, pair_key_);
-    give_back(api_.login_account_failures_, username_);
-    give_back(api_.login_ip_failures_, remote_);
+    give_back(api_.login_failures_, pair_key_, pair_window_);
+    give_back(api_.login_account_failures_, username_, account_window_);
+    give_back(api_.login_ip_failures_, remote_, ip_window_);
 }
 
 void ApiServer::drain_commands(std::vector<PendingCommand>& out)
@@ -1206,7 +1216,7 @@ void ApiServer::setup_routes()
             constexpr int max_failures = 5;
             constexpr int max_ip_failures = 10;
             constexpr int max_account_failures = 50;
-            const auto now = now_ms();
+            const auto now = login_clock_ ? login_clock_() : now_ms();
             const std::string remote = client_ip(req);
             const std::string pair_key = remote + "|" + username;
             purge_expired_sessions_if_due(now);
@@ -1266,12 +1276,16 @@ void ApiServer::setup_routes()
                     if (count == 0)
                         window_start = now;
                     ++count;
+                    return window_start;
                 };
-                reserve(login_failures_, pair_key);
-                reserve(login_account_failures_, username);
-                reserve(login_ip_failures_, remote);
-                reservation.arm();
+                const auto pair_window = reserve(login_failures_, pair_key);
+                const auto account_window = reserve(login_account_failures_, username);
+                const auto ip_window = reserve(login_ip_failures_, remote);
+                reservation.arm(pair_window, account_window, ip_window);
             }
+
+            if (after_reservation_hook_)
+                after_reservation_hook_(username);
 
             // Issue #154: unknown and disabled users are verified against a
             // dummy hash so every failure path pays for one Argon2 run and

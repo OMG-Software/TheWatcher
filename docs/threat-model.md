@@ -130,7 +130,9 @@ working document for audit, design review, and regression testing.
 - A login attempt holds a slot in the throttle counters while its password is
   verified; the slot is returned on success or on an unexpected error, and
   only a genuine credential failure keeps it. A successful login therefore
-  never erases the slots of other attempts still in flight.
+  never erases the slots of other attempts still in flight. A slot is released
+  only against the counter window it was taken in, so an attempt that outlives
+  its window cannot decrement or erase a newer window's entry.
 - A session is created only if the password hash the login verified is still
   the user's current hash and the user is still enabled (one atomic store
   statement), so a login that races a password reset or a disable cannot

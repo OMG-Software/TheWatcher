@@ -75,6 +75,13 @@ public:
     // skipped with a warning.
     void set_trusted_proxies(std::vector<std::string> proxies);
 
+    // Test seam, call before start(): replaces the clock used by the login
+    // throttle and installs a hook that runs right after an attempt's slot is
+    // counted (with the username), so tests can drive window expiry without
+    // sleeping. Both are empty in production.
+    void set_login_test_hooks(std::function<int64_t()> clock,
+                              std::function<void(const std::string&)> after_reservation);
+
     // Drain pending commands into caller's vector (called from ZMQ thread).
     void drain_commands(std::vector<PendingCommand>& out);
 
@@ -107,9 +114,16 @@ private:
         LoginReservation(const LoginReservation&) = delete;
         LoginReservation& operator=(const LoginReservation&) = delete;
         ~LoginReservation();
-        void arm() noexcept
+        // Records the window each counter entry belonged to when this attempt
+        // was counted. release() then touches an entry only while it is still
+        // that window's entry: pruning may have dropped it and a newer attempt
+        // recreated the key, and that newer slot must not be decremented.
+        void arm(int64_t pair_window, int64_t account_window, int64_t ip_window) noexcept
         {
             armed_ = true;
+            pair_window_ = pair_window;
+            account_window_ = account_window;
+            ip_window_ = ip_window;
         }
         void keep() noexcept
         {
@@ -123,6 +137,9 @@ private:
         std::string username_;
         std::string remote_;
         bool armed_ = false;
+        int64_t pair_window_ = 0;
+        int64_t account_window_ = 0;
+        int64_t ip_window_ = 0;
     };
 
     // Deletes expired sessions at most once per purge interval.
@@ -155,6 +172,8 @@ private:
     std::string dummy_password_hash_;
     std::atomic<int64_t> last_session_purge_ms_{0};  // advanced only after a successful purge
     std::atomic<bool> session_purge_running_{false}; // at most one purge in flight
+    std::function<int64_t()> login_clock_;
+    std::function<void(const std::string&)> after_reservation_hook_;
 };
 
 } // namespace thewatcher::server

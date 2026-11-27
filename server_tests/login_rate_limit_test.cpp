@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <future>
 #include <memory>
 #include <string>
 #include <thread>
@@ -608,6 +609,94 @@ SCENARIO("A forwarded chain with an empty entry is malformed even next to a trus
             {
                 REQUIRE(attempt_login_via_proxy(fx.client, ",127.0.0.1", "thewatcher", "look_at_me") == 429);
                 REQUIRE(attempt_login(fx.client, "thewatcher", "look_at_me") == 200);
+            }
+        }
+    }
+}
+
+SCENARIO("A leading empty X-Forwarded-For line makes the header malformed")
+{
+    GIVEN("an API server that trusts 127.0.0.1 as a reverse proxy")
+    {
+        ApiFixture fx(60'000, {"127.0.0.1"});
+
+        WHEN("ten failures send an empty header line followed by a line with an address")
+        {
+            for (int i = 0; i < 10; ++i)
+                REQUIRE(attempt_login(fx.client, "spray-user-" + std::to_string(i), "wrong-password",
+                                      {
+                                          {"X-Forwarded-For", ""           },
+                                          {"X-Forwarded-For", "203.0.113.7"}
+                }) == 401);
+
+            THEN("they are throttled as unknown-client, not as the address on the second line")
+            {
+                REQUIRE(attempt_login(fx.client, "thewatcher", "wrong-password",
+                                      {
+                                          {"X-Forwarded-For", ""           },
+                                          {"X-Forwarded-For", "203.0.113.7"}
+                }) == 429);
+                REQUIRE(attempt_login_via_proxy(fx.client, "203.0.113.7", "thewatcher", "look_at_me") == 200);
+            }
+        }
+    }
+}
+
+SCENARIO("A login that outlives its throttle window cannot release a newer window's slot")
+{
+    GIVEN("an API server with a controllable clock and a 3 second throttle window")
+    {
+        ApiFixture fx(3000);
+        std::atomic<int64_t> clock_ms{1'000'000};
+        std::promise<void> in_flight;
+        std::promise<void> proceed;
+        auto proceed_future = proceed.get_future();
+        std::atomic<bool> hold_next{true};
+        fx.api.set_login_test_hooks(
+            [&] {
+                return clock_ms.load();
+            },
+            [&](const std::string&) {
+                // Park only the first attempt, after its slot was counted.
+                if (hold_next.exchange(false))
+                {
+                    in_flight.set_value();
+                    proceed_future.wait();
+                }
+            });
+
+        WHEN("a correct login is still verifying while the window expires and a new failure arrives")
+        {
+            int slow_status = 0;
+            std::thread slow([&] {
+                httplib::Client client("http://127.0.0.1:" + std::to_string(fx.port));
+                client.set_read_timeout(30, 0);
+                // No Catch2 assertions off the main thread.
+                auto res = client.Post("/api/login",
+                                       json{
+                                           {"username", "thewatcher"},
+                                           {"password", "look_at_me"}
+                }
+                                           .dump(),
+                                       "application/json");
+                slow_status = res ? res->status : 0;
+            });
+            in_flight.get_future().wait();
+            clock_ms += 10'000; // the first attempt's window has long expired
+            REQUIRE(attempt_login(fx.client, "thewatcher", "wrong-password") == 401);
+            proceed.set_value();
+            slow.join();
+            REQUIRE(slow_status == 200);
+
+            AND_WHEN("four more failures follow in the new window")
+            {
+                for (int i = 0; i < 4; ++i)
+                    REQUIRE(attempt_login(fx.client, "thewatcher", "wrong-password") == 401);
+
+                THEN("all five failures count, so the account is locked out")
+                {
+                    REQUIRE(attempt_login(fx.client, "thewatcher", "wrong-password") == 429);
+                }
             }
         }
     }
