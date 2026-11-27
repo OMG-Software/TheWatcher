@@ -3,7 +3,7 @@ import { Check, Search, SlidersHorizontal, Trash2, X } from 'lucide-react';
 import { createView, deleteView, updateView } from '../api';
 import { ActionError } from '../components/ActionError';
 import { ActionButton } from '../components/ActionButton';
-import type { RunAction } from '../hooks/useRunAction';
+import { ActionFailureContext, type RunAction } from '../hooks/useRunAction';
 import type { DashboardAgent, GroupRecord, SessionInfo, ViewRecord } from '../models';
 import { isGlobal } from '../permissions';
 
@@ -28,6 +28,7 @@ export function ViewsPage({
   onOpenView: (viewId: number) => void;
   groups: GroupRecord[];
 }) {
+  const { clear } = React.useContext(ActionFailureContext);
   const [newName, setNewName] = React.useState('');
   const [newPublic, setNewPublic] = React.useState(false);
   const [newGroupId, setNewGroupId] = React.useState<number>(groups[0]?.group_id ?? 0);
@@ -52,6 +53,7 @@ export function ViewsPage({
   }, [editGroupId, editId, globalAccount, groups]);
 
   const startEdit = (v: ViewRecord) => {
+    if (editId !== null) clear(`view:save:${editId}`); // the editor being replaced takes its old failure with it
     setEditId(v.view_id);
     setEditName(v.name);
     setEditPublic(v.is_public);
@@ -107,7 +109,7 @@ export function ViewsPage({
                           // Stay in the editor with the changes when the save failed.
                           if (saved) setEditId(null);
                         })} />
-                      <ActionButton busy={false} label="Cancel" icon={<X size={14} />} onClick={() => setEditId(null)} />
+                      <ActionButton busy={false} disabled={busyAction === `view:save:${v.view_id}`} label="Cancel" icon={<X size={14} />} onClick={() => { clear(`view:save:${v.view_id}`); setEditId(null); }} />
                     </td>
                   </>
                 ) : (

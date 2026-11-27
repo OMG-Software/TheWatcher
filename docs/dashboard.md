@@ -112,12 +112,26 @@ server) over HTTPS, because the session cookie is `Secure`. Set
   summary cards, or, with `{ inline: true }`, next to the form or dialog that
   started it via `<ActionError actionKey="...">`. Forms and dialogs clear or
   close only when `runAction` resolves `true`, so input survives a failed save.
+  `true` means the mutation itself succeeded: if the refresh afterwards fails,
+  that is reported in the page banner ("Saved, but the dashboard could not be
+  refreshed"), never as a failed action, so a retry cannot duplicate the change.
+  A dialog or form with a Cancel (acknowledge, agent configuration, password,
+  view editor) cannot be dismissed while its request runs, because the failure
+  would have nowhere to show, and it drops its own failure when closed, so
+  reopening it does not show an old error (`clear(key)` from
+  `ActionFailureContext`). Settings disables its form while a save runs, so
+  nothing typed meanwhile is lost.
 - **Failed loads are not "no data".** If the first load of the required data
   fails, the page is replaced by "Could not load dashboard data" with Retry. If
   a later refresh fails, the old data stays under a "Could not refresh" banner.
   Optional sections (alerts, silences, maintenance windows, users, views,
   pending enrollments, groups) load independently: a 403 means the role may not
   see them (empty); any other failure is flagged and the last good data is kept.
+  A failed group list is flagged on every page that uses groups (Monitoring,
+  Views, Agents, Users). A page that loads for itself (runbooks, settings,
+  archived alerts) shows "Loading..." until its first request settles, never
+  its empty state. The Monitoring detail row loads metric history and log
+  matches independently, each with its own error.
   Settings shows an error instead of a form when it cannot load, so defaults can
   never be saved over the real settings.
 - **Session expiry.** Any API call that returns 401 (except the login and
@@ -129,7 +143,10 @@ server) over HTTPS, because the session cookie is `Secure`. Set
   a request is in flight, drops the result of a request that a newer one (for
   example a manual refresh after an action) overtook, and pauses while the tab
   is hidden, refreshing as soon as it is visible again. `useDashboardData` polls
-  every 5 s with it.
+  every 5 s with it. An optional `merge(next, previous)` combines an accepted
+  result with the previous data and never sees a stale one; `useDashboardData`
+  uses it to keep the last good value of a failed section. `useSession` ignores
+  a slow startup session probe that settles after a sign-in or sign-out.
 
 ## Tests
 

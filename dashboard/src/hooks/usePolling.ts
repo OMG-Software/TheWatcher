@@ -20,16 +20,20 @@ export interface PollingState<T> {
  * - The poll pauses while the tab is hidden and runs at once when it is shown again.
  *
  * `enabled: false` neither loads nor polls (data from an earlier enabled period is kept).
+ * `merge` combines an accepted result with the previous data (for example to keep the last
+ * good part of a partial failure); it never sees a stale response.
  * `fetcher` may change between renders; the latest one is always used.
  */
-export function usePolling<T>(fetcher: () => Promise<T>, { intervalMs, enabled = true }: { intervalMs?: number; enabled?: boolean } = {}) {
+export function usePolling<T>(fetcher: () => Promise<T>, { intervalMs, enabled = true, merge }: { intervalMs?: number; enabled?: boolean; merge?: (next: T, previous: T | null) => T } = {}) {
   const [state, setState] = React.useState<PollingState<T>>({ data: null, error: null, loading: true, loadedAt: null });
   const fetcherRef = React.useRef(fetcher);
+  const mergeRef = React.useRef(merge);
   const ticketRef = React.useRef(0); // id of the newest request; older responses are stale
   const runningRef = React.useRef(0); // id of the request in flight, 0 when idle
 
   React.useEffect(() => {
     fetcherRef.current = fetcher;
+    mergeRef.current = merge;
   });
 
   const load = React.useCallback(async (force: boolean): Promise<void> => {
@@ -39,7 +43,8 @@ export function usePolling<T>(fetcher: () => Promise<T>, { intervalMs, enabled =
     try {
       const data = await fetcherRef.current();
       if (ticket !== ticketRef.current) return;
-      setState({ data, error: null, loading: false, loadedAt: new Date() });
+      const merger = mergeRef.current;
+      setState((previous) => ({ data: merger ? merger(data, previous.data) : data, error: null, loading: false, loadedAt: new Date() }));
     } catch (err) {
       if (ticket !== ticketRef.current) return;
       setState((previous) => ({ ...previous, error: errorMessage(err, 'Failed to load data'), loading: false }));

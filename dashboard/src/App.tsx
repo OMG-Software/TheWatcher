@@ -59,10 +59,11 @@ function Dashboard({ session, onSignOut }: { session: SessionInfo; onSignOut: ()
     clearFailure();
     setView(next);
   };
+  const failureState = React.useMemo(() => ({ failure, clear: clearFailure }), [failure, clearFailure]);
   const retry = () => void refresh();
 
   return (
-    <ActionFailureContext.Provider value={failure}>
+    <ActionFailureContext.Provider value={failureState}>
       <header className="topbar">
         <div className="logo">
           <span className="logo-dot" />
@@ -103,7 +104,7 @@ function Dashboard({ session, onSignOut }: { session: SessionInfo; onSignOut: ()
 
       {/* A failed refresh with older data on screen is flagged; with no data yet it replaces the page below. */}
       {error && loadedAt ? <LoadFailed what="dashboard data" message={error} stale onRetry={retry} /> : null}
-      <ActionErrorBanner onDismiss={clearFailure} />
+      <ActionErrorBanner onDismiss={() => clearFailure()} />
 
       {unloaded && error ? <LoadFailed what="dashboard data" message={error} onRetry={retry} /> : null}
       {unloaded && !error && loading ? <div className="banner">Loading dashboard data...</div> : null}
@@ -111,6 +112,7 @@ function Dashboard({ session, onSignOut }: { session: SessionInfo; onSignOut: ()
       {!unloaded && view === 'monitoring' ? (
         <>
           {sectionErrors.alerts ? <LoadFailed what="alerts" message={sectionErrors.alerts} onRetry={retry} /> : null}
+          {sectionErrors.groups ? <LoadFailed what="groups" message={sectionErrors.groups} onRetry={retry} /> : null}
           {alerts.length > 0 ? (
             <div className="alert-strip">
               {displayAlerts.slice(0, 4).map((alert) => (
@@ -147,6 +149,7 @@ function Dashboard({ session, onSignOut }: { session: SessionInfo; onSignOut: ()
       {!unloaded && view === 'views' ? (
         <>
           {sectionErrors.views ? <LoadFailed what="views" message={sectionErrors.views} onRetry={retry} /> : null}
+          {sectionErrors.groups ? <LoadFailed what="groups" message={sectionErrors.groups} onRetry={retry} /> : null}
           <ViewsPage
             agents={agents}
             busyAction={busyAction}

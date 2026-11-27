@@ -190,6 +190,16 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Dashboard: forms and dialogs (silence, maintenance, group, user, view,
   password, acknowledge, settings, runbook) keep their input and stay open
   when a save fails (#166).
+- Dashboard: review fixes for the error handling. A slow startup session probe
+  can no longer overwrite a newer sign-in; an overtaken older load can no
+  longer become the snapshot a failed section falls back to; a failed refresh
+  after a successful change no longer reports the change as failed (and so
+  cannot invite a duplicate); metric history and log matches load and fail
+  independently; Settings is locked while a save runs; acknowledge, agent
+  configuration, password and view dialogs cannot be dismissed while saving
+  and drop their old error on close; the groups load failure is flagged on
+  Monitoring and Views; and the runbooks page shows "Loading" instead of "No
+  runbooks configured." before its first load (#104, #105, #106, #166).
 
 ### Changed
 

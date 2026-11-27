@@ -6,7 +6,7 @@ import { ActionError } from './ActionError';
 import { ActionButton } from './ActionButton';
 import { AgentIdentity } from './AgentIdentity';
 import { AnomalyInputs, NetworkThresholdInputs, NumberField, ThresholdInputs, ThresholdRow } from './ThresholdInputs';
-import type { RunAction } from '../hooks/useRunAction';
+import { ActionFailureContext, type RunAction } from '../hooks/useRunAction';
 import type { AgentCollectorConfigUpdate, CollectorConfig, DashboardAgent, DiskMonitorConfig, GroupRecord, LogMonitorConfig, NetworkInterfaceConfig, ProcessWatchConfig } from '../models';
 import { DEFAULT_ANOMALY_CONFIG, DEFAULT_PERCENT_THRESHOLDS } from '../status';
 
@@ -82,6 +82,14 @@ export function AgentConfigModal({
     }));
   };
 
+  // Closing is blocked while saving (the failure would have nowhere to show) and drops the old failure.
+  const { clear } = React.useContext(ActionFailureContext);
+  const dismiss = () => {
+    if (busy) return;
+    clear(`${agent.id}:collector_config`);
+    onClose();
+  };
+
   return (
     <div className="modal-backdrop" role="presentation">
       <form
@@ -95,7 +103,7 @@ export function AgentConfigModal({
       >
         <div className="modal-header">
           <AgentIdentity id={agent.id} name={agent.name} />
-          <button className="icon-button" type="button" onClick={onClose} aria-label="Close configuration">
+          <button className="icon-button" type="button" disabled={busy} onClick={dismiss} aria-label="Close configuration">
             <X size={14} />
           </button>
         </div>
@@ -282,7 +290,7 @@ export function AgentConfigModal({
 
         <ActionError actionKey={`${agent.id}:collector_config`} />
         <div className="modal-actions">
-          <button className="text-button" type="button" onClick={onClose}>Cancel</button>
+          <button className="text-button" type="button" disabled={busy} onClick={dismiss}>Cancel</button>
           <button className="text-button" type="submit" disabled={!operator || busy}>{busy ? '...' : 'Save'}</button>
         </div>
       </form>
