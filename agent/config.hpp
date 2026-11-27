@@ -48,12 +48,14 @@ struct AgentConfig
     void apply_cli_overrides(const std::string& server, const std::string& enrollment, const std::string& server_key);
 
     static AgentConfig load_or_create(const std::filesystem::path& path);
-    // Writes the config as KEY=VALUE lines. Throws std::runtime_error if the file
-    // cannot be opened. ALLOW_INSECURE is written only when allow_insecure is
-    // set; allow_insecure_cli is never persisted. Fields overridden on the
-    // command line are written with their file values (issue #150). ENROLLMENT_TOKEN is written
-    // only when non-empty. On POSIX the file is then restricted to owner
-    // read/write because it holds the CURVE secret key.
+    // Writes the config as KEY=VALUE lines, atomically: an owner-only temp file
+    // in the same directory is flushed and renamed over the target (it holds
+    // the CURVE secret key). Throws std::runtime_error if any value contains
+    // CR or LF (issue #148) or a write or rename fails (issue #149).
+    // ALLOW_INSECURE is written only when allow_insecure is set;
+    // allow_insecure_cli is never persisted. Fields overridden on the
+    // command line are written with their file values (issue #150).
+    // ENROLLMENT_TOKEN is written only when non-empty.
     void save(const std::filesystem::path& path) const;
 
     static std::filesystem::path default_path();

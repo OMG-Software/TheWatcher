@@ -2,11 +2,14 @@
 
 #include "common/SingleLog.hpp"
 #include "common/crypto.hpp"
+#include "common/secure_file.hpp"
 
+#include <algorithm>
 #include <cctype>
 #include <cstdint>
 #include <cstdio>
 #include <fstream>
+#include <sstream>
 #include <stdexcept>
 #include <string_view>
 #include <unordered_map>
@@ -81,15 +84,36 @@ namespace
         return values;
     }
 
+    // Extracts the host from "host", "host:port", "tcp://host:port" or the
+    // IPv6 forms "[addr]" / "[addr]:port". The result keeps the brackets so it
+    // can be put straight back into an endpoint. An unbracketed IPv6 address
+    // is ambiguous with host:port and is rejected (issue #98). Throws
+    // std::invalid_argument.
     std::string host_from_server_value(const std::string& value)
     {
         auto host = trim(value);
         constexpr std::string_view tcp_prefix = "tcp://";
         if (host.rfind(tcp_prefix, 0) == 0)
             host = host.substr(tcp_prefix.size());
-        const auto colon = host.rfind(':');
-        if (colon != std::string::npos && host.find(']') == std::string::npos)
-            host = host.substr(0, colon);
+
+        if (!host.empty() && host.front() == '[')
+        {
+            const auto close = host.find(']');
+            if (close == std::string::npos)
+                throw std::invalid_argument("Unterminated '[' in server address: " + value);
+            const auto rest = host.substr(close + 1);
+            const bool port_ok = rest.empty() || (rest.size() > 1 && rest.front() == ':' &&
+                                                  rest.find_first_not_of("0123456789", 1) == std::string::npos);
+            if (close == 1 || !port_ok)
+                throw std::invalid_argument("Invalid bracketed IPv6 server address: " + value);
+            return host.substr(0, close + 1);
+        }
+
+        const auto colons = std::count(host.begin(), host.end(), ':');
+        if (colons > 1)
+            throw std::invalid_argument("IPv6 server addresses must be written in brackets, e.g. [::1]:5555: " + value);
+        if (colons == 1)
+            host = host.substr(0, host.find(':'));
         return host.empty() ? "127.0.0.1" : host;
     }
 
@@ -98,9 +122,27 @@ namespace
         return "tcp://" + host_from_server_value(host) + ":" + std::to_string(port);
     }
 
+    // Value for the informational THEWATCHER_SERVER line, or empty when the
+    // endpoint has no host that can be read back (the line is then omitted;
+    // SERVER_ADDRESS is authoritative on load).
     std::string server_host_from_endpoint(const std::string& endpoint)
     {
-        return host_from_server_value(endpoint);
+        try
+        {
+            return host_from_server_value(endpoint);
+        }
+        catch (const std::invalid_argument&)
+        {
+            return {};
+        }
+    }
+
+    // Throws std::runtime_error if value contains CR or LF, which would let it
+    // start a new KEY=VALUE line in the file (issue #148).
+    void require_single_line(const char* name, const std::string& value)
+    {
+        if (value.find_first_of("\r\n") != std::string::npos)
+            throw std::runtime_error(std::string("Refusing to save config: ") + name + " contains a line break");
     }
 
     // Copies recognised KEY=VALUE entries onto cfg; absent keys keep their
@@ -247,23 +289,32 @@ void AgentConfig::apply_cli_overrides(const std::string& server, const std::stri
 }
 
 // Writes the config as KEY=VALUE lines, creating missing parent directories.
-// On POSIX it limits the file to the owner (it holds the CURVE secret key).
-// Throws std::runtime_error if the file cannot be opened for writing.
+// The file is replaced atomically through an owner-only temporary file (it
+// holds the CURVE secret key), so a failed write never truncates the old
+// config. Throws std::runtime_error on a value containing CR/LF (issue #148)
+// or on any write or rename failure (issue #149).
 void AgentConfig::save(const std::filesystem::path& path) const
 {
     LOG_FUNCTION_TRACE
     LOGF_DEBUG("Saving agent config to %s", path.string().c_str());
-    if (path.has_parent_path())
-        std::filesystem::create_directories(path.parent_path());
-    std::ofstream f(path);
-    if (!f)
-        throw std::runtime_error("Cannot write " + path.string());
     // Issue #150: command-line overrides are not persisted.
     const auto& saved_server_address = file_server_address.value_or(server_address);
     const auto& saved_enrollment_address = file_enrollment_address.value_or(enrollment_address);
     const auto& saved_server_key = file_server_public_key.value_or(server_public_key);
     const auto& saved_fingerprint = file_server_public_key_fingerprint.value_or(server_public_key_fingerprint);
-    f << "THEWATCHER_SERVER=" << server_host_from_endpoint(saved_server_address) << '\n';
+
+    require_single_line("SERVER_ADDRESS", saved_server_address);
+    require_single_line("ENROLLMENT_ADDRESS", saved_enrollment_address);
+    require_single_line("SERVER_PUBLIC_KEY", saved_server_key);
+    require_single_line("SERVER_PUBLIC_KEY_FINGERPRINT", saved_fingerprint);
+    require_single_line("ENROLLMENT_TOKEN", enrollment_token);
+    require_single_line("AGENT_ID", agent_id);
+    require_single_line("AGENT_PUBLIC_KEY", agent_public_key);
+    require_single_line("AGENT_SECRET_KEY", agent_secret_key);
+
+    std::ostringstream f;
+    if (const auto host = server_host_from_endpoint(saved_server_address); !host.empty())
+        f << "THEWATCHER_SERVER=" << host << '\n';
     f << "SERVER_ADDRESS=" << saved_server_address << '\n';
     f << "ENROLLMENT_ADDRESS=" << saved_enrollment_address << '\n';
     f << "SERVER_PUBLIC_KEY=" << saved_server_key << '\n';
@@ -278,13 +329,10 @@ void AgentConfig::save(const std::filesystem::path& path) const
     f << "COLLECTION_INTERVAL=" << collection_interval << '\n';
     f << "HEARTBEAT_INTERVAL=" << heartbeat_interval << '\n';
     f << "PROCESS_LIMIT=" << process_limit << '\n';
-    f.close();
 
-    // M-6: Restrict config file to owner read/write only — it contains the CURVE secret key.
-#ifndef _WIN32
-    std::filesystem::permissions(path, std::filesystem::perms::owner_read | std::filesystem::perms::owner_write,
-                                 std::filesystem::perm_options::replace);
-#endif
+    if (path.has_parent_path())
+        std::filesystem::create_directories(path.parent_path());
+    thewatcher::common::write_private_file_atomic(path, f.str());
 }
 
 } // namespace thewatcher::agent
