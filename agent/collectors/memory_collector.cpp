@@ -16,10 +16,10 @@
 #include <sys/sysctl.h>
 #include <sys/types.h>
 #include <sys/vmmeter.h>
+// struct xswdev and XSWDEV_VERSION (vm.swap_info) on FreeBSD. Not
+// <vm/swap_pager.h>: that is the kernel's swap-device header and does not
+// compile in user space without <sys/queue.h> and kernel types.
 #include <vm/vm_param.h>
-#if defined(__FreeBSD__)
-#include <vm/swap_pager.h> // struct xswdev
-#endif
 #elif defined(__OpenBSD__)
 #include <sys/param.h>
 #include <sys/sysctl.h>
