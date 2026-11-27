@@ -172,6 +172,11 @@ Files:
 dashboard/src/api.ts
 dashboard/src/status.ts
 dashboard/src/main.tsx
+dashboard/src/App.tsx
+dashboard/src/pages/
+dashboard/src/components/
+dashboard/src/hooks/
+dashboard/src/permissions.ts
 dashboard/src/models.ts
 dashboard/src/styles.css
 ```
