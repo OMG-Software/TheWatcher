@@ -112,11 +112,11 @@ SCENARIO("A test DSN is pinned to a schema in both libpq DSN forms")
     {
         WHEN("a search_path is added")
         {
-            const auto dsn = dsn_with_search_path("postgresql://tw:pw@db:5432/tw", "tw_test_1");
+            const auto dsn = dsn_with_search_path("postgresql://tw@db:5432/tw", "tw_test_1");
 
             THEN("it becomes a URL-encoded query parameter, and the URI stays a URI")
             {
-                REQUIRE(dsn == "postgresql://tw:pw@db:5432/tw?options=-csearch_path%3Dtw_test_1");
+                REQUIRE(dsn == "postgresql://tw@db:5432/tw?options=-csearch_path%3Dtw_test_1");
             }
         }
     }

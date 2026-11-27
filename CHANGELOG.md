@@ -177,6 +177,12 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   - The PostgreSQL test DSN helper accepts both libpq DSN forms: a
     `postgresql://` URI gets `options` as a URL-encoded query parameter
     instead of a keyword (#82).
+  - The PostgreSQL reconnect tests now cut the connection while a write, a
+    read and a transaction are in flight (test seam
+    `PostgresStore::set_statement_hook`), and assert the documented policy:
+    an in-flight write fails and is not repeated, an in-flight read is
+    retried, a transaction fails and rolls back, and the next call
+    reconnects (#82).
 
 ### Changed
 

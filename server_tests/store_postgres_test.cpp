@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <memory>
 #include <thread>
 #include <vector>
@@ -244,92 +245,139 @@ SCENARIO("[postgres] Several nodes starting at once migrate the schema exactly o
 
 namespace
 {
-// Terminates every backend that belongs to the store tagged `application`,
-// as a pgBouncer restart or failover would.
+// Terminates every backend that belongs to the store tagged `application`, as
+// a pgBouncer restart or a failover would, and waits until they are gone so
+// the next statement cannot slip in before the server has acted on it.
 void kill_connections(const std::string& application)
 {
     run_sql("SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE application_name='" + application +
             "' AND pid<>pg_backend_pid()");
+    for (int i = 0; i < 100; ++i)
+    {
+        if (query_scalar("SELECT count(*) FROM pg_stat_activity WHERE application_name='" + application + "'") == "0")
+            return;
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    FAIL("the backend tagged " << application << " did not terminate");
+}
+
+// Cuts the store's connection once, at the moment the store is about to send
+// the first statement that starts with `sql_prefix`: that is, while the call
+// is in flight (and, for a transaction, after BEGIN and earlier statements).
+// Returns a counter of how many times it fired.
+std::shared_ptr<std::atomic<int>> cut_connection_at(PostgresStore& store, const std::string& application,
+                                                    const std::string& sql_prefix)
+{
+    auto fired = std::make_shared<std::atomic<int>>(0);
+    store.set_statement_hook([=](const char* sql) {
+        if (std::string(sql).rfind(sql_prefix, 0) == 0 && fired->fetch_add(1) == 0)
+            kill_connections(application);
+    });
+    return fired;
 }
 } // namespace
 
-SCENARIO("[postgres] The store recovers after its connection is cut")
+SCENARIO("[postgres] A write that dies with its connection is reported, not repeated, and the next call recovers")
 {
     test::TestSchema schema;
-    GIVEN("a store whose server connection is then terminated")
+    GIVEN("a store whose connection is cut while a write is in flight")
     {
-        const std::string application = "tw_reconnect_" + schema.name();
+        const std::string application = "tw_write_" + schema.name();
         PostgresStore store(schema.dsn(application));
-        store.upsert_agent(make_agent("reconnect-agent"));
-        kill_connections(application);
+        const auto fired = cut_connection_at(store, application, "INSERT INTO server_settings");
 
-        WHEN("a read is issued")
+        WHEN("the write is made")
         {
-            THEN("it is retried on a fresh connection and succeeds")
+            THEN("it fails, because it may have been applied and so is never silently retried")
             {
-                const auto agent = store.get_agent("reconnect-agent");
-                REQUIRE(agent.has_value());
-                CHECK(agent->hostname == "host-reconnect-agent");
-            }
-        }
-
-        WHEN("a write is issued")
-        {
-            // A write that dies with the connection may or may not have been
-            // applied, so it is reported instead of silently repeated.
-            try
-            {
-                store.set_setting("reconnect", "first");
-            }
-            catch (const std::exception&)
-            {
+                REQUIRE_THROWS_AS(store.set_setting("reconnect", "lost"), std::runtime_error);
+                CHECK(fired->load() == 1);
             }
 
-            THEN("the next write succeeds without restarting the process")
+            AND_THEN("the next calls reconnect by themselves; the lost write was not applied")
             {
+                REQUIRE_THROWS(store.set_setting("reconnect", "lost"));
+                CHECK(store.get_setting("reconnect", "absent") == "absent");
                 REQUIRE_NOTHROW(store.set_setting("reconnect", "second"));
-                CHECK(store.get_setting("reconnect", "") == "second");
-            }
-        }
-
-        WHEN("the connection is cut again while the store is idle")
-        {
-            REQUIRE(store.get_agent("reconnect-agent").has_value());
-            kill_connections(application);
-
-            THEN("the store keeps working")
-            {
-                REQUIRE(store.get_agent("reconnect-agent").has_value());
+                CHECK(store.get_setting("reconnect", "absent") == "second");
             }
         }
     }
 }
 
-SCENARIO("[postgres] A cut connection inside a transaction rolls it back and later calls recover")
+SCENARIO("[postgres] A read that dies with its connection is retried on a fresh one")
 {
     test::TestSchema schema;
-    GIVEN("a group-assignment transaction whose connection dies halfway")
+    GIVEN("a store with a setting, whose connection is cut while a read is in flight")
+    {
+        const std::string application = "tw_read_" + schema.name();
+        PostgresStore store(schema.dsn(application));
+        store.set_setting("reconnect", "kept");
+        const auto fired = cut_connection_at(store, application, "SELECT value FROM server_settings");
+
+        WHEN("the setting is read")
+        {
+            const auto value = store.get_setting("reconnect", "absent");
+
+            THEN("the caller sees the stored value and never notices the cut")
+            {
+                CHECK(value == "kept");
+                CHECK(fired->load() == 1);
+            }
+        }
+    }
+}
+
+SCENARIO("[postgres] A store that was idle when its connection was cut keeps working")
+{
+    test::TestSchema schema;
+    GIVEN("a store whose connection is terminated between two calls")
+    {
+        const std::string application = "tw_idle_" + schema.name();
+        PostgresStore store(schema.dsn(application));
+        store.upsert_agent(make_agent("idle-agent"));
+        kill_connections(application);
+
+        WHEN("a read is issued")
+        {
+            THEN("it succeeds on a fresh connection")
+            {
+                const auto agent = store.get_agent("idle-agent");
+                REQUIRE(agent.has_value());
+                CHECK(agent->hostname == "host-idle-agent");
+            }
+        }
+    }
+}
+
+SCENARIO("[postgres] A connection cut inside a transaction fails the call and rolls the transaction back")
+{
+    test::TestSchema schema;
+    GIVEN("an agent in one group and a transaction that moves it to another")
     {
         const std::string application = "tw_txn_" + schema.name();
         PostgresStore store(schema.dsn(application));
         store.upsert_agent(make_agent("txn-agent"));
-        const auto group = store.create_group("txn-group");
-        store.set_agent_groups("txn-agent", {group});
-        kill_connections(application);
+        const auto old_group = store.create_group("txn-old");
+        const auto new_group = store.create_group("txn-new");
+        store.set_agent_groups("txn-agent", {old_group});
+        // BEGIN and the DELETE have run; the connection dies before the INSERT.
+        const auto fired = cut_connection_at(store, application, "INSERT INTO agent_groups");
 
-        WHEN("the transactional call is made")
+        WHEN("the group list is replaced")
         {
-            try
+            THEN("the call fails instead of carrying on outside the transaction")
             {
-                store.set_agent_groups("txn-agent", {});
-            }
-            catch (const std::exception&)
-            {
+                REQUIRE_THROWS_AS(store.set_agent_groups("txn-agent", {new_group}), std::runtime_error);
+                CHECK(fired->load() == 1);
             }
 
-            THEN("the old membership is intact and the store works again")
+            AND_THEN("the original membership is intact and the store works again")
             {
-                REQUIRE(store.get_agent_groups("txn-agent") == std::vector<int64_t>{group});
+                REQUIRE_THROWS(store.set_agent_groups("txn-agent", {new_group}));
+                CHECK(store.get_agent_groups("txn-agent") == std::vector<int64_t>{old_group});
+                REQUIRE_NOTHROW(store.set_agent_groups("txn-agent", {new_group}));
+                CHECK(store.get_agent_groups("txn-agent") == std::vector<int64_t>{new_group});
             }
         }
     }

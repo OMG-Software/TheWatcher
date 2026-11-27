@@ -18,6 +18,12 @@ public:
     explicit PostgresStore(const std::string& dsn);
     ~PostgresStore() override;
 
+    // Test seam, see postgres::Connection::set_statement_hook. Unset in production.
+    void set_statement_hook(postgres::Connection::StatementHook hook)
+    {
+        conn_.set_statement_hook(std::move(hook));
+    }
+
     void upsert_agent(const AgentRecord& rec) override;
     std::optional<AgentRecord> get_agent(const std::string& agent_id) override;
     std::vector<AgentRecord> list_agents() override;

@@ -8,6 +8,7 @@
 #include <cctype>
 #include <chrono>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -84,6 +85,16 @@ public:
 
     // Same contracts as PQexec / PQexecParams, plus reconnection. The caller
     // owns the result (wrap it in an RAII holder).
+    // Test seam: called with the SQL text just before each statement is sent
+    // (after any reconnect, never for BEGIN/COMMIT/ROLLBACK). Lets a test cut
+    // the connection while a statement or transaction is in flight. Unset, and
+    // so a no-op, in production.
+    using StatementHook = std::function<void(const char* sql)>;
+    void set_statement_hook(StatementHook hook)
+    {
+        statement_hook_ = std::move(hook);
+    }
+
     PGresult* exec(const char* sql)
     {
         return run(sql, [&] {
@@ -139,6 +150,8 @@ private:
     PGresult* run(const char* sql, Call&& call)
     {
         ensure_connected();
+        if (statement_hook_)
+            statement_hook_(sql);
         PGresult* res = call();
         if (PQstatus(conn_.get()) == CONNECTION_OK || in_transaction_ || !is_read_only(sql))
             return res;
@@ -150,6 +163,7 @@ private:
     std::string dsn_;
     std::unique_ptr<PGconn, ConnectionCloser> conn_;
     bool in_transaction_ = false;
+    StatementHook statement_hook_;
 };
 
 // Runs a command that returns no rows. Returns whether it succeeded; the

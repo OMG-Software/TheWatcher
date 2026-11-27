@@ -169,7 +169,7 @@ may already have been applied: it throws, and the next call reconnects. A
 connection lost inside a transaction is never reset mid-transaction; the call
 throws, the guard rolls back, and the next call reconnects. After a pgBouncer
 restart or failover the server therefore recovers by itself, with at most one
-failed write per outage. Add `connect_timeout=5` to `POSTGRES_DSN` so a
+failed write per outage. `PostgresStore::set_statement_hook` is a test seam (unset in production) that lets the tests cut the connection while a statement or transaction is in flight. Add `connect_timeout=5` to `POSTGRES_DSN` so a
 black-holed server does not stall a call for the OS default.
 
 ### Store threading and transactions
