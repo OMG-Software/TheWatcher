@@ -87,6 +87,10 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   handshake (#89).
 - Added agent lifecycle, shutdown, heartbeat and config validation tests
   (part of #101). Tests join their threads with `std::jthread` (part of #100).
+- The Linux CI build (GCC 11, `-O3 -Werror`) compiles again:
+  `protocol_security_test` builds its CBOR payloads in a buffer sized up
+  front instead of appending with `vector::insert`, which tripped a GCC 11
+  `-Wstringop-overread` false positive.
 
 ### Changed
 
@@ -94,7 +98,12 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   fails any PR whose C++ is not (`clang-format` 22.1.5, pinned). The
   formatting commit is listed in `.git-blame-ignore-revs`. A new include
   category keeps `<windows.h>`/`<winsock2.h>` ahead of the Win32 headers
-  that need them (#121).
+  that need them (#121). The CI job installs `clang-format` with
+  `--only-binary :all:`, so no source-distribution setup script can run.
+  The CI workflow limits `GITHUB_TOKEN` to `contents: read`.
+- SonarCloud leaves test code out of duplication detection
+  (`.sonarcloud.properties`); BDD scenarios repeat their setup on purpose.
+  Test files are still analysed for bugs and vulnerabilities.
 - CI runs for every pull request, not only those targeting `main`, so
   stacked PRs are built and tested too (#119).
 - `.gitignore` covers local build directories (`build-*/`, `builddir-*/`),
