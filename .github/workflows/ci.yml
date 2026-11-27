@@ -12,6 +12,12 @@ on:
   schedule:
     - cron: "32 1 * * 1"
 
+# Least privilege for GITHUB_TOKEN: every job only reads the repository.
+# actions/cache and actions/upload-artifact use the runner's own token and
+# need no extra scopes.
+permissions:
+  contents: read
+
 jobs:
 
   # ── Formatting ─────────────────────────────────────────────────────────────
@@ -24,7 +30,10 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install clang-format 22.1.5
-        run: python3 -m pip install --user clang-format==22.1.5
+        # --only-binary: install the published wheel only, never run a
+        # source distribution's setup script.
+        run: |
+          python3 -m pip install --user --only-binary :all: clang-format==22.1.5
 
       - name: Check formatting
         run: |
