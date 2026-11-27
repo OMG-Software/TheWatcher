@@ -85,6 +85,9 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Changed
 
+- The server config save now uses the shared `common::write_private_file_atomic`
+  helper (atomic, owner-only write) that the agent config also uses; the
+  duplicated code in `server/config.cpp` is removed. No behaviour change (#149).
 - The whole C++ tree is formatted with the root `.clang-format`, and CI
   fails any PR whose C++ is not (`clang-format` 22.1.5, pinned). The
   formatting commit is listed in `.git-blame-ignore-revs`. A new include
