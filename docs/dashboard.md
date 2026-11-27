@@ -142,16 +142,26 @@ server) over HTTPS, because the session cookie is `Secure`. Set
   "Your session expired" and unmounts the dashboard, which stops all polling.
   The login page warns when served over plain HTTP from a non-local host: the
   session cookie is `Secure`, so the browser drops it there.
-- **Polling.** `usePolling(fetcher, { intervalMs, enabled })` skips a tick while
-  a request is in flight, drops the result of a request that a newer one (for
-  example a manual refresh after an action) overtook, and pauses while the tab
-  is hidden, refreshing as soon as it is visible again. `useDashboardData` polls
-  every 5 s with it. `refresh()` resolves to the load error message (null on
-  success, or when a newer request overtook it) and never rejects; `runAction`
-  uses that to report a failed post-action refresh. An optional `merge(next, previous)` combines an accepted
-  result with the previous data and never sees a stale one; `useDashboardData`
-  uses it to keep the last good value of a failed section. `useSession` ignores
-  a slow startup session probe that settles after a sign-in or sign-out.
+- **Polling.** `usePolling(fetcher, { intervalMs, enabled })` keeps at most one
+  request in flight and skips a tick while one runs. `refresh()` during an
+  in-flight request queues exactly one follow-up load, which starts when the
+  current one settles (the running one may predate the change that prompted the
+  refresh); further `refresh()` calls share that follow-up. Disabling or
+  unmounting ignores the in-flight result and drops the queued follow-up. The
+  poll pauses while the tab is hidden and refreshes as soon as it is visible
+  again. `useDashboardData` polls every 5 s with it. `refresh()` resolves to
+  the load error message of a load that started after the call (null on
+  success) and never rejects. `runAction` stays busy until the mutation and
+  its refresh have both settled, so a control guarded by `busyAction` cannot
+  repeat the change while the result loads, and it uses the refresh result to
+  report a failed post-action refresh. An optional `merge(next, previous)`
+  combines an accepted result with the previous data and never sees a stale
+  one; `useDashboardData` uses it to keep the last good value of a failed
+  section. `useSession` ignores a slow startup session probe that settles
+  after a sign-in or sign-out. After a successful settings save whose reload
+  fails, the form keeps the saved values and shows a "Could not refresh
+  settings" warning. There is no request timeout in `api.ts`, so a hung request
+  keeps its action busy, as a hung mutation always has.
 
 ## Tests
 

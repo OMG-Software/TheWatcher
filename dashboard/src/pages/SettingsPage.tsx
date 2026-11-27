@@ -25,6 +25,7 @@ export function SettingsPage({
       <div className="management-header"><h1>Settings</h1></div>
       {!draft && !error ? <div className="banner">Loading settings...</div> : null}
       {!draft && error ? <LoadFailed what="settings" message={error} onRetry={() => void refresh()} /> : null}
+      {draft && error ? <LoadFailed what="settings" message={error} stale onRetry={() => void refresh()} /> : null}
       {draft ? (
         <form
           className="settings-form"
@@ -34,8 +35,9 @@ export function SettingsPage({
             void runAction('settings:save', () => updateSettings(draft), { inline: true })
               .then(async (ok) => {
                 if (!ok) return; // keep the edits so the user can fix and retry
-                await refresh();
-                setEdits({});
+                // Drop the edits only once the reload shows the saved values; if the reload failed,
+                // the edits are the saved values and must stay visible.
+                if ((await refresh()) === null) setEdits({});
               })
               .finally(() => setSaving(false));
           }}
