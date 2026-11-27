@@ -97,8 +97,9 @@ The once-a-second offline scan sits next to it:
 - Effective timeout per agent: `max(base, 3 x heartbeat_interval)`. With the
   default 5 s heartbeat the base applies; a 60 s heartbeat gets 180 s, so an
   agent heartbeating on time never flaps offline.
-- A saved `offline_after_seconds` of 0 or less disables offline detection, like
-  a non-positive config value.
+- The saved setting overrides the config value in both directions: a saved
+  value of 0 or less disables offline detection, and a saved positive value
+  enables it even when `OFFLINE_AFTER_SECONDS` is 0 in the config.
 - The same per-agent timeout expires an agent's learned command route when it
   has sent no frame for that long.
 - Agents in maintenance are never marked offline.

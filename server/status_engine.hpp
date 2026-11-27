@@ -72,9 +72,10 @@ public:
     std::vector<std::string> mark_offline_agents(int64_t now_ms, int default_offline_after_seconds);
 
     // The effective offline timeout for an agent with this heartbeat interval:
-    // max(base, 3 x heartbeat) where base is the "offline_after_seconds"
-    // setting, else default_offline_after_seconds. Returns 0 when offline
-    // detection is disabled (the default or the saved setting is not positive).
+    // max(base, 3 x heartbeat) where base is the saved "offline_after_seconds"
+    // setting, else default_offline_after_seconds. The saved setting wins over
+    // the config either way. Returns 0 when offline detection is disabled (the
+    // resulting base is not positive).
     int offline_timeout_seconds_for(int heartbeat_interval_seconds, int default_offline_after_seconds);
 
     // Number of agents with cached state (for tests and diagnostics).

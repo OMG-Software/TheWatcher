@@ -425,8 +425,6 @@ void StatusEngine::reconcile_maintenance(int64_t now_ms)
 int StatusEngine::offline_timeout_seconds_for(int heartbeat_interval_seconds, int default_offline_after_seconds)
 {
     int base_seconds = default_offline_after_seconds;
-    if (base_seconds <= 0)
-        return 0;
     const auto setting = store_.get_setting("offline_after_seconds", "");
     if (!setting.empty())
     {
@@ -439,7 +437,8 @@ int StatusEngine::offline_timeout_seconds_for(int heartbeat_interval_seconds, in
             LOGF_WARNING("Ignoring invalid offline_after_seconds setting '%s'", setting.c_str());
         }
     }
-    // A saved non-positive value disables offline detection, like the config.
+    // The saved setting overrides the config in both directions; detection is
+    // off only when the resulting base is not positive.
     if (base_seconds <= 0)
         return 0;
     return effective_offline_timeout_seconds(base_seconds, heartbeat_interval_seconds);
@@ -449,7 +448,7 @@ std::vector<std::string> StatusEngine::mark_offline_agents(int64_t now_ms, int d
 {
     std::vector<std::string> gone;
     if (offline_timeout_seconds_for(0, default_offline_after_seconds) <= 0)
-        return gone;
+        return gone; // disabled
 
     for (const auto& agent : store_.list_approved_agents())
     {

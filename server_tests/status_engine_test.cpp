@@ -1924,3 +1924,30 @@ SCENARIO("Expired timed maintenance inside an active window re-enters for the wi
         }
     }
 }
+
+SCENARIO("A saved positive offline_after_seconds enables offline detection that the config disabled")
+{
+    GIVEN("a config with offline detection disabled and offline_after_seconds=120 saved in the store")
+    {
+        SqliteStore store(":memory:");
+        store.set_setting("offline_after_seconds", "120");
+        put_agent(store, "agent-runtime-on", 1'000'000 - 200'000, 5);
+        StatusEngine engine(store);
+
+        THEN("the timeout is the saved setting, which also decides route expiry")
+        {
+            REQUIRE(engine.offline_timeout_seconds_for(5, 0) == 120);
+        }
+
+        WHEN("the agent has been silent past the saved setting")
+        {
+            const auto gone = engine.mark_offline_agents(1'000'000, 0);
+
+            THEN("it is marked offline")
+            {
+                REQUIRE(gone == std::vector<std::string>{"agent-runtime-on"});
+                REQUIRE_FALSE(store.get_agent("agent-runtime-on")->connected);
+            }
+        }
+    }
+}

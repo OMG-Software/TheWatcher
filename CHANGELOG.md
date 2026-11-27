@@ -65,7 +65,8 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   per-agent offline timeout as the offline scan; an acknowledged PAUSE keeps
   the maintenance reason and expiry set by the API instead of making timed
   maintenance open ended; maintenance resets stale-value clocks; a saved
-  `offline_after_seconds` of 0 disables offline detection; the engine drops
+  `offline_after_seconds` overrides the config value in both directions (0
+  disables, a positive value enables even if the config disables it); the engine drops
   state of deleted agents; expiring timed maintenance inside an active window
   hands over to the window without a gap.
 - A NaN or infinite reading no longer raises a "grey" alert: Grey means no

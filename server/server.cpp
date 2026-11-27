@@ -240,7 +240,7 @@ void Server::run(StartupSignal* startup)
         if (std::chrono::steady_clock::now() >= next_offline_scan)
         {
             const auto now = now_ms();
-            if (config_.offline_after_seconds > 0)
+            if (status_engine_->offline_timeout_seconds_for(0, config_.offline_after_seconds) > 0)
             {
                 // #46: the cutoff is per agent (dashboard setting, heartbeat interval).
                 status_engine_->mark_offline_agents(now, config_.offline_after_seconds);
