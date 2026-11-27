@@ -82,6 +82,15 @@ auth_file   = /etc/pgbouncer/userlist.txt
 pool_mode   = transaction
 max_client_conn = 200
 default_pool_size = 20
+
+; TLS from TheWatcherServer to pgBouncer (the DSN below uses sslmode=require)
+client_tls_sslmode   = require
+client_tls_cert_file = /etc/pgbouncer/server.crt
+client_tls_key_file  = /etc/pgbouncer/server.key
+
+; TLS from pgBouncer onward to PostgreSQL (PostgreSQL must have ssl = on)
+server_tls_sslmode   = verify-full
+server_tls_ca_file   = /etc/pgbouncer/postgres-ca.crt
 ```
 
 `/etc/pgbouncer/userlist.txt`:

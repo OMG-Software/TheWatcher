@@ -34,6 +34,10 @@ Source: "..\..\dashboard\dist\*"; DestDir: "{app}\dashboard"; Flags: ignoreversi
 Name: "{commonappdata}\TheWatcher"; AfterInstall: SecureConfigDir
 
 [Run]
+; Upgrades: a service registered by an older installer still points at
+; server.json and CreateService does not update an existing registration, so
+; remove the old registration first. This fails harmlessly on a fresh install.
+Filename: "{app}\server\TheWatcherServer.exe"; Parameters: "--uninstall-service"; Flags: runhidden waituntilterminated
 Filename: "{app}\server\TheWatcherServer.exe"; Parameters: "--install-service --config ""{commonappdata}\TheWatcher\TheWatcherServer.conf"""; Flags: runhidden waituntilterminated
 Filename: "{app}\agent\TheWatcherAgent.exe"; Parameters: "--install-service --config ""{commonappdata}\TheWatcher\TheWatcherAgent.conf"""; Flags: runhidden waituntilterminated
 
@@ -79,6 +83,34 @@ begin
   end;
 end;
 
+// Older installers registered the server service with server.json. The server
+// wrote a KEY=VALUE file there (the same format as TheWatcherServer.conf), so
+// on upgrade the file is COPIED to TheWatcherServer.conf. If that were not
+// done the service would start on a missing .conf and load_or_create would
+// generate a new CURVE keypair, breaking every enrolled agent.
+// - An existing TheWatcherServer.conf is never overwritten.
+// - server.json is left in place as a backup.
+// - A server.json that does not look like a KEY=VALUE config (for example one
+//   hand-written as JSON) is not converted; see the upgrade notes in
+//   docs/installation.md.
+procedure MigrateServerConfig(const Dir: String);
+var
+  OldConf, NewConf: String;
+  Raw: AnsiString;
+begin
+  OldConf := AddBackslash(Dir) + 'server.json';
+  NewConf := AddBackslash(Dir) + 'TheWatcherServer.conf';
+  if FileExists(NewConf) or not FileExists(OldConf) then
+    Exit;
+  if not LoadStringFromFile(OldConf, Raw) or (Pos('SERVER_SECRET_KEY=', String(Raw)) = 0) then
+  begin
+    Log('server.json is not a KEY=VALUE server config; not migrated');
+    Exit;
+  end;
+  if not FileCopy(OldConf, NewConf, True) then
+    RaiseException('Could not copy ' + OldConf + ' to ' + NewConf);
+end;
+
 // SEC-45: restrict the config directory to Administrators (*S-1-5-32-544)
 // and SYSTEM (*S-1-5-18).
 // - /inheritance:r drops ACEs inherited from ProgramData.
@@ -110,4 +142,7 @@ begin
   // SDDL trustee aliases: BU = Users, AU = Authenticated Users, WD = Everyone.
   if (Pos(';BU)', Sddl) > 0) or (Pos(';AU)', Sddl) > 0) or (Pos(';WD)', Sddl) > 0) then
     RaiseException('The ACL of ' + Dir + ' still grants access to non-administrators');
+
+  // After the ACL reset so the copied file inherits the restricted ACL.
+  MigrateServerConfig(Dir);
 end;

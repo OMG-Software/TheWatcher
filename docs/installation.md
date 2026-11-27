@@ -239,8 +239,8 @@ C:\ProgramData\TheWatcher\TheWatcherAgent.conf
 C:\ProgramData\TheWatcher\TheWatcherAgent.log
 ```
 
-The server creates `TheWatcherServer.conf` on first run if it does not exist. The agent
-creates `TheWatcherAgent.conf` on first run if it does not exist.
+The server creates `TheWatcherServer.conf` on first run if it does not exist.
+The agent creates `TheWatcherAgent.conf` on first run if it does not exist.
 
 The config directory holds the server and agent CURVE secret keys. On POSIX
 installs the generated config files are owner-only (`0600`). On Windows,
@@ -257,6 +257,27 @@ The first command removes the `Users` grant that installers before 0.8.0
 added. `/grant:r` alone does not remove it. The second command makes existing
 files inherit only the restricted ACL; skip it when the directory is empty. Use
 the third command to confirm that only `Administrators` and `SYSTEM` remain.
+
+### Upgrading from an installer that used `server.json`
+
+Older Windows installers registered the server service with
+`--config C:\ProgramData\TheWatcher\server.json`. The server wrote a
+`KEY=VALUE` file at that path, the same format as `TheWatcherServer.conf`. The
+current installer therefore:
+
+1. copies `server.json` to `TheWatcherServer.conf` when the old file exists
+   and has a `SERVER_SECRET_KEY=` line and `TheWatcherServer.conf` does not
+   exist (an existing `.conf` is never overwritten, and `server.json` is kept
+   as a backup), so the server keeps its CURVE identity and agents keep
+   working;
+2. removes the old service registration and registers it again so the service
+   command line points at `TheWatcherServer.conf`.
+
+If `server.json` is not a `KEY=VALUE` file (for example you wrote JSON by
+hand), it is not converted. Copy the settings into `TheWatcherServer.conf`
+yourself before starting the service, and keep the old `SERVER_PUBLIC_KEY` and
+`SERVER_SECRET_KEY` if you have them: without them the server generates a new
+keypair and every agent must be re-enrolled.
 
 ## Foreground Install
 

@@ -92,9 +92,15 @@ usage, services, packages, or custom application health.
    `SystemMetrics`, and add `to_cbor` / `from_cbor` specialisations for the
    struct. Agents send metrics to the server as CBOR (the `cbor` helpers live
    in `common/protocol.hpp`), and `SystemMetrics` is encoded as a fixed-length
-   positional array, so a new field changes the wire format: update the array
-   size in both `to_cbor` and `from_cbor` and keep the protocol version in
-   mind. The REST API serialises the same structs as JSON; add the
+   positional array. Today `from_cbor<SystemMetrics>` accepts exactly 11
+   elements and there is no protocol version negotiation, so adding a field
+   changes the array length and an agent and server on different layouts
+   cannot decode each other's frames. Stored `metrics_cbor` rows are never
+   rewritten, so they would also stop decoding. Until the decoder accepts the
+   previous length and defaults the new fields (protocol versioning work in
+   #57 and #102), a new `SystemMetrics` field needs a coordinated upgrade of
+   server and all agents, and old stored rows will not decode. Do not add a
+   field without addressing that. The REST API serialises the same structs as JSON; add the
    `NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT` mapping for the new
    struct, and the new `SystemMetrics` field, in `server/api_json.hpp`.
 
