@@ -65,7 +65,9 @@ npm.cmd run lint
 
 ESLint (flat config, `typescript-eslint`, `eslint-plugin-react-hooks`) runs in
 CI in the `dashboard` job together with `npm run build`, `npm test` and
-`npm audit --omit=dev`. The footer shows the dashboard version, injected from
+`npm audit --omit=dev`. CI installs with `npm ci --ignore-scripts`, so no
+package's install lifecycle script runs; a new dependency that only works
+after its `postinstall` script will fail CI. The footer shows the dashboard version, injected from
 `dashboard/package.json` at build time.
 
 ## Development

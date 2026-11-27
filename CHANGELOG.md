@@ -107,8 +107,9 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 ### Added
 
 - Dashboard: ESLint (flat config, `typescript-eslint`, `react-hooks`) with
-  `npm run lint`, and a `dashboard` CI job running `npm ci`, lint, build,
-  tests and `npm audit --omit=dev` (#120).
+  `npm run lint`, and a `dashboard` CI job running
+  `npm ci --ignore-scripts` (no package install scripts), lint, build, tests
+  and `npm audit --omit=dev` (#120).
 - Dashboard: the footer shows the dashboard version from `package.json`
   (#127).
 
