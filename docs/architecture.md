@@ -146,6 +146,16 @@ Files: `server/store_synchronized.hpp`, `server/sqlite_raii.hpp`,
   never throws from the destructor, so the original error is kept. Do not
   start a transaction inside another one: share a private helper that does
   not begin its own (see `replace_agent_groups`).
+- Insert-if-absent across server nodes (`insert_heartbeat_alert_if_absent`)
+  cannot rely on the in-process mutex. On PostgreSQL the check and the insert
+  run in one transaction holding
+  `pg_advisory_xact_lock(hashtext('thewatcher:heartbeat:<agent_id>'))`,
+  which serialises them per agent across every node. The lock only protects
+  nodes that take it: a node older than 0.9.0 still scans then inserts
+  without it, so upgrade every node before running a mixed cluster
+  concurrently, or accept a possible duplicate Heartbeat alert during the
+  upgrade. No unique index is used, so existing databases that already hold
+  duplicates need no migration.
 - Read paths throw on a database error. `sqlite::step_row` returns false only
   for `SQLITE_DONE`; "no rows" is never the result of a busy or failing
   statement. SQLite waits up to 5 seconds for a lock (`busy_timeout`).
