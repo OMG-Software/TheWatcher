@@ -80,8 +80,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   connection now waits up to 5 seconds for a competing lock (#78).
 - Bulk acknowledge and bulk delete of alerts run in one transaction on both
   backends, and the dead-agent alert is created with an atomic
-  insert-if-absent (on PostgreSQL under a per-agent advisory lock), so two
-  server nodes cannot create duplicates (#79).
+  insert-if-absent (#79). On PostgreSQL this runs under a per-agent advisory
+  lock, so two server nodes cannot create duplicates once every node runs
+  0.9.0. A pre-0.9.0 node does not take the lock: during a rolling upgrade,
+  upgrade every node before running them concurrently, or accept that one
+  duplicate Heartbeat alert per agent is possible in that window.
 - A heartbeat or an API setting no longer rewrites the whole agent row from a
   stale snapshot, which silently reverted a collector config, heartbeat
   interval, runbook or maintenance change saved at the same moment. The data
