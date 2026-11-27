@@ -40,6 +40,12 @@ namespace detail
     struct InterfaceReading
     {
         std::string name;
+        // Stable identity used to track counters between samples (Windows
+        // IfIndex); the display name can change. Empty means use `name`.
+        std::string key;
+        // False when the OS counters could not be read; the sample is then
+        // skipped and the previous baseline kept rather than diffing zeros.
+        bool counters_valid = true;
         uint64_t rx_bytes = 0;
         uint64_t tx_bytes = 0;
         uint64_t rx_packets = 0;

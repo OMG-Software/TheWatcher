@@ -79,7 +79,14 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   Windows pseudo interfaces and interfaces that are down, in the status engine
   and the dashboard. Interfaces named in the collector config are still
   evaluated, and a down one is red. `NetworkMetrics` gains an `is_loopback`
-  field (#57).
+  field (#57). Windows loopback adapters are now reported (flagged
+  `is_loopback`) so a config can select them, and the dashboard's primary IP
+  skips loopback and pseudo interfaces.
+- Network collector hardening: IPv6 link-local detection covers all of
+  `fe80::/10`; Windows counters are tracked by interface index so a renamed
+  adapter keeps its history; an unreadable `/proc/net/dev` skips the sample
+  and keeps the baseline instead of producing a huge false delta; if
+  `getifaddrs` fails the `/proc` fallback reports interfaces down (#92, #91).
 - The Linux CI build (GCC 11, `-O3 -Werror`) compiles again:
   `protocol_security_test` builds its CBOR payloads in a buffer sized up
   front instead of appending with `vector::insert`, which tripped a GCC 11

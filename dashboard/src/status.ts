@@ -170,11 +170,14 @@ const PSEUDO_INTERFACE_FRAGMENTS = ['loopback', 'pseudo-interface', 'isatap', 't
 // Mirrors the server's default network evaluation: with no explicit network
 // config only real, connected interfaces are monitored, so loopback, BSD/Windows
 // pseudo devices and down interfaces are skipped.
+function isPseudoInterfaceName(interfaceName: string): boolean {
+  const name = interfaceName.toLowerCase();
+  if (PSEUDO_INTERFACE_PREFIXES.some((prefix) => name.startsWith(prefix) && /^\d*$/.test(name.slice(prefix.length)))) return true;
+  return PSEUDO_INTERFACE_FRAGMENTS.some((fragment) => name.includes(fragment));
+}
+
 function isDefaultMonitoredNetwork(network: NetworkMetrics): boolean {
-  if (!network.is_up || network.is_loopback) return false;
-  const name = network.interface_name.toLowerCase();
-  if (PSEUDO_INTERFACE_PREFIXES.some((prefix) => name.startsWith(prefix) && /^\d*$/.test(name.slice(prefix.length)))) return false;
-  return !PSEUDO_INTERFACE_FRAGMENTS.some((fragment) => name.includes(fragment));
+  return network.is_up && network.is_loopback !== true && !isPseudoInterfaceName(network.interface_name);
 }
 
 function networkMbps(network: NetworkMetrics): number {
@@ -328,11 +331,21 @@ function metricComponents(agent: AgentRecord, metrics?: SystemMetrics): Componen
   ];
 }
 
+function isLoopbackNetwork(network: NetworkMetrics): boolean {
+  const ip = network.ip_address?.trim();
+  return (
+    network.is_loopback === true ||
+    isPseudoInterfaceName(network.interface_name) ||
+    ip === '::1' ||
+    (ip?.startsWith('127.') ?? false)
+  );
+}
+
+// The address shown for an agent: the first interface that has one and is not
+// loopback or a pseudo device (lo, lo0, pflog0, ...). Down interfaces count,
+// since their last address is still the best identifier.
 export function primaryIpAddress(metrics?: SystemMetrics): string {
-  const candidates = metrics?.networks.filter((network) => {
-    const ip = network.ip_address?.trim();
-    return ip && ip !== '127.0.0.1' && ip !== '::1' && network.interface_name !== 'lo';
-  }) ?? [];
+  const candidates = metrics?.networks.filter((network) => network.ip_address?.trim() && !isLoopbackNetwork(network)) ?? [];
   return candidates[0]?.ip_address ?? '';
 }
 

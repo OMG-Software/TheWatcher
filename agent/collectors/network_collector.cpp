@@ -80,7 +80,11 @@ namespace detail
         constexpr unsigned int ethernet_csmacd = 6;
         constexpr unsigned int ppp = 23;
         constexpr unsigned int ieee80211 = 71;
-        return if_type == ethernet_csmacd || if_type == ppp || if_type == ieee80211;
+        // Software loopback is kept so it is reported with is_loopback set;
+        // the server's default evaluation skips it, an explicit config can
+        // still select it.
+        constexpr unsigned int software_loopback = 24;
+        return if_type == ethernet_csmacd || if_type == ppp || if_type == ieee80211 || if_type == software_loopback;
     }
 
     uint64_t counter_delta(uint64_t previous, uint64_t current)
@@ -122,10 +126,26 @@ namespace detail
     std::string choose_primary_address(const std::vector<std::string>& addresses)
     {
         // Lower rank wins; ties keep the first address seen.
+        // IPv6 link-local is fe80::/10: the first 10 bits are 1111111010, so
+        // the first group masked with 0xFFC0 equals 0xFE80 (fe80 to febf).
         const auto rank = [](const std::string& address) {
             const bool v6 = address.find(':') != std::string::npos;
-            const bool link_local =
-                v6 ? lowercase_ascii(address).rfind("fe80", 0) == 0 : address.rfind("169.254.", 0) == 0;
+            bool link_local = false;
+            if (v6)
+            {
+                const auto first_group = address.substr(0, address.find(':'));
+                if (!first_group.empty() && first_group.size() <= 4 &&
+                    std::all_of(first_group.begin(), first_group.end(), [](unsigned char ch) {
+                        return std::isxdigit(ch) != 0;
+                    }))
+                {
+                    link_local = (std::stoul(first_group, nullptr, 16) & 0xFFC0u) == 0xFE80u;
+                }
+            }
+            else
+            {
+                link_local = address.rfind("169.254.", 0) == 0;
+            }
             return (link_local ? 2 : 0) + (v6 ? 1 : 0);
         };
         const std::string* best = nullptr;
@@ -185,7 +205,9 @@ namespace
 
             row >> counters.tx_bytes >> counters.tx_packets >> counters.tx_errors >> counters.tx_drops;
 
-            if (!name.empty())
+            // A malformed row is left out so its interface is marked unreadable
+            // instead of reporting zeros.
+            if (!name.empty() && !row.fail())
             {
                 interfaces[name] = counters;
             }
@@ -254,6 +276,7 @@ namespace
                 reading.name = name;
                 reading.is_up = (entry->ifa_flags & IFF_UP) != 0 && (entry->ifa_flags & IFF_RUNNING) != 0;
                 reading.is_loopback = (entry->ifa_flags & IFF_LOOPBACK) != 0;
+                reading.counters_valid = false; // set once counters are read
                 readings.push_back(std::move(reading));
             }
             [[maybe_unused]] auto& reading = readings[slot->second];
@@ -290,6 +313,7 @@ namespace
                     reading.tx_errors = data.ifi_oerrors;
                     // Input queue drops only: if_data has no portable output drop counter.
                     reading.rx_drops = data.ifi_iqdrops;
+                    reading.counters_valid = true;
                 }
             }
 #endif
@@ -312,11 +336,13 @@ namespace
         if (readings.empty())
         {
             // getifaddrs failed: fall back to the interfaces /proc knows about.
+            // The link state is unknown, so report them down: a configured
+            // interface then fails closed (red) instead of looking healthy.
             for (const auto& entry : counters)
             {
                 detail::InterfaceReading reading;
                 reading.name = entry.first;
-                reading.is_up = true;
+                reading.is_up = false;
                 readings.push_back(std::move(reading));
             }
         }
@@ -324,7 +350,8 @@ namespace
         {
             const auto found = counters.find(reading.name);
             if (found == counters.end())
-                continue;
+                continue; // unreadable: counters_valid stays false
+            reading.counters_valid = true;
             reading.rx_bytes = found->second.rx_bytes;
             reading.rx_packets = found->second.rx_packets;
             reading.rx_errors = found->second.rx_errors;
@@ -451,6 +478,7 @@ namespace
 
             detail::InterfaceReading reading;
             reading.name = adapter.name;
+            reading.key = std::to_string(adapter.if_index); // friendly names can change
             reading.ip_address = adapter.ip_address;
             reading.mac_address = adapter.mac_address;
             reading.is_up = row.OperStatus == IfOperStatusUp;
@@ -488,7 +516,17 @@ std::vector<NetworkMetrics> NetworkCollector::process_readings(const std::vector
         network.is_up = reading.is_up;
         network.is_loopback = reading.is_loopback;
 
-        const auto previous = prev_.find(reading.name);
+        const auto& key = reading.key.empty() ? reading.name : reading.key;
+        const auto previous = prev_.find(key);
+        if (!reading.counters_valid)
+        {
+            // Unreadable counters: report no rates and keep the old baseline
+            // so the next good sample is not diffed against zeros.
+            if (previous != prev_.end())
+                current[key] = previous->second;
+            result.push_back(std::move(network));
+            continue;
+        }
         if (previous != prev_.end())
         {
             const auto& before = previous->second;
@@ -515,7 +553,7 @@ std::vector<NetworkMetrics> NetworkCollector::process_readings(const std::vector
         sample.rx_drops = reading.rx_drops;
         sample.tx_drops = reading.tx_drops;
         sample.sampled_at = now;
-        current[reading.name] = sample;
+        current[key] = sample;
         result.push_back(std::move(network));
     }
 

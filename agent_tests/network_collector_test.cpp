@@ -150,6 +150,60 @@ SCENARIO("NetworkCollector turns cumulative counters into per-interval figures")
     }
 }
 
+SCENARIO("NetworkCollector keeps history across renames and unreadable counters")
+{
+    GIVEN("a Windows-style adapter identified by a stable key whose friendly name later changes")
+    {
+        NetworkCollector collector;
+        const auto t0 = std::chrono::steady_clock::now();
+        auto first = reading(1'000, 0);
+        first.key = "12";
+        first.name = "Ethernet";
+        collector.process_readings({first}, t0);
+
+        WHEN("the adapter is renamed between samples")
+        {
+            auto second = reading(3'000, 0);
+            second.key = "12";
+            second.name = "Ethernet (renamed)";
+            const auto out = collector.process_readings({second}, t0 + 2s);
+
+            THEN("its rate is computed against the earlier sample and the new name is shown")
+            {
+                REQUIRE(out[0].interface_name == "Ethernet (renamed)");
+                REQUIRE(out[0].bytes_recv_per_sec == 1'000);
+            }
+        }
+    }
+
+    GIVEN("a collector with a baseline sample")
+    {
+        NetworkCollector collector;
+        const auto t0 = std::chrono::steady_clock::now();
+        collector.process_readings({reading(1'000, 0, 5, 5)}, t0);
+
+        WHEN("one sample has unreadable counters (zeros that are not real)")
+        {
+            auto bad = reading(0, 0);
+            bad.counters_valid = false;
+            const auto skipped = collector.process_readings({bad}, t0 + 2s);
+            const auto next = collector.process_readings({reading(5'000, 0, 5, 5)}, t0 + 4s);
+
+            THEN("the bad sample reports no rates or deltas")
+            {
+                REQUIRE(skipped[0].bytes_recv_per_sec == 0);
+                REQUIRE(skipped[0].errors_in == 0);
+            }
+
+            AND_THEN("the next good sample is measured against the old baseline, not against zero")
+            {
+                REQUIRE(next[0].bytes_recv_per_sec == 1'000);
+                REQUIRE(next[0].errors_in == 0);
+            }
+        }
+    }
+}
+
 SCENARIO("Link-layer and IP addresses are formatted for display")
 {
     GIVEN("a six-byte hardware address")
@@ -192,6 +246,14 @@ SCENARIO("Link-layer and IP addresses are formatted for display")
         {
             const std::vector<std::string> addresses = {"fe80::1", "169.254.3.4"};
             REQUIRE(detail::choose_primary_address(addresses) == "169.254.3.4");
+        }
+
+        THEN("only fe80::/10 counts as IPv6 link-local, including febf:: but not fec0:: or fe8:: lookalikes")
+        {
+            // febf::1 is inside fe80::/10 (link-local); fec0::1 is outside it.
+            REQUIRE(detail::choose_primary_address({"febf::1", "2001:db8::7"}) == "2001:db8::7");
+            REQUIRE(detail::choose_primary_address({"fec0::1", "febf::1"}) == "fec0::1");
+            REQUIRE(detail::choose_primary_address({"fe8::1", "febf::1"}) == "fe8::1");
         }
 
         THEN("no addresses yields an empty string")

@@ -489,6 +489,27 @@ describe('GIVEN toDashboardAgents with metric components', () => {
     expect(dashAgent.ipAddress).toBe('192.0.2.10');
   });
 
+  it('WHEN the only addressed interfaces are loopback by flag, BSD name or address THEN no primary IP is shown', () => {
+    const snapshot = baseSnapshot('comp-agent');
+    const template = snapshot.metrics.networks[0];
+    snapshot.metrics.networks = [
+      { ...template, interface_name: 'lo0', ip_address: '127.0.0.1' },
+      { ...template, interface_name: 'weird0', ip_address: '10.255.0.1', is_loopback: true },
+      { ...template, interface_name: 'pflog0', ip_address: '' },
+    ];
+    expect(primaryIpAddress(snapshot.metrics)).toBe('');
+  });
+
+  it('WHEN a loopback interface precedes a real one THEN the real interface address is the primary IP', () => {
+    const snapshot = baseSnapshot('comp-agent');
+    const template = snapshot.metrics.networks[0];
+    snapshot.metrics.networks = [
+      { ...template, interface_name: 'lo0', ip_address: '127.0.0.1', is_loopback: true },
+      { ...template, interface_name: 'em0', ip_address: '198.51.100.7' },
+    ];
+    expect(primaryIpAddress(snapshot.metrics)).toBe('198.51.100.7');
+  });
+
   it('WHEN a network interface has a burst of errors in the latest interval THEN network component is red', () => {
     const snapshot = baseSnapshot('comp-agent');
     snapshot.metrics.networks[0].errors_in = NETWORK_ERROR_DELTA_THRESHOLD;
