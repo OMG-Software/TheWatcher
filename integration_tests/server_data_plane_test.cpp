@@ -98,16 +98,9 @@ struct AgentPeer
 
 struct DataPlaneFixture : ServerFixture
 {
-    explicit DataPlaneFixture(int offline_after_seconds = 0)
-        : ServerFixture(make_options(offline_after_seconds))
+    DataPlaneFixture()
+        : ServerFixture(ServerFixtureOptions::with_curve(true))
     {
-    }
-
-    static ServerFixtureOptions make_options(int offline_after_seconds)
-    {
-        auto options = ServerFixtureOptions::with_curve(true);
-        options.offline_after_seconds = offline_after_seconds;
-        return options;
     }
 
     // Enrolls agent_id with `keys` and approves it.
@@ -518,32 +511,6 @@ SCENARIO("Agent-supplied strings cannot forge log lines or break JSON (issues #1
                     REQUIRE(res);
                     REQUIRE(res->status == 200);
                 }
-            }
-        }
-    }
-}
-
-SCENARIO("A command route survives the gap between an agent's heartbeats")
-{
-    GIVEN("a server with a 2 s offline threshold and an agent whose heartbeat interval is 5 s")
-    {
-        crypto::init();
-        DataPlaneFixture fx(2);
-        fx.start_and_login();
-        const auto keys = crypto::generate_curve_keypair();
-        fx.enroll_and_approve_with("dp-slow", keys);
-        AgentPeer peer(fx.config, keys);
-        peer.send_cpu("dp-slow", 1.0);
-
-        WHEN("the agent is silent for 4 s and then a command is queued")
-        {
-            std::this_thread::sleep_for(4s);
-            auto queued = fx.client.Post("/api/agents/dp-slow/restart_collectors", "", "application/json");
-            REQUIRE(queued);
-
-            THEN("the command still reaches the agent")
-            {
-                REQUIRE(peer.receive().has_value());
             }
         }
     }

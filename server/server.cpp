@@ -11,7 +11,6 @@
 #include "report_generator.hpp"
 #include "status_engine.hpp"
 
-#include <algorithm>
 #include <chrono>
 #include <ctime>
 #include <stdexcept>
@@ -1072,16 +1071,10 @@ void Server::expire_routes()
 {
     if (config_.offline_after_seconds <= 0)
         return;
-    const auto now = std::chrono::steady_clock::now();
+    const auto cutoff = std::chrono::steady_clock::now() - std::chrono::seconds{config_.offline_after_seconds};
     for (auto it = agent_routes_.begin(); it != agent_routes_.end();)
     {
-        // An agent that heartbeats every N seconds is silent for up to N
-        // seconds between frames, so the threshold is never shorter than three
-        // of its heartbeat intervals (the same rule as offline detection).
-        int threshold_seconds = config_.offline_after_seconds;
-        if (const auto agent = store_->get_agent(it->first))
-            threshold_seconds = std::max(threshold_seconds, 3 * agent->heartbeat_interval);
-        if (it->second.last_frame < now - std::chrono::seconds{threshold_seconds})
+        if (it->second.last_frame < cutoff)
         {
             LOGF_DEBUG("Forgetting route of agent_id=%s with no frame since the offline threshold",
                        sanitize_log_text(it->first).c_str());
