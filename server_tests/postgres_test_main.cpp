@@ -1,6 +1,6 @@
 // Test main for the PostgreSQL test executables. It runs Catch2 as usual, then
-// reports "skipped" to meson (exit code 77) when every failure-free run only
-// got that far because no PostgreSQL server was reachable. Without this a
+// reports "skipped" to meson (exit code 77) when nothing failed but some tests
+// were skipped because no PostgreSQL server was reachable. Without this a
 // machine with no server would show a green, passing test.
 #ifdef HAVE_LIBPQ
 

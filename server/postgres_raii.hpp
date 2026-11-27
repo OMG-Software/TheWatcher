@@ -3,7 +3,7 @@
 #ifdef HAVE_LIBPQ
 
 // RAII building blocks for the PostgreSQL store: an owning, self-healing
-// connection handle, a transaction guard and a session advisory lock.
+// connection handle, and a transaction guard.
 
 #include <cctype>
 #include <chrono>
@@ -58,6 +58,13 @@ public:
         if (!conn_ || PQstatus(conn_.get()) != CONNECTION_OK)
             throw std::runtime_error("PostgreSQL connect failed: " +
                                      std::string(conn_ ? PQerrorMessage(conn_.get()) : "out of memory"));
+        // The idempotent migrations (CREATE ... IF NOT EXISTS) raise a NOTICE
+        // per object on every start; they are not worth printing to stderr.
+        PQsetNoticeProcessor(
+            conn_.get(),
+            [](void*, const char*) {
+            },
+            nullptr);
     }
 
     Connection(const Connection&) = delete;
@@ -79,7 +86,9 @@ public:
     // owns the result (wrap it in an RAII holder).
     PGresult* exec(const char* sql)
     {
-        return run(sql, [&] { return PQexec(conn_.get(), sql); });
+        return run(sql, [&] {
+            return PQexec(conn_.get(), sql);
+        });
     }
     PGresult* exec_params(const char* sql, int n_params, const Oid* param_types, const char* const* param_values,
                           const int* param_lengths, const int* param_formats, int result_format)
@@ -193,41 +202,6 @@ public:
 private:
     Connection& conn_;
     bool open_ = false;
-};
-
-// Holds a session-level advisory lock for its lifetime. Serialises schema
-// migration across server nodes that start at the same time. The server also
-// drops the lock if the session ends, so a crash cannot leave it held.
-class AdvisoryLock
-{
-public:
-    AdvisoryLock(Connection& conn, int64_t key)
-        : conn_(conn)
-        , key_(std::to_string(key))
-    {
-        const char* params[] = {key_.c_str()};
-        PGresult* res =
-            conn_.exec_params("SELECT pg_advisory_lock($1::bigint)", 1, nullptr, params, nullptr, nullptr, 0);
-        const bool ok = res != nullptr && PQresultStatus(res) == PGRES_TUPLES_OK;
-        const std::string error = ok ? std::string() : PQresultErrorMessage(res);
-        PQclear(res);
-        if (!ok)
-            throw std::runtime_error("pg_advisory_lock failed: " + error);
-    }
-    ~AdvisoryLock() noexcept
-    {
-        const char* params[] = {key_.c_str()};
-        PQclear(PQexecParams(conn_.get(), "SELECT pg_advisory_unlock($1::bigint)", 1, nullptr, params, nullptr,
-                             nullptr, 0));
-    }
-    AdvisoryLock(const AdvisoryLock&) = delete;
-    AdvisoryLock& operator=(const AdvisoryLock&) = delete;
-    AdvisoryLock(AdvisoryLock&&) = delete;
-    AdvisoryLock& operator=(AdvisoryLock&&) = delete;
-
-private:
-    Connection& conn_;
-    std::string key_;
 };
 
 } // namespace thewatcher::server::postgres

@@ -43,8 +43,8 @@ Options:
 | `API_HOST` | `0.0.0.0` | HTTP REST API bind host. |
 | `API_PORT` | `8080` | HTTP REST API port consumed by the dashboard. |
 | `DB_PATH` | `thewatcher.db` | SQLite database path when `DB_TYPE` is `sqlite`. Relative paths resolve beside the active server config file so server restarts from different working directories keep using the same database. |
-| `DB_TYPE` | `sqlite` | Storage backend. `sqlite` is implemented. `postgres` is reserved in config but not implemented by the current build. |
-| `POSTGRES_DSN` | empty | Reserved for future PostgreSQL support. |
+| `DB_TYPE` | `sqlite` | Storage backend: `sqlite` (default) or `postgres`. `postgres` needs a build with libpq (Meson detects it; the build message says whether PostgreSQL support is enabled). |
+| `POSTGRES_DSN` | empty | libpq connection string (`host=... port=... dbname=... user=... password=... sslmode=require`) or `postgresql://` URI, used when `DB_TYPE` is `postgres`. The store uses the schema selected by `options=-csearch_path=NAME` (default `public`), creates its tables on first start, and reconnects after a dropped connection. Add `connect_timeout=5`. The password is redacted wherever the DSN is logged. |
 | `OFFLINE_AFTER_SECONDS` | `60` | Approved connected agents are marked disconnected when `last_seen` is older than this number of seconds. Set `0` or a negative value to disable automatic offline marking. |
 | `SERVER_PUBLIC_KEY` | generated | Server CURVE public key. Approved enrollment responses include this key and its fingerprint so agents can learn and pin it. |
 | `SERVER_SECRET_KEY` | generated | Server CURVE secret key. Keep this private. |

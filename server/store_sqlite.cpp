@@ -1460,11 +1460,12 @@ void SqliteStore::delete_maintenance_window(int64_t window_id)
 std::vector<MaintenanceWindowRecord> SqliteStore::active_maintenance_windows(int64_t now_ms)
 {
     Stmt st;
-    check(sqlite3_prepare_v2(db_,
-                             "SELECT window_id,agent_id,start_ms,end_ms,reason,created_by,created_at FROM "
-                             "maintenance_windows WHERE start_ms<=? AND end_ms>? ORDER BY start_ms DESC,window_id DESC;",
-                             -1, &st.s, nullptr),
-          db_, "prepare active_maintenance_windows");
+    check(
+        sqlite3_prepare_v2(db_,
+                           "SELECT window_id,agent_id,start_ms,end_ms,reason,created_by,created_at FROM "
+                           "maintenance_windows WHERE start_ms<=? AND end_ms>? ORDER BY start_ms DESC,window_id DESC;",
+                           -1, &st.s, nullptr),
+        db_, "prepare active_maintenance_windows");
     sqlite3_bind_int64(st.s, 1, now_ms);
     sqlite3_bind_int64(st.s, 2, now_ms);
     std::vector<MaintenanceWindowRecord> out;

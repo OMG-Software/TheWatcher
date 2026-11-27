@@ -44,6 +44,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - The browser Origin check accepts the loopback exception only for real
   `127.0.0.0/8` addresses; DNS names such as `127.attacker.example` no
   longer match (#164).
+- `make_store` no longer writes the PostgreSQL DSN, password included, to the
+  debug log: the logged target goes through `redact_dsn`, which now also
+  handles quoted passwords (`password='a b'`), spaces around `=` and
+  `postgresql://user:pw@host/db` URIs, including a `password=` query
+  parameter (#81, part of #12).
 
 ### Fixed
 
@@ -99,6 +104,39 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   `protocol_security_test` builds its CBOR payloads in a buffer sized up
   front instead of appending with `vector::insert`, which tripped a GCC 11
   `-Wstringop-overread` false positive.
+- PostgreSQL store parity (#74 #75 #77 #80 #81 #82, part of #12):
+  - `get_metrics_in_window` returns the newest 2,880 rows, oldest first, on
+    both backends. SQLite used to return the oldest 2,880 and PostgreSQL
+    returned all rows, so the anomaly baseline was built from stale or
+    different data. The limit is a parameter; a limit of 0 or less returns
+    no rows on every backend (it was "unlimited" on SQLite and an error on
+    PostgreSQL) for `get_metrics`, `list_status_history` and
+    `list_log_matches` too (#74, #80).
+  - PostgreSQL status history orders by `created_at DESC, id DESC`, so two
+    transitions in one millisecond have a defined "latest" (#75). Ties are
+    broken by id in the other list queries (agents, silences, log matches,
+    views, runbooks, maintenance windows) on both backends (#80).
+  - `list_groups` and `list_users` sort by name in byte order on both
+    backends (PostgreSQL used the id order and its database collation);
+    `active_maintenance_windows` is ordered on PostgreSQL; `latest_metrics`
+    returns exactly one row per agent when the newest timestamps tie;
+    `create_session` replaces an existing token on PostgreSQL as on SQLite
+    (it used to keep the old row) (#80).
+  - New indexes: `metrics(timestamp_ms)`, `alerts(agent_id, indicator,
+    deleted_at)`, `agent_groups(group_id)`, `user_groups(group_id)`,
+    `sessions(expires_at)`, `sessions(user_id)`. `prune_metrics_before`
+    deletes in batches of 5,000 rows (#77).
+  - The PostgreSQL store reconnects (`PQreset`, three attempts) instead of
+    failing every call until the process restarts: reads are retried once on
+    the new connection, a write that dies with the connection is reported,
+    not repeated. Migrations use `current_schema()` instead of `public` and
+    `ADD COLUMN IF NOT EXISTS`, run in one transaction under a
+    transaction-scoped advisory lock so nodes starting together do not race,
+    and the default-admin bootstrap is atomic. A database from before the
+    per-indicator threshold columns existed now gains them (it failed on the
+    first `get_agent`) (#81).
+  - The PostgreSQL tests no longer skip silently or share a database: see
+    Added (#82).
 
 ### Changed
 
@@ -120,6 +158,18 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   history. `*.cmd`/`*.bat` are checked out with CRLF (#128).
 - Version bumped to 0.9.0 in `meson.build`, `dashboard/package.json` and
   the Windows installer.
+
+### Added
+
+- `store_test.cpp` runs against PostgreSQL as well: the new
+  `store_postgres_suite` meson test builds the same scenarios with a
+  `PostgresStore` in a private schema per scenario. `store_postgres` holds
+  PostgreSQL-only scenarios: legacy-schema migration, non-public schema,
+  concurrent node start, reconnection, rollback on a cut connection, two
+  nodes sharing state, the heartbeat-alert race. Without a server they skip
+  visibly (meson exit code 77); `THEWATCHER_REQUIRE_POSTGRES=1`, set in CI,
+  turns an unreachable server into a failure. `meson.build` no longer
+  overrides `THEWATCHER_POSTGRES_TEST_DSN` (#82, part of #12).
 
 ## [0.8.0] - 2026-11-02
 

@@ -96,7 +96,7 @@ working document for audit, design review, and regression testing.
 - Group-scoped API queries filter agents, agent history, alerts, metrics,
   runbooks (agent-scoped entries), views and view agent ids by shared group
   membership.
-- PostgreSQL DSNs are logged with password values redacted.
+- PostgreSQL DSNs are logged with password values redacted (`redact_dsn`: keyword/value strings including quoted passwords, and `postgresql://` URIs). `make_store` logs only the redacted DSN. Residual risk: a password inside an unrecognised DSN form would be logged; the DSN lives in the server config, which is owner-only.
 - The generated server config is written atomically with owner-only
   permissions on non-Windows platforms, and the load path warns when an
   existing config is group/world readable. On Windows the installer grants

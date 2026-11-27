@@ -235,8 +235,8 @@ public:
         return inner_->get_metrics(agent_id, limit);
     }
 
-    std::vector<MetricsRow> get_metrics_in_window(const std::string& agent_id, int64_t since_ms,
-                                                  int64_t until_ms, int limit = kMetricsWindowLimit) override
+    std::vector<MetricsRow> get_metrics_in_window(const std::string& agent_id, int64_t since_ms, int64_t until_ms,
+                                                  int limit = kMetricsWindowLimit) override
     {
         const std::lock_guard<std::mutex> lock(mutex_);
         return inner_->get_metrics_in_window(agent_id, since_ms, until_ms, limit);

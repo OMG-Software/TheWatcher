@@ -89,21 +89,28 @@ SCENARIO("[postgres] A database created by an older version is migrated in place
     GIVEN("a legacy schema whose tables lack the newer columns, holding one row each")
     {
         const auto& n = schema.name();
-        run_sql("CREATE TABLE " + n + ".agents (agent_id TEXT PRIMARY KEY, hostname TEXT NOT NULL DEFAULT '', "
+        run_sql("CREATE TABLE " + n +
+                ".agents (agent_id TEXT PRIMARY KEY, hostname TEXT NOT NULL DEFAULT '', "
                 "platform TEXT NOT NULL DEFAULT '', curve_public_key_z85 TEXT NOT NULL DEFAULT '', "
                 "approved BOOLEAN NOT NULL DEFAULT FALSE, first_seen BIGINT NOT NULL DEFAULT 0, "
                 "last_seen BIGINT NOT NULL DEFAULT 0)");
-        run_sql("INSERT INTO " + n + ".agents(agent_id,hostname,approved,first_seen,last_seen) "
+        run_sql("INSERT INTO " + n +
+                ".agents(agent_id,hostname,approved,first_seen,last_seen) "
                 "VALUES('old-agent','old-host',TRUE,5,6)");
-        run_sql("CREATE TABLE " + n + ".alerts (alert_id BIGSERIAL PRIMARY KEY, "
-                "agent_id TEXT NOT NULL REFERENCES " + n + ".agents(agent_id) ON DELETE CASCADE, "
+        run_sql("CREATE TABLE " + n +
+                ".alerts (alert_id BIGSERIAL PRIMARY KEY, "
+                "agent_id TEXT NOT NULL REFERENCES " +
+                n +
+                ".agents(agent_id) ON DELETE CASCADE, "
                 "indicator TEXT NOT NULL, old_status TEXT NOT NULL, new_status TEXT NOT NULL, "
                 "message TEXT NOT NULL DEFAULT '', created_at BIGINT NOT NULL, "
                 "acknowledged_by TEXT NOT NULL DEFAULT '', acknowledged_at BIGINT NOT NULL DEFAULT 0, "
                 "deleted_at BIGINT NOT NULL DEFAULT 0)");
-        run_sql("INSERT INTO " + n + ".alerts(agent_id,indicator,old_status,new_status,created_at) "
+        run_sql("INSERT INTO " + n +
+                ".alerts(agent_id,indicator,old_status,new_status,created_at) "
                 "VALUES('old-agent','cpu','green','red',7)");
-        run_sql("CREATE TABLE " + n + ".runbooks (runbook_id BIGSERIAL PRIMARY KEY, "
+        run_sql("CREATE TABLE " + n +
+                ".runbooks (runbook_id BIGSERIAL PRIMARY KEY, "
                 "indicator TEXT NOT NULL DEFAULT '*', status TEXT NOT NULL, url TEXT NOT NULL, "
                 "notes TEXT NOT NULL DEFAULT '', created_by TEXT NOT NULL DEFAULT '', "
                 "created_at BIGINT NOT NULL DEFAULT 0)");
@@ -281,7 +288,7 @@ SCENARIO("[postgres] The store recovers after its connection is cut")
             THEN("the next write succeeds without restarting the process")
             {
                 REQUIRE_NOTHROW(store.set_setting("reconnect", "second"));
-                CHECK(store.get_setting("reconnect") == "second");
+                CHECK(store.get_setting("reconnect", "") == "second");
             }
         }
 

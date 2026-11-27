@@ -94,17 +94,24 @@ dedicated pgBouncer host.
 
 ---
 
-## TheWatcher configuration (`/etc/thewatcher/server.toml`)
+## TheWatcher configuration (`TheWatcherServer.conf`)
 
-```toml
-db_type     = "postgres"
-postgres_dsn = "host=10.0.0.20 port=6432 dbname=thewatcher user=thewatcher password=change-me sslmode=require"
+```text
+DB_TYPE=postgres
+POSTGRES_DSN=host=10.0.0.20 port=6432 dbname=thewatcher user=thewatcher password=change-me sslmode=require connect_timeout=5
 
-bind_address       = "tcp://10.0.0.10:5555"   # VIP
-enrollment_address = "tcp://10.0.0.10:5556"   # VIP
-api_host           = "0.0.0.0"
-api_port           = 8080
+BIND_ADDRESS=tcp://10.0.0.10:5555
+ENROLLMENT_ADDRESS=tcp://10.0.0.10:5556
+API_HOST=0.0.0.0
+API_PORT=8080
 ```
+
+`BIND_ADDRESS` and `ENROLLMENT_ADDRESS` use the VIP. See
+[Configuration](configuration.md) for every option. The store uses the schema
+that `search_path` selects (`public` unless the DSN says
+`options=-csearch_path=myschema`); the server creates and migrates its tables
+on start, and nodes that start together wait for each other, so both nodes
+can use the same config and start at once.
 
 Use the same config on both nodes.  Only the active node will hold the VIP.
 
@@ -177,7 +184,7 @@ Make both scripts executable: `chmod +x /usr/local/bin/thewatcher-*.sh`
 4. The `notify_master` script starts TheWatcherServer on the standby.
 5. Agents reconnect automatically — their ZeroMQ sockets will retry until
    the new endpoint accepts connections.
-6. TheWatcherServer connects to PostgreSQL through pgBouncer and resumes
+6. TheWatcherServer reconnects to PostgreSQL through pgBouncer (the store resets a dead connection by itself; no process restart) and resumes
    normal operation.  Because all state is in PostgreSQL, no data is lost.
 
 Typical failover time is **5–15 seconds** depending on `advert_int` and

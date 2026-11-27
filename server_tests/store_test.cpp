@@ -6,6 +6,8 @@
 #include <algorithm>
 #include <filesystem>
 
+#include <sqlite3.h>
+
 using namespace thewatcher;
 using namespace thewatcher::server;
 
@@ -36,7 +38,8 @@ SCENARIO("A freshly created store has no agents or metrics")
 {
     GIVEN("an empty store")
     {
-        TestStore store;
+        TestStoreHandle test_store;
+        Store& store = test_store.store();
 
         THEN("list_agents returns an empty vector")
         {
@@ -56,7 +59,8 @@ SCENARIO("An agent can be upserted and retrieved by id")
 {
     GIVEN("an in-memory store and a populated AgentRecord")
     {
-        TestStore store;
+        TestStoreHandle test_store;
+        Store& store = test_store.store();
 
         AgentRecord rec;
         rec.agent_id = "agent-001";
@@ -91,7 +95,8 @@ SCENARIO("get_agent returns nullopt for an unknown id")
 {
     GIVEN("an empty store")
     {
-        TestStore store;
+        TestStoreHandle test_store;
+        Store& store = test_store.store();
 
         WHEN("get_agent is called with an id that was never inserted")
         {
@@ -109,7 +114,8 @@ SCENARIO("Upserting an existing agent updates mutable fields but preserves first
 {
     GIVEN("a store with an existing agent")
     {
-        TestStore store;
+        TestStoreHandle test_store;
+        Store& store = test_store.store();
 
         AgentRecord rec;
         rec.agent_id = "agent-004";
@@ -148,7 +154,8 @@ SCENARIO("list_agents returns all stored agents")
 {
     GIVEN("a store with two agents inserted")
     {
-        TestStore store;
+        TestStoreHandle test_store;
+        Store& store = test_store.store();
 
         for (auto id : {"agent-A", "agent-B"})
         {
@@ -177,7 +184,8 @@ SCENARIO("Approving an agent sets the approved flag to true")
 {
     GIVEN("a store with an unapproved agent")
     {
-        TestStore store;
+        TestStoreHandle test_store;
+        Store& store = test_store.store();
 
         AgentRecord rec;
         rec.agent_id = "agent-002";
@@ -204,7 +212,8 @@ SCENARIO("Rejecting an agent prevents later enrollment approval")
 {
     GIVEN("a store with a pending agent")
     {
-        TestStore store;
+        TestStoreHandle test_store;
+        Store& store = test_store.store();
 
         AgentRecord rec;
         rec.agent_id = "agent-reject";
@@ -233,7 +242,8 @@ SCENARIO("Agent maintenance state is persisted across upserts")
 {
     GIVEN("a store with an approved agent")
     {
-        TestStore store;
+        TestStoreHandle test_store;
+        Store& store = test_store.store();
 
         AgentRecord rec;
         rec.agent_id = "agent-maintenance";
@@ -263,7 +273,8 @@ SCENARIO("Agent runtime settings are persisted across upserts")
 {
     GIVEN("a store with an approved agent")
     {
-        TestStore store;
+        TestStoreHandle test_store;
+        Store& store = test_store.store();
 
         AgentRecord rec;
         rec.agent_id = "agent-settings";
@@ -296,7 +307,8 @@ SCENARIO("Agent threshold settings are persisted across upserts")
 {
     GIVEN("a store with an approved agent")
     {
-        TestStore store;
+        TestStoreHandle test_store;
+        Store& store = test_store.store();
 
         AgentRecord rec;
         rec.agent_id = "agent-thresholds";
@@ -346,7 +358,8 @@ SCENARIO("Agent collector config is persisted across upserts")
 {
     GIVEN("a store with an approved agent")
     {
-        TestStore store;
+        TestStoreHandle test_store;
+        Store& store = test_store.store();
 
         AgentRecord rec;
         rec.agent_id = "agent-collector-config";
@@ -407,7 +420,8 @@ SCENARIO("Pending indicator readings are persisted and can be cleared")
 {
     GIVEN("a store with an approved agent")
     {
-        TestStore store;
+        TestStoreHandle test_store;
+        Store& store = test_store.store();
 
         AgentRecord rec;
         rec.agent_id = "agent-pending-status";
@@ -500,7 +514,8 @@ SCENARIO("A new store bootstraps the default admin user and Admins group")
 {
     GIVEN("an empty in-memory store")
     {
-        TestStore store;
+        TestStoreHandle test_store;
+        Store& store = test_store.store();
 
         WHEN("users and groups are listed")
         {
@@ -530,7 +545,8 @@ SCENARIO("Soft-deleted alerts are hidden from active alert queries but remain hi
 {
     GIVEN("a store with an agent and an alert")
     {
-        TestStore store;
+        TestStoreHandle test_store;
+        Store& store = test_store.store();
         AgentRecord rec;
         rec.agent_id = "agent-alert";
         rec.approved = true;
@@ -571,7 +587,8 @@ SCENARIO("Approved agents are marked offline after the configured cutoff")
 {
     GIVEN("a store with a connected approved agent last seen before the cutoff")
     {
-        TestStore store;
+        TestStoreHandle test_store;
+        Store& store = test_store.store();
 
         AgentRecord rec;
         rec.agent_id = "agent-offline";
@@ -601,7 +618,8 @@ SCENARIO("Deleting an agent removes it from the store")
 {
     GIVEN("a store with a known agent")
     {
-        TestStore store;
+        TestStoreHandle test_store;
+        Store& store = test_store.store();
 
         AgentRecord rec;
         rec.agent_id = "agent-003";
@@ -634,7 +652,8 @@ SCENARIO("Metrics can be inserted and retrieved for an agent")
 {
     GIVEN("a store with an agent and one metrics row")
     {
-        TestStore store;
+        TestStoreHandle test_store;
+        Store& store = test_store.store();
 
         AgentRecord rec;
         rec.agent_id = "agent-m1";
@@ -667,7 +686,8 @@ SCENARIO("get_metrics respects the row limit and returns newest rows first")
 {
     GIVEN("a store with 5 metrics rows for one agent")
     {
-        TestStore store;
+        TestStoreHandle test_store;
+        Store& store = test_store.store();
 
         AgentRecord rec;
         rec.agent_id = "agent-m2";
@@ -706,7 +726,8 @@ SCENARIO("latest_metrics returns one row per agent with their most recent timest
 {
     GIVEN("two agents each with three metrics rows at different timestamps")
     {
-        TestStore store;
+        TestStoreHandle test_store;
+        Store& store = test_store.store();
 
         for (auto id : {"alpha", "beta"})
         {
@@ -750,7 +771,8 @@ SCENARIO("Acknowledging an alert stores the operator note alongside the ack meta
 {
     GIVEN("a store with an agent and an active alert")
     {
-        TestStore store;
+        TestStoreHandle test_store;
+        Store& store = test_store.store();
 
         AgentRecord rec;
         rec.agent_id = "agent-note";
@@ -803,7 +825,8 @@ SCENARIO("Unacknowledged alerts older than the cutoff are escalated")
 {
     GIVEN("a store with two unacknowledged alerts at different ages")
     {
-        TestStore store;
+        TestStoreHandle test_store;
+        Store& store = test_store.store();
 
         AgentRecord rec;
         rec.agent_id = "agent-esc";
@@ -857,7 +880,8 @@ SCENARIO("Bulk acknowledging alerts sets ack metadata on all specified alerts")
 {
     GIVEN("a store with an agent and three active alerts")
     {
-        TestStore store;
+        TestStoreHandle test_store;
+        Store& store = test_store.store();
 
         AgentRecord rec;
         rec.agent_id = "agent-bulk";
@@ -913,7 +937,8 @@ SCENARIO("count_metrics_in_window counts only rows within the time window")
 {
     GIVEN("a store with 5 metrics rows for an agent spread over time")
     {
-        TestStore store;
+        TestStoreHandle test_store;
+        Store& store = test_store.store();
 
         AgentRecord rec;
         rec.agent_id = "agent-cnt";
@@ -948,7 +973,8 @@ SCENARIO("Maintenance windows can be created, listed, and deleted")
 {
     GIVEN("an empty store")
     {
-        TestStore store;
+        TestStoreHandle test_store;
+        Store& store = test_store.store();
 
         WHEN("a maintenance window is created")
         {
@@ -987,7 +1013,8 @@ SCENARIO("Bulk soft-deleting alerts hides all specified alerts from active queri
 {
     GIVEN("a store with an agent and four alerts")
     {
-        TestStore store;
+        TestStoreHandle test_store;
+        Store& store = test_store.store();
 
         AgentRecord rec;
         rec.agent_id = "agent-bulk-del";
@@ -1032,7 +1059,8 @@ SCENARIO("get_offline_unalerted_agent_ids returns only offline approved agents w
 {
     GIVEN("a store with several agents in different states")
     {
-        TestStore store;
+        TestStoreHandle test_store;
+        Store& store = test_store.store();
 
         auto make_agent = [&](const std::string& id, bool approved, bool connected, bool maintenance) {
             AgentRecord r;
@@ -1077,7 +1105,8 @@ SCENARIO("archive_heartbeat_alerts_for_agent removes active Heartbeat alerts for
 {
     GIVEN("two agents each with an active Heartbeat alert")
     {
-        TestStore store;
+        TestStoreHandle test_store;
+        Store& store = test_store.store();
 
         for (auto id : {"agent-A", "agent-B"})
         {
@@ -1134,7 +1163,8 @@ SCENARIO("active_maintenance_windows only returns windows that span the current 
 {
     GIVEN("a store with windows in the past, present, and future")
     {
-        TestStore store;
+        TestStoreHandle test_store;
+        Store& store = test_store.store();
 
         MaintenanceWindowRecord past;
         past.agent_id = "*";
@@ -1174,7 +1204,8 @@ SCENARIO("set_agent_description stores a description against a known agent")
 {
     GIVEN("a store with an approved agent")
     {
-        TestStore store;
+        TestStoreHandle test_store;
+        Store& store = test_store.store();
 
         AgentRecord agent;
         agent.agent_id = "desc-agent";
@@ -1219,7 +1250,8 @@ SCENARIO("disable_user and enable_user toggle the disabled flag")
 {
     GIVEN("a store with a non-built-in user")
     {
-        TestStore store;
+        TestStoreHandle test_store;
+        Store& store = test_store.store();
 
         store.create_user("operator1", "hash", "operator");
 
@@ -1267,7 +1299,8 @@ SCENARIO("delete_user removes a non-built-in user")
 {
     GIVEN("a store with two users")
     {
-        TestStore store;
+        TestStoreHandle test_store;
+        Store& store = test_store.store();
 
         store.create_user("to-delete", "h1", "viewer");
         store.create_user("to-keep", "h2", "viewer");
@@ -1304,7 +1337,8 @@ SCENARIO("update_user_password changes the stored credential hash")
 {
     GIVEN("a store with a user")
     {
-        TestStore store;
+        TestStoreHandle test_store;
+        Store& store = test_store.store();
 
         store.create_user("pwuser", "old-hash", "viewer");
 
@@ -1337,7 +1371,8 @@ SCENARIO("list_approved_agents and list_pending_agents filter by enrollment stat
 {
     GIVEN("a store with approved, pending, and rejected agents")
     {
-        TestStore store;
+        TestStoreHandle test_store;
+        Store& store = test_store.store();
 
         AgentRecord pending_agent;
         pending_agent.agent_id = "pending-1";
@@ -1389,7 +1424,8 @@ SCENARIO("session lifecycle: create, retrieve by token, and expire")
 {
     GIVEN("an empty store")
     {
-        TestStore store;
+        TestStoreHandle test_store;
+        Store& store = test_store.store();
 
         WHEN("a session is created and retrieved before expiry")
         {
@@ -1468,7 +1504,8 @@ SCENARIO("settings key-value store persists values with fallback for missing key
 {
     GIVEN("an empty store")
     {
-        TestStore store;
+        TestStoreHandle test_store;
+        Store& store = test_store.store();
 
         WHEN("a missing key is fetched without a fallback")
         {
@@ -1518,7 +1555,8 @@ SCENARIO("group management: groups can be created and listed")
 {
     GIVEN("a fresh store with only the built-in Admins group")
     {
-        TestStore store;
+        TestStoreHandle test_store;
+        Store& store = test_store.store();
         auto initial = store.list_groups();
         REQUIRE(initial.size() == 1);
         REQUIRE(initial[0].name == "Admins");
@@ -1557,7 +1595,8 @@ SCENARIO("agent group membership can be set and retrieved")
 {
     GIVEN("a store with an agent and two groups")
     {
-        TestStore store;
+        TestStoreHandle test_store;
+        Store& store = test_store.store();
 
         AgentRecord agent;
         agent.agent_id = "grp-agent";
@@ -1613,7 +1652,8 @@ SCENARIO("user group membership can be set and retrieved")
 {
     GIVEN("a store with a user and two groups")
     {
-        TestStore store;
+        TestStoreHandle test_store;
+        Store& store = test_store.store();
 
         int64_t uid = store.create_user("viewer1", "hash", "viewer");
         int64_t gid1 = store.create_group("TeamA");
@@ -1650,7 +1690,8 @@ SCENARIO("status history records transitions and the latest entry is queryable p
 {
     GIVEN("a store with an approved agent")
     {
-        TestStore store;
+        TestStoreHandle test_store;
+        Store& store = test_store.store();
 
         AgentRecord agent;
         agent.agent_id = "hist-agent";
@@ -1740,7 +1781,8 @@ SCENARIO("pending status accumulates consecutive readings and clears on recovery
 {
     GIVEN("a store with an approved agent")
     {
-        TestStore store;
+        TestStoreHandle test_store;
+        Store& store = test_store.store();
 
         AgentRecord agent;
         agent.agent_id = "pending-agent";
@@ -1799,7 +1841,8 @@ SCENARIO("clear_active_alerts_for_agent archives only that agent's alerts")
 {
     GIVEN("a store with active alerts for two different agents")
     {
-        TestStore store;
+        TestStoreHandle test_store;
+        Store& store = test_store.store();
 
         AgentRecord a1;
         a1.agent_id = "agent-one";
@@ -1856,7 +1899,8 @@ SCENARIO("clear_active_alerts_for_agent archives only that agent's alerts")
 
 SCENARIO("Silence rules can be created, listed, and deleted")
 {
-    TestStore store;
+    TestStoreHandle test_store;
+    Store& store = test_store.store();
     const int64_t now = 1'000'000;
 
     GIVEN("an empty silences table")
@@ -1912,7 +1956,8 @@ SCENARIO("Silence rules can be created, listed, and deleted")
 
 SCENARIO("Silence rules support wildcard and specific matching")
 {
-    TestStore store;
+    TestStoreHandle test_store;
+    Store& store = test_store.store();
     const int64_t now = 2'000'000;
     const int64_t future = now + 3'600'000;
 
@@ -1965,7 +2010,8 @@ SCENARIO("Silence rules support wildcard and specific matching")
 
 SCENARIO("prune_metrics_before removes old metrics rows")
 {
-    TestStore store;
+    TestStoreHandle test_store;
+    Store& store = test_store.store();
 
     GIVEN("three metrics rows at different timestamps")
     {
@@ -2033,7 +2079,8 @@ SCENARIO("Acknowledged alerts are not escalated by escalate_old_alerts")
 {
     GIVEN("a store with one acknowledged and one unacknowledged alert both older than the cutoff")
     {
-        TestStore store;
+        TestStoreHandle test_store;
+        Store& store = test_store.store();
 
         AgentRecord rec;
         rec.agent_id = "agent-esc-ack";
@@ -2088,7 +2135,8 @@ SCENARIO("Log matches can be inserted and retrieved by agent")
 {
     GIVEN("an empty store")
     {
-        TestStore store;
+        TestStoreHandle test_store;
+        Store& store = test_store.store();
 
         AgentRecord agent;
         agent.agent_id = "log-agent";
@@ -2157,7 +2205,8 @@ SCENARIO("Log matches are isolated per agent")
 {
     GIVEN("a store with two agents each with a log match")
     {
-        TestStore store;
+        TestStoreHandle test_store;
+        Store& store = test_store.store();
 
         for (auto id : {"agent-A", "agent-B"})
         {
@@ -2197,7 +2246,8 @@ SCENARIO("Views can be created, retrieved, updated, and deleted")
 {
     GIVEN("a store with a user")
     {
-        TestStore store;
+        TestStoreHandle test_store;
+        Store& store = test_store.store();
         const int64_t uid = store.create_user("view-owner", "hash", "operator");
 
         WHEN("a private view is created for that user")
@@ -2272,7 +2322,8 @@ SCENARIO("list_views returns own views and public views but not other users' pri
 {
     GIVEN("two users each with a private view, and one user with a public view")
     {
-        TestStore store;
+        TestStoreHandle test_store;
+        Store& store = test_store.store();
         const int64_t uid_a = store.create_user("user-a", "ha", "operator");
         const int64_t uid_b = store.create_user("user-b", "hb", "operator");
 
@@ -2344,7 +2395,8 @@ SCENARIO("get_view returns nullopt for an unknown view id")
 {
     GIVEN("an empty store")
     {
-        TestStore store;
+        TestStoreHandle test_store;
+        Store& store = test_store.store();
 
         WHEN("get_view is called with a non-existent id")
         {
@@ -2364,7 +2416,8 @@ SCENARIO("get_metrics_in_window uses inclusive boundaries and returns only rows 
 {
     GIVEN("a store with four metrics rows at distinct timestamps")
     {
-        TestStore store;
+        TestStoreHandle test_store;
+        Store& store = test_store.store();
 
         AgentRecord agent;
         agent.agent_id = "win-agent";
@@ -2428,7 +2481,8 @@ SCENARIO("get_metrics_in_window returns empty for an agent with no rows in the r
 {
     GIVEN("a store with an agent but no metrics")
     {
-        TestStore store;
+        TestStoreHandle test_store;
+        Store& store = test_store.store();
 
         AgentRecord agent;
         agent.agent_id = "no-rows";
@@ -2454,7 +2508,8 @@ SCENARIO("Re-acknowledging an already-acknowledged alert overwrites the note and
 {
     GIVEN("a store with an acknowledged alert")
     {
-        TestStore store;
+        TestStoreHandle test_store;
+        Store& store = test_store.store();
 
         AgentRecord rec;
         rec.agent_id = "agent-reack";
@@ -2494,7 +2549,8 @@ SCENARIO("get_session respects the expiry timestamp and rejects disabled users")
 {
     GIVEN("a store with a user and an active session expiring at t=5000")
     {
-        TestStore store;
+        TestStoreHandle test_store;
+        Store& store = test_store.store();
 
         // Use the bootstrapped admin user (user_id=1, username="thewatcher").
         auto users = store.list_users();
@@ -2550,7 +2606,8 @@ SCENARIO("get_session returns nullopt when the user account is disabled")
 {
     GIVEN("a store with a disabled user who has an active session")
     {
-        TestStore store;
+        TestStoreHandle test_store;
+        Store& store = test_store.store();
 
         const int64_t uid = store.create_user("locked-user", "hash", "operator");
 
@@ -2583,7 +2640,8 @@ SCENARIO("Deleting an agent cascades to remove its metrics, alerts, and status h
 {
     GIVEN("a store with an agent that has metrics, an alert, and status history")
     {
-        TestStore store;
+        TestStoreHandle test_store;
+        Store& store = test_store.store();
 
         AgentRecord agent;
         agent.agent_id = "cascade-agent";
@@ -2650,7 +2708,8 @@ SCENARIO("mark_agents_offline_before is a no-op when all agents are within the c
 {
     GIVEN("a store with an agent whose last_seen is recent")
     {
-        TestStore store;
+        TestStoreHandle test_store;
+        Store& store = test_store.store();
 
         AgentRecord agent;
         agent.agent_id = "fresh-agent";
@@ -2680,7 +2739,8 @@ SCENARIO("A view with an empty agent list is stored and retrieved correctly")
 {
     GIVEN("a store with a user")
     {
-        TestStore store;
+        TestStoreHandle test_store;
+        Store& store = test_store.store();
         const int64_t uid = store.create_user("empty-view-owner", "hash", "operator");
 
         WHEN("a view is created with no agent ids")
@@ -2711,7 +2771,8 @@ SCENARIO("is_silenced uses strict less-than on until_ms so expiry is exact")
 {
     GIVEN("a silence rule expiring at t=10000")
     {
-        TestStore store;
+        TestStoreHandle test_store;
+        Store& store = test_store.store();
 
         SilenceRecord rec;
         rec.agent_id = "*";
@@ -2746,7 +2807,8 @@ SCENARIO("approve_agent on a rejected agent clears the rejected flag and approve
 {
     GIVEN("a store with a rejected agent")
     {
-        TestStore store;
+        TestStoreHandle test_store;
+        Store& store = test_store.store();
 
         AgentRecord agent;
         agent.agent_id = "rejected-agent";
@@ -2783,7 +2845,8 @@ SCENARIO("list_views returns empty for a user who owns no views and there are no
 {
     GIVEN("a store with two users, neither with views")
     {
-        TestStore store;
+        TestStoreHandle test_store;
+        Store& store = test_store.store();
         const int64_t uid_a = store.create_user("user-no-views-a", "ha", "operator");
         const int64_t uid_b = store.create_user("user-no-views-b", "hb", "operator");
 
@@ -2813,7 +2876,8 @@ SCENARIO("Runbooks can be created, listed, and deleted")
 {
     GIVEN("an empty store")
     {
-        TestStore store;
+        TestStoreHandle test_store;
+        Store& store = test_store.store();
 
         WHEN("no runbooks have been created")
         {
@@ -2863,7 +2927,8 @@ SCENARIO("get_runbook returns exact indicator match before wildcard")
 {
     GIVEN("a store with a wildcard runbook and an exact runbook for the same status")
     {
-        TestStore store;
+        TestStoreHandle test_store;
+        Store& store = test_store.store();
 
         RunbookRecord wildcard;
         wildcard.indicator = "*";
@@ -2905,7 +2970,8 @@ SCENARIO("insert_alert persists runbook_url and list_alerts returns it")
 {
     GIVEN("a store with a runbook for cpu/red")
     {
-        TestStore store;
+        TestStoreHandle test_store;
+        Store& store = test_store.store();
 
         AgentRecord agent;
         agent.agent_id = "agent-rb";
@@ -2950,7 +3016,8 @@ SCENARIO("get_runbook never returns another agent's runbook")
 {
     GIVEN("a store with a runbook scoped to agent-a and a generic runbook")
     {
-        TestStore store;
+        TestStoreHandle test_store;
+        Store& store = test_store.store();
 
         RunbookRecord scoped;
         scoped.agent_id = "agent-a";
@@ -2984,7 +3051,8 @@ SCENARIO("get_runbook never returns another agent's runbook")
 
     GIVEN("a store with only a runbook scoped to agent-a")
     {
-        TestStore store;
+        TestStoreHandle test_store;
+        Store& store = test_store.store();
 
         RunbookRecord scoped;
         scoped.agent_id = "agent-a";
@@ -3028,7 +3096,8 @@ SCENARIO("A metrics window larger than its limit returns the newest rows, oldest
 {
     GIVEN("an agent with 3000 metric rows at timestamps 1..3000")
     {
-        TestStore store;
+        TestStoreHandle test_store;
+        Store& store = test_store.store();
         add_agent(store, "win-limit");
         for (int64_t ts = 1; ts <= 3000; ++ts)
             add_metric(store, "win-limit", ts);
@@ -3075,7 +3144,8 @@ SCENARIO("A non-positive limit returns nothing from every limited read")
 {
     GIVEN("an agent with metrics, status history and log matches")
     {
-        TestStore store;
+        TestStoreHandle test_store;
+        Store& store = test_store.store();
         add_agent(store, "neg-limit");
         add_metric(store, "neg-limit", 1);
         StatusHistoryRow history;
@@ -3109,7 +3179,8 @@ SCENARIO("Status transitions in the same millisecond keep a deterministic order"
 {
     GIVEN("two transitions for one indicator with the same created_at")
     {
-        TestStore store;
+        TestStoreHandle test_store;
+        Store& store = test_store.store();
         add_agent(store, "tie-agent");
         StatusHistoryRow first;
         first.agent_id = "tie-agent";
@@ -3144,7 +3215,8 @@ SCENARIO("latest_metrics returns one row per agent even when timestamps tie")
 {
     GIVEN("two agents, one with two rows at the same newest timestamp")
     {
-        TestStore store;
+        TestStoreHandle test_store;
+        Store& store = test_store.store();
         add_agent(store, "lm-b");
         add_agent(store, "lm-a");
         add_metric(store, "lm-a", 100, 1);
@@ -3171,7 +3243,8 @@ SCENARIO("Groups and users are listed in byte order of their names on every back
 {
     GIVEN("groups and users whose names differ in case")
     {
-        TestStore store;
+        TestStoreHandle test_store;
+        Store& store = test_store.store();
         store.create_group("zeta");
         store.create_group("Beta");
         store.create_group("alpha");
@@ -3207,7 +3280,8 @@ SCENARIO("Active maintenance windows are listed newest start first")
 {
     GIVEN("three overlapping windows")
     {
-        TestStore store;
+        TestStoreHandle test_store;
+        Store& store = test_store.store();
         MaintenanceWindowRecord w;
         w.agent_id = "*";
         w.end_ms = 10000;
@@ -3237,7 +3311,8 @@ SCENARIO("Creating a session with an existing token replaces that session")
 {
     GIVEN("a stored session")
     {
-        TestStore store;
+        TestStoreHandle test_store;
+        Store& store = test_store.store();
         const auto admin = store.get_user_by_username("thewatcher");
         REQUIRE(admin.has_value());
         SessionRecord session;
@@ -3266,7 +3341,8 @@ SCENARIO("Pruning metrics removes every row before the cutoff, across batches")
 {
     GIVEN("more old rows than one prune batch, plus newer rows for two agents")
     {
-        TestStore store;
+        TestStoreHandle test_store;
+        Store& store = test_store.store();
         add_agent(store, "prune-a");
         add_agent(store, "prune-b");
         const int old_rows = kPruneBatchRows + 500;
@@ -3292,7 +3368,8 @@ SCENARIO("Agents with equal last_seen are listed in a stable order")
 {
     GIVEN("three agents seen at the same instant")
     {
-        TestStore store;
+        TestStoreHandle test_store;
+        Store& store = test_store.store();
         for (const char* id : {"stable-c", "stable-a", "stable-b"})
         {
             AgentRecord rec;
@@ -3315,3 +3392,40 @@ SCENARIO("Agents with equal last_seen are listed in a stable order")
         }
     }
 }
+
+#ifndef THEWATCHER_STORE_TEST_POSTGRES
+SCENARIO("A SQLite store creates the hot-path indexes")
+{
+    GIVEN("a file-backed store")
+    {
+        const auto path = unique_store_path("indexes.db");
+        {
+            SqliteStore store(path.string());
+        }
+
+        WHEN("the database catalogue is read")
+        {
+            sqlite3* raw = nullptr;
+            REQUIRE(sqlite3_open(path.string().c_str(), &raw) == SQLITE_OK);
+            std::vector<std::string> names;
+            sqlite3_stmt* st = nullptr;
+            REQUIRE(sqlite3_prepare_v2(raw, "SELECT name FROM sqlite_master WHERE type='index';", -1, &st, nullptr) ==
+                    SQLITE_OK);
+            while (sqlite3_step(st) == SQLITE_ROW)
+                names.emplace_back(reinterpret_cast<const char*>(sqlite3_column_text(st, 0)));
+            sqlite3_finalize(st);
+            sqlite3_close(raw);
+
+            THEN("the indexes for pruning, alert lookups, group cascades and sessions exist")
+            {
+                for (const char* index : {"idx_metrics_ts", "idx_alerts_agent_indicator", "idx_agent_groups_group",
+                                          "idx_user_groups_group", "idx_sessions_expires", "idx_sessions_user"})
+                {
+                    INFO(index);
+                    CHECK(std::find(names.begin(), names.end(), index) != names.end());
+                }
+            }
+        }
+    }
+}
+#endif // THEWATCHER_STORE_TEST_POSTGRES
