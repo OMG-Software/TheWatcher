@@ -302,6 +302,33 @@ void StatusEngine::enter_maintenance(const std::string& agent_id, const std::str
     store_.clear_active_alerts_for_agent(agent_id, now_ms);
     mark_indicators_blue(agent_id, now_ms);
     maintenance_marked_.insert(agent_id);
+    // Readings frozen during maintenance must not look stale afterwards.
+    forget_agent_state(agent_id);
+}
+
+void StatusEngine::pause_agent(const std::string& agent_id, int64_t now_ms)
+{
+    const auto agent = store_.get_agent(agent_id);
+    if (agent && agent->maintenance)
+        enter_maintenance(agent_id, agent->maintenance_reason, agent->maintenance_until, now_ms);
+    else
+        enter_maintenance(agent_id, "command", 0, now_ms);
+}
+
+void StatusEngine::forget_agent_state(const std::string& agent_id)
+{
+    baseline_cache_.erase(agent_id);
+    staleness_cache_.erase(agent_id);
+}
+
+size_t StatusEngine::tracked_agent_count() const
+{
+    std::unordered_set<std::string> ids;
+    for (const auto& entry : baseline_cache_)
+        ids.insert(entry.first);
+    for (const auto& entry : staleness_cache_)
+        ids.insert(entry.first);
+    return ids.size();
 }
 
 // Indicators stay Blue until the next evaluation replaces them. Blue carries no
@@ -311,6 +338,7 @@ void StatusEngine::exit_maintenance(const std::string& agent_id)
 {
     store_.set_agent_maintenance(agent_id, false, "", 0);
     maintenance_marked_.erase(agent_id);
+    forget_agent_state(agent_id);
 }
 
 void StatusEngine::mark_indicators_blue(const std::string& agent_id, int64_t now_ms)
@@ -330,14 +358,34 @@ void StatusEngine::mark_indicators_blue(const std::string& agent_id, int64_t now
 void StatusEngine::reconcile_maintenance(int64_t now_ms)
 {
     const auto active_windows = store_.active_maintenance_windows(now_ms);
-    for (const auto& agent : store_.list_approved_agents())
+    const auto agents = store_.list_approved_agents();
+
+    // Drop engine state of agents that were deleted or are no longer approved.
+    std::unordered_set<std::string> known;
+    for (const auto& agent : agents)
+        known.insert(agent.agent_id);
+    for (const auto& state : std::vector<std::string>(maintenance_marked_.begin(), maintenance_marked_.end()))
     {
-        // #45: timed manual maintenance ends when its until time passes.
+        if (known.count(state) == 0)
+            maintenance_marked_.erase(state);
+    }
+    for (auto it = baseline_cache_.begin(); it != baseline_cache_.end();)
+        it = known.count(it->first) == 0 ? baseline_cache_.erase(it) : std::next(it);
+    for (auto it = staleness_cache_.begin(); it != staleness_cache_.end();)
+        it = known.count(it->first) == 0 ? staleness_cache_.erase(it) : std::next(it);
+
+    for (const auto& listed : agents)
+    {
+        auto agent = listed;
+        // #45: timed manual maintenance ends when its until time passes. The
+        // pass carries on so an active window takes over without a gap.
         if (agent.maintenance && agent.maintenance_until > 0 && now_ms >= agent.maintenance_until)
         {
             exit_maintenance(agent.agent_id);
             LOGF_INFO("Timed maintenance expired agent_id=%s", agent.agent_id.c_str());
-            continue;
+            agent.maintenance = false;
+            agent.maintenance_reason.clear();
+            agent.maintenance_until = 0;
         }
 
         const MaintenanceWindowRecord* window = nullptr;
@@ -374,13 +422,11 @@ void StatusEngine::reconcile_maintenance(int64_t now_ms)
     }
 }
 
-std::vector<std::string> StatusEngine::mark_offline_agents(int64_t now_ms, int default_offline_after_seconds)
+int StatusEngine::offline_timeout_seconds_for(int heartbeat_interval_seconds, int default_offline_after_seconds)
 {
-    std::vector<std::string> gone;
-    if (default_offline_after_seconds <= 0)
-        return gone;
-
     int base_seconds = default_offline_after_seconds;
+    if (base_seconds <= 0)
+        return 0;
     const auto setting = store_.get_setting("offline_after_seconds", "");
     if (!setting.empty())
     {
@@ -393,12 +439,23 @@ std::vector<std::string> StatusEngine::mark_offline_agents(int64_t now_ms, int d
             LOGF_WARNING("Ignoring invalid offline_after_seconds setting '%s'", setting.c_str());
         }
     }
+    // A saved non-positive value disables offline detection, like the config.
+    if (base_seconds <= 0)
+        return 0;
+    return effective_offline_timeout_seconds(base_seconds, heartbeat_interval_seconds);
+}
+
+std::vector<std::string> StatusEngine::mark_offline_agents(int64_t now_ms, int default_offline_after_seconds)
+{
+    std::vector<std::string> gone;
+    if (offline_timeout_seconds_for(0, default_offline_after_seconds) <= 0)
+        return gone;
 
     for (const auto& agent : store_.list_approved_agents())
     {
         if (!agent.connected || agent.maintenance || agent.last_seen <= 0)
             continue;
-        const auto timeout_s = effective_offline_timeout_seconds(base_seconds, agent.heartbeat_interval);
+        const auto timeout_s = offline_timeout_seconds_for(agent.heartbeat_interval, default_offline_after_seconds);
         if (agent.last_seen < now_ms - static_cast<int64_t>(timeout_s) * 1000)
         {
             store_.mark_agent_offline(agent.agent_id);
@@ -547,8 +604,7 @@ IndicatorStatus StatusEngine::maybe_anomaly_status(IndicatorStatus threshold_sta
         return threshold_status;
 
     constexpr int64_t cache_ttl_ms = 5 * 60 * 1000; // 5 minutes
-    const std::string cache_key = agent_id + ":" + indicator;
-    auto& entry = baseline_cache_[cache_key];
+    auto& entry = baseline_cache_[agent_id][indicator];
     if (now_ms - entry.computed_at >= cache_ttl_ms)
     {
         entry.mean = compute_metric_mean(agent_id, indicator, anomaly_cfg.baseline_window_hours, now_ms);
@@ -577,8 +633,7 @@ IndicatorStatus StatusEngine::maybe_stale_status(IndicatorStatus threshold_statu
     if (stale_after_seconds <= 0 || !std::isfinite(current_value))
         return threshold_status;
 
-    const std::string key = agent_id + ":" + indicator;
-    auto& entry = staleness_cache_[key];
+    auto& entry = staleness_cache_[agent_id][indicator];
 
     constexpr double epsilon = 0.01;
     if (entry.value_since_ms == 0 || std::abs(current_value - entry.last_value) > epsilon)

@@ -1705,3 +1705,222 @@ SCENARIO("The retention task prunes every growing table without any metrics arri
         }
     }
 }
+
+// ── Review follow-ups for PR #174 ────────────────────────────────────────────
+
+SCENARIO("The first post-maintenance stale check starts a fresh clock")
+{
+    GIVEN("an agent with stale detection at 10 s that reported 50% before maintenance")
+    {
+        SqliteStore store(":memory:");
+        insert_approved_agent(store, "agent-stale-maint");
+        auto agent = store.get_agent("agent-stale-maint");
+        agent->collector_config.stale_after_seconds = 10;
+        store.set_agent_collector_config("agent-stale-maint", agent->collector_config);
+        StatusEngine engine(store);
+        engine.evaluate_metrics("agent-stale-maint", metrics_with_cpu(50.0), 1000);
+
+        WHEN("maintenance lasts a long time and the same value is reported afterwards")
+        {
+            engine.enter_maintenance("agent-stale-maint", "patching", 0, 2000);
+            engine.exit_maintenance("agent-stale-maint");
+            engine.evaluate_metrics("agent-stale-maint", metrics_with_cpu(50.0), 60'000);
+
+            THEN("the indicator is not flagged stale")
+            {
+                REQUIRE(store.latest_status_for_indicator("agent-stale-maint", "cpu")->new_status == "green");
+            }
+        }
+    }
+}
+
+SCENARIO("Consecutive-reading confirmation counts the first reading after maintenance")
+{
+    GIVEN("an agent needing 3 consecutive red CPU readings that was in maintenance")
+    {
+        SqliteStore store(":memory:");
+        insert_approved_agent(store, "agent-confirm");
+        auto agent = store.get_agent("agent-confirm");
+        agent->collector_config.cpu_readings = 3;
+        store.set_agent_collector_config("agent-confirm", agent->collector_config);
+        StatusEngine engine(store);
+        engine.evaluate_metrics("agent-confirm", metrics_with_cpu(10.0), 1000);
+        engine.enter_maintenance("agent-confirm", "patching", 0, 2000);
+        engine.exit_maintenance("agent-confirm");
+
+        WHEN("three red readings arrive after maintenance")
+        {
+            engine.evaluate_metrics("agent-confirm", metrics_with_cpu(99.0), 3000);
+            engine.evaluate_metrics("agent-confirm", metrics_with_cpu(99.0), 4000);
+            const bool alerted_before_third = has_alert(store, "cpu", "red");
+            engine.evaluate_metrics("agent-confirm", metrics_with_cpu(99.0), 5000);
+
+            THEN("the alert is raised on the third reading, not the fourth")
+            {
+                REQUIRE_FALSE(alerted_before_third);
+                REQUIRE(has_alert(store, "cpu", "red"));
+            }
+        }
+    }
+}
+
+SCENARIO("A persisted non-positive offline_after_seconds disables offline detection")
+{
+    GIVEN("an agent silent for a long time and offline_after_seconds=0 saved in the store")
+    {
+        SqliteStore store(":memory:");
+        store.set_setting("offline_after_seconds", "0");
+        put_agent(store, "agent-never-off", 1, 5);
+        StatusEngine engine(store);
+
+        WHEN("the offline check runs with a positive configured default")
+        {
+            const auto gone = engine.mark_offline_agents(10'000'000, 60);
+
+            THEN("the agent stays online")
+            {
+                REQUIRE(gone.empty());
+                REQUIRE(store.get_agent("agent-never-off")->connected);
+            }
+        }
+    }
+}
+
+SCENARIO("offline_timeout_seconds_for combines the setting, the default and the heartbeat")
+{
+    GIVEN("a store with and without the setting")
+    {
+        SqliteStore store(":memory:");
+        StatusEngine engine(store);
+
+        THEN("the configured default is used when no setting is saved")
+        {
+            REQUIRE(engine.offline_timeout_seconds_for(5, 60) == 60);
+            REQUIRE(engine.offline_timeout_seconds_for(60, 60) == 180);
+        }
+
+        AND_WHEN("the setting is saved")
+        {
+            store.set_setting("offline_after_seconds", "300");
+
+            THEN("it replaces the default")
+            {
+                REQUIRE(engine.offline_timeout_seconds_for(5, 60) == 300);
+            }
+        }
+
+        AND_WHEN("detection is disabled by the setting or by the default")
+        {
+            THEN("the timeout is 0")
+            {
+                REQUIRE(engine.offline_timeout_seconds_for(5, 0) == 0);
+                store.set_setting("offline_after_seconds", "-1");
+                REQUIRE(engine.offline_timeout_seconds_for(5, 60) == 0);
+            }
+        }
+    }
+}
+
+SCENARIO("A pause acknowledgement keeps the maintenance reason and expiry already set")
+{
+    GIVEN("an agent put into timed maintenance through the API")
+    {
+        SqliteStore store(":memory:");
+        insert_approved_agent(store, "agent-pause");
+        store.set_agent_maintenance("agent-pause", true, "kernel patch", 9000);
+        StatusEngine engine(store);
+
+        WHEN("the agent acknowledges the pause command")
+        {
+            engine.pause_agent("agent-pause", 2000);
+
+            THEN("the reason and expiry are preserved and the indicators are blue")
+            {
+                const auto agent = store.get_agent("agent-pause");
+                REQUIRE(agent->maintenance);
+                REQUIRE(agent->maintenance_reason == "kernel patch");
+                REQUIRE(agent->maintenance_until == 9000);
+                REQUIRE(store.latest_status_for_indicator("agent-pause", "cpu")->new_status == "blue");
+            }
+        }
+    }
+
+    GIVEN("an agent not in maintenance")
+    {
+        SqliteStore store(":memory:");
+        insert_approved_agent(store, "agent-pause2");
+        StatusEngine engine(store);
+
+        WHEN("the agent acknowledges a pause command")
+        {
+            engine.pause_agent("agent-pause2", 2000);
+
+            THEN("it enters open-ended maintenance with the reason command")
+            {
+                const auto agent = store.get_agent("agent-pause2");
+                REQUIRE(agent->maintenance);
+                REQUIRE(agent->maintenance_reason == "command");
+                REQUIRE(agent->maintenance_until == 0);
+            }
+        }
+    }
+}
+
+SCENARIO("Engine state of agents that no longer exist is dropped by the maintenance tick")
+{
+    GIVEN("an engine that evaluated two agents")
+    {
+        SqliteStore store(":memory:");
+        for (const auto* id : {"agent-keep", "agent-gone"})
+        {
+            insert_approved_agent(store, id);
+            auto agent = store.get_agent(id);
+            agent->collector_config.stale_after_seconds = 10;
+            store.set_agent_collector_config(id, agent->collector_config);
+        }
+        StatusEngine engine(store);
+        engine.evaluate_metrics("agent-keep", metrics_with_cpu(50.0), 1000);
+        engine.evaluate_metrics("agent-gone", metrics_with_cpu(50.0), 1000);
+        REQUIRE(engine.tracked_agent_count() == 2);
+
+        WHEN("one agent is deleted and the tick runs")
+        {
+            store.delete_agent("agent-gone");
+            engine.reconcile_maintenance(2000);
+
+            THEN("only the remaining agent is tracked")
+            {
+                REQUIRE(engine.tracked_agent_count() == 1);
+            }
+        }
+    }
+}
+
+SCENARIO("Expired timed maintenance inside an active window re-enters for the window at once")
+{
+    GIVEN("an agent in timed manual maintenance until t=3000 and a window from 2000 to 4000")
+    {
+        SqliteStore store(":memory:");
+        insert_approved_agent(store, "agent-overlap");
+        StatusEngine engine(store);
+        engine.enter_maintenance("agent-overlap", "by hand", 3000, 1000);
+        MaintenanceWindowRecord window;
+        window.agent_id = "*";
+        window.start_ms = 2000;
+        window.end_ms = 4000;
+        window.reason = "nightly";
+        store.create_maintenance_window(window);
+
+        WHEN("the tick runs when the timed maintenance expires")
+        {
+            engine.reconcile_maintenance(3000);
+
+            THEN("the agent is in scheduled maintenance without a gap")
+            {
+                const auto agent = store.get_agent("agent-overlap");
+                REQUIRE(agent->maintenance);
+                REQUIRE(agent->maintenance_reason == "mw:nightly");
+            }
+        }
+    }
+}

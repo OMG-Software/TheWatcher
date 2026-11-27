@@ -539,12 +539,6 @@ void Server::handle_router_frame(zmq::socket_t& router)
                         {
                             if (command->second.type == CommandType::DISCONNECT)
                                 command_agent->connected = false;
-                            else if (command->second.type == CommandType::PAUSE)
-                            {
-                                command_agent->maintenance = true;
-                                command_agent->maintenance_reason = "command";
-                                command_agent->maintenance_until = 0;
-                            }
                             else if (command->second.type == CommandType::RESUME)
                             {
                                 command_agent->maintenance = false;
@@ -555,7 +549,8 @@ void Server::handle_router_frame(zmq::socket_t& router)
                             store_->upsert_agent(*command_agent);
                             if (command->second.type == CommandType::PAUSE)
                             {
-                                status_engine_->enter_maintenance(agent_id, "command", 0, command_agent->last_seen);
+                                // Keeps the reason and expiry the API already stored.
+                                status_engine_->pause_agent(agent_id, command_agent->last_seen);
                             }
                             else if (command->second.type == CommandType::RESUME)
                             {
@@ -1015,17 +1010,21 @@ void Server::forget_route(const std::string& agent_id)
     agent_routes_.erase(route);
 }
 
-// Drops routes whose agent has sent no frame for offline_after_seconds, so a
-// closed connection's routing id cannot receive that agent's commands.
-// Does nothing when offline detection is disabled (offline_after_seconds <= 0).
+// Drops routes whose agent has sent no frame for its effective offline timeout
+// (the same per-agent timeout the offline scan uses), so a closed connection's
+// routing id cannot receive that agent's commands. Does nothing when offline
+// detection is disabled.
 void Server::expire_routes()
 {
-    if (config_.offline_after_seconds <= 0)
+    if (status_engine_->offline_timeout_seconds_for(0, config_.offline_after_seconds) <= 0)
         return;
-    const auto cutoff = std::chrono::steady_clock::now() - std::chrono::seconds{config_.offline_after_seconds};
+    const auto now = std::chrono::steady_clock::now();
     for (auto it = agent_routes_.begin(); it != agent_routes_.end();)
     {
-        if (it->second.last_frame < cutoff)
+        const auto agent = store_->get_agent(it->first);
+        const int heartbeat = agent ? agent->heartbeat_interval : 0;
+        const auto timeout_s = status_engine_->offline_timeout_seconds_for(heartbeat, config_.offline_after_seconds);
+        if (it->second.last_frame < now - std::chrono::seconds{timeout_s})
         {
             LOGF_DEBUG("Forgetting route of agent_id=%s with no frame since the offline threshold",
                        sanitize_log_text(it->first).c_str());

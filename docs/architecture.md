@@ -63,9 +63,16 @@ Manual, timed and scheduled maintenance share one state machine in
   `network:<iface>`, `process:<name>`, ...).
 - `exit_maintenance(agent)` clears the flag. Indicators stay Blue until the
   next metrics frame replaces them; the first real reading after maintenance
-  alerts normally even if it is already Red.
+  alerts normally even if it is already Red. Entering and leaving maintenance
+  also resets the agent's stale-value clocks and baselines, so readings frozen
+  during maintenance are not flagged stale afterwards.
 - Timed manual maintenance (`until_ms > 0`) ends when `now >= until_ms`.
-  `until_ms = 0` is open ended and ends only on resume.
+  `until_ms = 0` is open ended and ends only on resume. If a maintenance
+  window is active when it expires, the agent moves straight into the window's
+  maintenance in the same tick.
+- A PAUSE command acknowledged by the agent keeps the reason and expiry the API
+  already stored; only an agent not yet in maintenance gets the open-ended
+  reason `command`.
 - A scheduled maintenance window covering an agent (`agent_id` or `*`) starts
   maintenance with the reason `mw:<window reason>` and ends it when the window
   is over. Only maintenance whose reason starts with `mw:` is ended by a
@@ -90,6 +97,10 @@ The once-a-second offline scan sits next to it:
 - Effective timeout per agent: `max(base, 3 x heartbeat_interval)`. With the
   default 5 s heartbeat the base applies; a 60 s heartbeat gets 180 s, so an
   agent heartbeating on time never flaps offline.
+- A saved `offline_after_seconds` of 0 or less disables offline detection, like
+  a non-positive config value.
+- The same per-agent timeout expires an agent's learned command route when it
+  has sent no frame for that long.
 - Agents in maintenance are never marked offline.
 - A newly offline agent gets one open `Heartbeat` alert, archived when it
   reconnects.
@@ -107,7 +118,8 @@ The once-a-second offline scan sits next to it:
 | Silences, maintenance windows | `alerts_retention_days` | 90 | deleted once expired / ended for longer than the period |
 
 Invalid or non-positive values fall back to the default. Sessions are not
-pruned by this job.
+pruned by this job. The tick also drops the engine's cached state (stale-value
+clocks, baselines) of agents that were deleted.
 
 ## Agent
 

@@ -49,6 +49,11 @@ public:
     void enter_maintenance(const std::string& agent_id, const std::string& reason, int64_t until_ms, int64_t now_ms);
     void exit_maintenance(const std::string& agent_id);
 
+    // Applies an agent's acknowledged PAUSE command. An agent already in
+    // maintenance (set through the API) keeps its reason and expiry; otherwise
+    // it enters open-ended maintenance with the reason "command".
+    void pause_agent(const std::string& agent_id, int64_t now_ms);
+
     // The one maintenance state machine (#44, #45). Called from the server's
     // periodic maintenance tick for every approved agent:
     //  - timed manual maintenance whose until time has passed ends,
@@ -65,6 +70,15 @@ public:
     // back to default_offline_after_seconds (the config value). A non-positive
     // default disables offline detection. Agents in maintenance are skipped.
     std::vector<std::string> mark_offline_agents(int64_t now_ms, int default_offline_after_seconds);
+
+    // The effective offline timeout for an agent with this heartbeat interval:
+    // max(base, 3 x heartbeat) where base is the "offline_after_seconds"
+    // setting, else default_offline_after_seconds. Returns 0 when offline
+    // detection is disabled (the default or the saved setting is not positive).
+    int offline_timeout_seconds_for(int heartbeat_interval_seconds, int default_offline_after_seconds);
+
+    // Number of agents with cached state (for tests and diagnostics).
+    size_t tracked_agent_count() const;
 
 private:
     struct BaselineCacheEntry
@@ -101,8 +115,13 @@ private:
     Store& store_;
     // Agents whose indicators were already marked Blue for the current maintenance.
     std::unordered_set<std::string> maintenance_marked_;
-    std::unordered_map<std::string, BaselineCacheEntry> baseline_cache_;
-    std::unordered_map<std::string, StalenessEntry> staleness_cache_;
+    // Drops the stale-value clocks and baselines of one agent.
+    void forget_agent_state(const std::string& agent_id);
+
+    // agent_id -> indicator -> state. Nested so one agent's state can be
+    // dropped cheaply when it is deleted or leaves maintenance.
+    std::unordered_map<std::string, std::unordered_map<std::string, BaselineCacheEntry>> baseline_cache_;
+    std::unordered_map<std::string, std::unordered_map<std::string, StalenessEntry>> staleness_cache_;
 };
 
 } // namespace thewatcher::server

@@ -61,6 +61,13 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   page shows the real default, 60), and the offline timeout per agent is
   `max(setting, 3 x heartbeat_interval)`, so a slow heartbeat no longer makes
   an agent flap offline (#46).
+- Review follow-ups for the status engine: command routes expire with the same
+  per-agent offline timeout as the offline scan; an acknowledged PAUSE keeps
+  the maintenance reason and expiry set by the API instead of making timed
+  maintenance open ended; maintenance resets stale-value clocks; a saved
+  `offline_after_seconds` of 0 disables offline detection; the engine drops
+  state of deleted agents; expiring timed maintenance inside an active window
+  hands over to the window without a gap.
 - A NaN or infinite reading no longer raises a "grey" alert: Grey means no
   data and never alerts (#55).
 - Alerts, status history, log matches, expired silences and ended
