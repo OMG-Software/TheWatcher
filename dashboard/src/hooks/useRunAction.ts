@@ -26,7 +26,8 @@ export interface ActionFailureState {
 /** Provides the latest failure so `<ActionError>` can render it next to the form that caused it. */
 export const ActionFailureContext = React.createContext<ActionFailureState>({ failure: null, clear: () => undefined });
 
-export function useRunAction(refresh: () => Promise<void>) {
+/** `refresh` may resolve to a load error message (as `usePolling`'s does) or reject; either means the reload failed. */
+export function useRunAction(refresh: () => Promise<string | null | void>) {
   const [busyAction, setBusyAction] = React.useState<string | null>(null);
   const [failure, setFailure] = React.useState<ActionFailure | null>(null);
 
@@ -44,10 +45,14 @@ export function useRunAction(refresh: () => Promise<void>) {
       }
       // The change is saved. A failed refresh is a load problem, not a failed action:
       // reporting the action as failed would invite a retry that duplicates the change.
+      let refreshError: string | null;
       try {
-        await refresh();
+        refreshError = (await refresh()) ?? null;
       } catch (err) {
-        setFailure({ key: `${key}:refresh`, message: `Saved, but the dashboard could not be refreshed: ${errorMessage(err, 'refresh failed')}`, inline: false });
+        refreshError = errorMessage(err, 'refresh failed');
+      }
+      if (refreshError !== null) {
+        setFailure({ key: `${key}:refresh`, message: `Saved, but the dashboard could not be refreshed: ${refreshError}`, inline: false });
       }
       return true;
     },

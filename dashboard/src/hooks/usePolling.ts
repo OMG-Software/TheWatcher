@@ -22,6 +22,8 @@ export interface PollingState<T> {
  * `enabled: false` neither loads nor polls (data from an earlier enabled period is kept).
  * `merge` combines an accepted result with the previous data (for example to keep the last
  * good part of a partial failure); it never sees a stale response.
+ * `refresh()` resolves to the load error message, or null when it succeeded or was overtaken by
+ * a newer request (an overtaken load is not a failure). It never rejects.
  * `fetcher` may change between renders; the latest one is always used.
  */
 export function usePolling<T>(fetcher: () => Promise<T>, { intervalMs, enabled = true, merge }: { intervalMs?: number; enabled?: boolean; merge?: (next: T, previous: T | null) => T } = {}) {
@@ -36,18 +38,21 @@ export function usePolling<T>(fetcher: () => Promise<T>, { intervalMs, enabled =
     mergeRef.current = merge;
   });
 
-  const load = React.useCallback(async (force: boolean): Promise<void> => {
-    if (runningRef.current !== 0 && !force) return;
+  const load = React.useCallback(async (force: boolean): Promise<string | null> => {
+    if (runningRef.current !== 0 && !force) return null;
     const ticket = ++ticketRef.current;
     runningRef.current = ticket;
     try {
       const data = await fetcherRef.current();
-      if (ticket !== ticketRef.current) return;
+      if (ticket !== ticketRef.current) return null;
       const merger = mergeRef.current;
       setState((previous) => ({ data: merger ? merger(data, previous.data) : data, error: null, loading: false, loadedAt: new Date() }));
+      return null;
     } catch (err) {
-      if (ticket !== ticketRef.current) return;
-      setState((previous) => ({ ...previous, error: errorMessage(err, 'Failed to load data'), loading: false }));
+      if (ticket !== ticketRef.current) return null; // overtaken: the newer request decides
+      const message = errorMessage(err, 'Failed to load data');
+      setState((previous) => ({ ...previous, error: message, loading: false }));
+      return message;
     } finally {
       if (runningRef.current === ticket) runningRef.current = 0;
     }
