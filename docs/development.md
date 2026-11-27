@@ -48,7 +48,13 @@ npm.cmd test
 ## Coding Standards
 
 - C++ code is C++20.
-- Format C++ with the repository `.clang-format`.
+- Format C++ with the repository `.clang-format`. CI runs
+  `clang-format --dry-run --Werror` (version 22.1.5, installable with
+  `pip install clang-format==22.1.5`) over every tracked C++ file and fails
+  the build on any difference. Whole-tree reformatting commits are listed in
+  `.git-blame-ignore-revs`; run
+  `git config blame.ignoreRevsFile .git-blame-ignore-revs` once so
+  `git blame` skips them.
 - Keep top-level C++ namespace as `thewatcher`.
 - Prefer structured types in `common/metrics.hpp`, `common/protocol.hpp`, and
   `common/commands.hpp` over ad hoc strings.

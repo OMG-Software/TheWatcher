@@ -6,14 +6,30 @@ on:
       - master
       - 'claude/**'
       - 'codex/**'
+  # Every PR is built, whatever its base, so stacked PRs (based on another
+  # feature branch rather than main) are verified before they land.
   pull_request:
-    branches:
-      - main
-      - master
   schedule:
     - cron: "32 1 * * 1"
 
 jobs:
+
+  # ── Formatting ─────────────────────────────────────────────────────────────
+  # The version is pinned so a new clang-format release cannot fail CI on
+  # code that was formatted correctly with the project's toolchain.
+  format:
+    name: clang-format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install clang-format 22.1.5
+        run: python3 -m pip install --user clang-format==22.1.5
+
+      - name: Check formatting
+        run: |
+          git ls-files '*.cpp' '*.hpp' '*.h' ':!:subprojects/**' \
+            | xargs ~/.local/bin/clang-format --dry-run --Werror
 
   # ── Linux ──────────────────────────────────────────────────────────────────
   linux:

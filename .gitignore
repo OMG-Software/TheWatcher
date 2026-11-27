@@ -8,24 +8,33 @@
 .claudeignore
 .clwb/
 .idea/
+.serena/
 .vscode/
 .tmp/
 .venv/
 msvctmp/
+
+# Nested clones left behind by review tooling.
+.codex-*/
 
 dashboard/.npm-cache/
 dashboard/dist/
 dashboard/node_modules/
 dashboard/*.tsbuildinfo
 
-plans/
+# plans/ is tracked on purpose: task plans are kept as project history
+# (see docs/01-progress-tracker.md).
 
 build/
+build-*/
 builddir/
-builddir-release/
+builddir-*/
 meson-*/
 vcpkg_installed/
 .aider*
+
+# Local build archives.
+*.zip
 
 subprojects/*
 !subprojects/*.wrap

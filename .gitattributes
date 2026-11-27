@@ -1,2 +1,7 @@
 # Shell scripts must keep LF line endings or the shebang breaks on Unix.
 *.sh text eol=lf
+
+# Windows batch scripts need CRLF: cmd.exe can misparse labels and goto
+# targets in LF-only files.
+*.cmd text eol=crlf
+*.bat text eol=crlf
