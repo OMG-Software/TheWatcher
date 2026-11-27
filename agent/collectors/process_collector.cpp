@@ -85,6 +85,12 @@ bool process_matches_watch(std::string_view watch_name, std::string_view name, s
            (!exe_name.empty() && equal_names(watch_name, exe_name, case_insensitive));
 }
 
+bool open_process_should_retry_limited(unsigned long last_error)
+{
+    constexpr unsigned long error_access_denied = 5; // ERROR_ACCESS_DENIED
+    return last_error == error_access_denied;
+}
+
 double cpu_percent_of_one_core(uint64_t delta_ticks, double elapsed_seconds, double ticks_per_second)
 {
     if (elapsed_seconds <= 0.0 || ticks_per_second <= 0.0)
@@ -278,6 +284,14 @@ namespace
         ScopedHandle(const ScopedHandle&) = delete;
         ScopedHandle& operator=(const ScopedHandle&) = delete;
 
+        // Closes the current handle (if any) and takes ownership of `handle`.
+        void reset(HANDLE handle) noexcept
+        {
+            if (valid())
+                ::CloseHandle(handle_);
+            handle_ = handle;
+        }
+
         bool valid() const noexcept
         {
             return handle_ != nullptr && handle_ != INVALID_HANDLE_VALUE;
@@ -320,9 +334,15 @@ namespace
                 ::WideCharToMultiByte(CP_UTF8, 0, pe.szExeFile, -1, rec.name.data(), sz, nullptr, nullptr);
             }
 
-            // PROCESS_QUERY_LIMITED_INFORMATION is enough for times and memory
-            // counters, and is granted for other users' processes without admin.
-            ScopedHandle proc(::OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pe.th32ProcessID));
+            // GetProcessMemoryInfo documents PROCESS_QUERY_[LIMITED_]INFORMATION plus
+            // PROCESS_VM_READ. Protected and other users' processes refuse VM_READ, so
+            // reopen those with limited access only: they stay listed with name and CPU,
+            // and their memory is reported as 0.
+            constexpr DWORD limited = PROCESS_QUERY_LIMITED_INFORMATION;
+            ScopedHandle proc(::OpenProcess(limited | PROCESS_VM_READ, FALSE, pe.th32ProcessID));
+            bool memory_readable = proc.valid();
+            if (!proc.valid() && open_process_should_retry_limited(::GetLastError()))
+                proc.reset(::OpenProcess(limited, FALSE, pe.th32ProcessID));
             if (proc.valid())
             {
                 FILETIME ct, et, kt, ut;
@@ -335,7 +355,8 @@ namespace
                 }
                 PROCESS_MEMORY_COUNTERS_EX pmc{};
                 pmc.cb = sizeof(pmc);
-                if (::GetProcessMemoryInfo(proc.get(), reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&pmc), sizeof(pmc)))
+                if (memory_readable &&
+                    ::GetProcessMemoryInfo(proc.get(), reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&pmc), sizeof(pmc)))
                 {
                     rec.rss_bytes = pmc.WorkingSetSize;
                     rec.vms_bytes = pmc.PrivateUsage;

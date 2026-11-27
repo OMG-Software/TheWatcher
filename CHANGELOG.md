@@ -99,10 +99,14 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Process CPU is now percent of one core on every OS (Windows was divided by
   the core count, and Linux/BSD values were clamped to 100); a process using
   two cores reports about 200 (#95).
-- Windows process collection opens processes with
-  `PROCESS_QUERY_LIMITED_INFORMATION` only, so other users' processes are
-  readable without admin (#95). The Toolhelp snapshot, process handles and
-  the Linux `/proc` `DIR*` are now RAII-owned (#100, part of).
+- Windows process collection opens each process with
+  `PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ`, the rights
+  `GetProcessMemoryInfo` documents. If that is denied (protected processes,
+  other users' processes) it reopens with `PROCESS_QUERY_LIMITED_INFORMATION`
+  only: the process stays listed with its name and CPU and its memory is
+  reported as 0 (#95).
+- The Toolhelp snapshot, process handles and the Linux `/proc` `DIR*` are now
+  RAII-owned (#100, part of).
 - Process collector (BSD): FreeBSD owner comes from the uid, not the login
   name; OpenBSD (`struct kinfo_proc`, `p_*`) and NetBSD (`kinfo_proc2`) now
   have their own readers instead of the FreeBSD layout (#93).

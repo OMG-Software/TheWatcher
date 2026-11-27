@@ -46,6 +46,12 @@ bool process_matches_watch(std::string_view watch_name, std::string_view name, s
 // is the platform's tick unit (clock ticks, microseconds or 100-ns units).
 double cpu_percent_of_one_core(uint64_t delta_ticks, double elapsed_seconds, double ticks_per_second);
 
+// Windows: after OpenProcess with PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ
+// (the rights GetProcessMemoryInfo documents) fails with this error code, true
+// means retry with PROCESS_QUERY_LIMITED_INFORMATION only, so the process is
+// still listed with its name and CPU but with memory reported as 0.
+bool open_process_should_retry_limited(unsigned long last_error);
+
 // Top `limit` processes by cpu_percent, plus every process matching an enabled
 // watch. A process matching a watch is reported under the watch's name so the
 // dashboard's exact-name count sees it.

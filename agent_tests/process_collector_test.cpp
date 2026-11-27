@@ -356,3 +356,50 @@ SCENARIO("On Windows, memory of another process is reported with the access the 
 }
 
 #endif
+
+SCENARIO("A failed open with VM_READ falls back to limited access only when access was denied (issue #95)")
+{
+    GIVEN("the Windows error codes OpenProcess can return")
+    {
+        constexpr unsigned long error_access_denied = 5;
+        constexpr unsigned long error_invalid_parameter = 87;
+
+        THEN("only access denied triggers the reopen with limited access")
+        {
+            REQUIRE(open_process_should_retry_limited(error_access_denied));
+            REQUIRE_FALSE(open_process_should_retry_limited(error_invalid_parameter));
+            REQUIRE_FALSE(open_process_should_retry_limited(0));
+        }
+    }
+}
+
+#ifdef _WIN32
+
+SCENARIO("On Windows, a process that cannot be opened with VM_READ is still listed (issue #95)")
+{
+    GIVEN("the System process (pid 4), which a normal user cannot open with PROCESS_VM_READ")
+    {
+        WHEN("the collector lists all processes")
+        {
+            ProcessCollector collector(100000);
+            SystemMetrics metrics;
+            collector.update(metrics);
+
+            THEN("it is still reported by name")
+            {
+                bool found = false;
+                for (const auto& p : metrics.top_processes)
+                {
+                    if (p.pid == 4)
+                    {
+                        found = true;
+                        REQUIRE(p.name == "System");
+                    }
+                }
+                REQUIRE(found);
+            }
+        }
+    }
+}
+
+#endif

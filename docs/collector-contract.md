@@ -135,6 +135,12 @@ process is reported under the watch's configured name. Process readers on
 FreeBSD, OpenBSD and NetBSD use `sysctl(KERN_PROC)`; OpenBSD does not report
 thread counts (always 1); DragonFly BSD reports no processes.
 
+On Windows each process is opened with `PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ`,
+the rights `GetProcessMemoryInfo` documents. When that is denied (protected
+processes such as `System`, and other users' processes) it is reopened with
+`PROCESS_QUERY_LIMITED_INFORMATION` only: the process is still listed with its
+name and CPU, and `memory_rss_bytes` and `memory_vms_bytes` are 0.
+
 ## Adding A Collector
 
 1. Add the metric struct and JSON mapping to `common/metrics.hpp`.
