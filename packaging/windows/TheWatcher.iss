@@ -58,10 +58,8 @@ function PrepareToInstall(var NeedsRestart: Boolean): String;
 var
   ResultCode: Integer;
 begin
-  Exec(ExpandConstant('{sys}
-et.exe'), 'stop TheWatcherAgent', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
-  Exec(ExpandConstant('{sys}
-et.exe'), 'stop TheWatcherServer', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  Exec(ExpandConstant('{sys}\net.exe'), 'stop TheWatcherAgent', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  Exec(ExpandConstant('{sys}\net.exe'), 'stop TheWatcherServer', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
   Result := '';
 end;
 
