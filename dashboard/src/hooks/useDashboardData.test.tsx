@@ -31,7 +31,7 @@ describe('GIVEN two overlapping dashboard loads', () => {
       .mockResolvedValueOnce(snapshot([], 'database is locked')); // the next load fails its groups section
     const { result } = renderHook(() => useDashboardData());
 
-    let refreshing!: Promise<void>;
+    let refreshing!: Promise<unknown>;
     act(() => {
       refreshing = result.current.refresh();
     });

@@ -255,7 +255,9 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   configuration, password and view dialogs cannot be dismissed while saving
   and drop their old error on close; the groups load failure is flagged on
   Monitoring and Views; and the runbooks page shows "Loading" instead of "No
-  runbooks configured." before its first load (#104, #105, #106, #166).
+  runbooks configured." before its first load; a failed reload after a successful
+  change is now actually reported (`refresh()` returns the load error); modal
+  backdrops are marked `role="presentation"` (#104, #105, #106, #166).
 
 ### Changed
 
