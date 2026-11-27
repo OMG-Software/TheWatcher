@@ -63,6 +63,10 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   unprivileged writers, and root-reserved blocks count as used (#158).
 - Encoding a frame with an empty payload no longer passes a null pointer to
   libcbor (undefined behaviour reported by UBSan on every heartbeat) (#162).
+- The Linux CI build (GCC 11, `-O3 -Werror`) compiles again:
+  `protocol_security_test` builds its CBOR payloads in a buffer sized up
+  front instead of appending with `vector::insert`, which tripped a GCC 11
+  `-Wstringop-overread` false positive.
 
 ### Changed
 
@@ -70,7 +74,12 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   fails any PR whose C++ is not (`clang-format` 22.1.5, pinned). The
   formatting commit is listed in `.git-blame-ignore-revs`. A new include
   category keeps `<windows.h>`/`<winsock2.h>` ahead of the Win32 headers
-  that need them (#121).
+  that need them (#121). The CI job installs `clang-format` with
+  `--only-binary :all:`, so no source-distribution setup script can run.
+  The CI workflow limits `GITHUB_TOKEN` to `contents: read`.
+- SonarCloud leaves test code out of duplication detection
+  (`.sonarcloud.properties`); BDD scenarios repeat their setup on purpose.
+  Test files are still analysed for bugs and vulnerabilities.
 - CI runs for every pull request, not only those targeting `main`, so
   stacked PRs are built and tested too (#119).
 - `.gitignore` covers local build directories (`build-*/`, `builddir-*/`),
