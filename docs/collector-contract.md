@@ -62,10 +62,12 @@ uptime_seconds
 
 The current runtime settings are:
 
-- `collection_interval`: seconds between periodic metrics submissions.
+- `collection_interval`: seconds between periodic metrics submissions. Valid
+  range is 1 to 3600 seconds.
 - `heartbeat_interval`: seconds between heartbeat frames. Valid range is 1 to
   60 seconds. The default is 5 seconds.
 - `process_limit`: number of top processes captured by `ProcessCollector`.
+  Valid range is 1 to 1000.
 - `collector_config`: per-agent collector thresholds, enabled fixed disks,
   enabled network interfaces, process watches, and consecutive-reading counts.
 

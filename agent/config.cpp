@@ -1,6 +1,7 @@
 #include "config.hpp"
 
 #include "common/SingleLog.hpp"
+#include "common/agent_limits.hpp"
 #include "common/crypto.hpp"
 
 #include <cctype>
@@ -105,8 +106,8 @@ namespace
 
     // Copies recognised KEY=VALUE entries onto cfg; absent keys keep their
     // defaults. ALLOW_INSECURE is true only for "1", "true" or "yes" (SEC-08).
-    // Throws std::invalid_argument or std::out_of_range if a numeric
-    // value is not a valid integer.
+    // Throws std::invalid_argument naming the key if a numeric
+    // value is not an integer or is outside its range (issue #88).
     void apply_key_value(AgentConfig& cfg, const std::unordered_map<std::string, std::string>& values)
     {
         if (auto it = values.find("THEWATCHER_SERVER"); it != values.end())
@@ -133,11 +134,11 @@ namespace
         if (auto it = values.find("AGENT_SECRET_KEY"); it != values.end())
             cfg.agent_secret_key = it->second;
         if (auto it = values.find("COLLECTION_INTERVAL"); it != values.end())
-            cfg.collection_interval = std::stoi(it->second);
+            cfg.collection_interval = parse_int_setting("COLLECTION_INTERVAL", it->second, kCollectionIntervalRange);
         if (auto it = values.find("HEARTBEAT_INTERVAL"); it != values.end())
-            cfg.heartbeat_interval = std::stoi(it->second);
+            cfg.heartbeat_interval = parse_int_setting("HEARTBEAT_INTERVAL", it->second, kHeartbeatIntervalRange);
         if (auto it = values.find("PROCESS_LIMIT"); it != values.end())
-            cfg.process_limit = std::stoi(it->second);
+            cfg.process_limit = parse_int_setting("PROCESS_LIMIT", it->second, kProcessLimitRange);
     }
 
 } // namespace

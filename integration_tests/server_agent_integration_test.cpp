@@ -143,7 +143,7 @@ thewatcher::proto::EnrollResponse send_enrollment_request(const thewatcher::agen
 struct ServerThreadGuard
 {
     thewatcher::server::Server& server;
-    std::thread& thread;
+    std::jthread& thread; // joined on scope exit even if a REQUIRE throws
 
     ~ServerThreadGuard()
     {
@@ -156,7 +156,7 @@ struct ServerThreadGuard
 struct AgentThreadGuard
 {
     thewatcher::agent::Agent& agent;
-    std::thread& thread;
+    std::jthread& thread; // joined on scope exit even if a REQUIRE throws
 
     ~AgentThreadGuard()
     {
@@ -201,7 +201,7 @@ SCENARIO("A real agent enrolls, sends metrics, disconnects, and the server recor
         thewatcher::server::StartupSignal startup;
         std::exception_ptr server_error;
 
-        std::thread server_thread([&] {
+        std::jthread server_thread([&] {
             try
             {
                 server.run(&startup);
@@ -258,7 +258,7 @@ SCENARIO("A real agent enrolls, sends metrics, disconnects, and the server recor
                 5s));
 
             thewatcher::agent::Agent agent(agent_config);
-            std::thread agent_thread([&] {
+            std::jthread agent_thread([&] {
                 agent.start();
             });
             AgentThreadGuard agent_guard{agent, agent_thread};

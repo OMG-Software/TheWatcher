@@ -218,3 +218,68 @@ SCENARIO("Operators keep admin-set log monitors intact")
         }
     }
 }
+
+SCENARIO("Collector settings outside the agent's valid ranges are rejected by the API")
+{
+    GIVEN("a running server with an approved agent and a global admin session")
+    {
+        ServerFixture fx;
+        fx.start_and_login();
+        REQUIRE(fx.enroll_and_approve("cfg-range-agent", "collector-test-host"));
+
+        const auto post_settings = [&](int interval, int heartbeat, int process_limit) {
+            return fx.client.Post("/api/agents/cfg-range-agent/collector_config",
+                                  json{
+                                      {"collection_interval", interval                     },
+                                      {"heartbeat_interval",  heartbeat                    },
+                                      {"process_limit",       process_limit                },
+                                      {"collector_config",    json{{"logs", json::array()}}}
+            }
+                                      .dump(),
+                                  "application/json");
+        };
+
+        WHEN("the settings are at the edges of their ranges")
+        {
+            THEN("they are accepted")
+            {
+                require_status(post_settings(1, 1, 1), 200);
+                require_status(post_settings(3600, 60, 1000), 200);
+            }
+        }
+
+        WHEN("an interval, heartbeat or process limit is out of range")
+        {
+            THEN("each is rejected with 400")
+            {
+                require_status(post_settings(3601, 5, 5), 400);
+                require_status(post_settings(30, 0, 5), 400);
+                require_status(post_settings(30, 61, 5), 400);
+                require_status(post_settings(30, 5, 1001), 400);
+                require_status(post_settings(0, 5, 5), 400);
+            }
+        }
+
+        WHEN("the dedicated interval and process-limit endpoints receive out-of-range values")
+        {
+            const auto interval = fx.client.Post("/api/agents/cfg-range-agent/set_interval",
+                                                 json{
+                                                     {"interval_seconds", 99999}
+            }
+                                                     .dump(),
+                                                 "application/json");
+            const auto limit = fx.client.Post("/api/agents/cfg-range-agent/set_process_limit",
+                                              json{
+                                                  {"limit", 5000}
+            }
+                                                  .dump(),
+                                              "application/json");
+
+            THEN("both are rejected with 400")
+            {
+                require_status(interval, 400);
+                require_status(limit, 400);
+            }
+        }
+    }
+}

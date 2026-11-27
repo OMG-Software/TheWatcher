@@ -2,6 +2,7 @@
 
 #include "api_json.hpp"
 #include "common/SingleLog.hpp"
+#include "common/agent_limits.hpp"
 #include "common/protocol.hpp"
 #include "report_generator.hpp"
 
@@ -1848,8 +1849,8 @@ void ApiServer::setup_routes()
                 return;
             auto body = json::parse(req.body);
             int secs = body.at("interval_seconds").get<int>();
-            if (secs <= 0)
-                throw std::runtime_error("interval_seconds must be greater than zero");
+            if (!in_range(secs, kCollectionIntervalRange))
+                throw std::runtime_error(range_message("interval_seconds", kCollectionIntervalRange));
             LOGF_INFO("Setting collection interval id=%s interval_seconds=%d", id.c_str(), secs);
 
             auto rec = store_.get_agent(id);
@@ -1900,8 +1901,8 @@ void ApiServer::setup_routes()
                 return;
             auto body = json::parse(req.body);
             int limit = body.at("limit").get<int>();
-            if (limit <= 0)
-                throw std::runtime_error("limit must be greater than zero");
+            if (!in_range(limit, kProcessLimitRange))
+                throw std::runtime_error(range_message("limit", kProcessLimitRange));
             LOGF_INFO("Setting process limit id=%s limit=%d", id.c_str(), limit);
 
             auto rec = store_.get_agent(id);
@@ -2000,12 +2001,12 @@ void ApiServer::setup_routes()
             const auto interval = body.at("collection_interval").get<int>();
             const auto heartbeat_interval = body.value("heartbeat_interval", rec->heartbeat_interval);
             const auto process_limit = body.at("process_limit").get<int>();
-            if (interval <= 0)
-                throw std::runtime_error("collection_interval must be greater than zero");
-            if (heartbeat_interval < 1 || heartbeat_interval > 60)
-                throw std::runtime_error("heartbeat_interval must be between 1 and 60");
-            if (process_limit <= 0)
-                throw std::runtime_error("process_limit must be greater than zero");
+            if (!in_range(interval, kCollectionIntervalRange))
+                throw std::runtime_error(range_message("collection_interval", kCollectionIntervalRange));
+            if (!in_range(heartbeat_interval, kHeartbeatIntervalRange))
+                throw std::runtime_error(range_message("heartbeat_interval", kHeartbeatIntervalRange));
+            if (!in_range(process_limit, kProcessLimitRange))
+                throw std::runtime_error(range_message("process_limit", kProcessLimitRange));
 
             auto config = body.at("collector_config").get<CollectorConfig>();
             validate_collector_config(config);

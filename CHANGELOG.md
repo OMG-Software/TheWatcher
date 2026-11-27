@@ -63,6 +63,30 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   unprivileged writers, and root-reserved blocks count as used (#158).
 - Encoding a frame with an empty payload no longer passes a null pointer to
   libcbor (undefined behaviour reported by UBSan on every heartbeat) (#162).
+- Fixed a use-after-free in the agent: `RESTART_COLLECTORS`, `GET_STATUS` and
+  `CONFIG_UPDATE` ran on the IO thread while the collection thread used the
+  collectors. The collection thread is now their only owner and applies
+  posted requests between passes; the raw `log_collector_` pointer and the
+  `dynamic_cast` are gone (#87, part of #100).
+- Fixed Ctrl-C hanging the agent on Linux/BSD: a blocking send under the
+  outbox lock, a stop request erased by `start()`, a race between `stop()` and
+  thread creation, and 10-15 s uninterruptible enrollment waits. Sends are
+  non-blocking, the outbox is bounded (metrics are dropped oldest-first,
+  heartbeats first out), one stop source is never reset, and enrollment stops
+  within about 100 ms (#83).
+- A `DISCONNECT` command now makes the agent process exit (and the Windows
+  service stop) instead of idling with no threads (#85).
+- The agent validates the collection interval (1-3600 s), heartbeat interval
+  (1-60 s) and process limit (1-1000) in the config file, `CONFIG_UPDATE` and
+  commands, rejecting out-of-range values naming the key; command integers
+  are narrowed with a range check; the server REST API enforces the same
+  ranges (#88).
+- Heartbeat and interval changes apply at once, heartbeats run on their own
+  timer and top the outbox, config is requested on connect and every 10 s
+  (also while paused), and the agent reports connected only after the real
+  handshake (#89).
+- Added agent lifecycle, shutdown, heartbeat and config validation tests
+  (part of #101). Tests join their threads with `std::jthread` (part of #100).
 
 ### Changed
 

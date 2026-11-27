@@ -53,3 +53,27 @@ disk_collector_test = executable(
   dependencies: [collectors_dep, common_dep, catch2_dep, platform_deps],
 )
 test('disk_collector', disk_collector_test)
+
+outbox_test = executable(
+  'outbox_test',
+  ['outbox_test.cpp'],
+  include_directories: root_inc,
+  dependencies: [catch2_dep, platform_deps],
+)
+test('outbox', outbox_test)
+
+agent_limits_test = executable(
+  'agent_limits_test',
+  ['agent_limits_test.cpp'],
+  include_directories: root_inc,
+  dependencies: [agent_dep, catch2_dep, cbor_dep, cppzmq_dep, platform_deps],
+)
+test('agent_limits', agent_limits_test, is_parallel: false)
+
+agent_runtime_test = executable(
+  'agent_runtime_test',
+  ['agent_runtime_test.cpp'],
+  include_directories: root_inc,
+  dependencies: [agent_dep, catch2_dep, cbor_dep, cppzmq_dep, sodium_dep, platform_deps],
+)
+test('agent_runtime', agent_runtime_test, is_parallel: false, timeout: 180)

@@ -8,6 +8,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <stop_token>
 #include <thread>
 
 #include <zmq.hpp>
@@ -135,7 +136,12 @@ SCENARIO("Enrollment recovers after a transient server non-response")
             // Run enrollment in the background; first send lands in ZMQ's buffer
             // (no server yet), recv times out after 500 ms, then the fix recreates
             // the socket and sends a second request.
-            std::thread enroll_thread([&]() {
+            std::jthread enroll_thread([&](std::stop_token st) {
+                // A failing REQUIRE unwinds past this scope: the jthread destructor requests
+                // stop, which sets the flag enroll() polls, so the join cannot hang.
+                std::stop_callback on_stop(st, [&] {
+                    stop.store(true);
+                });
                 try
                 {
                     thewatcher::agent::enroll(cfg, agent_ctx, stop, /*poll_interval=*/0, /*recv_timeout_ms=*/500);

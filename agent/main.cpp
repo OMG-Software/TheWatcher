@@ -236,25 +236,23 @@ int main(int argc, char* argv[])
         if (service_mode)
         {
             LOGF_INFO("Starting Windows service mode as %s", service_name.c_str());
-            std::atomic<bool> service_stop{false};
-            std::shared_ptr<Agent> agent;
+            // Built before the service dispatcher starts so the stop callback
+            // never races with the worker creating it.
+            Agent agent(std::move(config));
             return thewatcher::service::run_windows_service(
                 service_name,
                 [&] {
-                    LOG_DEBUG("Service worker constructing agent");
-                    agent = std::make_shared<Agent>(std::move(config));
                     LOG_DEBUG("Service worker starting agent");
-                    agent->start();
-                    while (!service_stop.load())
+                    agent.start();
+                    // A DISCONNECT command also ends the service (issue #85).
+                    while (!agent.stop_requested())
                         std::this_thread::sleep_for(std::chrono::milliseconds(200));
                     LOG_DEBUG("Service worker stopping agent");
-                    agent->stop();
+                    agent.stop();
                 },
                 [&] {
                     LOG_DEBUG("Service stop callback received");
-                    service_stop.store(true);
-                    if (agent)
-                        agent->stop();
+                    agent.stop();
                 });
         }
 
@@ -269,8 +267,9 @@ int main(int argc, char* argv[])
         agent.start();
 
         LOG_INFO("Running. Press Ctrl+C to stop.");
-        while (!g_stop)
-            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        // A DISCONNECT command ends the process too (issue #85).
+        while (!g_stop && !agent.stop_requested())
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
         LOG_INFO("Shutting down...");
         signal_watchdog.request_stop();
