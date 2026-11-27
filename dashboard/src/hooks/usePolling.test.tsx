@@ -80,7 +80,7 @@ describe('GIVEN a polling hook', () => {
     const fetcher = vi.fn().mockReturnValueOnce(older.promise).mockReturnValueOnce(newer.promise);
     const { result } = renderHook(() => usePolling(fetcher, { intervalMs: 1000 }));
 
-    let refreshing!: Promise<void>;
+    let refreshing!: Promise<unknown>;
     act(() => {
       refreshing = result.current.refresh();
     });

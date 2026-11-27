@@ -17,7 +17,7 @@ export function AcknowledgeModal({ busy, bulk, errorKey, onClose, onSubmit }: { 
     onClose();
   };
   return (
-    <div className="modal-backdrop" onClick={dismiss}>
+    <div className="modal-backdrop" role="presentation" onClick={dismiss}>
       <div className="modal-panel" onClick={(e) => e.stopPropagation()}>
         <div className="modal-header">
           <h2>{bulk ? 'Acknowledge selected alerts' : 'Acknowledge alert'}</h2>
