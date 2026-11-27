@@ -18,6 +18,7 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 #include <httplib.h>
 #include <zmq.hpp>
@@ -292,6 +293,62 @@ SCENARIO("Only real loopback addresses get the loopback origin exception (issue 
             {
                 REQUIRE(res);
                 REQUIRE(res->status == 200);
+            }
+        }
+    }
+}
+
+SCENARIO("Commands for agents that are not connected are refused (issue #54)")
+{
+    GIVEN("an approved agent that is offline and one that is connected")
+    {
+        ApiFixture fx;
+        auto offline = agent("agent-offline", "", true);
+        offline.connected = false;
+        fx.store->upsert_agent(offline);
+        auto online = agent("agent-online", "", true);
+        online.connected = true;
+        fx.store->upsert_agent(online);
+        REQUIRE(login_as_default_admin(fx.client));
+
+        WHEN("an operator sends a command to the offline agent")
+        {
+            auto res = fx.client.Post("/api/agents/agent-offline/restart_collectors", "", "application/json");
+
+            THEN("the API answers 409 and queues nothing")
+            {
+                REQUIRE(res);
+                REQUIRE(res->status == 409);
+                std::vector<thewatcher::server::PendingCommand> queued;
+                fx.api.drain_commands(queued);
+                REQUIRE(queued.empty());
+            }
+        }
+
+        WHEN("an operator pauses the offline agent")
+        {
+            auto res = fx.client.Post("/api/agents/agent-offline/pause", "", "application/json");
+
+            THEN("it is refused and the agent is not put into maintenance")
+            {
+                REQUIRE(res);
+                REQUIRE(res->status == 409);
+                REQUIRE_FALSE(fx.store->get_agent("agent-offline")->maintenance);
+            }
+        }
+
+        WHEN("an operator sends a command to the connected agent")
+        {
+            auto res = fx.client.Post("/api/agents/agent-online/restart_collectors", "", "application/json");
+
+            THEN("the command is queued for it")
+            {
+                REQUIRE(res);
+                REQUIRE(res->status == 200);
+                std::vector<thewatcher::server::PendingCommand> queued;
+                fx.api.drain_commands(queued);
+                REQUIRE(queued.size() == 1);
+                REQUIRE(queued[0].agent_id == "agent-online");
             }
         }
     }

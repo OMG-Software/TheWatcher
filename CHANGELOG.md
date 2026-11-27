@@ -47,6 +47,25 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 
+- All alerts now go through one pipeline that applies maintenance, silences,
+  severity validation, de-duplication, the runbook link and the webhook.
+  Log-match alerts no longer fire during maintenance, offline and log-match
+  alerts now send the webhook and offline alerts honour silences, and 100
+  matching log lines leave one open alert (#52).
+- Alert webhooks and scheduled reports are delivered by a worker thread with a
+  bounded queue and timeouts, so a slow webhook no longer stalls the data
+  plane (#48).
+- The scheduled report reads its last-sent time at startup, so a restart in
+  the scheduled hour does not send it twice. A non-2xx response is a failure
+  and is retried with backoff; invalid `reports.*` values no longer throw
+  (#49). The `reports.*` settings are documented.
+- Commands for an agent that is not connected now get `409` from the API
+  instead of being dropped after a success reply, and the ROUTER reports
+  undeliverable commands (#54).
+- An operator DISCONNECT no longer raises a red "Agent has gone offline"
+  alert that escalates; the agent is marked operator-disconnected until it
+  sends a frame again (#156).
+- Added behavioural tests for `ReportGenerator` (part of #137).
 - Alert notes longer than 4,096 bytes are cut on a UTF-8 character
   boundary. Oversize `runbook_markdown` (collector config) and
   `reports_webhook_url` (settings) are rejected with 400 instead of being

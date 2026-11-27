@@ -30,6 +30,30 @@ webhook_security_test = executable(
 )
 test('webhook_security', webhook_security_test)
 
+notification_worker_test = executable(
+  'notification_worker_test',
+  ['notification_worker_test.cpp'],
+  include_directories: root_inc,
+  dependencies: [server_store_dep, catch2_dep, platform_deps],
+)
+test('notification_worker', notification_worker_test)
+
+alert_pipeline_test = executable(
+  'alert_pipeline_test',
+  ['alert_pipeline_test.cpp'],
+  include_directories: root_inc,
+  dependencies: [server_store_dep, catch2_dep, cbor_dep, sqlite_dep, platform_deps],
+)
+test('alert_pipeline', alert_pipeline_test)
+
+report_generator_test = executable(
+  'report_generator_test',
+  ['report_generator_test.cpp'],
+  include_directories: root_inc,
+  dependencies: [server_store_dep, catch2_dep, cbor_dep, sqlite_dep, platform_deps],
+)
+test('report_generator', report_generator_test)
+
 zap_handler_test = executable(
   'zap_handler_test',
   ['zap_handler_test.cpp'],

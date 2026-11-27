@@ -143,6 +143,12 @@ multicast, documentation, benchmark, and other non-public literal IP ranges.
 IPv6 literals are parsed before range checks so alternate textual forms of the
 same restricted address are handled consistently.
 
+Webhook delivery runs on a separate worker thread with bounded queue (256), 2 s
+or 5 s timeouts and limited retries. The URL is validated before a notification
+is queued, so the worker only posts to validated targets. A slow or hostile
+endpoint can no longer stall the data plane; at worst notifications are
+dropped when the queue is full.
+
 Hostname targets that resolve to private IPs after DNS lookup remain a residual
 risk. Deployments should restrict outbound egress at the host or network layer
 when webhooks are enabled.

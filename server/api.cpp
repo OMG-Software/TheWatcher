@@ -2079,7 +2079,11 @@ void ApiServer::setup_routes()
             const auto until = body.value("until_ms", static_cast<int64_t>(0));
             store_.set_agent_maintenance(id, true, reason, until);
             store_.clear_active_alerts_for_agent(id, now_ms());
-            enqueue_simple_command(id, CommandType::PAUSE);
+            // Maintenance is a server-side state and applies at once. The
+            // PAUSE command is only sent to an agent that can receive it (#54).
+            const auto target = store_.get_agent(id);
+            if (target && target->connected)
+                enqueue_simple_command(id, CommandType::PAUSE);
             set_json(res, json{
                               {"ok", true}
             });
@@ -2101,6 +2105,18 @@ void ApiServer::setup_routes()
                 auto id = req.path_params.at("id");
                 if (!require_agent_access(req, res, "operator", id))
                     return;
+                // #54: a command for an agent that is not connected would be
+                // dropped by the server, so refuse it instead of reporting
+                // success. Nothing is changed or queued.
+                const auto target = store_.get_agent(id);
+                if (!target || !target->connected)
+                {
+                    res.status = 409;
+                    set_json(res, json{
+                                      {"error", "agent is offline; command not queued"}
+                    });
+                    return;
+                }
                 if (ct == CommandType::PAUSE)
                 {
                     store_.set_agent_maintenance(id, true, "command", 0);
@@ -2529,7 +2545,10 @@ void ApiServer::setup_routes()
         }
         const auto ts = now_ms();
         const auto payload = build_report_json(store_, ts);
-        const bool sent = generate_and_send_report(store_, ts);
+        // Runs on this API request thread, not the data plane, so it can wait
+        // for the endpoint. Only a 2xx response counts as sent.
+        const auto notification = build_report_notification(store_, ts);
+        const bool sent = notification && is_success_status(deliver_notification(*notification));
         json out;
         out["sent"] = sent;
         out["report"] = payload;
