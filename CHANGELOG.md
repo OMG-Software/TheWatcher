@@ -55,6 +55,10 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 
+- Dashboard: `tsc` no longer writes `.js`/`.d.ts` files into `dashboard/src`
+  (`noEmit`), the 21 committed compiled twins are removed, and vitest runs
+  only `*.test.ts(x)`. Before, Vite served the stale twins and every test ran
+  twice (8 files / 172 tests became 4 / 86) (#103).
 - Agent enrollment recovers after a reply timeout: each attempt uses a new
   REQ socket, so a late server is reached without restarting the agent (#86).
 - A malformed enrollment reply is logged and retried instead of terminating
@@ -155,6 +159,26 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   `docs/architecture.md`. Releases before 0.9.0 need exact array lengths and
   cannot read 0.9.0 agents' frames, so upgrade the server before the agents
   (#102).
+- Dashboard: `main.tsx` is split into `App.tsx`, `pages/`, `components/`,
+  `hooks/` and `permissions.ts` (role helpers, now unit tested); inline
+  styles moved into `styles.css`. No behaviour change (#117).
+- Dashboard: removed the unused API helpers `deleteAlert` (identical to
+  `archiveAlert`), `setAgentGroups`, `setAgentRunbook`, `setAgentInterval`,
+  `setAgentProcessLimit`, `setAgentThresholds` and `fetchUptimeReport`, and
+  the unused imports in `main.tsx` (#116).
+- `docs/dashboard.md` now describes the UI as it behaves, including the
+  Silences, Maintenance and Settings pages, the fixed maintenance reason and
+  the first-group approval, and that the server does not serve the bundle
+  (#135).
+
+### Added
+
+- Dashboard: ESLint (flat config, `typescript-eslint`, `react-hooks`) with
+  `npm run lint`, and a `dashboard` CI job running
+  `npm ci --ignore-scripts` (no package install scripts), lint, build, tests
+  and `npm audit --omit=dev` (#120).
+- Dashboard: the footer shows the dashboard version from `package.json`
+  (#127).
 
 ## [0.8.0] - 2026-11-02
 

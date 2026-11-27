@@ -223,14 +223,6 @@ export interface ViewRecord {
   created_at: number;
 }
 
-export interface UptimeReport {
-  agent_id: string;
-  days: number;
-  uptime_percent: number;
-  actual_samples: number;
-  expected_samples: number;
-}
-
 export interface CpuMetrics {
   usage_percent: number;
   num_logical_cores: number;
