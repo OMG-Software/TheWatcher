@@ -13,23 +13,21 @@ import { colorLabel } from '../uiLogic';
 export function AgentsPage({
   agents,
   busyAction,
-  error,
   groups,
-  loading,
   onConfigure,
   operator,
   pending,
+  pendingLoadFailed,
   showPending,
   runAction,
 }: {
   agents: DashboardAgent[];
   busyAction: string | null;
-  error: string | null;
   groups: GroupRecord[];
-  loading: boolean;
   onConfigure: (agentId: string) => void;
   operator: boolean;
   pending: DashboardAgent[];
+  pendingLoadFailed: boolean;
   showPending: boolean;
   runAction: RunAction;
 }) {
@@ -37,9 +35,7 @@ export function AgentsPage({
 
   return (
     <main className="table-wrap management-wrap">
-      {error ? <div className="banner error">API error: {error}</div> : null}
-      {loading ? <div className="banner">Loading dashboard data...</div> : null}
-      {showPending ? <PendingEnrollments agents={pending} busyAction={busyAction} groups={groups} runAction={runAction} /> : null}
+      {showPending ? <PendingEnrollments agents={pending} busyAction={busyAction} groups={groups} loadFailed={pendingLoadFailed} runAction={runAction} /> : null}
       <div className="management-header"><h1>Agent Management</h1></div>
       <div className="table-container">
         <table className="management-table">

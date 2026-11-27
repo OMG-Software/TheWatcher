@@ -1,5 +1,8 @@
 import React from 'react';
 import { fetchSettings, sendReport, updateSettings } from '../api';
+import { ActionError } from '../components/ActionError';
+import { LoadFailed } from '../components/LoadFailed';
+import { usePolling } from '../hooks/usePolling';
 import type { RunAction } from '../hooks/useRunAction';
 import type { ServerSettings } from '../models';
 
@@ -8,26 +11,29 @@ export function SettingsPage({
 }: {
   runAction: RunAction;
 }) {
-  const [draft, setDraft] = React.useState<ServerSettings>({ webhook_url: '', offline_after_seconds: 120, escalation_timeout_seconds: 300, metrics_retention_days: 30, reports_enabled: false, reports_schedule: 'daily', reports_hour: 8, reports_day_of_week: 1, reports_webhook_url: '' });
-  const [loaded, setLoaded] = React.useState(false);
-
-  React.useEffect(() => {
-    void fetchSettings().then((s) => {
-      setDraft(s);
-      setLoaded(true);
-    }).catch(() => setLoaded(true));
-  }, []);
+  // Settings come from the server only. If they cannot be loaded there is no form at
+  // all: showing built-in defaults would let "Save" overwrite the real settings.
+  const { data: saved, error, refresh } = usePolling(fetchSettings);
+  const [edits, setEdits] = React.useState<Partial<ServerSettings>>({});
+  const draft = saved ? { ...saved, ...edits } : null;
+  const setDraft = (update: (current: ServerSettings) => ServerSettings) =>
+    setEdits((current) => (saved ? update({ ...saved, ...current }) : current));
 
   return (
     <main className="table-wrap management-wrap">
       <div className="management-header"><h1>Settings</h1></div>
-      {!loaded ? <div className="banner">Loading settings...</div> : null}
-      {loaded ? (
+      {!draft && !error ? <div className="banner">Loading settings...</div> : null}
+      {!draft && error ? <LoadFailed what="settings" message={error} onRetry={() => void refresh()} /> : null}
+      {draft ? (
         <form
           className="settings-form"
           onSubmit={(event) => {
             event.preventDefault();
-            void runAction('settings:save', () => updateSettings(draft));
+            void runAction('settings:save', () => updateSettings(draft), { inline: true }).then(async (ok) => {
+              if (!ok) return; // keep the edits so the user can fix and retry
+              await refresh();
+              setEdits({});
+            });
           }}
         >
           <div className="form-grid">
@@ -130,12 +136,14 @@ export function SettingsPage({
               />
             </label>
           </div>
+          <ActionError actionKey="settings:save" />
+          <ActionError actionKey="reports:send" />
           <div className="button-row">
             <button className="text-button" type="submit">Save Settings</button>
             <button
               className="text-button"
               type="button"
-              onClick={() => void runAction('reports:send', () => sendReport().then(() => undefined))}
+              onClick={() => void runAction('reports:send', () => sendReport().then(() => undefined), { inline: true })}
             >
               Send Report Now
             </button>

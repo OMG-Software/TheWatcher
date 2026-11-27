@@ -42,7 +42,7 @@ Dashboard:
 cd dashboard
 npm.cmd install
 npm.cmd run build
-npm.cmd test
+npm.cmd test      # Vitest + jsdom + React Testing Library UI tests; see docs/dashboard.md
 ```
 
 ## Coding Standards

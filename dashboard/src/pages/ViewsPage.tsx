@@ -1,6 +1,7 @@
 import React from 'react';
 import { Check, Search, SlidersHorizontal, Trash2, X } from 'lucide-react';
 import { createView, deleteView, updateView } from '../api';
+import { ActionError } from '../components/ActionError';
 import { ActionButton } from '../components/ActionButton';
 import type { RunAction } from '../hooks/useRunAction';
 import type { DashboardAgent, GroupRecord, SessionInfo, ViewRecord } from '../models';
@@ -9,6 +10,7 @@ import { isGlobal } from '../permissions';
 export function ViewsPage({
   agents,
   busyAction,
+  loadFailed = false,
   operator,
   runAction,
   session,
@@ -18,6 +20,7 @@ export function ViewsPage({
 }: {
   agents: DashboardAgent[];
   busyAction: string | null;
+  loadFailed?: boolean;
   operator: boolean;
   runAction: RunAction;
   session: SessionInfo;
@@ -94,12 +97,16 @@ export function ViewsPage({
                           {globalAccount ? <option value={0}>No group</option> : null}
                           {groups.map((group) => <option key={group.group_id} value={group.group_id}>{group.name}</option>)}
                         </select>
+                        <ActionError actionKey={`view:save:${v.view_id}`} />
                       </div>
                     </td>
                     <td>{new Date(v.created_at).toLocaleDateString()}</td>
                     <td>
                       <ActionButton busy={busyAction === `view:save:${v.view_id}`} label="Save" icon={<Check size={14} />}
-                        onClick={() => void runAction(`view:save:${v.view_id}`, () => updateView(v.view_id, editName, editAgentIds, editPublic, editGroupId).then(() => {})).then(() => setEditId(null))} />
+                        onClick={() => void runAction(`view:save:${v.view_id}`, () => updateView(v.view_id, editName, editAgentIds, editPublic, editGroupId).then(() => {}), { inline: true }).then((saved) => {
+                          // Stay in the editor with the changes when the save failed.
+                          if (saved) setEditId(null);
+                        })} />
                       <ActionButton busy={false} label="Cancel" icon={<X size={14} />} onClick={() => setEditId(null)} />
                     </td>
                   </>
@@ -124,7 +131,7 @@ export function ViewsPage({
                 )}
               </tr>
             ))}
-            {views.length === 0 ? (
+            {views.length === 0 && !loadFailed ? (
               <tr><td colSpan={7} className="empty-row">No views yet. Create one below.</td></tr>
             ) : null}
           </tbody>
@@ -136,7 +143,8 @@ export function ViewsPage({
           <form className="view-form view-form-create"
             onSubmit={(e) => {
               e.preventDefault();
-              void runAction('view:create', () => createView(newName, newAgentIds, newPublic, newGroupId).then(() => {})).then(() => {
+              void runAction('view:create', () => createView(newName, newAgentIds, newPublic, newGroupId).then(() => {}), { inline: true }).then((saved) => {
+                if (!saved) return;
                 setNewName('');
                 setNewPublic(false);
                 setNewAgentIds([]);
@@ -160,6 +168,7 @@ export function ViewsPage({
             <button className="text-button" type="submit" disabled={busyAction === 'view:create' || !newName}>
               {busyAction === 'view:create' ? '...' : 'Create View'}
             </button>
+            <ActionError actionKey="view:create" />
           </form>
         </div>
       ) : null}

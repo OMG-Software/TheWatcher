@@ -38,7 +38,8 @@ dashboard/src/pages/            one file per page (Monitoring, Views, Agents, Al
                                 Silences, Maintenance, Users, Runbooks, Settings, Login)
 dashboard/src/components/       shared components and modals (ActionButton, StatusDot,
                                 AgentConfigModal, AcknowledgeModal, RunbookModal, ...)
-dashboard/src/hooks/            data loading and polling, action runner, session, active view
+dashboard/src/hooks/            usePolling, useDashboardData, useRunAction, useSession, useActiveView
+dashboard/src/testing/          fake REST server for UI tests
 dashboard/src/permissions.ts    role helpers: isGlobal, canOperate, canManageUsers, canManageGroups
 dashboard/src/api.ts            REST client
 dashboard/src/models.ts         API row types
@@ -101,6 +102,35 @@ separately (for example behind a reverse proxy that also forwards `/api` to the
 server) over HTTPS, because the session cookie is `Secure`. Set
 `VITE_API_BASE_URL` at build time if the API lives on another origin.
 
+## Errors, session expiry and polling
+
+- **API errors.** `api.ts` throws `ApiError` (HTTP `status` plus the server's
+  `{"error": "..."}` message, or the status line when there is no body).
+  `errorMessage(err, fallback)` turns any caught value into text.
+- **Failed actions.** `runAction(key, fn, { inline })` resolves `true`/`false`.
+  A failure shows the server's message in a dismissible banner under the
+  summary cards, or, with `{ inline: true }`, next to the form or dialog that
+  started it via `<ActionError actionKey="...">`. Forms and dialogs clear or
+  close only when `runAction` resolves `true`, so input survives a failed save.
+- **Failed loads are not "no data".** If the first load of the required data
+  fails, the page is replaced by "Could not load dashboard data" with Retry. If
+  a later refresh fails, the old data stays under a "Could not refresh" banner.
+  Optional sections (alerts, silences, maintenance windows, users, views,
+  pending enrollments, groups) load independently: a 403 means the role may not
+  see them (empty); any other failure is flagged and the last good data is kept.
+  Settings shows an error instead of a form when it cannot load, so defaults can
+  never be saved over the real settings.
+- **Session expiry.** Any API call that returns 401 (except the login and
+  session probes) tells `useSession`, which returns to the login screen with
+  "Your session expired" and unmounts the dashboard, which stops all polling.
+  The login page warns when served over plain HTTP from a non-local host: the
+  session cookie is `Secure`, so the browser drops it there.
+- **Polling.** `usePolling(fetcher, { intervalMs, enabled })` skips a tick while
+  a request is in flight, drops the result of a request that a newer one (for
+  example a manual refresh after an action) overtook, and pauses while the tab
+  is hidden, refreshing as soon as it is visible again. `useDashboardData` polls
+  every 5 s with it.
+
 ## Tests
 
 ```powershell
@@ -113,6 +143,15 @@ worst-status summary counts, missing-metrics behavior, maintenance state, agent
 management API calls, grouped views, role helpers, navigation and label logic,
 and role-aware user/group API calls. Tests are collected from
 `src/**/*.test.ts(x)` only; `tsc` never writes into `src`.
+
+UI behaviour tests (`*.test.tsx`) use Vitest with jsdom and React Testing
+Library. `src/testing/fakeApi.ts` is a fake REST server: routes are keyed
+`"METHOD /path"`, unlisted routes answer an empty list, and `calls` records
+requests. Tests are written as GIVEN/WHEN/THEN `describe`/`it` names. They cover
+role gating, action and load errors, 401 to login, the polling guard and
+hidden-tab pause (fake timers), Settings after a failed load and forms after a
+failed save. These dev dependencies install without install scripts
+(`npm ci --ignore-scripts`, as CI does).
 
 ## Views
 

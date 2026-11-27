@@ -1,6 +1,7 @@
 import React from 'react';
 import { Pause, Play, Plus, SlidersHorizontal, Trash2, X } from 'lucide-react';
 import { changeUserPassword, createGroup, createUser, deleteUser, disableUser, enableUser } from '../api';
+import { ActionError } from '../components/ActionError';
 import { ActionButton } from '../components/ActionButton';
 import type { RunAction } from '../hooks/useRunAction';
 import type { GroupRecord, SessionInfo, UserRecord } from '../models';
@@ -57,17 +58,20 @@ export function UsersPage({
                 onChange={(e) => setPwValue(e.target.value)}
               />
             </label>
+            <ActionError actionKey={`user:${pwUserId}:pw`} />
             <div className="button-row modal-actions">
               <button className="text-button secondary" onClick={() => setPwUserId(null)}>Cancel</button>
               <button
                 className="text-button"
-                disabled={!pwValue}
+                disabled={!pwValue || busyAction === `user:${pwUserId}:pw`}
                 onClick={() => {
                   const id = pwUserId;
-                  const pw = pwValue;
-                  setPwUserId(null);
-                  setPwValue('');
-                  void runAction(`user:${id}:pw`, () => changeUserPassword(id, pw));
+                  // Close and clear only once the server accepted the new password.
+                  void runAction(`user:${id}:pw`, () => changeUserPassword(id, pwValue), { inline: true }).then((saved) => {
+                    if (!saved) return;
+                    setPwUserId(null);
+                    setPwValue('');
+                  });
                 }}
               >
                 Save
@@ -77,13 +81,17 @@ export function UsersPage({
         </div>
       ) : null}
       <div className="management-header"><h1>Users & Groups</h1></div>
+      <ActionError actionKey="group:create" />
+      <ActionError actionKey="user:create" />
       <div className="management-grid">
         {canManageGroups(session.role) ? <form
           className="inline-form"
           onSubmit={(event) => {
             event.preventDefault();
             if (!groupName.trim()) return;
-            void runAction('group:create', () => createGroup(groupName.trim())).then(() => setGroupName(''));
+            void runAction('group:create', () => createGroup(groupName.trim()), { inline: true }).then((saved) => {
+              if (saved) setGroupName('');
+            });
           }}
         >
           <input aria-label="Group name" placeholder="Group name" value={groupName} onChange={(event) => setGroupName(event.target.value)} />
@@ -94,7 +102,8 @@ export function UsersPage({
           onSubmit={(event) => {
             event.preventDefault();
             if (!username.trim() || !password) return;
-            void runAction('user:create', () => createUser(username.trim(), password, role, groupId ? [groupId] : [])).then(() => {
+            void runAction('user:create', () => createUser(username.trim(), password, role, groupId ? [groupId] : []), { inline: true }).then((saved) => {
+              if (!saved) return;
               setUsername('');
               setPassword('');
             });

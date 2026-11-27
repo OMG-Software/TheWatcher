@@ -1,6 +1,6 @@
 import React from 'react';
 import { SlidersHorizontal } from 'lucide-react';
-import { fetchLogMatches, fetchMetricHistory } from '../api';
+import { errorMessage, fetchLogMatches, fetchMetricHistory } from '../api';
 import { AgentIdentity } from '../components/AgentIdentity';
 import { Sparkline } from '../components/Sparkline';
 import { StatusDot } from '../components/StatusDot';
@@ -11,51 +11,57 @@ import { colorLabel } from '../uiLogic';
 
 export function MonitoringPage({
   agents,
-  error,
   expanded,
   global,
   groupFilter,
   groups,
-  loading,
   setExpanded,
   setGroupFilter,
 }: {
   agents: DashboardAgent[];
-  error: string | null;
   expanded: Set<string>;
   global: boolean;
   groupFilter: OverviewGroupFilter;
   groups: GroupRecord[];
-  loading: boolean;
   setExpanded: React.Dispatch<React.SetStateAction<Set<string>>>;
   setGroupFilter: React.Dispatch<React.SetStateAction<OverviewGroupFilter>>;
 }) {
   const [agentHistory, setAgentHistory] = React.useState<Record<string, MetricsSnapshot[]>>({});
   const [agentLogMatches, setAgentLogMatches] = React.useState<Record<string, LogMatchRecord[]>>({});
+  const [detailErrors, setDetailErrors] = React.useState<Record<string, string>>({});
   const [historyAgent, setHistoryAgent] = React.useState<{ id: string; name: string } | null>(null);
+  const requested = React.useRef(new Set<string>()); // agents whose detail is loaded or loading
 
+  // Load detail once per expanded agent. A failure is shown in the detail row and
+  // retried the next time the row is expanded.
   React.useEffect(() => {
     for (const id of expanded) {
-      if (!agentHistory[id]) {
-        void fetchMetricHistory(id, 20).then((snapshots) => {
+      if (requested.current.has(id)) continue;
+      requested.current.add(id);
+      void Promise.all([fetchMetricHistory(id, 20), fetchLogMatches(id, 20)])
+        .then(([snapshots, rows]) => {
           setAgentHistory((prev) => ({ ...prev, [id]: snapshots }));
-        }).catch(() => undefined);
-        void fetchLogMatches(id, 20).then((rows) => {
           setAgentLogMatches((prev) => ({ ...prev, [id]: rows }));
-        }).catch(() => undefined);
-      }
+          setDetailErrors((prev) => {
+            const next = { ...prev };
+            delete next[id];
+            return next;
+          });
+        })
+        .catch((err: unknown) => {
+          requested.current.delete(id);
+          setDetailErrors((prev) => ({ ...prev, [id]: errorMessage(err, 'Failed to load history') }));
+        });
     }
-  }, [expanded, agentHistory]);
+  }, [expanded]);
 
   const overviewGroups = groupOverviewAgents(agents, groups, groupFilter);
   const visibleAgentCount = overviewGroups.reduce((count, group) => count + group.agents.length, 0);
 
   return (
     <main className="table-wrap">
-      {error ? <div className="banner error">API error: {error}</div> : null}
-      {loading ? <div className="banner">Loading dashboard data...</div> : null}
-      {!loading && agents.length === 0 ? <div className="banner">No approved agents are reporting yet.</div> : null}
-      {!loading && agents.length > 0 && visibleAgentCount === 0 ? <div className="banner">No agents match this group filter.</div> : null}
+      {agents.length === 0 ? <div className="banner">No approved agents are reporting yet.</div> : null}
+      {agents.length > 0 && visibleAgentCount === 0 ? <div className="banner">No agents match this group filter.</div> : null}
 
       {global ? (
         <div className="overview-toolbar">
@@ -127,6 +133,7 @@ export function MonitoringPage({
                     <tr className={`detail-row ${expanded.has(agent.id) ? '' : 'hidden'}`}>
                       <td colSpan={4 + COMPONENT_LABELS.length}>
                         <div className="detail-inner">
+                          {detailErrors[agent.id] ? <div className="banner error detail-card-wide" role="alert">Could not load history for {agent.name}: {detailErrors[agent.id]}</div> : null}
                           {agent.components.map((component) => {
                             const history = agentHistory[agent.id];
                             const sparkData = history

@@ -72,6 +72,27 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   front instead of appending with `vector::insert`, which tripped a GCC 11
   `-Wstringop-overread` false positive.
 
+- Dashboard: errors are no longer lost or disguised. API errors keep the
+  HTTP status and the server's message (`ApiError`); a failed action shows
+  that message (page banner, or inline in the form or dialog that started
+  it) on every page (#104). A failed load is shown as "could not load", never
+  as "no data" or an all-clear: a failed required load replaces the page with
+  an error and Retry, a failed section (alerts, silences, maintenance, users,
+  views, pending enrollments) is flagged and keeps its last good data (#105).
+- Dashboard: a 401 from any call returns to the login screen with a "session
+  expired" notice and stops polling; the login page warns when it is served
+  over plain HTTP, where the `Secure` session cookie is dropped (#106).
+- Dashboard: polling skips a tick while a request is in flight, ignores
+  responses that a newer request overtook, and pauses while the tab is
+  hidden. The archived-alerts list polls on its own timer instead of
+  re-fetching on every dashboard poll (#107).
+- Dashboard: Settings no longer falls back to built-in defaults when loading
+  fails, so Save cannot overwrite the real settings; it shows an error and
+  Retry instead (#108).
+- Dashboard: forms and dialogs (silence, maintenance, group, user, view,
+  password, acknowledge, settings, runbook) keep their input and stay open
+  when a save fails (#166).
+
 ### Changed
 
 - The whole C++ tree is formatted with the root `.clang-format`, and CI
@@ -112,6 +133,10 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   and `npm audit --omit=dev` (#120).
 - Dashboard: the footer shows the dashboard version from `package.json`
   (#127).
+- Dashboard UI behaviour tests with React Testing Library and jsdom (exact
+  devDependency versions): role gating, action and load errors, 401 to login,
+  polling guard and hidden-tab pause, Settings after a failed load, and forms
+  after a failed save (#118).
 
 ## [0.8.0] - 2026-11-02
 
