@@ -232,6 +232,10 @@ public:
     // happen or neither does. Returns the number of sessions revoked.
     virtual int update_user_password_and_revoke_sessions(int64_t user_id, const std::string& password_hash,
                                                          const std::string& keep_token = "") = 0;
+    // Disables the user and revokes all of their sessions as one atomic
+    // operation, so re-enabling cannot revive old sessions. Returns the number
+    // of users affected (0: unknown id or built-in; nothing is revoked then).
+    virtual int disable_user_and_revoke_sessions(int64_t user_id) = 0;
 
     virtual void insert_metrics(const MetricsRow& row) = 0;
     virtual std::vector<MetricsRow> get_metrics(const std::string& agent_id, int limit = 100) = 0;

@@ -18,6 +18,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <functional>
 #include <future>
 #include <memory>
 #include <string>
@@ -40,7 +41,10 @@ namespace
 // one window even on a loaded host.
 struct ApiFixture
 {
-    explicit ApiFixture(int64_t window_ms = 3000, std::vector<std::string> trusted_proxies = {})
+    // `configure` runs before the listener starts (for test hooks). Anything
+    // its callbacks capture must outlive the fixture.
+    explicit ApiFixture(int64_t window_ms = 3000, std::vector<std::string> trusted_proxies = {},
+                        const std::function<void(thewatcher::server::ApiServer&)>& configure = {})
         : store(thewatcher::server::make_store("sqlite", ":memory:"))
         , api(*store, zap, "127.0.0.1", port, window_ms, window_ms)
         , client("http://127.0.0.1:" + std::to_string(port))
@@ -48,6 +52,8 @@ struct ApiFixture
         client.set_connection_timeout(5, 0);
         client.set_read_timeout(5, 0);
         api.set_trusted_proxies(std::move(trusted_proxies));
+        if (configure)
+            configure(api);
         api.start();
     }
 
@@ -329,6 +335,13 @@ SCENARIO("X-Real-IP set by a trusted proxy takes precedence over X-Forwarded-For
                                           {"X-Real-IP",       "203.0.113.40" },
                                           {"X-Forwarded-For", "198.51.100.77"}
                 }) == 429);
+                // The same peer with a different X-Real-IP is a different
+                // client, so the bucket is the forwarded address, not the peer.
+                REQUIRE(attempt_login(fx.client, "thewatcher", "look_at_me",
+                                      {
+                                          {"X-Real-IP",       "203.0.113.41" },
+                                          {"X-Forwarded-For", "198.51.100.77"}
+                }) == 200);
             }
         }
     }
@@ -358,6 +371,14 @@ SCENARIO("Every X-Forwarded-For header line is considered, the proxy's line last
                                           {"X-Forwarded-For", "203.0.113.50" }
                 }) ==
                         429);
+                // A different address on the proxy's line is a different
+                // client, so the bucket is the forwarded address, not the peer.
+                REQUIRE(attempt_login(fx.client, "thewatcher", "look_at_me",
+                                      {
+                                          {"X-Forwarded-For", "198.51.100.99"},
+                                          {"X-Forwarded-For", "203.0.113.51" }
+                }) ==
+                        200);
             }
         }
     }
@@ -461,16 +482,26 @@ SCENARIO("Unknown and disabled usernames cost as much as a wrong password")
 
 SCENARIO("Concurrent login attempts cannot exceed the failure limit")
 {
-    GIVEN("an API server and many simultaneous bad logins for one account from one address")
+    GIVEN("an API server that holds every admitted login before it verifies the password")
     {
-        ApiFixture fx(60'000);
         constexpr int attempts = 16;
+        constexpr int limit = 5;
+        // Declared before the fixture so they outlive the server's threads.
+        std::atomic<int> admitted{0};
+        std::promise<void> gate;
+        auto gate_open = gate.get_future().share();
+        ApiFixture fx(60'000, {}, [&](thewatcher::server::ApiServer& api) {
+            api.set_login_test_hooks({}, [&](const std::string&) {
+                ++admitted;
+                gate_open.wait_for(10s);
+            });
+        });
         std::atomic<int> unauthorized{0};
         std::atomic<int> throttled{0};
+        std::vector<std::thread> threads;
 
-        WHEN("they are all in flight at once")
+        WHEN("sixteen bad logins for one account from one address are in flight at once")
         {
-            std::vector<std::thread> threads;
             for (int i = 0; i < attempts; ++i)
             {
                 threads.emplace_back([&] {
@@ -489,13 +520,25 @@ SCENARIO("Concurrent login attempts cannot exceed the failure limit")
                         ++throttled;
                 });
             }
+
+            // The admitted attempts stay parked, so the rest are judged while
+            // the admitted ones are still unverified: only reservations made
+            // up front can already have turned them away.
+            const auto deadline = std::chrono::steady_clock::now() + 10s;
+            while (throttled.load() < attempts - limit && std::chrono::steady_clock::now() < deadline)
+                std::this_thread::sleep_for(10ms);
+            const int admitted_while_parked = admitted.load();
+            const int throttled_while_parked = throttled.load();
+            gate.set_value();
             for (auto& t : threads)
                 t.join();
 
-            THEN("no more than the per-account limit of five verifications are admitted")
+            THEN("only the per-account limit of five were admitted and the rest were refused at once")
             {
-                REQUIRE(unauthorized.load() == 5);
-                REQUIRE(throttled.load() == attempts - 5);
+                REQUIRE(admitted_while_parked == limit);
+                REQUIRE(throttled_while_parked == attempts - limit);
+                REQUIRE(unauthorized.load() == limit);
+                REQUIRE(throttled.load() == attempts - limit);
             }
         }
     }
@@ -642,28 +685,54 @@ SCENARIO("A leading empty X-Forwarded-For line makes the header malformed")
     }
 }
 
+namespace
+{
+
+// Opens the gate and joins the worker however the scope is left, so a failed
+// assertion cannot leave a joinable thread (which would terminate the process).
+struct GateGuard
+{
+    std::thread& worker;
+    std::promise<void>& gate;
+    std::atomic<bool>& opened;
+
+    ~GateGuard()
+    {
+        if (!opened.exchange(true))
+            gate.set_value();
+        if (worker.joinable())
+            worker.join();
+    }
+};
+
+} // namespace
+
 SCENARIO("A login that outlives its throttle window cannot release a newer window's slot")
 {
     GIVEN("an API server with a controllable clock and a 3 second throttle window")
     {
-        ApiFixture fx(3000);
+        // Declared before the fixture so the server's threads never outlive them.
         std::atomic<int64_t> clock_ms{1'000'000};
         std::promise<void> in_flight;
+        auto in_flight_future = in_flight.get_future();
         std::promise<void> proceed;
-        auto proceed_future = proceed.get_future();
+        auto proceed_future = proceed.get_future().share();
         std::atomic<bool> hold_next{true};
-        fx.api.set_login_test_hooks(
-            [&] {
-                return clock_ms.load();
-            },
-            [&](const std::string&) {
-                // Park only the first attempt, after its slot was counted.
-                if (hold_next.exchange(false))
-                {
-                    in_flight.set_value();
-                    proceed_future.wait();
-                }
-            });
+        std::atomic<bool> proceed_set{false};
+        ApiFixture fx(3000, {}, [&](thewatcher::server::ApiServer& api) {
+            api.set_login_test_hooks(
+                [&] {
+                    return clock_ms.load();
+                },
+                [&](const std::string&) {
+                    // Park only the first attempt, after its slot was counted.
+                    if (hold_next.exchange(false))
+                    {
+                        in_flight.set_value();
+                        proceed_future.wait_for(15s);
+                    }
+                });
+        });
 
         WHEN("a correct login is still verifying while the window expires and a new failure arrives")
         {
@@ -681,10 +750,12 @@ SCENARIO("A login that outlives its throttle window cannot release a newer windo
                                        "application/json");
                 slow_status = res ? res->status : 0;
             });
-            in_flight.get_future().wait();
+            GateGuard guard{slow, proceed, proceed_set};
+            REQUIRE(in_flight_future.wait_for(10s) == std::future_status::ready);
             clock_ms += 10'000; // the first attempt's window has long expired
             REQUIRE(attempt_login(fx.client, "thewatcher", "wrong-password") == 401);
-            proceed.set_value();
+            if (!proceed_set.exchange(true))
+                proceed.set_value();
             slow.join();
             REQUIRE(slow_status == 200);
 
@@ -697,6 +768,27 @@ SCENARIO("A login that outlives its throttle window cannot release a newer windo
                 {
                     REQUIRE(attempt_login(fx.client, "thewatcher", "wrong-password") == 429);
                 }
+            }
+        }
+    }
+}
+
+SCENARIO("An invalid entry left of the client address makes the forwarded chain malformed")
+{
+    GIVEN("an API server that trusts 127.0.0.1 as a reverse proxy")
+    {
+        ApiFixture fx(60'000, {"127.0.0.1"});
+
+        WHEN("ten failures send junk before a valid client address")
+        {
+            for (int i = 0; i < 10; ++i)
+                REQUIRE(attempt_login_via_proxy(fx.client, "junk, 203.0.113.9", "spray-user-" + std::to_string(i),
+                                                "wrong-password") == 401);
+
+            THEN("they are throttled as unknown-client, not as the address after the junk")
+            {
+                REQUIRE(attempt_login_via_proxy(fx.client, "junk, 203.0.113.9", "thewatcher", "look_at_me") == 429);
+                REQUIRE(attempt_login_via_proxy(fx.client, "203.0.113.9", "thewatcher", "look_at_me") == 200);
             }
         }
     }

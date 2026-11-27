@@ -1054,6 +1054,22 @@ int PostgresStore::update_user_password_and_revoke_sessions(int64_t user_id, con
     return affected != nullptr ? std::atoi(affected) : 0;
 }
 
+int PostgresStore::disable_user_and_revoke_sessions(int64_t user_id)
+{
+    const auto p = s(user_id);
+    const char* params[] = {p.c_str()};
+    // One statement is atomic. The built-in admin is excluded exactly as in
+    // disable_user, and only the user row that was updated loses sessions.
+    Res res(PQexecParams(conn_, R"(
+        WITH upd AS (UPDATE users SET disabled=TRUE WHERE user_id=$1::bigint AND built_in=FALSE RETURNING user_id),
+             del AS (DELETE FROM sessions WHERE user_id IN (SELECT user_id FROM upd))
+        SELECT COUNT(*) FROM upd;
+    )",
+                         1, nullptr, params, nullptr, nullptr, 0));
+    check_res(res.r, "disable_user_and_revoke_sessions");
+    return PQntuples(res.r) > 0 ? std::atoi(PQgetvalue(res.r, 0, 0)) : 0;
+}
+
 // ── Metrics ───────────────────────────────────────────────────────────────────
 
 void PostgresStore::insert_metrics(const MetricsRow& row)

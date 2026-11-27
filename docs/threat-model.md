@@ -125,7 +125,7 @@ working document for audit, design review, and regression testing.
   hash runs.
 - A trusted range only matches peers of its own address family (`::/0` does not
   trust IPv4 peers, and IPv4-mapped IPv6 peers count as IPv4). A forwarding
-  header that is present but empty, holds no address, or contains any empty entry (for example a trailing comma) is treated as
+  header that is present but empty, holds no address, or contains any empty or invalid entry (for example a trailing comma or junk left of the client) is treated as
   malformed (own bucket), never as "no header".
 - A login attempt holds a slot in the throttle counters while its password is
   verified; the slot is returned on success or on an unexpected error, and
@@ -140,10 +140,13 @@ working document for audit, design review, and regression testing.
   the session revocation are one atomic store operation.
 - Unknown and disabled usernames are verified against a dummy Argon2 hash
   (random password hashed at startup with the real parameters), so
-  response time does not reveal which usernames exist.
+  the response time of those paths is close to a real failure, which reduces
+  (but does not eliminate) timing-based username enumeration.
 - Sessions are revoked when a user's password changes (all of the user's
   sessions, except the caller's own on a self-service change), when a user is
-  disabled or deleted (re-enabling does not restore old sessions). Expired
+  disabled (one atomic store operation, so re-enabling cannot restore old
+  sessions; enabling also drops any leftover sessions) or deleted (the sessions
+  table cascades). Expired
   sessions are purged at most every five minutes (a failed purge is retried) from login and session
   validation.
 - Every ZMQ socket caps inbound message size (`ZMQ_MAXMSGSIZE`: 64 KiB

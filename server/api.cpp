@@ -304,16 +304,16 @@ std::string ApiServer::client_ip(const httplib::Request& req)
         xff += req.get_header_value("X-Forwarded-For", "", i);
     }
 
-    // A header that was sent must be a list of non-empty entries; one empty
-    // entry (",", "a,", ",a") makes it malformed, however many valid hops
-    // sit beside it. Absent means no header line at all.
+    // A header that was sent must be a list of valid addresses: one empty or
+    // invalid entry anywhere (",", "a,", ",a", "junk, a") makes it malformed,
+    // however many valid hops sit beside it. Absent means no header line.
     if (xff_lines > 0)
     {
         std::string_view all = xff;
         for (;;)
         {
             const auto comma = all.find(',');
-            if (trim_ws(all.substr(0, comma)).empty())
+            if (!parse_ip(trim_ws(all.substr(0, comma))))
                 return std::string(unknown_client);
             if (comma == std::string_view::npos)
                 break;
@@ -358,16 +358,21 @@ void ApiServer::purge_expired_sessions_if_due(int64_t now_ms)
     constexpr int64_t purge_interval_ms = 5LL * 60LL * 1000LL;
     if (now_ms - last_session_purge_ms_.load() < purge_interval_ms || session_purge_running_.exchange(true))
         return;
-    try
+    // Recheck while holding the flag: another request may have finished a
+    // purge between our first check and taking the flag.
+    if (now_ms - last_session_purge_ms_.load() >= purge_interval_ms)
     {
-        const auto removed = store_.delete_expired_sessions(now_ms);
-        last_session_purge_ms_.store(now_ms);
-        if (removed > 0)
-            LOGF_DEBUG("Purged %d expired session(s)", removed);
-    }
-    catch (const std::exception& e)
-    {
-        LOGF_WARNING("Expired session purge failed: %s", e.what());
+        try
+        {
+            const auto removed = store_.delete_expired_sessions(now_ms);
+            last_session_purge_ms_.store(now_ms); // only after a successful purge
+            if (removed > 0)
+                LOGF_DEBUG("Purged %d expired session(s)", removed);
+        }
+        catch (const std::exception& e)
+        {
+            LOGF_WARNING("Expired session purge failed: %s", e.what());
+        }
     }
     session_purge_running_.store(false);
 }
@@ -1357,9 +1362,11 @@ void ApiServer::setup_routes()
         auto token = cookie_value(req, "tw_session");
         if (!token.empty())
         {
-            if (const auto session = store_.get_session(token, now_ms()))
-                audit("logout", "success", session->username, client_ip(req));
+            const auto session = store_.get_session(token, now_ms());
             store_.delete_session(token);
+            // Recorded only once the session is really gone.
+            if (session)
+                audit("logout", "success", session->username, client_ip(req));
         }
         res.set_header("Set-Cookie", "tw_session=; Path=/; HttpOnly; SameSite=Strict; Secure; Max-Age=0");
         set_json(res, json{
@@ -2848,7 +2855,7 @@ void ApiServer::setup_routes()
         try
         {
             const auto user_id = std::stoll(req.path_params.at("id"));
-            const auto affected = store_.disable_user(user_id);
+            const auto affected = store_.disable_user_and_revoke_sessions(user_id);
             if (affected == 0)
             {
                 // SEC-14: unknown id or the built_in guard refused the change;
@@ -2860,9 +2867,6 @@ void ApiServer::setup_routes()
                 return;
             }
             LOGF_INFO("Disabled user user_id=%lld", static_cast<long long>(user_id));
-            // Issue #145: end the user's logins now; re-enabling must not
-            // bring old sessions back.
-            store_.delete_sessions_for_user(user_id);
             audit("user_disable", "success", session->username, client_ip(req), "user_id=" + std::to_string(user_id));
             set_json(res, json{
                               {"ok", true}
@@ -2893,6 +2897,20 @@ void ApiServer::setup_routes()
         try
         {
             const auto user_id = std::stoll(req.path_params.at("id"));
+            const auto users = store_.list_users();
+            if (std::none_of(users.begin(), users.end(), [user_id](const UserRecord& u) {
+                    return u.user_id == user_id;
+                }))
+            {
+                res.status = 404;
+                set_json(res, json{
+                                  {"error", "user not found"}
+                });
+                return;
+            }
+            // Defence in depth: disabling already revoked the sessions; drop any
+            // that exist before the account becomes usable again.
+            store_.delete_sessions_for_user(user_id);
             store_.enable_user(user_id);
             LOGF_INFO("Enabled user user_id=%lld", static_cast<long long>(user_id));
             audit("user_enable", "success", session->username, client_ip(req), "user_id=" + std::to_string(user_id));
@@ -2936,7 +2954,9 @@ void ApiServer::setup_routes()
                 return;
             }
             LOGF_INFO("Deleted user user_id=%lld", static_cast<long long>(user_id));
-            store_.delete_sessions_for_user(user_id);
+            // The sessions table cascades on user delete (FK in both stores), so no
+            // separate revocation is needed and a cleanup failure cannot turn a
+            // committed delete into an error response.
             audit("user_delete", "success", session->username, client_ip(req), "user_id=" + std::to_string(user_id));
             set_json(res, json{
                               {"ok", true}

@@ -487,3 +487,71 @@ SCENARIO("A password change and the revocation of old sessions are one operation
         }
     }
 }
+
+SCENARIO("Disabling a user and revoking their sessions is one operation")
+{
+    GIVEN("a user with two sessions and the built-in admin with one")
+    {
+        auto store = thewatcher::server::make_store("sqlite", ":memory:");
+        const auto user_id = store->create_user("hank", hash_for("pw"), "global_viewer");
+        const auto admin_id = store->get_user_by_username("thewatcher")->user_id;
+        const int64_t now = 1'000'000;
+        store->create_session(make_session("h1", user_id, now + hour_ms));
+        store->create_session(make_session("h2", user_id, now + hour_ms));
+        store->create_session(make_session("a1", admin_id, now + hour_ms));
+
+        WHEN("the user is disabled with revocation")
+        {
+            const auto affected = store->disable_user_and_revoke_sessions(user_id);
+
+            THEN("the user is disabled and every session row of theirs is gone")
+            {
+                REQUIRE(affected == 1);
+                REQUIRE(store->get_user_by_username("hank")->disabled);
+                // Re-enabling must not revive anything.
+                store->enable_user(user_id);
+                REQUIRE_FALSE(store->get_session("h1", now));
+                REQUIRE_FALSE(store->get_session("h2", now));
+            }
+        }
+
+        WHEN("the built-in admin is disabled with revocation")
+        {
+            const auto affected = store->disable_user_and_revoke_sessions(admin_id);
+
+            THEN("nothing changes, so the admin keeps their session")
+            {
+                REQUIRE(affected == 0);
+                REQUIRE(store->get_session("a1", now));
+            }
+        }
+
+        WHEN("an unknown user is disabled with revocation")
+        {
+            THEN("zero rows are affected")
+            {
+                REQUIRE(store->disable_user_and_revoke_sessions(987654) == 0);
+            }
+        }
+    }
+}
+
+SCENARIO("Enabling an unknown user is reported as not found")
+{
+    GIVEN("an admin session on an API server")
+    {
+        ApiFixture fx;
+        const auto admin = fx.login("thewatcher", "look_at_me");
+        REQUIRE_FALSE(admin.empty());
+
+        WHEN("an unknown user id is enabled")
+        {
+            const auto status = fx.put(admin, "/api/users/987654/enable");
+
+            THEN("the API answers 404")
+            {
+                REQUIRE(status == 404);
+            }
+        }
+    }
+}

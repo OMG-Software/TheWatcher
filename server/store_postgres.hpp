@@ -59,6 +59,7 @@ public:
     bool create_session_if_credentials_current(const SessionRecord& session, const std::string& password_hash) override;
     int update_user_password_and_revoke_sessions(int64_t user_id, const std::string& password_hash,
                                                  const std::string& keep_token = "") override;
+    int disable_user_and_revoke_sessions(int64_t user_id) override;
 
     void insert_metrics(const MetricsRow& row) override;
     std::vector<MetricsRow> get_metrics(const std::string& agent_id, int limit) override;

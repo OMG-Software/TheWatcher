@@ -135,9 +135,13 @@ Authentication and authorization events are written to the server log at
 flushed immediately and can be filtered with one search:
 
 ```text
-AUDIT event=login outcome=failure user="alice" source=203.0.113.7
-AUDIT event=permission_denied outcome=denied user="bob" source=203.0.113.9 target="PUT /api/users/1/disable"
+2026-11-27 21:57:25.107 +0000  <NOTICE>  audit:  AUDIT event=login outcome=failure user="alice" source=203.0.113.7
+2026-11-27 21:57:25.206 +0000  <NOTICE>  audit:  AUDIT event=permission_denied outcome=denied user="bob" source=203.0.113.9 target="PUT /api/users/1/disable"
 ```
+
+Each line starts with the usual log prefix (timestamp, level and the
+emitting function), then `AUDIT` and the fields, so `Select-String` or `grep`
+for `AUDIT event=` finds them.
 
 Events: `login` (`success`, `failure`, `locked_out`), `logout`,
 `permission_denied` (every HTTP 403), `user_create`, `user_disable`,
@@ -151,3 +155,9 @@ lines. Passwords and session tokens are never logged.
 The audit trail shares the server log file (and its rotation and retention)
 rather than a separate file or database table. Ship the log to a remote
 collector if you need tamper resistance.
+
+The server opens its log file in truncate mode at every start, so a restart
+discards the local audit trail. Ship the log to a remote collector, or copy it
+before restarting, if you need to keep it. Appending to the log across
+restarts is a logging change outside this feature and is tracked as a
+follow-up.

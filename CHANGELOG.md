@@ -12,10 +12,13 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Login throttling no longer lets a client-supplied or malformed
   `X-Forwarded-For` / `X-Real-IP` choose or poison the throttle bucket.
   `TRUSTED_PROXIES` now accepts CIDR ranges, `X-Real-IP` is preferred, all
-  `X-Forwarded-For` lines are read, and a malformed forwarded address gets
-  its own bucket instead of the proxy's address (#153).
-- Unknown and disabled usernames are verified against a dummy Argon2 hash so
-  login timing no longer reveals which usernames exist, and the login rate
+  `X-Forwarded-For` lines are read (any empty or invalid entry makes the header
+  malformed), and a malformed forwarded address gets
+  its own bucket instead of the proxy's address. This only holds if the
+  trusted proxy overwrites or strips any client-supplied `X-Real-IP` and
+  `X-Forwarded-For` (#153).
+- Unknown and disabled usernames are verified against a dummy Argon2 hash to
+  reduce timing-based username enumeration (not eliminate it), and the login rate
   limit check and failure count are one atomic step, so concurrent guesses
   cannot exceed the limits (#154).
 - Sessions are revoked when a password changes (the caller's own session is
@@ -38,6 +41,13 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   longer decrements a newer window's slot (reservations remember the window
   they were counted in), and an empty first `X-Forwarded-For` header line is
   malformed instead of being skipped when the lines are joined (#153, #154).
+- Review follow-ups on user and session handling: disabling a user and
+  revoking their sessions is now one atomic store operation
+  (`disable_user_and_revoke_sessions`), enabling an unknown user id returns
+  404, the logout audit line is written only after the session is deleted, an
+  invalid entry anywhere in `X-Forwarded-For` makes the header malformed, and
+  the expired-session purge rechecks that it is still due and advances its
+  clock only on success (#145, #153, #70).
 - The agent no longer trusts the server key in an enrollment reply: it must
   be 40 Z85 characters decoding to a 32-byte key, and the config writer
   refuses any value containing CR or LF. Before, a crafted key could inject

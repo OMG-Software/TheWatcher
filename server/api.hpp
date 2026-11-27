@@ -94,9 +94,11 @@ private:
     std::optional<SessionRecord> require_agent_access(const httplib::Request& req, httplib::Response& res,
                                                       const std::string& role, const std::string& agent_id);
     std::string enqueue_simple_command(const std::string& id, CommandType ct);
-    // Client address used for login throttling: honours X-Forwarded-For /
-    // X-Real-IP only when the TCP peer is a trusted proxy. Falls back to the
-    // peer address when the header value is not a plausible IP literal.
+    // Client address used for login throttling: honours X-Real-IP /
+    // X-Forwarded-For only when the TCP peer is a trusted proxy. For a trusted
+    // peer a present but malformed forwarded value yields "unknown-client"
+    // (its own bucket); the peer address is used when the peer is not trusted
+    // or no forwarding header was sent.
     std::string client_ip(const httplib::Request& req);
     // Writes an AUDIT line (NOTICE) for an authentication or authorization
     // event. user/target are sanitised; detail must not contain secrets.

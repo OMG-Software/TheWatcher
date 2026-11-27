@@ -1024,6 +1024,24 @@ int SqliteStore::update_user_password_and_revoke_sessions(int64_t user_id, const
     }
 }
 
+int SqliteStore::disable_user_and_revoke_sessions(int64_t user_id)
+{
+    exec("BEGIN IMMEDIATE;");
+    try
+    {
+        const auto affected = disable_user(user_id);
+        if (affected > 0)
+            delete_sessions_for_user(user_id);
+        exec("COMMIT;");
+        return affected;
+    }
+    catch (...)
+    {
+        exec("ROLLBACK;");
+        throw;
+    }
+}
+
 void SqliteStore::insert_metrics(const MetricsRow& row)
 {
     Stmt st;
