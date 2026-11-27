@@ -56,6 +56,10 @@ libsodium_lib = static_library(
   c_args: libsodium_c_args,
   pic: true,
   install: false,
+  # Third-party code is not instrumented by -Db_sanitize: Argon2 under ASan
+  # makes every password hash take seconds, which makes the store, API and
+  # integration tests time out in the sanitizer CI job.
+  override_options: ['b_sanitize=none'],
 )
 
 libsodium_dep = declare_dependency(

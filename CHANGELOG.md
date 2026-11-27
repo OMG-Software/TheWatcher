@@ -130,7 +130,12 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   test and a CI job check `dashboard/package.json`, `package-lock.json`,
   `packaging/windows/TheWatcher.iss` and `CHANGELOG.md` against it (#127).
 - CI job `Linux (ASan + UBSan, debug)` runs the whole suite with
-  AddressSanitizer and UndefinedBehaviorSanitizer in a debug build (#122).
+  AddressSanitizer and UndefinedBehaviorSanitizer in a debug build. The
+  bundled libsodium is not instrumented (Argon2 under ASan made password
+  hashing take seconds) and Meson timeouts are scaled; no sanitizer finding
+  was reported by the existing suite. `login_rate_limit` assumes real-time
+  windows and fails under the slowdown, so it runs in a separate
+  informational step (#122).
 
 ## [0.8.0] - 2026-11-02
 

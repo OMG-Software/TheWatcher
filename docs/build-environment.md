@@ -158,13 +158,15 @@ together.
 
 CI has a Linux job that builds with AddressSanitizer and
 UndefinedBehaviorSanitizer in a debug configuration (assertions enabled) and
-runs the whole suite. Run it locally with:
+runs the whole suite. The bundled libsodium is deliberately not instrumented
+(Argon2 under ASan makes every password hash take seconds) and Meson timeouts
+are scaled by 5. Run it locally with:
 
 ```bash
 meson setup builddir-asan --buildtype=debug -Db_sanitize=address,undefined -Db_lundef=false
 meson compile -C builddir-asan
 ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 \
-  meson test -C builddir-asan --suite thewatcher --print-errorlogs
+  meson test -C builddir-asan --suite thewatcher --timeout-multiplier 5 --print-errorlogs
 ```
 
 Run the full server-agent integration path directly with:
