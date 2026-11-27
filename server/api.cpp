@@ -378,7 +378,11 @@ void ApiServer::LoginReservation::release()
     armed_ = false;
     std::lock_guard<std::mutex> lk(api_.login_mutex_);
     const auto give_back = [](auto& map, const std::string& key) {
-        if (const auto it = map.find(key); it != map.end() && --it->second.first <= 0)
+        const auto it = map.find(key);
+        if (it == map.end())
+            return;
+        --it->second.first;
+        if (it->second.first <= 0)
             map.erase(it);
     };
     give_back(api_.login_failures_, pair_key_);
