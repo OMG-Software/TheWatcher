@@ -22,13 +22,9 @@ export function keepFailedSections(next: DashboardData, previous: DashboardData 
 
 /** Loads everything the dashboard shows and re-polls every few seconds. */
 export function useDashboardData() {
-  const previous = React.useRef<DashboardData | null>(null);
-  const fetcher = React.useCallback(async () => {
-    const data = keepFailedSections(await loadDashboardData(), previous.current);
-    previous.current = data;
-    return data;
-  }, []);
-  const { data, error, loading, loadedAt, refresh } = usePolling(fetcher, { intervalMs: POLL_INTERVAL_MS });
+  // usePolling applies the merge only to the accepted (latest) response, so an overtaken
+  // older load can never become the "last good" snapshot.
+  const { data, error, loading, loadedAt, refresh } = usePolling(loadDashboardData, { intervalMs: POLL_INTERVAL_MS, merge: keepFailedSections });
 
   const agents = React.useMemo(() => (data ? toDashboardAgents(data.agents, data.metrics, data.alerts) : []), [data]);
   const pending = React.useMemo(() => (data ? toDashboardAgents(data.pending, [], []) : []), [data]);

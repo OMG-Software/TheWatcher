@@ -3,7 +3,7 @@ import { ActionFailureContext } from '../hooks/useRunAction';
 
 /** Shows the failure of one specific action, next to the form or modal that started it. */
 export function ActionError({ actionKey }: { actionKey: string }) {
-  const failure = React.useContext(ActionFailureContext);
+  const { failure } = React.useContext(ActionFailureContext);
   if (failure?.key !== actionKey) return null;
   return (
     <div className="banner error" role="alert">
@@ -14,7 +14,7 @@ export function ActionError({ actionKey }: { actionKey: string }) {
 
 /** Page-level banner for failures that have no form of their own. Dismissible. */
 export function ActionErrorBanner({ onDismiss }: { onDismiss: () => void }) {
-  const failure = React.useContext(ActionFailureContext);
+  const { failure } = React.useContext(ActionFailureContext);
   if (!failure || failure.inline) return null;
   return (
     <div className="banner error" role="alert">
