@@ -7,6 +7,7 @@
 #include "common/zmq_limits.hpp"
 #include "offline_alerts.hpp"
 #include "report_generator.hpp"
+#include "router_send.hpp"
 #include "status_engine.hpp"
 
 #include <chrono>
@@ -126,6 +127,11 @@ Server::Server(ServerConfig config)
     api_ = std::make_unique<ApiServer>(*store_, *zap_, config_.api_host, config_.api_port);
     // SEC-12: login throttling honours X-Forwarded-For / X-Real-IP only from these peers.
     api_->set_trusted_proxies(config_.trusted_proxies);
+    // #54: the API refuses commands for an agent with no live route, not just
+    // one stored as disconnected (the stored flag survives a restart).
+    api_->set_connectivity_check([this](const std::string& agent_id) {
+        return has_route(agent_id);
+    });
     alerts_ = std::make_unique<AlertPipeline>(*store_, notifier_);
     offline_alerts_ = std::make_unique<OfflineAlerts>(*store_, *alerts_);
 
@@ -959,11 +965,13 @@ void Server::dispatch_commands(zmq::socket_t& router)
         {
             const auto& routing_id = route->second.routing_id;
             // ROUTER_MANDATORY makes this throw EHOSTUNREACH when the peer is
-            // gone; dontwait stops a full send queue blocking the data plane.
-            router.send(zmq::message_t(routing_id.data(), routing_id.size()),
-                        zmq::send_flags::sndmore | zmq::send_flags::dontwait);
-            router.send(zmq::message_t{}, zmq::send_flags::sndmore);
-            router.send(zmq::message_t(encoded.data(), encoded.size()), zmq::send_flags::none);
+            // gone; every part uses dontwait so a full queue cannot block.
+            if (!send_to_peer(router, routing_id, encoded.data(), encoded.size()))
+            {
+                LOGF_WARNING("Command not delivered (send queue full) agent_id=%s command_id=%s",
+                             sanitize_log_text(pc.agent_id).c_str(), pc.cmd.command_id.c_str());
+                continue;
+            }
             dispatched_commands_[pc.cmd.command_id] = {static_cast<CommandType>(pc.cmd.command_type), now_ms(),
                                                        pc.agent_id};
             LOGF_DEBUG("Dispatched command agent_id=%s command_id=%s type=%u", pc.agent_id.c_str(),
@@ -1005,6 +1013,7 @@ void Server::learn_route(const std::string& agent_id, const std::string& routing
     forget_route(agent_id);
     agent_routes_[agent_id] = AgentRoute{routing_id, now};
     route_owners_[routing_id] = agent_id;
+    publish_reachable_agents();
 }
 
 // Removes agent_id's route and its reverse-index entry, if present.
@@ -1015,6 +1024,25 @@ void Server::forget_route(const std::string& agent_id)
         return;
     route_owners_.erase(route->second.routing_id);
     agent_routes_.erase(route);
+    publish_reachable_agents();
+}
+
+// Copies the set of agents with a learned route where the API threads can read
+// it. Called after every route change, which is rare (the per-frame fast path
+// in learn_route changes nothing).
+void Server::publish_reachable_agents()
+{
+    std::unordered_set<std::string> reachable;
+    for (const auto& [agent_id, route] : agent_routes_)
+        reachable.insert(agent_id);
+    std::lock_guard lock(reachable_mutex_);
+    reachable_agents_ = std::move(reachable);
+}
+
+bool Server::has_route(const std::string& agent_id) const
+{
+    std::lock_guard lock(reachable_mutex_);
+    return reachable_agents_.count(agent_id) > 0;
 }
 
 // Drops routes whose agent has sent no frame for offline_after_seconds, so a
@@ -1025,10 +1053,12 @@ void Server::expire_routes()
     if (config_.offline_after_seconds <= 0)
         return;
     const auto cutoff = std::chrono::steady_clock::now() - std::chrono::seconds{config_.offline_after_seconds};
+    bool changed = false;
     for (auto it = agent_routes_.begin(); it != agent_routes_.end();)
     {
         if (it->second.last_frame < cutoff)
         {
+            changed = true;
             LOGF_DEBUG("Forgetting route of agent_id=%s with no frame since the offline threshold",
                        sanitize_log_text(it->first).c_str());
             route_owners_.erase(it->second.routing_id);
@@ -1039,6 +1069,8 @@ void Server::expire_routes()
             ++it;
         }
     }
+    if (changed)
+        publish_reachable_agents();
 }
 
 // Sends the scheduled digest when one is due (#48, #49). Building the payload
@@ -1076,15 +1108,7 @@ void Server::maybe_send_report(int64_t now_ms)
         return;
 
     const auto schedule = load_report_schedule(*store_);
-    int64_t last_sent_ms = 0;
-    try
-    {
-        last_sent_ms = std::stoll(store_->get_setting("reports.last_sent_ms", "0"));
-    }
-    catch (const std::exception&)
-    {
-        // unreadable value: treat as never sent
-    }
+    const auto last_sent_ms = load_report_last_sent_ms(*store_);
     if (!report_due(schedule, last_sent_ms, now_ms))
     {
         report_failures_ = 0; // outside the slot: start the next one fresh

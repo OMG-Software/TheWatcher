@@ -5,6 +5,7 @@
 #include "webhook_security.hpp"
 
 #include <algorithm>
+#include <limits>
 #include <string>
 
 namespace thewatcher::server
@@ -133,22 +134,28 @@ namespace
     constexpr int64_t kHourMs = 3'600'000LL;
     constexpr int64_t kDayMs = 24 * kHourMs;
 
-    // Parses a whole-number setting within [min, max]; otherwise the fallback.
-    int int_setting(Store& store, const std::string& key, int fallback, int min, int max)
+    // Parses a setting that must be one whole number within [min, max];
+    // otherwise (empty, trailing junk, out of range) the fallback.
+    int64_t whole_number_setting(Store& store, const std::string& key, int64_t fallback, int64_t min, int64_t max)
     {
         const auto text = store.get_setting(key, "");
         try
         {
             std::size_t used = 0;
-            const int value = std::stoi(text, &used);
+            const long long value = std::stoll(text, &used);
             if (used == text.size() && value >= min && value <= max)
                 return value;
         }
         catch (const std::exception&)
         {
-            // empty or not a number: use the default
+            // empty or not a number: use the fallback
         }
         return fallback;
+    }
+
+    int int_setting(Store& store, const std::string& key, int fallback, int min, int max)
+    {
+        return static_cast<int>(whole_number_setting(store, key, fallback, min, max));
     }
 
     // Floor division so times before 1970 still land in the right day.
@@ -183,6 +190,11 @@ ReportSchedule load_report_schedule(Store& store)
     schedule.hour = int_setting(store, "reports.hour", 8, 0, 23);
     schedule.day_of_week = int_setting(store, "reports.day_of_week", 1, 0, 6);
     return schedule;
+}
+
+int64_t load_report_last_sent_ms(Store& store)
+{
+    return whole_number_setting(store, "reports.last_sent_ms", 0, 0, std::numeric_limits<int64_t>::max());
 }
 
 bool report_due(const ReportSchedule& schedule, int64_t last_sent_ms, int64_t now_ms)

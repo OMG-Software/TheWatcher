@@ -257,13 +257,26 @@ offline-red, and nothing escalates.
 ### Commands for disconnected agents
 
 The server cannot reach an agent that is not connected, and commands are not
-queued for later. `POST /api/agents/:id/{pause,resume,restart_collectors,
-disconnect,get_status}` answers `409` with `agent is offline; command not
-queued` when the agent is not connected, and changes nothing. `POST
+queued for later. Every route that queues a command (`pause`, `resume`,
+`restart_collectors`, `disconnect`, `get_status`, `command`, `set_interval`,
+`set_process_limit`) first calls one admission check and answers `409` with
+`agent is offline; command not queued` when the agent cannot receive it. The
+check changes nothing: no setting is stored and nothing is queued. "Can
+receive" means the server holds a live route for the agent (it has sent an
+authenticated frame since the server started and the route has not expired),
+not just the persisted `connected` flag, which survives a restart. `POST
 /api/agents/:id/maintenance` still sets maintenance on the server and sends the
-`PAUSE` command only to a connected agent. The ROUTER socket uses
-`ZMQ_ROUTER_MANDATORY`, so a command to an agent whose connection has just
-closed fails with `EHOSTUNREACH`; it is logged and not recorded as dispatched.
+`PAUSE` command only to a reachable agent.
+
+The ROUTER socket uses `ZMQ_ROUTER_MANDATORY` and every part of a command is
+sent with `dontwait`. A peer whose connection has just closed (`EHOSTUNREACH`)
+or a full send queue makes the command undelivered: it is logged and not
+recorded as dispatched.
+
+`GET /api/settings` returns the effective `reports_schedule`, `reports_hour`
+and `reports_day_of_week`; a malformed stored value reads as its default.
+`reports.last_sent_ms` must be one whole non-negative number, otherwise it is
+treated as never sent.
 
 ## Data Flow
 

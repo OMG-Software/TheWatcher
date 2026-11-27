@@ -287,3 +287,24 @@ SCENARIO("A failed digest is retried with growing backoff (issue #49)")
         REQUIRE(report_retry_delay_ms(50) == 900'000);
     }
 }
+
+SCENARIO("The last-sent time is read strictly (issue #49)")
+{
+    GIVEN("a store with reports.last_sent_ms set")
+    {
+        SqliteStore store(":memory:");
+
+        THEN("only a whole non-negative number counts")
+        {
+            REQUIRE(load_report_last_sent_ms(store) == 0);
+            store.set_setting("reports.last_sent_ms", "1700000000000");
+            REQUIRE(load_report_last_sent_ms(store) == 1'700'000'000'000LL);
+            store.set_setting("reports.last_sent_ms", "123junk");
+            REQUIRE(load_report_last_sent_ms(store) == 0);
+            store.set_setting("reports.last_sent_ms", "-5");
+            REQUIRE(load_report_last_sent_ms(store) == 0);
+            store.set_setting("reports.last_sent_ms", "");
+            REQUIRE(load_report_last_sent_ms(store) == 0);
+        }
+    }
+}

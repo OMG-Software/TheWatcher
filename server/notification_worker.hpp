@@ -102,7 +102,7 @@ private:
     Options options_;
     Deliverer deliverer_;
     mutable std::mutex mutex_;
-    std::condition_variable_any wake_;
+    std::condition_variable wake_;
     std::deque<Notification> queue_;
     std::vector<DeliveryResult> results_;
     std::size_t in_flight_ = 0;

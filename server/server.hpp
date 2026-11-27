@@ -13,8 +13,10 @@
 #include <atomic>
 #include <chrono>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 
 #include <zmq.hpp>
 
@@ -82,6 +84,10 @@ private:
     // a closed connection's routing id cannot be reused by another peer to
     // receive that agent's commands.
     void expire_routes();
+    // Rebuilds the API-visible set of agents that have a learned route.
+    void publish_reachable_agents();
+    // Thread-safe: true when agent_id has a learned route. Used by API threads.
+    bool has_route(const std::string& agent_id) const;
 
     // Queue the scheduled digest report if one is due, and record the outcome
     // of earlier ones.
@@ -114,6 +120,10 @@ private:
     };
     std::unordered_map<std::string, AgentRoute> agent_routes_;
     std::unordered_map<std::string, std::string> route_owners_;
+    // Copy of agent_routes_ keys for the API threads (the maps above belong to
+    // the server thread).
+    mutable std::mutex reachable_mutex_;
+    std::unordered_set<std::string> reachable_agents_;
     // agent_id -> last enrollment request time (ms); used for rate limiting
     std::unordered_map<std::string, int64_t> enrollment_last_request_ms_;
     // SEC-05: peer address -> last enrollment request time (ms); a second,

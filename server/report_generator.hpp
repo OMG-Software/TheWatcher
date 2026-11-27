@@ -35,6 +35,10 @@ ReportSchedule load_report_schedule(Store& store);
 // last_sent_ms == 0 means never sent.
 bool report_due(const ReportSchedule& schedule, int64_t last_sent_ms, int64_t now_ms);
 
+// Reads reports.last_sent_ms. Only a whole, non-negative number counts; anything
+// else (empty, "123junk", negative) is treated as never sent (0).
+int64_t load_report_last_sent_ms(Store& store);
+
 // Start of the first scheduled slot strictly after after_ms.
 int64_t next_report_time_ms(const ReportSchedule& schedule, int64_t after_ms);
 

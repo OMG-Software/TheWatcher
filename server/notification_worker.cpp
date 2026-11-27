@@ -83,13 +83,22 @@ std::size_t NotificationWorker::dropped() const
 
 void NotificationWorker::run(std::stop_token stop)
 {
+    // A stop request must wake the waits below. Taking the mutex first means
+    // the notify cannot fall between a predicate check and the wait.
+    const std::stop_callback wake_on_stop(stop, [this] {
+        {
+            std::lock_guard lock(mutex_);
+        }
+        wake_.notify_all();
+    });
+
     while (true)
     {
         Notification next;
         {
             std::unique_lock lock(mutex_);
-            wake_.wait(lock, stop, [this] {
-                return !queue_.empty();
+            wake_.wait(lock, [this, &stop] {
+                return !queue_.empty() || stop.stop_requested();
             });
             if (stop.stop_requested())
                 return;
@@ -138,8 +147,8 @@ DeliveryResult NotificationWorker::deliver(const Notification& notification, std
         if (attempt < attempts)
         {
             std::unique_lock lock(mutex_);
-            wake_.wait_for(lock, stop, backoff, [] {
-                return false;
+            wake_.wait_for(lock, backoff, [&stop] {
+                return stop.stop_requested();
             });
             backoff *= 2;
         }

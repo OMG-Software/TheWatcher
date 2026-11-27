@@ -54,6 +54,14 @@ report_generator_test = executable(
 )
 test('report_generator', report_generator_test)
 
+router_send_test = executable(
+  'router_send_test',
+  ['router_send_test.cpp'],
+  include_directories: root_inc,
+  dependencies: [cppzmq_dep, catch2_dep, platform_deps],
+)
+test('router_send', router_send_test)
+
 zap_handler_test = executable(
   'zap_handler_test',
   ['zap_handler_test.cpp'],

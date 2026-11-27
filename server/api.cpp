@@ -867,6 +867,30 @@ std::optional<SessionRecord> ApiServer::require_agent_access(const httplib::Requ
     return session;
 }
 
+void ApiServer::set_connectivity_check(ConnectivityCheck check)
+{
+    connectivity_check_ = std::move(check);
+}
+
+bool ApiServer::agent_reachable(const std::string& agent_id)
+{
+    if (connectivity_check_)
+        return connectivity_check_(agent_id);
+    const auto agent = store_.get_agent(agent_id);
+    return agent && agent->connected;
+}
+
+bool ApiServer::admit_command(const std::string& agent_id, httplib::Response& res)
+{
+    if (agent_reachable(agent_id))
+        return true;
+    res.status = 409;
+    set_json(res, json{
+                      {"error", "agent is offline; command not queued"}
+    });
+    return false;
+}
+
 std::string ApiServer::enqueue_simple_command(const std::string& id, CommandType ct)
 {
     CommandMessage cmd;
@@ -1784,6 +1808,8 @@ void ApiServer::setup_routes()
             auto id = req.path_params.at("id");
             if (!require_agent_access(req, res, "operator", id))
                 return;
+            if (!admit_command(id, res))
+                return;
             auto body = json::parse(req.body);
 
             CommandMessage cmd;
@@ -1846,6 +1872,8 @@ void ApiServer::setup_routes()
             auto id = req.path_params.at("id");
             if (!require_agent_access(req, res, "operator", id))
                 return;
+            if (!admit_command(id, res))
+                return;
             auto body = json::parse(req.body);
             int secs = body.at("interval_seconds").get<int>();
             if (secs <= 0)
@@ -1897,6 +1925,8 @@ void ApiServer::setup_routes()
         {
             auto id = req.path_params.at("id");
             if (!require_agent_access(req, res, "operator", id))
+                return;
+            if (!admit_command(id, res))
                 return;
             auto body = json::parse(req.body);
             int limit = body.at("limit").get<int>();
@@ -2081,8 +2111,7 @@ void ApiServer::setup_routes()
             store_.clear_active_alerts_for_agent(id, now_ms());
             // Maintenance is a server-side state and applies at once. The
             // PAUSE command is only sent to an agent that can receive it (#54).
-            const auto target = store_.get_agent(id);
-            if (target && target->connected)
+            if (agent_reachable(id))
                 enqueue_simple_command(id, CommandType::PAUSE);
             set_json(res, json{
                               {"ok", true}
@@ -2108,15 +2137,8 @@ void ApiServer::setup_routes()
                 // #54: a command for an agent that is not connected would be
                 // dropped by the server, so refuse it instead of reporting
                 // success. Nothing is changed or queued.
-                const auto target = store_.get_agent(id);
-                if (!target || !target->connected)
-                {
-                    res.status = 409;
-                    set_json(res, json{
-                                      {"error", "agent is offline; command not queued"}
-                    });
+                if (!admit_command(id, res))
                     return;
-                }
                 if (ct == CommandType::PAUSE)
                 {
                     store_.set_agent_maintenance(id, true, "command", 0);
@@ -2441,9 +2463,11 @@ void ApiServer::setup_routes()
         out["escalation_timeout_seconds"] = std::stoi(store_.get_setting("escalation_timeout_seconds", "3600"));
         out["metrics_retention_days"] = std::stoi(store_.get_setting("metrics_retention_days", "30"));
         out["reports_enabled"] = store_.get_setting("reports.enabled", "false") == "true";
-        out["reports_schedule"] = store_.get_setting("reports.schedule", "daily");
-        out["reports_hour"] = std::stoi(store_.get_setting("reports.hour", "8"));
-        out["reports_day_of_week"] = std::stoi(store_.get_setting("reports.day_of_week", "1"));
+        // Effective values: a malformed stored value reads as its default.
+        const auto report_schedule = load_report_schedule(store_);
+        out["reports_schedule"] = report_schedule.weekly ? "weekly" : "daily";
+        out["reports_hour"] = report_schedule.hour;
+        out["reports_day_of_week"] = report_schedule.day_of_week;
         out["reports_webhook_url"] = store_.get_setting("reports.webhook_url", "");
         set_json(res, out);
     });
