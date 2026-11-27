@@ -73,3 +73,22 @@ server_access_scope_test = executable(
   ],
 )
 test('server_access_scope', server_access_scope_test, timeout: 180, is_parallel: false)
+
+server_data_plane_test = executable(
+  'server_data_plane_test',
+  ['server_data_plane_test.cpp'],
+  include_directories: root_inc,
+  dependencies: [
+    agent_dep,
+    server_dep,
+    common_dep,
+    catch2_dep,
+    http_dep,
+    cppzmq_dep,
+    sodium_dep,
+    cbor_dep,
+    json_dep,
+    platform_deps,
+  ],
+)
+test('server_data_plane', server_data_plane_test, timeout: 240, is_parallel: false)

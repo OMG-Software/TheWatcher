@@ -54,6 +54,8 @@ struct ServerFixtureOptions
     bool curve = false;
     // Pre-shared enrollment token (empty = none required).
     std::string enrollment_token;
+    // Seconds without a frame before an agent counts as offline (0 = server default).
+    int offline_after_seconds = 0;
 
     static ServerFixtureOptions with_curve(bool enabled = true)
     {
@@ -163,6 +165,8 @@ private:
             cfg.server_secret_key = keys.secret_key_z85;
         }
         cfg.enrollment_token = options.enrollment_token;
+        if (options.offline_after_seconds > 0)
+            cfg.offline_after_seconds = options.offline_after_seconds;
         return cfg;
     }
 };

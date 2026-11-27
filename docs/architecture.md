@@ -194,3 +194,19 @@ Server REST API -> Dashboard
 ```
 
 The dashboard talks only to the server API. It never talks directly to agents.
+
+## Data-Plane Liveness And Session Binding
+
+- The ROUTER and each agent DEALER enable ZMTP heartbeats (10 s interval,
+  30 s timeout and TTL) and TCP keepalive (`common/zmq_liveness.hpp`), so a
+  peer that disappears without closing its connection is dropped within about
+  30 s. The ROUTER also enables `ZMQ_ROUTER_HANDOVER`, so a reconnecting agent
+  replaces a stale connection that still holds its routing id.
+- ZAP reports the user id `<agent_id>:<z85 key>` for each CURVE session. The
+  server checks it against the agent's current record on every frame, so a
+  session opened with a deleted or replaced key is ignored.
+- An approved agent that enrolls with a different key gets a "public key
+  mismatch" refusal. To rotate a key, delete the agent and approve the new
+  enrollment; see `docs/threat-model.md`.
+- Invalid UTF-8 in agent-reported strings is replaced with U+FFFD on ingest
+  (`server/ingest_sanitize.hpp`).

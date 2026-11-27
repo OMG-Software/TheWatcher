@@ -127,3 +127,15 @@ directory.
 The `--help`, `--genkey`, `--install-service`, and `--uninstall-service`
 commands keep concise console output for scripting and operator feedback.
 Runtime diagnostics go through `SingleLog`.
+
+## Untrusted Text In Logs
+
+The server logs strings that agents and enrollment requests supply (agent
+ids, hostnames, mount points, interface and process names, log-match paths,
+indicator names and command ACK text). Each one passes through
+`thewatcher::text::sanitize_log_text` (`common/text_safety.hpp`) first:
+control characters (including CR, LF and ESC), the Unicode line separators
+U+0085, U+2028 and U+2029, and invalid UTF-8 bytes become `?`, and the text is
+cut to 64 bytes without splitting a character. A host cannot start a fake log
+line or inject terminal escapes. New code that logs peer-supplied text must
+use the same function.

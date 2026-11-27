@@ -8,6 +8,7 @@
 #include "collectors/process_collector.hpp"
 #include "common/SingleLog.hpp"
 #include "common/zmq_limits.hpp"
+#include "common/zmq_liveness.hpp"
 #include "enrollment.hpp"
 
 #include <chrono>
@@ -170,6 +171,8 @@ void Agent::start()
     // the connection handshake.
     dealer_.set(zmq::sockopt::maxmsgsize, proto::kDataPlaneMaxMessageBytes);
     dealer_.set(zmq::sockopt::handshake_ivl, proto::kHandshakeIvlMs);
+    // #143: notice a vanished server and let the server notice this agent.
+    proto::apply_connection_liveness(dealer_);
     if (!config_.server_public_key.empty())
     {
         LOG_DEBUG("Configuring DEALER socket with CURVE keys");

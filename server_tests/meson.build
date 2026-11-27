@@ -118,3 +118,11 @@ if libpq_dep.found()
     env: ['THEWATCHER_POSTGRES_TEST_DSN=host=localhost dbname=thewatcher_test user=thewatcher_test password=thewatcher_test'],
   )
 endif
+
+data_plane_hardening_test = executable(
+  'data_plane_hardening_test',
+  ['data_plane_hardening_test.cpp'],
+  include_directories: root_inc,
+  dependencies: [server_dep, common_dep, catch2_dep, cppzmq_dep, json_dep, platform_deps],
+)
+test('data_plane_hardening', data_plane_hardening_test)

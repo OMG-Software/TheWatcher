@@ -12,10 +12,39 @@
 namespace thewatcher::server
 {
 
+// The ZAP user_id of an authenticated CURVE session (issue #144). libzmq
+// stamps it once, at the handshake, so it carries both the agent_id and the
+// key the session was authenticated with. The server compares the key with
+// the agent's current record on every frame, so a session opened with a key
+// that was later deleted or replaced stops being accepted.
+struct SessionIdentity
+{
+    std::string agent_id;
+    std::string key_z85;
+};
+
+// "<agent_id>:<z85 key>". agent_id never contains ':' (enrollment limits it
+// to letters, digits and "._-"), so the first ':' splits the two.
+inline std::string make_session_identity(const std::string& agent_id, const std::string& key_z85)
+{
+    return agent_id + ":" + key_z85;
+}
+
+// Splits a user_id made by make_session_identity(). nullopt when it has no
+// agent_id or no key (for example the empty user_id of an unbound key).
+inline std::optional<SessionIdentity> parse_session_identity(const std::string& user_id)
+{
+    const auto separator = user_id.find(':');
+    if (separator == std::string::npos || separator == 0 || separator + 1 == user_id.size())
+        return std::nullopt;
+    return SessionIdentity{user_id.substr(0, separator), user_id.substr(separator + 1)};
+}
+
 // Runs the ZAP (ZeroMQ Authentication Protocol) handler on a background thread.
 // Approves CURVE connections whose z85 public key is in the approved set and
-// reports the bound agent_id as the ZAP user_id, which libzmq stamps onto
-// every message from that peer as the "User-Id" metadata property.
+// reports the bound agent_id and key as the ZAP user_id (see SessionIdentity),
+// which libzmq stamps onto every message from that peer as the "User-Id"
+// metadata property.
 class ZapHandler
 {
 public:

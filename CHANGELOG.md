@@ -9,6 +9,14 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Security
 
+- Deleting an agent and approving the same id again with a new key no longer
+  revives the old key's live session. ZAP now reports `<agent_id>:<key>` as
+  the session identity and the server compares the key with the agent's
+  record on every frame (#144).
+- The server sanitises every agent-supplied string (log-match indicator,
+  severity and path, hostnames, mount points, interface and process names)
+  before logging it, through one function, so an agent can no longer forge
+  log lines (#157).
 - Fixed a server crash (NULL dereference) and heap over-read when a metrics
   or collector-config payload has a CBOR `null`/`true`/`false`/`undefined`
   or a half/single-precision float where a double is expected. All float
@@ -47,6 +55,18 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 
+- A reconnecting agent is no longer shut out by its own dead connection:
+  the ROUTER and the agent DEALER use ZMTP heartbeats and TCP keepalive, and
+  the ROUTER uses `ZMQ_ROUTER_HANDOVER` (#143).
+- **Behaviour change:** an approved agent that enrolls again with a different
+  key is now refused with a "public key mismatch" reply instead of being told
+  it is approved and then never connecting. Rotate a key by deleting the
+  agent and approving the new enrollment (#155, documented in
+  `docs/threat-model.md`).
+- Invalid UTF-8 in agent-reported strings is replaced with U+FFFD when
+  metrics, log matches and enrollment requests arrive, so alerts, reports
+  and storage never see it. A failing scheduled report no longer ends the
+  server loop (rest of #56).
 - Alert notes longer than 4,096 bytes are cut on a UTF-8 character
   boundary. Oversize `runbook_markdown` (collector config) and
   `reports_webhook_url` (settings) are rejected with 400 instead of being
@@ -63,6 +83,13 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   unprivileged writers, and root-reserved blocks count as used (#158).
 - Encoding a frame with an empty payload no longer passes a null pointer to
   libcbor (undefined behaviour reported by UBSan on every heartbeat) (#162).
+
+### Added
+
+- Data-plane tests: every frame type through a running server with CURVE
+  keys, ZAP over a real CURVE connection, command dispatch and ACK, stale
+  sessions, reconnect handover and hostile strings. Maintenance flows are
+  tested only as far as the PAUSE/DISCONNECT command entry points (#59).
 
 ### Changed
 

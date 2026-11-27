@@ -59,6 +59,24 @@ working document for audit, design review, and regression testing.
   optional pre-shared enrollment token, strict field validation, and an
   immutable first-seen public key for pending records. First approval still
   relies on administrator judgment.
+- The authenticated identity is the pair agent_id and CURVE key (ZAP user id
+  `<agent_id>:<z85 key>`). libzmq fixes it once, at the handshake, so the
+  server also compares the session key with the agent's current record on
+  every frame. A live session opened with a key that was later deleted or
+  replaced (for example the old key after a compromise, once the agent is
+  deleted and approved again with a new key) is dropped without refreshing
+  `last_seen` or the agent's command route. The session stays open at the
+  transport level until the peer or the heartbeat timeout closes it; its
+  frames just no longer count.
+- **Key rotation flow.** An approved agent that enrolls again with a
+  different key is refused with a "public key mismatch" reply (never
+  "approved") and a WARNING is logged on the server. The
+  record and its key are unchanged, so a spoofed enrollment
+  cannot swap an approved agent's key. To rotate a key, an administrator
+  deletes the agent, then the agent enrolls with its new key and is approved
+  as a fresh pending record. Deleting removes the old key from ZAP, so no
+  new session can use it, and the check above ends sessions that already
+  exist.
 - Dashboard user spoofing is mitigated by libsodium password hashes and random
   256-bit session tokens.
 
@@ -70,6 +88,14 @@ working document for audit, design review, and regression testing.
 - SQL writes use parameter binding in SQLite and PostgreSQL stores.
 - Config files are KEY=VALUE only and are bounded by size during parsing.
 - All agent-supplied timestamps are advisory: metric rows, alert times and
+- Every string an agent supplies is untrusted text. It is made safe once, on
+  ingest: invalid UTF-8 is replaced with U+FFFD before status evaluation,
+  storage, webhooks and reports (so JSON serialisation cannot throw and
+  PostgreSQL cannot reject the row), and every such string is passed through
+  one log sanitiser (`thewatcher::text::sanitize_log_text`, in
+  `common/text_safety.hpp`) before it is logged. The sanitiser replaces
+  control characters, Unicode line separators and invalid bytes with `?` and
+  truncates, so an agent cannot forge log lines or inject terminal escapes.
   retention pruning run on the server's receive clock.
 - Log-monitor paths and patterns are validated server-side, restricted to
   global admins, and enforced against an agent-local `LOG_ALLOWED_DIRS`
@@ -112,6 +138,15 @@ working document for audit, design review, and regression testing.
 - Approval and revocation are enforced per frame: rejected or deleted agents
   stop contributing data on their live session without waiting for a
   reconnect.
+- The ROUTER and the agent's DEALER use ZMTP heartbeats (10 s interval, 30 s
+  timeout and TTL) and TCP keepalive, so a peer that vanished without closing
+  its connection (power loss, VM reset, NAT change) is dropped within about
+  30 s. The ROUTER also uses `ZMQ_ROUTER_HANDOVER`, so a reconnecting agent
+  replaces a stale connection that still holds its routing id instead of
+  being ignored. Handover is safe only because the routing id is merely an
+  address (#141): identity comes from ZAP, commands go to the route learned
+  from authenticated frames, and each frame is checked against the session
+  key.
 - Config parser file and line sizes are bounded to avoid unbounded local input.
 - The API still needs a global request-body size limit in httplib or a fronting
   reverse proxy; this is a residual risk.
@@ -167,3 +202,13 @@ when webhooks are enabled.
   agent; hardlinks to files outside the allowlist cannot be detected.
 - Windows installs made before 0.8.0 keep the old config-directory ACL (Users:
   modify) until the 0.8.0 installer is re-run.
+- With `ZMQ_ROUTER_HANDOVER`, an approved agent that sets another agent's
+  agent_id as its routing id (only agents older than 0.9.0 use it) can take
+  over that agent's connection, so the victim's frames stop arriving until it
+  reconnects. It cannot read the victim's commands or send as the victim:
+  commands go to the route learned from authenticated frames, and identity
+  comes from ZAP. Without handover the same peer could instead block the
+  victim by connecting first.
+- A deleted or rotated agent's old session is not closed by the server
+  (libzmq offers no way to close one peer from a ROUTER); its frames are
+  dropped until the peer disconnects or the heartbeat timeout ends it.

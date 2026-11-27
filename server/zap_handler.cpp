@@ -112,9 +112,11 @@ void ZapHandler::run(std::stop_token st)
                 std::shared_lock lock(keys_mutex_);
                 auto it = approved_keys_.find(z85);
                 allow = it != approved_keys_.end();
-                if (allow)
-                    user_id = it->second; // the agent_id this key authenticates
-                LOGF_TRACE("ZAP CURVE lookup approved=%d bound_agent_id=%s", allow ? 1 : 0, user_id.c_str());
+                // Issue #144: the identity names the key too, so the server
+                // can tell a session of a replaced key from the current one.
+                if (allow && !it->second.empty())
+                    user_id = make_session_identity(it->second, z85);
+                LOGF_TRACE("ZAP CURVE lookup approved=%d bound=%d", allow ? 1 : 0, user_id.empty() ? 0 : 1);
             }
             else if (mechanism == "NULL")
             {
@@ -133,7 +135,7 @@ void ZapHandler::run(std::stop_token st)
         }
 
         // ZAP reply: version, request_id, status_code, status_text, user_id, metadata
-        // SEC-04: user_id carries the agent_id the CURVE key is bound to; the
+        // SEC-04, #144: user_id carries the agent_id and key the CURVE peer is bound to; the
         // server reads it back as the "User-Id" metadata on every message
         // from this peer and treats it as the authoritative identity.
         // A malformed request may have no request_id frame; reply with an
