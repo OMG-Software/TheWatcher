@@ -150,7 +150,9 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   libsodium (>= 1.0.18); it fails when they are missing, and cppzmq always
   comes from its wrap (#125).
 - Every pip install in CI and in the BSD setup script is binary-only
-  (`--only-binary :all:`) and pinned (`meson==1.11.1`, `ninja==1.13.2`). The
+  (`--only-binary :all:`) and pinned (`meson==1.11.1`, plus `ninja==1.13.2` in the Windows CI job). The BSD
+  setup script pip-installs only Meson, because PyPI has no BSD wheels for
+  Ninja, and the sanitizer job installs Meson into a venv (PEP 668). The
   version checks no longer take paths from the command line:
   `check_version_consistency.py` derives the repository root from its own
   location and `check_binary_version.py` receives fixed names (`server`,

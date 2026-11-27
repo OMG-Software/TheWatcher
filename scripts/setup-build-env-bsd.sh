@@ -29,9 +29,10 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 SKIP_PACKAGES=0
 SKIP_MESON=0
-# Pinned, binary-only pip installs (no setup scripts run at install time).
+# Pinned, binary-only pip install of Meson (a pure-Python wheel; no setup
+# scripts run at install time). Ninja comes from the BSD package manager:
+# PyPI has no BSD wheels for it.
 MESON_VERSION=1.11.1
-NINJA_VERSION=1.13.2
 SKIP_NODE=0
 SKIP_POSTGRES=0
 NO_VERIFY=0
@@ -199,11 +200,11 @@ install_meson() {
     fi
 
     if python3 -m pip --version >/dev/null 2>&1; then
-        python3 -m pip install --user --upgrade --only-binary :all: "meson==${MESON_VERSION}" "ninja==${NINJA_VERSION}"
+        python3 -m pip install --user --upgrade --only-binary :all: "meson==${MESON_VERSION}"
     else
         python3 -m ensurepip --user >/dev/null 2>&1 || true
         if python3 -m pip --version >/dev/null 2>&1; then
-            python3 -m pip install --user --upgrade --only-binary :all: "meson==${MESON_VERSION}" "ninja==${NINJA_VERSION}"
+            python3 -m pip install --user --upgrade --only-binary :all: "meson==${MESON_VERSION}"
         else
             log_warn "pip is not available; skipping Meson/Ninja installation. Use the meson and ninja packages or install pip and rerun."
             return

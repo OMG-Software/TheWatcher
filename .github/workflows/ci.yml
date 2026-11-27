@@ -79,8 +79,12 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
-            cmake ninja-build python3-pip libpq-dev postgresql-client
-          pip3 install --quiet --only-binary :all: meson==1.11.1
+            cmake ninja-build python3-pip python3-venv libpq-dev postgresql-client
+          # Ubuntu 24.04's system Python is externally managed (PEP 668):
+          # install into a venv instead and put it first on PATH.
+          python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" install --quiet --only-binary :all: meson==1.11.1
+          echo "$RUNNER_TEMP/venv/bin" >> "$GITHUB_PATH"
 
       - name: Create PostgreSQL test database
         env:
