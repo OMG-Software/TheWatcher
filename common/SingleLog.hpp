@@ -63,7 +63,10 @@ namespace logging
         /**
          * Private Constructor
          */
-        SingleLog() : m_consoleLogLevel(LogLevel::L_INFO), m_fileLogLevel(LogLevel::L_TRACE), m_filePath("")
+        SingleLog()
+            : m_consoleLogLevel(LogLevel::L_INFO)
+            , m_fileLogLevel(LogLevel::L_TRACE)
+            , m_filePath("")
         {
             m_consoleWriter = std::thread(&SingleLog::ConsoleWriter, this);
             m_fstreamWriter = std::thread(&SingleLog::FstreamWriter, this);
@@ -552,7 +555,8 @@ namespace
     class FunctionTrace final
     {
     public:
-        explicit FunctionTrace(const std::string& functionName) : m_functionName{functionName}
+        explicit FunctionTrace(const std::string& functionName)
+            : m_functionName{functionName}
         {
             std::ostringstream ss;
             ss << ">>> Entering: " << m_functionName;

@@ -4,10 +4,11 @@
 
 #include "common/SingleLog.hpp"
 
+#include <nlohmann/json.hpp>
+
 #include <stdexcept>
 #include <string>
 
-#include <nlohmann/json.hpp>
 #include <sodium.h>
 
 namespace thewatcher::server
@@ -1648,7 +1649,7 @@ void PostgresStore::delete_runbook(int64_t runbook_id)
 }
 
 std::optional<RunbookRecord> PostgresStore::get_runbook(const std::string& agent_id, const std::string& indicator,
-                                                       const std::string& status)
+                                                        const std::string& status)
 {
     // SEC-11: same selection rules as SqliteStore::get_runbook.
     const char* params[] = {agent_id.c_str(), indicator.c_str(), status.c_str()};

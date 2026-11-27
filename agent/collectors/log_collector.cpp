@@ -23,8 +23,8 @@
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
-#include <process.h>
 #include <windows.h>
+#include <process.h>
 #else
 #include <fcntl.h>
 #include <limits.h>
@@ -188,8 +188,9 @@ namespace
 #ifdef _WIN32
         const auto& x = a.native();
         const auto& y = b.native();
-        return x.size() == y.size() &&
-               std::equal(x.begin(), x.end(), y.begin(), [](wchar_t l, wchar_t r) { return std::towlower(l) == std::towlower(r); });
+        return x.size() == y.size() && std::equal(x.begin(), x.end(), y.begin(), [](wchar_t l, wchar_t r) {
+                   return std::towlower(l) == std::towlower(r);
+               });
 #else
         return a == b;
 #endif
@@ -213,7 +214,9 @@ namespace
 
     bool is_allowed(const std::filesystem::path& path, const std::vector<std::filesystem::path>& dirs)
     {
-        return std::any_of(dirs.begin(), dirs.end(), [&](const auto& dir) { return is_under(path, dir); });
+        return std::any_of(dirs.begin(), dirs.end(), [&](const auto& dir) {
+            return is_under(path, dir);
+        });
     }
 
     // A file opened exactly once. Every later check (type, identity, size,
@@ -292,8 +295,8 @@ namespace
     // `error` set). Fails closed when the final path cannot be determined.
     ReadOnlyFile::Status ReadOnlyFile::open(const std::filesystem::path& path, std::string& error)
     {
-        handle_ = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
-                              OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+        handle_ = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                              nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
         if (handle_ == INVALID_HANDLE_VALUE)
         {
             const DWORD err = GetLastError();
@@ -710,8 +713,8 @@ void LogCollector::tail_file(const LogMonitorConfig& cfg)
     //  - A line longer than max_line_len is evaluated once, truncated, as
     //    soon as it overflows; the remainder is dropped up to the next '\n'
     //    (state.discarding carries this across ticks).
-    int64_t pos = state.offset;        // next byte to read
-    int64_t line_start = pos;          // where the current line began
+    int64_t pos = state.offset;         // next byte to read
+    int64_t line_start = pos;           // where the current line began
     bool discarding = state.discarding; // inside the tail of an over-long line
     int64_t bytes_read = 0;
     std::string line;

@@ -5,6 +5,8 @@
 #include "common/protocol.hpp"
 #include "report_generator.hpp"
 
+#include <nlohmann/json.hpp>
+
 #include <algorithm>
 #include <array>
 #include <cctype>
@@ -18,7 +20,6 @@
 #include <unordered_set>
 
 #include <httplib.h>
-#include <nlohmann/json.hpp>
 #include <sodium.h>
 
 #ifdef _WIN32
@@ -97,25 +98,25 @@ void ApiServer::set_trusted_proxies(std::vector<std::string> proxies)
 namespace
 {
 
-// Strips leading and trailing spaces and tabs. The view aliases the input.
-std::string_view trim_ws(std::string_view v)
-{
-    while (!v.empty() && (v.front() == ' ' || v.front() == '\t'))
-        v.remove_prefix(1);
-    while (!v.empty() && (v.back() == ' ' || v.back() == '\t'))
-        v.remove_suffix(1);
-    return v;
-}
+    // Strips leading and trailing spaces and tabs. The view aliases the input.
+    std::string_view trim_ws(std::string_view v)
+    {
+        while (!v.empty() && (v.front() == ' ' || v.front() == '\t'))
+            v.remove_prefix(1);
+        while (!v.empty() && (v.back() == ' ' || v.back() == '\t'))
+            v.remove_suffix(1);
+        return v;
+    }
 
-// Plausible IPv4/IPv6 literal: bounded length, digits / hex / '.' / ':' only.
-bool plausible_ip_literal(std::string_view v)
-{
-    if (v.empty() || v.size() > 45)
-        return false;
-    return std::all_of(v.begin(), v.end(), [](char c) {
-        return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F') || c == '.' || c == ':';
-    });
-}
+    // Plausible IPv4/IPv6 literal: bounded length, digits / hex / '.' / ':' only.
+    bool plausible_ip_literal(std::string_view v)
+    {
+        if (v.empty() || v.size() > 45)
+            return false;
+        return std::all_of(v.begin(), v.end(), [](char c) {
+            return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F') || c == '.' || c == ':';
+        });
+    }
 
 } // namespace
 

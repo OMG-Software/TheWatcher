@@ -10,10 +10,11 @@
 #include <vector>
 
 #ifdef __linux__
-#include <dirent.h>
 #include <fstream>
-#include <pwd.h>
 #include <sstream>
+
+#include <dirent.h>
+#include <pwd.h>
 #include <sys/types.h>
 #include <unistd.h>
 #elif defined(_WIN32)

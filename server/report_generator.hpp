@@ -2,8 +2,9 @@
 
 #include "store.hpp"
 
-#include <cstdint>
 #include <nlohmann/json.hpp>
+
+#include <cstdint>
 
 namespace thewatcher::server
 {

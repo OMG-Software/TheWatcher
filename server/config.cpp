@@ -199,8 +199,8 @@ namespace
         }
         LocalFree(sa.lpSecurityDescriptor);
         if (h == INVALID_HANDLE_VALUE)
-            throw std::runtime_error("Cannot create temporary file beside " + target.string() +
-                                     " (error " + std::to_string(create_error) + ")");
+            throw std::runtime_error("Cannot create temporary file beside " + target.string() + " (error " +
+                                     std::to_string(create_error) + ")");
 
         bool ok = true;
         const char* p = content.data();

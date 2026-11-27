@@ -388,8 +388,7 @@ void Server::handle_router_frame(zmq::socket_t& router)
     const std::string& agent_id = frame.agent_id;
     LOGF_TRACE("Received frame identity_size=%zu agent_id=%s type=%s raw_type=%u payload_size=%zu frame_timestamp=%lld",
                identity_msg.size(), sanitize_log_text(agent_id).c_str(), frame_type_name(frame.type),
-               static_cast<unsigned>(frame.type),
-               frame.payload.size(), static_cast<long long>(frame.timestamp_ms));
+               static_cast<unsigned>(frame.type), frame.payload.size(), static_cast<long long>(frame.timestamp_ms));
 
     // SEC-04: when CURVE is enabled, the ZAP-authenticated identity is
     // authoritative. frame.agent_id is attacker-controlled payload; a peer

@@ -6,11 +6,12 @@
 
 #include "common/SingleLog.hpp"
 
+#include <nlohmann/json.hpp>
+
 #include <cctype>
 #include <stdexcept>
 #include <string>
 
-#include <nlohmann/json.hpp>
 #include <sodium.h>
 
 namespace thewatcher::server
@@ -1700,7 +1701,7 @@ void SqliteStore::delete_runbook(int64_t runbook_id)
 }
 
 std::optional<RunbookRecord> SqliteStore::get_runbook(const std::string& agent_id, const std::string& indicator,
-                                                     const std::string& status)
+                                                      const std::string& status)
 {
     // SEC-11: only this agent's runbooks or generic ones (agent_id='') may be
     // attached, so an alert never carries another agent's runbook URL. Prefer

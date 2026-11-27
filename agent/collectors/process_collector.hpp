@@ -16,7 +16,8 @@ namespace thewatcher::agent
 class ProcessCollector final : public Collector
 {
 public:
-    explicit ProcessCollector(int limit = 25) : limit_{limit}
+    explicit ProcessCollector(int limit = 25)
+        : limit_{limit}
     {
     }
 

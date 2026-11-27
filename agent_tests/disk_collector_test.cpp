@@ -63,7 +63,7 @@ SCENARIO("On Windows, DiskCollector enumerates every fixed drive the system expo
             if (::GetDriveTypeA(root) != DRIVE_FIXED)
                 continue;
             std::error_code ec;
-            (void) std::filesystem::space(root, ec);
+            (void)std::filesystem::space(root, ec);
             if (ec)
                 continue;
             expected_mount_points.insert(root);
