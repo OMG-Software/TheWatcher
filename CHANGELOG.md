@@ -9,6 +9,14 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Security
 
+- The agent no longer trusts the server key in an enrollment reply: it must
+  be 40 Z85 characters decoding to a 32-byte key, and the config writer
+  refuses any value containing CR or LF. Before, a crafted key could inject
+  `SERVER_ADDRESS` or `ALLOW_INSECURE` lines into the saved config (#148).
+- The agent config is now written atomically through an owner-only temporary
+  file and renamed over the old one; write errors are reported. On Windows the
+  file gets a protected DACL (SYSTEM, Administrators, owner) instead of the
+  parent directory's inherited rights (#149).
 - Fixed a server crash (NULL dereference) and heap over-read when a metrics
   or collector-config payload has a CBOR `null`/`true`/`false`/`undefined`
   or a half/single-precision float where a double is expected. All float
@@ -47,6 +55,13 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 
+- Agent enrollment recovers after a reply timeout: each attempt uses a new
+  REQ socket, so a late server is reached without restarting the agent (#86).
+- A malformed enrollment reply is logged and retried instead of terminating
+  the agent (#160).
+- IPv6 server addresses such as `[2001:db8::1]:5555` are parsed correctly in
+  the agent config; an unbracketed IPv6 address is rejected with a clear
+  error (#98).
 - Alert notes longer than 4,096 bytes are cut on a UTF-8 character
   boundary. Oversize `runbook_markdown` (collector config) and
   `reports_webhook_url` (settings) are rejected with 400 instead of being
@@ -94,6 +109,9 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Changed
 
+- The server config save now uses the shared `common::write_private_file_atomic`
+  helper (atomic, owner-only write) that the agent config also uses; the
+  duplicated code in `server/config.cpp` is removed. No behaviour change (#149).
 - The whole C++ tree is formatted with the root `.clang-format`, and CI
   fails any PR whose C++ is not (`clang-format` 22.1.5, pinned). The
   formatting commit is listed in `.git-blame-ignore-revs`. A new include

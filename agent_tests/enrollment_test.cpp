@@ -3,13 +3,18 @@
 #include "common/crypto.hpp"
 #include "common/protocol.hpp"
 #include "test_support/enroll_reply_server.hpp"
+#include "test_support/timing.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
 #include <atomic>
 #include <chrono>
+#include <optional>
 #include <stop_token>
+#include <string>
 #include <thread>
+#include <utility>
+#include <vector>
 
 #include <zmq.hpp>
 
@@ -181,6 +186,294 @@ SCENARIO("Enrollment recovers after a transient server non-response")
             THEN("enrollment completed successfully after socket recovery")
             {
                 REQUIRE(enrolled.load());
+            }
+        }
+    }
+}
+
+// Issues #86 and #160: a bad reply must not end enrollment.
+
+namespace
+{
+
+// Answers each request with the next canned raw reply, then answers one more
+// request with a genuine approval. Raw replies model garbled or foreign answers.
+class ScriptedEnrollServer
+{
+public:
+    ScriptedEnrollServer(std::vector<std::string> raw_replies, const std::string& agent_id,
+                         const std::string& approved_key)
+    {
+        rep_.set(zmq::sockopt::linger, 0);
+        rep_.set(zmq::sockopt::rcvtimeo, 5000);
+        rep_.bind("tcp://127.0.0.1:*");
+        endpoint_ = rep_.get(zmq::sockopt::last_endpoint);
+        thread_ = std::thread([this, raw_replies = std::move(raw_replies), agent_id, approved_key] {
+            for (const auto& raw : raw_replies)
+            {
+                zmq::message_t req;
+                if (!rep_.recv(req, zmq::recv_flags::none))
+                    return;
+                ++requests_;
+                rep_.send(zmq::message_t(raw.data(), raw.size()), zmq::send_flags::none);
+            }
+            zmq::message_t req;
+            if (!rep_.recv(req, zmq::recv_flags::none))
+                return;
+            ++requests_;
+            send_enroll_response(rep_, agent_id, true, approved_key);
+        });
+    }
+
+    ~ScriptedEnrollServer()
+    {
+        if (thread_.joinable())
+            thread_.join();
+    }
+
+    const std::string& endpoint() const
+    {
+        return endpoint_;
+    }
+
+    int requests() const
+    {
+        return requests_.load();
+    }
+
+private:
+    zmq::context_t ctx_{1};
+    zmq::socket_t rep_{ctx_, ZMQ_REP};
+    std::string endpoint_;
+    std::atomic<int> requests_{0};
+    std::thread thread_;
+};
+
+// Encodes an ENROLL_RESPONSE frame carrying `payload`.
+std::string response_frame_bytes(const std::string& agent_id, const std::vector<uint8_t>& payload)
+{
+    Frame frame;
+    frame.type = static_cast<uint8_t>(FrameType::ENROLL_RESPONSE);
+    frame.agent_id = agent_id;
+    frame.payload = payload;
+    const auto encoded = encode_frame(frame);
+    return std::string(encoded.begin(), encoded.end());
+}
+
+AgentConfig make_config(const std::string& agent_id)
+{
+    const auto agent_kp = thewatcher::crypto::generate_curve_keypair();
+    AgentConfig cfg;
+    cfg.agent_id = agent_id;
+    cfg.agent_public_key = agent_kp.public_key_z85;
+    cfg.agent_secret_key = agent_kp.secret_key_z85;
+    return cfg;
+}
+
+} // namespace
+
+SCENARIO("Enrollment retries after a malformed reply instead of exiting (issue #160)")
+{
+    GIVEN("a server that first sends bytes that are not a frame and then approves")
+    {
+        thewatcher::crypto::init();
+        const auto server_kp = thewatcher::crypto::generate_curve_keypair();
+        auto cfg = make_config("enroll-test-malformed");
+        ScriptedEnrollServer server({"definitely not a frame", std::string(3, '\0')}, cfg.agent_id,
+                                    server_kp.public_key_z85);
+        cfg.enrollment_address = server.endpoint();
+
+        WHEN("enroll is called")
+        {
+            std::atomic<bool> stop{false};
+            zmq::context_t agent_ctx(1);
+            thewatcher::agent::enroll(cfg, agent_ctx, stop, /*poll_interval=*/0, /*recv_timeout_ms=*/2000);
+
+            THEN("it keeps asking until the genuine approval arrives")
+            {
+                REQUIRE(server.requests() == 3);
+                REQUIRE(cfg.server_public_key == server_kp.public_key_z85);
+            }
+        }
+    }
+}
+
+SCENARIO("Enrollment retries after a reply whose payload does not decode (issue #160)")
+{
+    GIVEN("a server that first answers with a valid frame carrying a garbage payload")
+    {
+        thewatcher::crypto::init();
+        const auto server_kp = thewatcher::crypto::generate_curve_keypair();
+        auto cfg = make_config("enroll-test-bad-payload");
+        ScriptedEnrollServer server({response_frame_bytes(cfg.agent_id, {0xff, 0xff, 0xff})}, cfg.agent_id,
+                                    server_kp.public_key_z85);
+        cfg.enrollment_address = server.endpoint();
+
+        WHEN("enroll is called")
+        {
+            std::atomic<bool> stop{false};
+            zmq::context_t agent_ctx(1);
+            thewatcher::agent::enroll(cfg, agent_ctx, stop, /*poll_interval=*/0, /*recv_timeout_ms=*/2000);
+
+            THEN("the second request is answered and enrollment succeeds")
+            {
+                REQUIRE(server.requests() == 2);
+                REQUIRE(cfg.server_public_key == server_kp.public_key_z85);
+            }
+        }
+    }
+}
+
+SCENARIO("Enrollment keeps asking while the server answers pending (issue #86)")
+{
+    GIVEN("a server that answers pending twice and then approves")
+    {
+        thewatcher::crypto::init();
+        const auto server_kp = thewatcher::crypto::generate_curve_keypair();
+        auto cfg = make_config("enroll-test-pending");
+
+        EnrollResponse pending;
+        pending.approved = false;
+        pending.message = "pending approval";
+        const auto pending_bytes = response_frame_bytes(cfg.agent_id, pack(pending));
+
+        ScriptedEnrollServer server({pending_bytes, pending_bytes}, cfg.agent_id, server_kp.public_key_z85);
+        cfg.enrollment_address = server.endpoint();
+
+        WHEN("enroll is called")
+        {
+            std::atomic<bool> stop{false};
+            zmq::context_t agent_ctx(1);
+            thewatcher::agent::enroll(cfg, agent_ctx, stop, /*poll_interval=*/0, /*recv_timeout_ms=*/2000);
+
+            THEN("it enrolls on the third request")
+            {
+                REQUIRE(server.requests() == 3);
+                REQUIRE(cfg.server_public_key == server_kp.public_key_z85);
+            }
+        }
+    }
+}
+
+// Issue #86 together with #83: every attempt uses a fresh socket and every
+// wait is interruptible.
+
+namespace
+{
+
+// Reads one request from a ROUTER stub within `wait`; returns its identity frame.
+std::optional<zmq::message_t> router_recv_request(zmq::socket_t& router, std::chrono::milliseconds wait)
+{
+    zmq::pollitem_t item{static_cast<void*>(router), 0, ZMQ_POLLIN, 0};
+    zmq::poll(&item, 1, wait);
+    if (!(item.revents & ZMQ_POLLIN))
+        return std::nullopt;
+    zmq::message_t identity, delim, payload;
+    (void)router.recv(identity, zmq::recv_flags::none);
+    (void)router.recv(delim, zmq::recv_flags::none);
+    (void)router.recv(payload, zmq::recv_flags::none);
+    return identity;
+}
+
+} // namespace
+
+SCENARIO("Enrollment recovers on a fresh socket and stops promptly when asked")
+{
+    GIVEN("a server that ignores the first request and a long retry interval")
+    {
+        thewatcher::crypto::init();
+        const auto agent_kp = thewatcher::crypto::generate_curve_keypair();
+        const auto server_kp = thewatcher::crypto::generate_curve_keypair();
+
+        zmq::context_t server_ctx(1);
+        zmq::socket_t router(server_ctx, ZMQ_ROUTER);
+        router.set(zmq::sockopt::linger, 0);
+        router.bind("tcp://127.0.0.1:*");
+
+        AgentConfig cfg;
+        cfg.agent_id = "enroll-test-fresh-socket";
+        cfg.agent_public_key = agent_kp.public_key_z85;
+        cfg.agent_secret_key = agent_kp.secret_key_z85;
+        cfg.enrollment_address = router.get(zmq::sockopt::last_endpoint);
+
+        std::atomic<bool> stop{false};
+        std::atomic<bool> enrolled{false};
+        std::atomic<bool> returned{false};
+        zmq::context_t agent_ctx(1);
+
+        WHEN("the first request goes unanswered and the second is approved")
+        {
+            std::jthread enroll_thread([&](std::stop_token st) {
+                std::stop_callback on_stop(st, [&] {
+                    stop.store(true);
+                });
+                try
+                {
+                    thewatcher::agent::enroll(cfg, agent_ctx, stop, /*poll_interval=*/0, /*recv_timeout_ms=*/300);
+                    enrolled.store(true);
+                }
+                catch (...)
+                {
+                }
+                returned.store(true);
+            });
+
+            REQUIRE(router_recv_request(router, std::chrono::seconds(5))); // first request: no reply
+            const auto second = router_recv_request(router, std::chrono::seconds(5));
+            REQUIRE(second.has_value());
+
+            EnrollResponse response;
+            response.approved = true;
+            response.message = "approved";
+            response.server_public_key_z85 = server_kp.public_key_z85;
+            response.server_public_key_fingerprint =
+                thewatcher::crypto::server_public_key_fingerprint(server_kp.public_key_z85);
+            Frame f;
+            f.type = static_cast<uint8_t>(FrameType::ENROLL_RESPONSE);
+            f.agent_id = cfg.agent_id;
+            f.payload = pack(response);
+            const auto encoded = encode_frame(f);
+            router.send(zmq::message_t(second->data(), second->size()), zmq::send_flags::sndmore);
+            router.send(zmq::message_t{}, zmq::send_flags::sndmore);
+            router.send(zmq::message_t(encoded.data(), encoded.size()), zmq::send_flags::none);
+
+            THEN("enrollment completes on a later attempt")
+            {
+                REQUIRE(thewatcher::test::eventually(
+                    [&] {
+                        return enrolled.load();
+                    },
+                    std::chrono::seconds(5), std::chrono::milliseconds(20)));
+            }
+        }
+
+        WHEN("stop is requested while waiting for a reply that never comes")
+        {
+            std::jthread enroll_thread([&](std::stop_token st) {
+                std::stop_callback on_stop(st, [&] {
+                    stop.store(true);
+                });
+                try
+                {
+                    thewatcher::agent::enroll(cfg, agent_ctx, stop, /*poll_interval=*/10, /*recv_timeout_ms=*/5000);
+                }
+                catch (...)
+                {
+                }
+                returned.store(true);
+            });
+            REQUIRE(router_recv_request(router, std::chrono::seconds(5)));
+            const auto requested = std::chrono::steady_clock::now();
+            stop.store(true);
+
+            THEN("enroll returns within a second, not after the 5 s receive timeout")
+            {
+                REQUIRE(thewatcher::test::eventually(
+                    [&] {
+                        return returned.load();
+                    },
+                    std::chrono::seconds(1), std::chrono::milliseconds(10)));
+                REQUIRE(std::chrono::steady_clock::now() - requested < std::chrono::seconds(1));
             }
         }
     }

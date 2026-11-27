@@ -7,10 +7,13 @@
 #include "config.hpp"
 
 #include <chrono>
+#include <cstdint>
 #include <cstdio>
 #include <optional>
 #include <stdexcept>
+#include <string>
 #include <thread>
+#include <vector>
 
 #include <zmq.hpp>
 
@@ -154,27 +157,82 @@ namespace
         }
         return std::nullopt;
     }
+
+    // True if key is exactly 40 Z85 characters that decode to a 32-byte CURVE key.
+    // The enrollment reply is untrusted text that ends up in the config file, so
+    // anything else must never be stored (issue #148).
+    bool is_valid_curve_public_key(const std::string& key)
+    {
+        try
+        {
+            thewatcher::crypto::z85_decode(key);
+            return true;
+        }
+        catch (const std::exception&)
+        {
+            return false;
+        }
+    }
+
+    // Makes one request/reply exchange on a fresh REQ socket. A REQ socket that
+    // has sent without receiving a reply, or received a bad one, cannot send again
+    // (EFSM), so every attempt gets its own socket instead of reusing one with
+    // ZMQ_REQ_RELAXED. That also drops any stale reply a late server sends to an
+    // earlier attempt, which ZMQ_REQ_CORRELATE would otherwise have to filter.
+    // Returns the decoded reply, or nullopt after logging why there is none
+    // (send failure, timeout or a reply that does not decode).
+    std::optional<EnrollResponse> request_enrollment(const AgentConfig& config, zmq::context_t& ctx,
+                                                     const std::atomic<bool>& stop_flag,
+                                                     const std::vector<uint8_t>& encoded, int recv_timeout_ms)
+    {
+        try
+        {
+            zmq::socket_t req(ctx, ZMQ_REQ);
+            req.set(zmq::sockopt::linger, 0);
+            req.set(zmq::sockopt::rcvtimeo, recv_timeout_ms);
+            req.set(zmq::sockopt::sndtimeo, recv_timeout_ms);
+            // SEC-02: enrollment replies are tiny; reject anything oversize at the
+            // socket layer and bound the handshake against a stalling server.
+            req.set(zmq::sockopt::maxmsgsize, kEnrollMaxMessageBytes);
+            req.set(zmq::sockopt::handshake_ivl, kHandshakeIvlMs);
+            req.connect(config.enrollment_address);
+
+            LOGF_TRACE("Sending enrollment request to %s", config.enrollment_address.c_str());
+            req.send(zmq::message_t(encoded.data(), encoded.size()), zmq::send_flags::none);
+
+            zmq::message_t resp;
+            // Interruptible: a stop request ends the wait within one slice.
+            if (!recv_unless_stopped(req, resp, stop_flag, recv_timeout_ms))
+            {
+                LOG_DEBUG("Enrollment response timed out");
+                return std::nullopt;
+            }
+
+            // The reply comes from an unauthenticated peer: a malformed one is
+            // dropped and retried, never fatal (issue #160).
+            const auto resp_frame = decode_frame(resp.data(), resp.size());
+            return unpack<EnrollResponse>(resp_frame.payload);
+        }
+        catch (const std::exception& e)
+        {
+            LOGF_WARNING("Enrollment attempt failed: %s", e.what());
+            return std::nullopt;
+        }
+    }
+
 } // namespace
 
 // Sends an EnrollRequest and polls until approved or stop_flag is set. Retries on
-// send failure and receive timeout. Throws std::runtime_error if rejected, if an
-// approved reply lacks a valid server key pin (unless insecure mode is on), or if
-// a fingerprint or configured key pin does not match. Stores the server key on success.
+// send failure, receive timeout and malformed replies, each on a fresh socket.
+// Throws std::runtime_error if rejected, if an approved reply lacks a valid
+// server key pin (unless insecure mode is on), carries an invalid key, or if a
+// fingerprint or configured key pin does not match. Stores the server key on success.
 void enroll(AgentConfig& config, zmq::context_t& ctx, const std::atomic<bool>& stop_flag, int poll_interval_seconds,
             int recv_timeout_ms)
 {
     LOG_FUNCTION_TRACE
     LOGF_INFO("Enrollment started agent_id=%s endpoint=%s poll_interval=%d", config.agent_id.c_str(),
               config.enrollment_address.c_str(), poll_interval_seconds);
-
-    zmq::socket_t req(ctx, ZMQ_REQ);
-    req.set(zmq::sockopt::linger, 0);
-    req.set(zmq::sockopt::rcvtimeo, recv_timeout_ms);
-    // SEC-02: enrollment replies are tiny; reject anything oversize at the
-    // socket layer and bound the handshake against a stalling server.
-    req.set(zmq::sockopt::maxmsgsize, kEnrollMaxMessageBytes);
-    req.set(zmq::sockopt::handshake_ivl, kHandshakeIvlMs);
-    req.connect(config.enrollment_address);
 
     EnrollRequest er;
     er.agent_id = config.agent_id;
@@ -199,29 +257,14 @@ void enroll(AgentConfig& config, zmq::context_t& ctx, const std::atomic<bool>& s
 
     while (!stop_flag.load())
     {
-        try
+        const auto reply = request_enrollment(config, ctx, stop_flag, encoded, recv_timeout_ms);
+        if (!reply)
         {
-            LOGF_TRACE("Sending enrollment request to %s", config.enrollment_address.c_str());
-            req.send(zmq::message_t(encoded.data(), encoded.size()), zmq::send_flags::none);
-        }
-        catch (const std::exception& e)
-        {
-            LOGF_WARNING("Enrollment send failed: %s", e.what());
+            LOGF_DEBUG("No usable enrollment reply; retrying in %d seconds", poll_interval_seconds);
             sleep_unless_stopped(stop_flag, poll_interval_seconds);
             continue;
         }
-
-        zmq::message_t resp;
-        auto rc = recv_unless_stopped(req, resp, stop_flag, recv_timeout_ms);
-        if (!rc)
-        {
-            LOGF_DEBUG("Enrollment response timed out; retrying in %d seconds", poll_interval_seconds);
-            sleep_unless_stopped(stop_flag, poll_interval_seconds);
-            continue;
-        }
-
-        auto resp_frame = decode_frame(resp.data(), resp.size());
-        auto er_resp = unpack<EnrollResponse>(resp_frame.payload);
+        const auto& er_resp = *reply;
         LOGF_DEBUG("Enrollment response approved=%d message=%s", er_resp.approved ? 1 : 0, er_resp.message.c_str());
 
         if (er_resp.approved)
@@ -243,6 +286,12 @@ void enroll(AgentConfig& config, zmq::context_t& ctx, const std::atomic<bool>& s
                     "Insecure mode: enrollment approved without server key; data socket encryption is disabled");
                 LOG_INFO("Enrollment approved");
                 return;
+            }
+
+            if (!is_valid_curve_public_key(er_resp.server_public_key_z85))
+            {
+                LOG_WARNING("Enrollment server key is not a valid Z85 CURVE public key");
+                throw std::runtime_error("Enrollment server key is not a valid CURVE public key");
             }
 
             const auto calculated_fingerprint =
