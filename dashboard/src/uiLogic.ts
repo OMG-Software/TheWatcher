@@ -1,4 +1,4 @@
-import type { UserRole } from './models';
+import type { HealthColor, UserRole } from './models';
 
 export type DashboardView =
   | 'monitoring'
@@ -120,4 +120,23 @@ export function safeMarkdownHref(href: string): string | null {
   const trimmed = href.trim();
   if (/^(https?:|mailto:)/i.test(trimmed)) return trimmed;
   return null;
+}
+
+const COLOR_LABELS: Record<HealthColor, string> = {
+  green: 'Healthy',
+  yellow: 'Warning',
+  amber: 'Degraded',
+  red: 'Critical',
+  grey: 'No Data',
+  blue: 'Maintenance',
+};
+
+export function colorLabel(color: HealthColor): string {
+  return COLOR_LABELS[color];
+}
+
+/** Reads the custom-view id from a `#view-<id>` URL hash, or null when absent or malformed. */
+export function parseViewHash(hash: string): number | null {
+  const match = hash.match(/^#view-(\d+)$/);
+  return match ? parseInt(match[1], 10) : null;
 }

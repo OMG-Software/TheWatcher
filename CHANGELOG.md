@@ -81,6 +81,10 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   metrics, log matches and enrollment requests arrive, so alerts, reports
   and storage never see it. A failing scheduled report no longer ends the
   server loop (rest of #56).
+- Dashboard: `tsc` no longer writes `.js`/`.d.ts` files into `dashboard/src`
+  (`noEmit`), the 21 committed compiled twins are removed, and vitest runs
+  only `*.test.ts(x)`. Before, Vite served the stale twins and every test ran
+  twice (8 files / 172 tests became 4 / 86) (#103).
 - Agent enrollment recovers after a reply timeout: each attempt uses a new
   REQ socket, so a late server is reached without restarting the agent (#86).
 - A malformed enrollment reply is logged and retried instead of terminating
@@ -126,13 +130,6 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   front instead of appending with `vector::insert`, which tripped a GCC 11
   `-Wstringop-overread` false positive.
 
-### Added
-
-- Data-plane tests: every frame type through a running server with CURVE
-  keys, ZAP over a real CURVE connection, command dispatch and ACK, stale
-  sessions, reconnect handover and hostile strings. Maintenance flows are
-  tested only as far as the PAUSE/DISCONNECT command entry points (#59).
-
 ### Changed
 
 - The server config save now uses the shared `common::write_private_file_atomic`
@@ -156,6 +153,30 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   history. `*.cmd`/`*.bat` are checked out with CRLF (#128).
 - Version bumped to 0.9.0 in `meson.build`, `dashboard/package.json` and
   the Windows installer.
+- Dashboard: `main.tsx` is split into `App.tsx`, `pages/`, `components/`,
+  `hooks/` and `permissions.ts` (role helpers, now unit tested); inline
+  styles moved into `styles.css`. No behaviour change (#117).
+- Dashboard: removed the unused API helpers `deleteAlert` (identical to
+  `archiveAlert`), `setAgentGroups`, `setAgentRunbook`, `setAgentInterval`,
+  `setAgentProcessLimit`, `setAgentThresholds` and `fetchUptimeReport`, and
+  the unused imports in `main.tsx` (#116).
+- `docs/dashboard.md` now describes the UI as it behaves, including the
+  Silences, Maintenance and Settings pages, the fixed maintenance reason and
+  the first-group approval, and that the server does not serve the bundle
+  (#135).
+
+### Added
+
+- Dashboard: ESLint (flat config, `typescript-eslint`, `react-hooks`) with
+  `npm run lint`, and a `dashboard` CI job running
+  `npm ci --ignore-scripts` (no package install scripts), lint, build, tests
+  and `npm audit --omit=dev` (#120).
+- Dashboard: the footer shows the dashboard version from `package.json`
+  (#127).
+- Data-plane tests: every frame type through a running server with CURVE
+  keys, ZAP over a real CURVE connection, command dispatch and ACK, stale
+  sessions, reconnect handover and hostile strings. Maintenance flows are
+  tested only as far as the PAUSE/DISCONNECT command entry points (#59).
 
 ## [0.8.0] - 2026-11-02
 
