@@ -83,16 +83,18 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   non-existent `server.json`; the docs name the same file and
   `OFFLINE_AFTER_SECONDS` key (#131). On upgrade the installer stops the
   services (aborting if one cannot be stopped), copies a KEY=VALUE
-  `server.json` that has a `SERVER_SECRET_KEY` line to
-  `TheWatcherServer.conf` without overwriting an existing one, and
-  re-registers the service, so agents keep the same server identity. A
-  `server.json` that cannot be converted, with no `TheWatcherServer.conf`
-  beside it, makes the installer refuse to run before it stops or changes
-  anything, so the server never starts without its keypair. Config
-  preparation and migration run in `PrepareToInstall` and abort the install on
-  failure; service registration checks exit codes, retries while the old
-  service is marked for deletion, and on failure shows the manual commands and
-  makes setup exit with code 10 (#131).
+  `server.json` whose `SERVER_PUBLIC_KEY` and `SERVER_SECRET_KEY` are both
+  40-character Z85 keys to `TheWatcherServer.conf` without overwriting an
+  existing one, and re-registers the service, so agents keep the same server
+  identity. A `server.json` that cannot be converted (either key missing,
+  empty or malformed), with no `TheWatcherServer.conf` beside it, makes the
+  installer refuse to run before it stops or changes anything, so the server
+  never starts without its keypair or without CURVE. The copy is checked again
+  and removed if it is incomplete. Config preparation and migration run in
+  `PrepareToInstall` and abort the install on failure, starting again the
+  services that were running; service registration checks exit codes,
+  retries while the old service is marked for deletion, and on failure shows
+  the manual commands and makes setup exit with code 10 (#131).
 - The CPU collector reports a real usage value on its first `update()` and
   after a collector restart. The constructor takes a baseline and the first
   update waits until it is at least 100 ms old. Calls closer than 100 ms to

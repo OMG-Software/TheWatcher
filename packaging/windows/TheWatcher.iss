@@ -40,25 +40,42 @@ Filename: "{app}\server\TheWatcherServer.exe"; Parameters: "--uninstall-service"
 Name: "{group}\TheWatcher Dashboard"; Filename: "{app}\dashboard\index.html"; Check: DashboardExists
 
 [Code]
+const
+  // The Z85 alphabet of common/crypto.hpp; a CURVE key is 40 of these.
+  Z85Alphabet = '0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ.-:+=^!/*?&<>()[]{}@%$#';
+
 var
   RegistrationError: String;
   RegistrationFailureText: String;
+
+// True when sc query reports the service as STOPPED.
+function ServiceIsStopped(const Name: String): Boolean;
+var
+  ResultCode: Integer;
+begin
+  Result := Exec(ExpandConstant('{sys}\cmd.exe'), '/C sc query ' + Name + ' | find "STOPPED" >nul', '', SW_HIDE,
+                 ewWaitUntilTerminated, ResultCode) and (ResultCode = 0);
+end;
 
 // Upgrades: stop the running services before any file is replaced, so the
 // executables are not locked and the service registration can be deleted and
 // recreated immediately afterwards.
 // - A service that does not exist (fresh install) is skipped: sc query fails
-//   with 1060 (ERROR_SERVICE_DOES_NOT_EXIST).
+//   with 1060 (ERROR_SERVICE_DOES_NOT_EXIST). So is one that is already
+//   stopped.
 // - Any other failure to query or stop an existing service aborts the install
 //   with a message, so files are never replaced under a running service.
 // `net stop` is only the request; the loop waits up to 30 seconds for sc query
 // to report STOPPED. `net stop`'s own exit code is not used: it is also
 // non-zero when the service was already stopped.
-function StopServiceIfPresent(const Name: String): String;
+// WasRunning is set when the service existed and was not already stopped, so
+// PrepareToInstall can start it again if the install is aborted later.
+function StopServiceIfPresent(const Name: String; var WasRunning: Boolean): String;
 var
   ResultCode, I: Integer;
 begin
   Result := '';
+  WasRunning := False;
   if not Exec(ExpandConstant('{sys}\sc.exe'), 'query ' + Name, '', SW_HIDE,
               ewWaitUntilTerminated, ResultCode) then
   begin
@@ -72,47 +89,114 @@ begin
     Result := 'Could not query the ' + Name + ' service (sc.exe exit code ' + IntToStr(ResultCode) + ').';
     Exit;
   end;
+  if ServiceIsStopped(Name) then
+    Exit;
 
+  WasRunning := True;
   Exec(ExpandConstant('{sys}\net.exe'), 'stop ' + Name, '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
   for I := 1 to 30 do
   begin
-    if Exec(ExpandConstant('{sys}\cmd.exe'), '/C sc query ' + Name + ' | find "STOPPED" >nul', '', SW_HIDE,
-            ewWaitUntilTerminated, ResultCode) and (ResultCode = 0) then
+    if ServiceIsStopped(Name) then
       Exit;
     Sleep(1000);
   end;
   Result := 'The ' + Name + ' service did not stop. Stop it manually and run the installer again.';
 end;
 
-// True when FileName has a non-comment KEY=VALUE line whose trimmed key is
-// SERVER_SECRET_KEY and whose value is not empty. This mirrors the parsing
-// rules of the server (trimmed keys and values, '#' comments, lines without
-// '=' skipped), so a JSON file that merely mentions the key does not match.
-function HasServerSecretKey(const FileName: String): Boolean;
+// Starts a service again after an aborted install, if StopServiceIfPresent
+// stopped it and it is still stopped. Returns a sentence for the abort
+// message.
+function RestartStoppedService(const Name: String; WasRunning: Boolean): String;
 var
-  Lines: TArrayOfString;
+  ResultCode: Integer;
+begin
+  Result := '';
+  if not WasRunning or not ServiceIsStopped(Name) then
+    Exit;
+  if Exec(ExpandConstant('{sys}\net.exe'), 'start ' + Name, '', SW_HIDE, ewWaitUntilTerminated, ResultCode)
+     and (ResultCode = 0) then
+    Result := ' The ' + Name + ' service was started again.'
+  else
+    Result := ' The ' + Name + ' service could not be started again; start it manually.';
+end;
+
+// Reads a KEY=VALUE config. An unreadable file aborts the install: carrying
+// on would let the server start on a missing .conf and generate a new
+// keypair.
+procedure LoadConfigLines(const FileName: String; var Lines: TArrayOfString);
+begin
+  if not LoadStringsFromFile(FileName, Lines) then
+    RaiseException('Could not read ' + FileName + '; the upgrade cannot preserve the server config.');
+end;
+
+// The value of Key, or '' when it is absent or empty. This mirrors the server
+// parser (server/config.cpp): lines are trimmed, blank and '#' lines and
+// lines without '=' are skipped, keys and values are trimmed, and a key that
+// appears twice keeps its last value. A JSON file that merely mentions a key
+// therefore does not match.
+function ConfigValue(const Lines: TArrayOfString; const Key: String): String;
+var
   I, P: Integer;
   Line: String;
 begin
-  Result := False;
-  // An unreadable legacy config aborts the install: carrying on would let the
-  // server start on a missing .conf and generate a new keypair.
-  if not LoadStringsFromFile(FileName, Lines) then
-    RaiseException('Could not read ' + FileName + '; the upgrade cannot preserve the server config.');
+  Result := '';
   for I := 0 to GetArrayLength(Lines) - 1 do
   begin
     Line := Trim(Lines[I]);
     if (Line = '') or (Line[1] = '#') then
       Continue;
     P := Pos('=', Line);
-    if P = 0 then
-      Continue;
-    if (Trim(Copy(Line, 1, P - 1)) = 'SERVER_SECRET_KEY') and (Trim(Copy(Line, P + 1, Length(Line))) <> '') then
+    if (P > 0) and (Trim(Copy(Line, 1, P - 1)) = Key) then
+      Result := Trim(Copy(Line, P + 1, Length(Line)));
+  end;
+end;
+
+// True when Value has the form of a CURVE key: 40 Z85 characters, which is
+// what z85_decode in common/crypto.hpp accepts.
+function IsZ85Key(const Value: String): Boolean;
+var
+  I: Integer;
+begin
+  Result := Length(Value) = 40;
+  if not Result then
+    Exit;
+  for I := 1 to Length(Value) do
+    if Pos(Copy(Value, I, 1), Z85Alphabet) = 0 then
     begin
-      Result := True;
+      Result := False;
       Exit;
     end;
-  end;
+end;
+
+function KeyProblem(const Lines: TArrayOfString; const Key: String): String;
+var
+  Value: String;
+begin
+  Result := '';
+  Value := ConfigValue(Lines, Key);
+  if Value = '' then
+    Result := Key + ' is missing or empty'
+  else if not IsZ85Key(Value) then
+    Result := Key + ' is not a 40-character Z85 key';
+end;
+
+// Why the config in FileName cannot keep the server's CURVE identity, or ''
+// when it can. Both keys are required: with only SERVER_SECRET_KEY the server
+// loads an empty public key, runs without CURVE and sends no server key on
+// enrollment, so agents that pinned the old key reject it. The message never
+// contains a key value.
+function ServerKeyProblem(const FileName: String): String;
+var
+  Lines: TArrayOfString;
+  PublicProblem, SecretProblem: String;
+begin
+  LoadConfigLines(FileName, Lines);
+  PublicProblem := KeyProblem(Lines, 'SERVER_PUBLIC_KEY');
+  SecretProblem := KeyProblem(Lines, 'SERVER_SECRET_KEY');
+  if (PublicProblem <> '') and (SecretProblem <> '') then
+    Result := PublicProblem + ' and ' + SecretProblem
+  else
+    Result := PublicProblem + SecretProblem;
 end;
 
 // True when the service is registered. sc query exits 1060
@@ -212,18 +296,18 @@ end;
 // generate a new CURVE keypair, breaking every enrolled agent.
 // - An existing TheWatcherServer.conf is never overwritten.
 // - server.json is left in place as a backup.
-// - A server.json that does not look like a KEY=VALUE config (for example one
-//   hand-written as JSON) is not converted; see the upgrade notes in
-//   docs/installation.md.
+// - A server.json without both CURVE keys as KEY=VALUE lines (for example one
+//   hand-written as JSON, or one with an empty SERVER_PUBLIC_KEY) is not
+//   converted; see the upgrade notes in docs/installation.md.
 // Pre-flight check, run before anything is stopped or changed. Returns an
 // error message when a legacy server.json exists, there is no
 // TheWatcherServer.conf yet, and server.json cannot be converted. Carrying on
-// would register the server without its config: on its next start it would
-// generate a new CURVE keypair and every enrolled agent would have to be
-// re-enrolled. Returns '' when the upgrade can proceed.
+// would register the server without its keypair: it would generate a new one,
+// or run without CURVE, and every enrolled agent would have to be re-enrolled.
+// Returns '' when the upgrade can proceed.
 function CheckLegacyServerConfig(): String;
 var
-  Dir, OldConf, NewConf: String;
+  Dir, OldConf, NewConf, Problem: String;
 begin
   Result := '';
   Dir := ExpandConstant('{commonappdata}\TheWatcher');
@@ -232,8 +316,9 @@ begin
   if FileExists(NewConf) or not FileExists(OldConf) then
     Exit;
   try
-    if not HasServerSecretKey(OldConf) then
-      Result := OldConf + ' is not a KEY=VALUE server config, so it cannot be migrated automatically. ' +
+    Problem := ServerKeyProblem(OldConf);
+    if Problem <> '' then
+      Result := OldConf + ' cannot be migrated automatically: ' + Problem + '. ' +
                 'Copy its settings, including SERVER_PUBLIC_KEY and SERVER_SECRET_KEY, into ' + NewConf +
                 ' and run the installer again. Nothing has been changed.';
   except
@@ -243,7 +328,7 @@ end;
 
 procedure MigrateServerConfig(const Dir: String);
 var
-  OldConf, NewConf: String;
+  OldConf, NewConf, Problem: String;
 begin
   OldConf := AddBackslash(Dir) + 'server.json';
   NewConf := AddBackslash(Dir) + 'TheWatcherServer.conf';
@@ -251,10 +336,28 @@ begin
     Exit;
   // CheckLegacyServerConfig already refused a server.json that cannot be
   // converted; check again in case the file changed since.
-  if not HasServerSecretKey(OldConf) then
-    RaiseException(OldConf + ' is not a KEY=VALUE server config; it was not migrated');
+  Problem := ServerKeyProblem(OldConf);
+  if Problem <> '' then
+    RaiseException(OldConf + ' was not migrated: ' + Problem);
+  // NewConf did not exist above and the services are stopped, so whatever is
+  // there after a failed or short copy (for example a full disk) is ours. It
+  // is removed: left in place, the next run would skip the migration and the
+  // server would start on a config without its keypair.
   if not FileCopy(OldConf, NewConf, True) then
+  begin
+    DeleteFile(NewConf);
     RaiseException('Could not copy ' + OldConf + ' to ' + NewConf);
+  end;
+  try
+    Problem := ServerKeyProblem(NewConf);
+  except
+    Problem := GetExceptionMessage();
+  end;
+  if Problem <> '' then
+  begin
+    DeleteFile(NewConf);
+    RaiseException('The copy of ' + OldConf + ' is incomplete (' + Problem + '); ' + NewConf + ' was removed');
+  end;
 end;
 
 // SEC-45: restrict the config directory to Administrators (*S-1-5-32-544)
@@ -305,13 +408,20 @@ end;
 // the service is registered, otherwise the server could start on a missing
 // TheWatcherServer.conf and generate a new CURVE keypair, which breaks every
 // enrolled agent.
+// When a step after a service was stopped fails, no file has been replaced
+// and the old registrations still point at the old configs, so the services
+// that were running are started again instead of being left down.
 function PrepareToInstall(var NeedsRestart: Boolean): String;
+var
+  AgentWasRunning, ServerWasRunning: Boolean;
 begin
+  AgentWasRunning := False;
+  ServerWasRunning := False;
   Result := CheckLegacyServerConfig();
   if Result = '' then
-    Result := StopServiceIfPresent('TheWatcherAgent');
+    Result := StopServiceIfPresent('TheWatcherAgent', AgentWasRunning);
   if Result = '' then
-    Result := StopServiceIfPresent('TheWatcherServer');
+    Result := StopServiceIfPresent('TheWatcherServer', ServerWasRunning);
   if Result = '' then
   begin
     try
@@ -320,6 +430,10 @@ begin
       Result := 'Could not prepare the configuration directory: ' + GetExceptionMessage();
     end;
   end;
+  // The server first, so the agent finds it when it reconnects.
+  if Result <> '' then
+    Result := Result + RestartStoppedService('TheWatcherServer', ServerWasRunning) +
+              RestartStoppedService('TheWatcherAgent', AgentWasRunning);
 end;
 
 // Registration needs the installed executables, so it runs after the files are

@@ -263,29 +263,37 @@ the third command to confirm that only `Administrators` and `SYSTEM` remain.
 Older Windows installers registered the server service with
 `--config C:\ProgramData\TheWatcher\server.json`. The server wrote a
 `KEY=VALUE` file at that path, the same format as `TheWatcherServer.conf`. The
-current installer therefore:
+current installer moves it to the new name as described below.
 
 Steps 0 to 2 run in `PrepareToInstall`, before any file is touched. Inno Setup
 carries on after an error raised later in the install, but a failure here
 aborts the install cleanly with a message, so the server can never be
-registered against a missing `TheWatcherServer.conf` (which would generate a new
-CURVE keypair and break every enrolled agent):
+registered against a missing or keyless `TheWatcherServer.conf` (the server
+would generate a new CURVE keypair, or run without CURVE, and every enrolled
+agent would break). If a step fails after a service was stopped, the
+installer starts the services that were running again before it exits (no
+file has been replaced yet, so they run the old version on the old config),
+and the message says whether that worked:
 
 0. checks, before stopping anything, that a `server.json` without a
    `TheWatcherServer.conf` next to it can be migrated (see below). If it
    cannot, the installer refuses to continue and the running install is left
    exactly as it was;
 1. stops the TheWatcher agent and server services, waiting up to 30 seconds
-   for each. A service that is not installed is skipped; if an installed
-   service cannot be stopped the installer aborts, so stop it manually and run
-   the installer again. It then creates the config directory and restricts it
-   to SYSTEM and Administrators;
+   for each. A service that is not installed or already stopped is skipped; if
+   an installed service cannot be stopped the installer aborts, so stop it
+   manually and run the installer again. It then creates the config directory
+   and restricts it to SYSTEM and Administrators;
 2. copies `server.json` to `TheWatcherServer.conf` when the old file exists,
-   has a non-comment `SERVER_SECRET_KEY=<value>` line (spaces around `=` are
-   fine, as in the server parser), and `TheWatcherServer.conf` does not
-   exist (an existing `.conf` is never overwritten, and `server.json` is kept
-   as a backup), so the server keeps its CURVE identity and agents keep
-   working. An unreadable `server.json` aborts the install;
+   `TheWatcherServer.conf` does not (an existing `.conf` is never overwritten,
+   and `server.json` is kept as a backup), and `server.json` has non-comment
+   `SERVER_PUBLIC_KEY=<key>` and `SERVER_SECRET_KEY=<key>` lines whose values
+   are 40-character Z85 keys (spaces around `=` are fine and a repeated key
+   keeps its last value, as in the server parser). The server therefore keeps
+   its CURVE identity and agents keep working. The copy is read back and must
+   pass the same check; a failed or incomplete copy is deleted, so the next run
+   migrates again instead of finding a broken `.conf`. An unreadable
+   `server.json` aborts the install;
 3. after the files are copied, removes the old service registration (skipped
    when the service is not installed), waits up to 30 seconds for it to
    disappear, and registers it again so the service command line points at
@@ -300,13 +308,15 @@ CURVE keypair and break every enrolled agent):
    `services.msc` and run the installer again if the old service is still marked
    for deletion.
 
-If `server.json` has no such line (for example JSON you wrote by hand, even if
-it mentions `SERVER_SECRET_KEY`) and there is no `TheWatcherServer.conf`, the
-installer stops at step 0 without changing anything. Copy the settings into
+If `server.json` lacks either key line or a key is not a valid Z85 key (for
+example JSON you wrote by hand, even if it mentions both keys, or a file with
+an empty `SERVER_PUBLIC_KEY`) and there is no `TheWatcherServer.conf`, the
+installer stops at step 0 without changing anything; the message names the
+key that is missing or malformed, never its value. Copy the settings into
 `TheWatcherServer.conf` yourself, keeping the old `SERVER_PUBLIC_KEY` and
-`SERVER_SECRET_KEY` (without them the server generates a new keypair and every
-agent must be re-enrolled), then run the installer again. `server.json` is
-never modified.
+`SERVER_SECRET_KEY` (without them the server generates a new keypair, or runs
+without CURVE, and every agent must be re-enrolled), then run the installer
+again. `server.json` is never modified.
 
 ## Foreground Install
 
