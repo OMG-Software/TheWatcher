@@ -9,19 +9,66 @@ not connect to agents.
 
 Current capabilities:
 
-- login/logout with SQLite-backed sessions;
+- login/logout with SQLite-backed sessions (the session cookie is `Secure`, so
+  the dashboard must be served over HTTPS, or from `localhost`, for login to
+  persist);
 - monitoring view of agent health and latest metrics;
 - approved-agent-only monitoring;
-- pending enrollment approval/rejection with group assignment on the Agents page;
-- hostname-based alert notifications and alert acknowledgement/delete workflow;
+- pending enrollment approval/rejection on the Agents page (an approved agent
+  is currently assigned to the first group in the group list, or to no group
+  when none exist; there is no group picker yet);
+- hostname-based alert notifications, alert acknowledgement (with a note) and
+  archive workflow;
+- custom Views, Silences, Maintenance windows and Settings pages;
 - six-role user and group access control;
 - per-agent collector configuration for poll interval, process limit, CPU,
   memory, disk, network, process watches, consecutive-reading counts,
   heartbeat interval, group assignment, and markdown runbooks;
-- pause/resume maintenance mode;
+- enter or resume maintenance mode for one agent;
 - restart collectors;
 - request immediate status;
-- delete stale or rejected agent records.
+- delete approved agent records.
+
+## Source Layout
+
+```text
+dashboard/src/main.tsx          entry point: mounts <App/>
+dashboard/src/App.tsx           app shell: session gate, top bar, summary cards, page routing
+dashboard/src/pages/            one file per page (Monitoring, Views, Agents, Alerts,
+                                Silences, Maintenance, Users, Runbooks, Settings, Login)
+dashboard/src/components/       shared components and modals (ActionButton, StatusDot,
+                                AgentConfigModal, AcknowledgeModal, RunbookModal, ...)
+dashboard/src/hooks/            data loading and polling, action runner, session, active view
+dashboard/src/permissions.ts    role helpers: isGlobal, canOperate, canManageUsers, canManageGroups
+dashboard/src/api.ts            REST client
+dashboard/src/models.ts         API row types
+dashboard/src/status.ts         health classification and view models
+dashboard/src/uiLogic.ts        navigation, labels and markdown helpers
+dashboard/src/styles.css        all styling
+```
+
+Roles decide which controls are shown (the server enforces every permission):
+
+| Helper | True for |
+| --- | --- |
+| `isGlobal` | `global_admin`, `global_operator`, `global_viewer` |
+| `canOperate` | admins and operators, global or group |
+| `canManageUsers` | `global_admin`, `group_admin` |
+| `canManageGroups` | `global_admin` |
+
+## Linting
+
+```powershell
+cd dashboard
+npm.cmd run lint
+```
+
+ESLint (flat config, `typescript-eslint`, `eslint-plugin-react-hooks`) runs in
+CI in the `dashboard` job together with `npm run build`, `npm test` and
+`npm audit --omit=dev`. CI installs with `npm ci --ignore-scripts`, so no
+package's install lifecycle script runs; a new dependency that only works
+after its `postinstall` script will fail CI. The footer shows the dashboard version, injected from
+`dashboard/package.json` at build time.
 
 ## Development
 
@@ -29,7 +76,7 @@ Install dependencies:
 
 ```powershell
 cd dashboard
-npm.cmd install
+npm.cmd ci
 ```
 
 Run the dev server:
@@ -49,7 +96,10 @@ npm.cmd run build
 ```
 
 The production bundle is written to `dashboard/dist/`. The C++ server does not
-serve this bundle yet. Host it separately for production use.
+serve this bundle: it only exposes the `/api` REST endpoints. Host `dist/`
+separately (for example behind a reverse proxy that also forwards `/api` to the
+server) over HTTPS, because the session cookie is `Secure`. Set
+`VITE_API_BASE_URL` at build time if the API lives on another origin.
 
 ## Tests
 
@@ -60,8 +110,9 @@ npm.cmd test
 
 The current tests cover health thresholds, alert display enrichment,
 worst-status summary counts, missing-metrics behavior, maintenance state, agent
-management API calls, grouped views, runbook saves, and role-aware user/group
-API calls.
+management API calls, grouped views, role helpers, navigation and label logic,
+and role-aware user/group API calls. Tests are collected from
+`src/**/*.test.ts(x)` only; `tsc` never writes into `src`.
 
 ## Views
 
@@ -112,10 +163,11 @@ changes which users can see its alerts.
 The Agents view starts with Pending Enrollments for global operators and global
 admins, then shows Agent Management below it.
 
-Pending enrollment rows show unapproved agents awaiting approval. Approving an
-agent accepts a list of group ids; rejecting an agent marks enrollment
-rejected. Approved/rejected buttons disappear from approved agent management
-because decided enrollments are no longer pending.
+Pending enrollment rows show unapproved agents awaiting approval. The Approve
+button currently always sends the first group in the group list (or no group
+when there are none); there is no group picker, so use Configure afterwards to
+change groups. Reject marks the enrollment rejected. Approve/Reject buttons
+disappear once an enrollment is decided.
 
 Agent Management handles approved agents:
 
@@ -135,15 +187,21 @@ Agent Management handles approved agents:
 - network thresholds are combined receive plus transmit megabits per second per
   selected interface;
 - process watches use exact executable names plus an expected process count;
-- approved agents can enter or leave maintenance mode with a stored reason and
-  optional expiry timestamp;
-- approved agents can restart collectors, request status, or disconnect;
-- any agent row can be deleted.
+- the Maintenance button enters maintenance with the fixed reason
+  `operator request` and no expiry; for a reason or an end time use the
+  Maintenance page. The button reads Resume while the agent is in maintenance;
+- approved agents can restart collectors or request status (there is no
+  Disconnect button);
+- Restart, Status, Maintenance, Configure and Delete are enabled only for
+  operators and admins, and only for approved, non-rejected agents.
 
 ### Alerts
 
 The Alerts view lists active, non-deleted alerts visible to the current user's
-groups. Operators and admins can acknowledge alerts or soft-delete them. The
+groups. Operators and admins can acknowledge alerts (with an optional note),
+acknowledge and archive them in one step, or archive them; the list supports
+agent and status filters, bulk selection, and a Show archived toggle. Archiving
+is a soft delete on the server. The
 Monitoring alert dot is green unless the host has an unacknowledged alert, in
 which case it is red. Monitoring alert notifications and Alert rows show the
 known hostname as primary text and the agent id as smaller secondary text.
@@ -172,11 +230,42 @@ Account types:
 
 ### Views
 
+The Views page lists the custom views the API returns for the current user,
+with name, owner, agent count, Public/Private flag, group and creation date.
+Open applies the view as a filter on the Monitoring page (the URL hash becomes
+`#view-<id>`, so it can be bookmarked). Operators can create views (name,
+agents, Public flag, group). Edit and Delete are shown only to operators who
+own the view, or to global operators and admins.
+
 The Views page supports group assignment when a view is created or edited.
-Global account types can see all views and all group choices. Group account
-types only receive their assigned groups from the API and only see views
-assigned to those groups; public views from other groups are not returned.
-Agents inside a view are still filtered by the same agent visibility rules.
+Global account types can see all views and all group choices ("No group" is
+only offered to them). Group account types only receive their assigned groups
+from the API and only see views assigned to those groups; public views from
+other groups are not returned. Agents inside a view are still filtered by the
+same agent visibility rules.
+
+### Silences
+
+Visible to operators and admins. A silence suppresses alerts for one agent (or
+all agents, global accounts only) and one indicator (or all indicators) for a
+number of hours, with a reason. The table lists agent, indicator, reason,
+expiry and creator; operators can delete a silence.
+
+### Maintenance
+
+Visible to operators and admins. Schedules a maintenance window for one agent
+(or all agents, global accounts only) from a start date and time for a number
+of hours, with a reason. The table lists agent, start, end, reason and creator;
+operators can delete a window. Times are entered and shown in the browser's
+local time zone.
+
+### Settings
+
+Visible to global operators and admins only. Edits the webhook URL, offline
+threshold (seconds), escalation timeout (seconds), metrics retention (days) and
+the scheduled digest report (enabled, daily or weekly schedule, day of week,
+report webhook URL). Save Settings persists them; Send Report Now sends the
+report immediately.
 
 ## API Contract
 
@@ -291,6 +380,7 @@ When server API fields change:
 
 1. Update `dashboard/src/models.ts`.
 2. Update `dashboard/src/status.ts` if health or grouping changes.
-3. Update `dashboard/src/main.tsx` if rendering or controls change.
+3. Update the matching file under `dashboard/src/pages/` or
+   `dashboard/src/components/` if rendering or controls change.
 4. Add/update Vitest coverage.
 5. Run `npm.cmd run build` and `npm.cmd test`.

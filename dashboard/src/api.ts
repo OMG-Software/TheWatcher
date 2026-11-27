@@ -1,7 +1,6 @@
 import type {
   AgentCollectorConfigUpdate,
   AgentRecord,
-  AgentThresholds,
   AlertRecord,
   GroupRecord,
   LogMatchRecord,
@@ -12,7 +11,6 @@ import type {
   SessionInfo,
   SilenceRecord,
   StatusHistoryRow,
-  UptimeReport,
   UserRecord,
   ViewRecord,
 } from './models';
@@ -125,30 +123,8 @@ export async function deleteAgent(agentId: string): Promise<void> {
   await mutateJson<{ ok: boolean }>(`/api/agents/${encodeURIComponent(agentId)}`, { method: 'DELETE' });
 }
 
-export async function setAgentGroups(agentId: string, groupIds: number[]): Promise<void> {
-  await jsonPost<{ ok: boolean }>(`/api/agents/${encodeURIComponent(agentId)}/groups`, { group_ids: groupIds });
-}
-
-export async function setAgentRunbook(agentId: string, markdown: string): Promise<void> {
-  await jsonPost<{ ok: boolean }>(`/api/agents/${encodeURIComponent(agentId)}/runbook`, { markdown });
-}
-
-export async function setAgentInterval(agentId: string, intervalSeconds: number): Promise<void> {
-  await jsonPost<{ ok: boolean }>(`/api/agents/${encodeURIComponent(agentId)}/set_interval`, {
-    interval_seconds: intervalSeconds,
-  });
-}
-
-export async function setAgentProcessLimit(agentId: string, limit: number): Promise<void> {
-  await jsonPost<{ ok: boolean }>(`/api/agents/${encodeURIComponent(agentId)}/set_process_limit`, { limit });
-}
-
 export async function setAgentCollectorConfig(agentId: string, update: AgentCollectorConfigUpdate): Promise<void> {
   await jsonPost<{ ok: boolean }>(`/api/agents/${encodeURIComponent(agentId)}/collector_config`, update);
-}
-
-export async function setAgentThresholds(agentId: string, thresholds: AgentThresholds): Promise<void> {
-  await jsonPost<{ ok: boolean }>(`/api/agents/${encodeURIComponent(agentId)}/thresholds`, { thresholds });
 }
 
 export async function setMaintenance(agentId: string, reason: string, untilMs: number): Promise<void> {
@@ -182,10 +158,6 @@ export async function bulkAcknowledgeAlerts(alertIds: number[], note = ''): Prom
   await jsonPost<{ ok: boolean }>('/api/alerts/bulk-ack', { alert_ids: alertIds, note });
 }
 
-export async function deleteAlert(alertId: number): Promise<void> {
-  await mutateJson<{ ok: boolean }>(`/api/alerts/${alertId}`, { method: 'DELETE' });
-}
-
 export async function archiveAlert(alertId: number): Promise<void> {
   await mutateJson<{ ok: boolean }>(`/api/alerts/${alertId}`, { method: 'DELETE' });
 }
@@ -196,10 +168,6 @@ export async function bulkArchiveAlerts(alertIds: number[]): Promise<void> {
 
 export async function fetchMetricHistory(agentId: string, limit = 20): Promise<MetricsSnapshot[]> {
   return fetchJson<MetricsSnapshot[]>(`/api/metrics/${encodeURIComponent(agentId)}?limit=${limit}`);
-}
-
-export async function fetchUptimeReport(agentId: string, days = 7): Promise<UptimeReport> {
-  return fetchJson<UptimeReport>(`/api/uptime/${encodeURIComponent(agentId)}?days=${days}`);
 }
 
 export async function fetchMaintenanceWindows(): Promise<MaintenanceWindowRecord[]> {
