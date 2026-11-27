@@ -112,12 +112,26 @@ working document for audit, design review, and regression testing.
 - The limit check and the failure count are one atomic step, so a burst of
   concurrent guesses cannot exceed the per-account limits while the password
   hash runs.
-- Unknown and disabled usernames are verified against a dummy Argon2 hash, so
+- A trusted range only matches peers of its own address family (`::/0` does not
+  trust IPv4 peers, and IPv4-mapped IPv6 peers count as IPv4). A forwarding
+  header that is present but empty or holds no address is treated as
+  malformed (own bucket), never as "no header".
+- A login attempt holds a slot in the throttle counters while its password is
+  verified; the slot is returned on success or on an unexpected error, and
+  only a genuine credential failure keeps it. A successful login therefore
+  never erases the slots of other attempts still in flight.
+- A session is created only if the password hash the login verified is still
+  the user's current hash and the user is still enabled (one atomic store
+  statement), so a login that races a password reset or a disable cannot
+  create a session after the old ones were revoked. The password update and
+  the session revocation are one atomic store operation.
+- Unknown and disabled usernames are verified against a dummy Argon2 hash
+  (random password hashed at startup with the real parameters), so
   response time does not reveal which usernames exist.
 - Sessions are revoked when a user's password changes (all of the user's
   sessions, except the caller's own on a self-service change), when a user is
   disabled or deleted (re-enabling does not restore old sessions). Expired
-  sessions are purged at most every five minutes from login and session
+  sessions are purged at most every five minutes (a failed purge is retried) from login and session
   validation.
 - Every ZMQ socket caps inbound message size (`ZMQ_MAXMSGSIZE`: 64 KiB
   enrollment, 4 MiB data plane) and bounds the connection handshake

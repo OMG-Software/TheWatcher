@@ -48,15 +48,18 @@ ApiServer::ApiServer(Store& store, ZapHandler& zap, const std::string& host, int
 {
     LOG_FUNCTION_TRACE
     LOGF_DEBUG("Constructing API server host=%s port=%d", host_.c_str(), port_);
-    // Same Argon2 parameters as hash_password, so verifying against it costs
-    // what a real verification costs (issue #154).
+    // Hash of random bytes generated now, with the same Argon2 parameters as
+    // hash_password, so verifying against it costs what a real verification
+    // costs (issue #154) and no secret-looking literal lives in the source.
     if (sodium_init() < 0)
         throw std::runtime_error("libsodium initialisation failed");
+    std::array<unsigned char, 32> random_password{};
+    randombytes_buf(random_password.data(), random_password.size());
     std::array<char, crypto_pwhash_STRBYTES> dummy{};
-    constexpr std::string_view dummy_password = "thewatcher-timing-equaliser";
-    if (crypto_pwhash_str(dummy.data(), dummy_password.data(), dummy_password.size(),
+    if (crypto_pwhash_str(dummy.data(), reinterpret_cast<const char*>(random_password.data()), random_password.size(),
                           crypto_pwhash_OPSLIMIT_INTERACTIVE, crypto_pwhash_MEMLIMIT_INTERACTIVE) != 0)
         throw std::runtime_error("password hashing failed");
+    sodium_memzero(random_password.data(), random_password.size());
     dummy_password_hash_ = dummy.data();
     setup_routes();
 }
@@ -134,22 +137,43 @@ namespace
 
     using IpBytes = std::array<unsigned char, 16>;
 
-    // Strictly parses an IPv4 or IPv6 literal (no zone, no port) into 16
-    // bytes; IPv4 becomes an IPv4-mapped IPv6 address so both compare alike.
-    std::optional<IpBytes> parse_ip(std::string_view text)
+    // A parsed address: 16 bytes (IPv4 stored IPv4-mapped) plus its family.
+    // An IPv4-mapped IPv6 literal such as ::ffff:192.0.2.1 counts as IPv4, so
+    // a trusted range of one family never matches the other.
+    struct IpAddr
+    {
+        IpBytes bytes{};
+        bool is_v4 = false;
+    };
+
+    bool is_mapped_v4(const IpBytes& b)
+    {
+        return std::all_of(b.begin(), b.begin() + 10,
+                           [](unsigned char x) {
+                               return x == 0;
+                           }) &&
+               b[10] == 0xff && b[11] == 0xff;
+    }
+
+    // Strictly parses an IPv4 or IPv6 literal (no zone, no port).
+    std::optional<IpAddr> parse_ip(std::string_view text)
     {
         if (text.empty() || text.size() > 45)
             return std::nullopt;
         const std::string s(text);
-        IpBytes out{};
+        IpAddr out;
         in6_addr v6{};
         in_addr v4{};
         if (inet_pton(AF_INET6, s.c_str(), &v6) == 1)
-            std::memcpy(out.data(), &v6, out.size());
+        {
+            std::memcpy(out.bytes.data(), &v6, out.bytes.size());
+            out.is_v4 = is_mapped_v4(out.bytes);
+        }
         else if (inet_pton(AF_INET, s.c_str(), &v4) == 1)
         {
-            out[10] = out[11] = 0xff;
-            std::memcpy(out.data() + 12, &v4, 4);
+            out.bytes[10] = out.bytes[11] = 0xff;
+            std::memcpy(out.bytes.data() + 12, &v4, 4);
+            out.is_v4 = true;
         }
         else
             return std::nullopt;
@@ -157,31 +181,27 @@ namespace
     }
 
     // Canonical text form, so "::1" and "0:0::1" share one throttle bucket.
-    std::string format_ip(const IpBytes& ip)
+    std::string format_ip(const IpAddr& ip)
     {
-        const bool mapped_v4 = std::all_of(ip.begin(), ip.begin() + 10,
-                                           [](unsigned char b) {
-                                               return b == 0;
-                                           }) &&
-                               ip[10] == 0xff && ip[11] == 0xff;
         std::array<char, 46> buf{};
-        if (mapped_v4)
+        if (ip.is_v4)
         {
             in_addr a{};
-            std::memcpy(&a, ip.data() + 12, 4);
+            std::memcpy(&a, ip.bytes.data() + 12, 4);
             inet_ntop(AF_INET, &a, buf.data(), static_cast<socklen_t>(buf.size()));
         }
         else
         {
             in6_addr a{};
-            std::memcpy(&a, ip.data(), ip.size());
+            std::memcpy(&a, ip.bytes.data(), ip.bytes.size());
             inet_ntop(AF_INET6, &a, buf.data(), static_cast<socklen_t>(buf.size()));
         }
         return buf.data();
     }
 
-    // Parses "addr" or "addr/prefix". The prefix of an IPv4 range counts IPv4
-    // bits. Returns nullopt for anything malformed.
+    // Parses "addr" or "addr/prefix". The prefix of a dotted IPv4 range counts
+    // IPv4 bits; an IPv6 literal counts all 128 bits (an IPv4-mapped literal
+    // needs a prefix of at least 96). Returns nullopt for anything malformed.
     std::optional<ProxyRange> parse_proxy_range(std::string_view entry)
     {
         entry = trim_ws(entry);
@@ -190,8 +210,8 @@ namespace
         const auto ip = parse_ip(addr);
         if (!ip)
             return std::nullopt;
-        const bool is_v4 = addr.find(':') == std::string_view::npos;
-        int bits = is_v4 ? 32 : 128;
+        const bool dotted_v4 = addr.find(':') == std::string_view::npos;
+        int bits = dotted_v4 ? 32 : 128;
         if (slash != std::string_view::npos)
         {
             const auto digits = entry.substr(slash + 1);
@@ -202,19 +222,24 @@ namespace
                 return std::nullopt;
             bits = parsed;
         }
-        return ProxyRange{*ip, is_v4 ? bits + 96 : bits};
+        const int prefix_bits = dotted_v4 ? bits + 96 : bits;
+        if (ip->is_v4 && prefix_bits < 96)
+            return std::nullopt;
+        return ProxyRange{ip->bytes, prefix_bits, ip->is_v4};
     }
 
-    bool in_range(const IpBytes& ip, const ProxyRange& range)
+    bool in_range(const IpAddr& ip, const ProxyRange& range)
     {
+        if (ip.is_v4 != range.is_v4)
+            return false;
         const int full = range.prefix_bits / 8;
-        if (!std::equal(ip.begin(), ip.begin() + full, range.bytes.begin()))
+        if (!std::equal(ip.bytes.begin(), ip.bytes.begin() + full, range.bytes.begin()))
             return false;
         const int rem = range.prefix_bits % 8;
         if (rem == 0)
             return true;
         const auto mask = static_cast<unsigned char>(0xFF << (8 - rem));
-        return (ip[full] & mask) == (range.bytes[full] & mask);
+        return (ip.bytes[full] & mask) == (range.bytes[full] & mask);
     }
 
 } // namespace
@@ -248,7 +273,7 @@ std::string ApiServer::client_ip(const httplib::Request& req)
         std::lock_guard<std::mutex> lk(login_mutex_);
         proxies = trusted_proxies_;
     }
-    const auto is_trusted = [&proxies](const IpBytes& ip) {
+    const auto is_trusted = [&proxies](const IpAddr& ip) {
         return std::any_of(proxies.begin(), proxies.end(), [&ip](const ProxyRange& r) {
             return in_range(ip, r);
         });
@@ -264,7 +289,8 @@ std::string ApiServer::client_ip(const httplib::Request& req)
     }
 
     std::string xff;
-    for (std::size_t i = 0; i < req.get_header_value_count("X-Forwarded-For"); ++i)
+    const auto xff_lines = req.get_header_value_count("X-Forwarded-For");
+    for (std::size_t i = 0; i < xff_lines; ++i)
     {
         if (!xff.empty())
             xff += ',';
@@ -272,6 +298,7 @@ std::string ApiServer::client_ip(const httplib::Request& req)
     }
 
     std::string_view rest = xff;
+    bool saw_entry = false;
     while (!rest.empty())
     {
         const auto comma = rest.rfind(',');
@@ -279,13 +306,17 @@ std::string ApiServer::client_ip(const httplib::Request& req)
         rest = comma == std::string_view::npos ? std::string_view{} : rest.substr(0, comma);
         if (entry.empty())
             continue;
+        saw_entry = true;
         const auto ip = parse_ip(entry);
         if (!ip)
             return std::string(unknown_client);
         if (!is_trusted(*ip))
             return format_ip(*ip);
     }
-    // No forwarding information (or only trusted hops): the proxy itself.
+    // A header that was sent but holds no address is malformed, not absent.
+    if (xff_lines > 0 && !saw_entry)
+        return std::string(unknown_client);
+    // No forwarding header, or only trusted hops: the proxy itself.
     return remote;
 }
 
@@ -303,21 +334,56 @@ void ApiServer::audit(const char* event, const char* outcome, const std::string&
 
 // Purges expired sessions at most once every five minutes. Called from login
 // and session validation; could move to the server maintenance tick later.
+// The interval only restarts after a successful purge, so a failure is
+// retried, and one flag keeps concurrent requests from purging together.
 void ApiServer::purge_expired_sessions_if_due(int64_t now_ms)
 {
     constexpr int64_t purge_interval_ms = 5LL * 60LL * 1000LL;
-    auto last = last_session_purge_ms_.load();
-    if (now_ms - last < purge_interval_ms || !last_session_purge_ms_.compare_exchange_strong(last, now_ms))
+    if (now_ms - last_session_purge_ms_.load() < purge_interval_ms || session_purge_running_.exchange(true))
         return;
     try
     {
-        if (const auto removed = store_.delete_expired_sessions(now_ms); removed > 0)
+        const auto removed = store_.delete_expired_sessions(now_ms);
+        last_session_purge_ms_.store(now_ms);
+        if (removed > 0)
             LOGF_DEBUG("Purged %d expired session(s)", removed);
     }
     catch (const std::exception& e)
     {
         LOGF_WARNING("Expired session purge failed: %s", e.what());
     }
+    session_purge_running_.store(false);
+}
+
+ApiServer::LoginReservation::LoginReservation(ApiServer& api, std::string pair_key, std::string username,
+                                              std::string remote)
+    : api_(api)
+    , pair_key_(std::move(pair_key))
+    , username_(std::move(username))
+    , remote_(std::move(remote))
+{
+}
+
+ApiServer::LoginReservation::~LoginReservation()
+{
+    release();
+}
+
+// Gives this attempt's slot back in all three counters (erasing an entry that
+// reaches zero). Does nothing when not armed or already released.
+void ApiServer::LoginReservation::release()
+{
+    if (!armed_)
+        return;
+    armed_ = false;
+    std::lock_guard<std::mutex> lk(api_.login_mutex_);
+    const auto give_back = [](auto& map, const std::string& key) {
+        if (const auto it = map.find(key); it != map.end() && --it->second.first <= 0)
+            map.erase(it);
+    };
+    give_back(api_.login_failures_, pair_key_);
+    give_back(api_.login_account_failures_, username_);
+    give_back(api_.login_ip_failures_, remote_);
 }
 
 void ApiServer::drain_commands(std::vector<PendingCommand>& out)
@@ -1130,6 +1196,7 @@ void ApiServer::setup_routes()
             const std::string remote = client_ip(req);
             const std::string pair_key = remote + "|" + username;
             purge_expired_sessions_if_due(now);
+            LoginReservation reservation(*this, pair_key, username, remote);
             {
                 std::lock_guard<std::mutex> lk(login_mutex_);
 
@@ -1178,7 +1245,8 @@ void ApiServer::setup_routes()
                     return;
                 }
 
-                // Reserve this attempt; released below if the login succeeds.
+                // Reserve this attempt; the guard gives the slot back unless the
+                // attempt ends as a genuine credential failure.
                 const auto reserve = [now](auto& map, const std::string& key) {
                     auto& [count, window_start] = map[key];
                     if (count == 0)
@@ -1188,6 +1256,7 @@ void ApiServer::setup_routes()
                 reserve(login_failures_, pair_key);
                 reserve(login_account_failures_, username);
                 reserve(login_ip_failures_, remote);
+                reservation.arm();
             }
 
             // Issue #154: unknown and disabled users are verified against a
@@ -1199,6 +1268,7 @@ void ApiServer::setup_routes()
             const bool verified = crypto_pwhash_str_verify(hash, password.c_str(), password.size()) == 0;
             if (!usable || !verified)
             {
+                reservation.keep(); // a genuine credential failure stays counted
                 audit("login", "failure", username, remote);
                 res.status = 401;
                 set_json(res, json{
@@ -1206,19 +1276,9 @@ void ApiServer::setup_routes()
                 });
                 return;
             }
-
-            {
-                // Success: give back the reservation, so only failures count.
-                std::lock_guard<std::mutex> lk(login_mutex_);
-                login_failures_.erase(pair_key);
-                const auto release = [](auto& map, const std::string& key) {
-                    if (const auto it = map.find(key); it != map.end() && --it->second.first <= 0)
-                        map.erase(it);
-                };
-                release(login_account_failures_, username);
-                release(login_ip_failures_, remote);
-            }
-            audit("login", "success", user->username, remote);
+            // Correct password: give back only this attempt's slot, so other
+            // in-flight attempts keep theirs.
+            reservation.release();
 
             SessionRecord session;
             session.token = random_token();
@@ -1227,7 +1287,19 @@ void ApiServer::setup_routes()
             session.role = user->role;
             session.created_at = now;
             session.expires_at = now + (8LL * 60LL * 60LL * 1000LL);
-            store_.create_session(session);
+            // Created only if the hash that was just verified is still the
+            // user's current one, so a login that raced a password reset or a
+            // disable cannot outlive the revocation.
+            if (!store_.create_session_if_credentials_current(session, user->password_hash))
+            {
+                audit("login", "failure", username, remote);
+                res.status = 401;
+                set_json(res, json{
+                                  {"error", "invalid credentials"}
+                });
+                return;
+            }
+            audit("login", "success", user->username, remote);
             res.set_header("Set-Cookie", "tw_session=" + session.token +
                                              "; Path=/; HttpOnly; SameSite=Strict; Secure; Max-Age=28800");
             set_json(res, json{
@@ -2890,15 +2962,18 @@ void ApiServer::setup_routes()
                 throw std::runtime_error("password is required");
             if (password.size() > 256)
                 throw std::runtime_error("password must be 256 characters or fewer");
-            store_.update_user_password(user_id, hash_password(password));
-            LOGF_INFO("Changed password for user_id=%lld by=%s", static_cast<long long>(user_id),
-                      session->username.c_str());
             // Issue #145: a new password invalidates existing logins. On a
             // self-service change the current session is kept (so the user
             // is not logged out of the page that made the change); an admin
             // reset of another account revokes all of that account's sessions.
+            // The store applies the new hash and the revocation atomically,
+            // so a failure cannot leave the new password set while old
+            // sessions stay valid.
             const auto kept_token = user_id == session->user_id ? cookie_value(req, "tw_session") : std::string{};
-            const auto revoked = store_.delete_sessions_for_user(user_id, kept_token);
+            const auto revoked =
+                store_.update_user_password_and_revoke_sessions(user_id, hash_password(password), kept_token);
+            LOGF_INFO("Changed password for user_id=%lld by=%s", static_cast<long long>(user_id),
+                      session->username.c_str());
             audit("password_change", "success", session->username, client_ip(req), target_user->username);
             if (revoked > 0)
                 audit("session_revoke", "success", session->username, client_ip(req), target_user->username);

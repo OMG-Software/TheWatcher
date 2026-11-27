@@ -221,6 +221,17 @@ public:
     virtual int delete_sessions_for_user(int64_t user_id, const std::string& keep_token = "") = 0;
     // Removes sessions that expired at or before now_ms. Returns the number removed.
     virtual int delete_expired_sessions(int64_t now_ms) = 0;
+    // Creates the session only while the user still exists, is enabled and
+    // still has password_hash (the hash the login verified). Returns false
+    // otherwise, so a login that raced a password reset or disable cannot
+    // mint a session after the old ones were revoked. Atomic.
+    virtual bool create_session_if_credentials_current(const SessionRecord& session,
+                                                       const std::string& password_hash) = 0;
+    // Replaces the password hash and revokes the user's sessions except
+    // keep_token (empty keeps none) as one atomic operation: either both
+    // happen or neither does. Returns the number of sessions revoked.
+    virtual int update_user_password_and_revoke_sessions(int64_t user_id, const std::string& password_hash,
+                                                         const std::string& keep_token = "") = 0;
 
     virtual void insert_metrics(const MetricsRow& row) = 0;
     virtual std::vector<MetricsRow> get_metrics(const std::string& agent_id, int limit = 100) = 0;

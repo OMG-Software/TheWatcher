@@ -383,7 +383,7 @@ SCENARIO("Trusted proxies may be given as CIDR ranges")
 
     GIVEN("an API server whose trusted entries are invalid or do not contain the peer")
     {
-        ApiFixture fx(60'000, {"10.0.0.0/8", "not-an-address", "10.0.0.0/99"});
+        ApiFixture fx(60'000, {"192.0.2.0/24", "not-an-address", "192.0.2.0/99"});
 
         WHEN("ten failures each claim a different forwarded client")
         {
@@ -495,6 +495,80 @@ SCENARIO("Concurrent login attempts cannot exceed the failure limit")
             {
                 REQUIRE(unauthorized.load() == 5);
                 REQUIRE(throttled.load() == attempts - 5);
+            }
+        }
+    }
+}
+
+SCENARIO("A trusted proxy that forwards an empty address list cannot lock out other clients")
+{
+    GIVEN("an API server that trusts 127.0.0.1 as a reverse proxy")
+    {
+        ApiFixture fx(60'000, {"127.0.0.1"});
+
+        WHEN("ten failures arrive with an X-Forwarded-For that holds no address")
+        {
+            for (int i = 0; i < 10; ++i)
+                REQUIRE(attempt_login_via_proxy(fx.client, ",,", "spray-user-" + std::to_string(i), "wrong-password") ==
+                        401);
+
+            THEN("only the empty-header bucket is throttled, not the proxy address")
+            {
+                REQUIRE(attempt_login_via_proxy(fx.client, ",,", "thewatcher", "look_at_me") == 429);
+                REQUIRE(attempt_login(fx.client, "thewatcher", "look_at_me") == 200);
+            }
+        }
+
+        WHEN("the forwarded list contains only trusted proxies")
+        {
+            for (int i = 0; i < 10; ++i)
+                REQUIRE(attempt_login_via_proxy(fx.client, "127.0.0.1", "spray-user-" + std::to_string(i),
+                                                "wrong-password") == 401);
+
+            THEN("the request is attributed to the proxy address itself")
+            {
+                REQUIRE(attempt_login(fx.client, "thewatcher", "look_at_me") == 429);
+            }
+        }
+    }
+}
+
+SCENARIO("A trusted IPv6 range does not trust IPv4 peers")
+{
+    GIVEN("an API server that trusts every IPv6 address but no IPv4 address")
+    {
+        ApiFixture fx(60'000, {"::/0"});
+
+        WHEN("ten failures from an IPv4 peer each claim a different forwarded client")
+        {
+            for (int i = 0; i < 10; ++i)
+                REQUIRE(attempt_login_via_proxy(fx.client, "198.51.100." + std::to_string(i + 1),
+                                                "spray-user-" + std::to_string(i), "wrong-password") == 401);
+
+            THEN("the headers are ignored and the real peer is throttled")
+            {
+                REQUIRE(attempt_login_via_proxy(fx.client, "198.51.100.200", "thewatcher", "look_at_me") == 429);
+            }
+        }
+    }
+}
+
+SCENARIO("A successful login only releases its own throttle reservation")
+{
+    GIVEN("an API server and four completed failures for the admin account")
+    {
+        ApiFixture fx(60'000);
+        for (int i = 0; i < 4; ++i)
+            REQUIRE(attempt_login(fx.client, "thewatcher", "wrong-password") == 401);
+
+        WHEN("a correct login succeeds and one more failure follows")
+        {
+            REQUIRE(attempt_login(fx.client, "thewatcher", "look_at_me") == 200);
+            REQUIRE(attempt_login(fx.client, "thewatcher", "wrong-password") == 401);
+
+            THEN("the earlier failures still count, so the account is now locked out")
+            {
+                REQUIRE(attempt_login(fx.client, "thewatcher", "wrong-password") == 429);
             }
         }
     }

@@ -1018,6 +1018,42 @@ int PostgresStore::delete_expired_sessions(int64_t now_ms)
     return affected != nullptr ? std::atoi(affected) : 0;
 }
 
+bool PostgresStore::create_session_if_credentials_current(const SessionRecord& session,
+                                                          const std::string& password_hash)
+{
+    const auto p_uid = s(session.user_id);
+    const auto p_cat = s(session.created_at);
+    const auto p_eat = s(session.expires_at);
+    const char* params[] = {session.token.c_str(), p_uid.c_str(), p_cat.c_str(), p_eat.c_str(), password_hash.c_str()};
+    // One statement, so the check and the insert are atomic.
+    Res res(PQexecParams(conn_,
+                         "INSERT INTO sessions(token,user_id,created_at,expires_at) "
+                         "SELECT $1::text,user_id,$3::bigint,$4::bigint FROM users "
+                         "WHERE user_id=$2::bigint AND password_hash=$5 AND disabled=FALSE "
+                         "ON CONFLICT DO NOTHING;",
+                         5, nullptr, params, nullptr, nullptr, 0));
+    check_res(res.r, "create_session_if_credentials_current");
+    const char* affected = PQcmdTuples(res.r);
+    return affected != nullptr && std::atoi(affected) > 0;
+}
+
+int PostgresStore::update_user_password_and_revoke_sessions(int64_t user_id, const std::string& password_hash,
+                                                            const std::string& keep_token)
+{
+    const auto p_uid = s(user_id);
+    const char* params[] = {password_hash.c_str(), p_uid.c_str(), keep_token.c_str()};
+    // A single statement is atomic: the sessions are deleted only for the
+    // user row that was just updated.
+    Res res(PQexecParams(conn_, R"(
+        WITH upd AS (UPDATE users SET password_hash=$1 WHERE user_id=$2::bigint RETURNING user_id)
+        DELETE FROM sessions WHERE user_id IN (SELECT user_id FROM upd) AND token<>$3;
+    )",
+                         3, nullptr, params, nullptr, nullptr, 0));
+    check_res(res.r, "update_user_password_and_revoke_sessions");
+    const char* affected = PQcmdTuples(res.r);
+    return affected != nullptr ? std::atoi(affected) : 0;
+}
+
 // ── Metrics ───────────────────────────────────────────────────────────────────
 
 void PostgresStore::insert_metrics(const MetricsRow& row)

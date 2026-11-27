@@ -32,12 +32,13 @@ struct PendingCommand
     CommandMessage cmd;
 };
 
-// A trusted-proxy network: address bytes (IPv4 as IPv4-mapped IPv6) and the
+// A trusted-proxy network: address bytes (IPv4 as IPv4-mapped IPv6), family and the
 // number of leading bits that must match.
 struct ProxyRange
 {
     std::array<unsigned char, 16> bytes{};
     int prefix_bits = 128;
+    bool is_v4 = false; // address family; a range only matches its own family
 };
 
 // REST API server (runs on its own thread via httplib).
@@ -94,6 +95,36 @@ private:
     // event. user/target are sanitised; detail must not contain secrets.
     void audit(const char* event, const char* outcome, const std::string& user, const std::string& source,
                const std::string& target = "") const;
+    // RAII hold on one login attempt's slot in the three throttle counters.
+    // arm() is called once the slot was counted (under login_mutex_). The
+    // destructor gives the slot back unless keep() recorded a genuine
+    // credential failure, so a success or an exception never consumes a slot
+    // and never touches other in-flight attempts' slots.
+    class LoginReservation
+    {
+    public:
+        LoginReservation(ApiServer& api, std::string pair_key, std::string username, std::string remote);
+        LoginReservation(const LoginReservation&) = delete;
+        LoginReservation& operator=(const LoginReservation&) = delete;
+        ~LoginReservation();
+        void arm() noexcept
+        {
+            armed_ = true;
+        }
+        void keep() noexcept
+        {
+            armed_ = false;
+        }
+        void release();
+
+    private:
+        ApiServer& api_;
+        std::string pair_key_;
+        std::string username_;
+        std::string remote_;
+        bool armed_ = false;
+    };
+
     // Deletes expired sessions at most once per purge interval.
     void purge_expired_sessions_if_due(int64_t now_ms);
 
@@ -122,7 +153,8 @@ private:
     // Argon2 hash of a throwaway password; verified when a login names an
     // unknown or disabled user so those paths cost the same as a real one.
     std::string dummy_password_hash_;
-    std::atomic<int64_t> last_session_purge_ms_{0};
+    std::atomic<int64_t> last_session_purge_ms_{0};  // advanced only after a successful purge
+    std::atomic<bool> session_purge_running_{false}; // at most one purge in flight
 };
 
 } // namespace thewatcher::server

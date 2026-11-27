@@ -413,3 +413,77 @@ SCENARIO("Authentication events are audit logged")
         }
     }
 }
+
+SCENARIO("A session can only be created for credentials that are still current")
+{
+    GIVEN("a store with a user whose password hash was read by a login")
+    {
+        auto store = thewatcher::server::make_store("sqlite", ":memory:");
+        const auto old_hash = hash_for("old-password");
+        const auto user_id = store->create_user("frank", old_hash, "global_viewer");
+        const int64_t now = 1'000'000;
+
+        WHEN("the hash is still current")
+        {
+            const auto created =
+                store->create_session_if_credentials_current(make_session("s1", user_id, now + hour_ms), old_hash);
+
+            THEN("the session is created")
+            {
+                REQUIRE(created);
+                REQUIRE(store->get_session("s1", now));
+            }
+        }
+
+        WHEN("the password changed after the login verified the old hash")
+        {
+            store->update_user_password(user_id, hash_for("new-password"));
+            const auto created =
+                store->create_session_if_credentials_current(make_session("s2", user_id, now + hour_ms), old_hash);
+
+            THEN("no session is created")
+            {
+                REQUIRE_FALSE(created);
+                REQUIRE_FALSE(store->get_session("s2", now));
+            }
+        }
+
+        WHEN("the user was disabled after the login verified the hash")
+        {
+            store->disable_user(user_id);
+            const auto created =
+                store->create_session_if_credentials_current(make_session("s3", user_id, now + hour_ms), old_hash);
+
+            THEN("no session is created")
+            {
+                REQUIRE_FALSE(created);
+            }
+        }
+    }
+}
+
+SCENARIO("A password change and the revocation of old sessions are one operation")
+{
+    GIVEN("a user with two sessions")
+    {
+        auto store = thewatcher::server::make_store("sqlite", ":memory:");
+        const auto user_id = store->create_user("gina", hash_for("old-password"), "global_viewer");
+        const int64_t now = 1'000'000;
+        store->create_session(make_session("keep", user_id, now + hour_ms));
+        store->create_session(make_session("drop", user_id, now + hour_ms));
+        const auto new_hash = hash_for("new-password");
+
+        WHEN("the password is replaced while keeping one session")
+        {
+            const auto revoked = store->update_user_password_and_revoke_sessions(user_id, new_hash, "keep");
+
+            THEN("the hash is stored and only the other session is revoked")
+            {
+                REQUIRE(revoked == 1);
+                REQUIRE(store->get_user_by_username("gina")->password_hash == new_hash);
+                REQUIRE(store->get_session("keep", now));
+                REQUIRE_FALSE(store->get_session("drop", now));
+            }
+        }
+    }
+}

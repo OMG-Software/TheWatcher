@@ -26,6 +26,14 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Authentication and authorization events are audit logged as `AUDIT` lines
   at NOTICE: login success/failure/lockout, logout, every 403, user
   create/disable/enable/delete, password change and session revocation (#70).
+- Hardened the new login and session code after review: a successful login
+  releases only its own throttle slot, an empty forwarded header and the
+  wrong address family no longer fall back to the proxy address or trust
+  the wrong peers, a login that verified an old password cannot create a
+  session after a reset or disable, the password change and session
+  revocation are atomic, and the dummy hash is generated randomly at startup.
+  New store methods `create_session_if_credentials_current` and
+  `update_user_password_and_revoke_sessions` (#145, #153, #154).
 - Fixed a server crash (NULL dereference) and heap over-read when a metrics
   or collector-config payload has a CBOR `null`/`true`/`false`/`undefined`
   or a half/single-precision float where a double is expected. All float

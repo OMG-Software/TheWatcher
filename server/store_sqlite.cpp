@@ -987,6 +987,43 @@ int SqliteStore::delete_expired_sessions(int64_t now_ms)
     return sqlite3_changes(db_);
 }
 
+bool SqliteStore::create_session_if_credentials_current(const SessionRecord& session, const std::string& password_hash)
+{
+    // One statement, so the check and the insert cannot interleave with a
+    // password change or disable.
+    Stmt st;
+    check(sqlite3_prepare_v2(db_,
+                             "INSERT OR REPLACE INTO sessions(token,user_id,created_at,expires_at) "
+                             "SELECT ?,user_id,?,? FROM users WHERE user_id=? AND password_hash=? AND disabled=0;",
+                             -1, &st.s, nullptr),
+          db_, "prepare create_session_if_credentials_current");
+    sqlite3_bind_text(st.s, 1, session.token.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(st.s, 2, session.created_at);
+    sqlite3_bind_int64(st.s, 3, session.expires_at);
+    sqlite3_bind_int64(st.s, 4, session.user_id);
+    sqlite3_bind_text(st.s, 5, password_hash.c_str(), -1, SQLITE_TRANSIENT);
+    check(sqlite3_step(st.s), db_, "step create_session_if_credentials_current");
+    return sqlite3_changes(db_) > 0;
+}
+
+int SqliteStore::update_user_password_and_revoke_sessions(int64_t user_id, const std::string& password_hash,
+                                                          const std::string& keep_token)
+{
+    exec("BEGIN IMMEDIATE;");
+    try
+    {
+        update_user_password(user_id, password_hash);
+        const auto revoked = delete_sessions_for_user(user_id, keep_token);
+        exec("COMMIT;");
+        return revoked;
+    }
+    catch (...)
+    {
+        exec("ROLLBACK;");
+        throw;
+    }
+}
+
 void SqliteStore::insert_metrics(const MetricsRow& row)
 {
     Stmt st;
