@@ -29,7 +29,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(ProcessInfo, pid, name, status, 
 
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(NetworkMetrics, interface_name, bytes_sent_per_sec, bytes_recv_per_sec,
                                                 packets_sent_per_sec, packets_recv_per_sec, errors_in, errors_out,
-                                                drops_in, drops_out, ip_address, mac_address, is_up)
+                                                drops_in, drops_out, ip_address, mac_address, is_up, is_loopback)
 
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(SystemMetrics, cpu, memory, disks, temperatures, top_processes,
                                                 networks, os_name, os_version, hostname, platform, uptime_seconds)

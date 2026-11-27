@@ -278,6 +278,8 @@ export interface NetworkMetrics {
   ip_address: string;
   mac_address: string;
   is_up: boolean;
+  /** Absent when the agent or server predates the loopback flag. */
+  is_loopback?: boolean;
 }
 
 export interface SystemMetrics {

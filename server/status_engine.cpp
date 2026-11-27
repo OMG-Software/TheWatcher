@@ -8,6 +8,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <stdexcept>
 #include <vector>
@@ -62,9 +63,48 @@ namespace
         return nullptr;
     }
 
+    // True when name is `prefix` followed only by digits (lo, lo0, enc0).
+    bool is_numbered_device(const std::string& name, const std::string& prefix)
+    {
+        return name.compare(0, prefix.size(), prefix) == 0 &&
+               std::all_of(name.begin() + static_cast<std::ptrdiff_t>(prefix.size()), name.end(), [](unsigned char ch) {
+                   return std::isdigit(ch) != 0;
+               });
+    }
+
+    // True for interfaces that are not real links: loopback and pseudo devices
+    // (BSD lo0/pflog0/pfsync0/enc0, Windows loopback and tunnel pseudo
+    // adapters). The agent's is_loopback flag is authoritative; the name
+    // patterns catch pseudo devices the agent cannot flag and older agents.
+    bool is_loopback_or_pseudo_interface(const NetworkMetrics& network)
+    {
+        if (network.is_loopback)
+            return true;
+
+        std::string name = network.interface_name;
+        std::transform(name.begin(), name.end(), name.begin(), [](unsigned char ch) {
+            return static_cast<char>(std::tolower(ch));
+        });
+
+        for (const char* prefix : {"lo", "pflog", "pfsync", "enc", "ipfw"})
+        {
+            if (is_numbered_device(name, prefix))
+                return true;
+        }
+        for (const char* fragment : {"loopback", "pseudo-interface", "isatap", "teredo", "6to4"})
+        {
+            if (name.find(fragment) != std::string::npos)
+                return true;
+        }
+        return false;
+    }
+
+    // With no explicit network configuration only real, connected interfaces
+    // are evaluated: a down interface (disconnected Wi-Fi/VPN, unused NIC) is
+    // ignored unless the operator configures it by name.
     bool should_monitor_default_network(const NetworkMetrics& network)
     {
-        return network.interface_name != "lo";
+        return network.is_up && !is_loopback_or_pseudo_interface(network);
     }
 
     void send_webhook(Store& store, const AlertRecord& alert, int64_t alert_id)

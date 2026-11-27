@@ -24,6 +24,7 @@ export declare function formatBytes(bytes: number): string;
 export declare function formatDuration(seconds: number): string;
 export declare const UPTIME_ALARM_SECONDS = 3600;
 export declare function isUptimeAlarm(uptimeSeconds: number): boolean;
+export declare const NETWORK_ERROR_DELTA_THRESHOLD = 10;
 export declare function primaryIpAddress(metrics?: SystemMetrics): string;
 export declare function toDashboardAgents(agents: AgentRecord[], snapshots: MetricsSnapshot[], alerts?: AlertRecord[]): DashboardAgent[];
 export declare function agentStatus(agent: DashboardAgent): HealthColor;

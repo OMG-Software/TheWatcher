@@ -36,6 +36,32 @@ On Windows, the network collector reports IP Helper adapters that line up with
 layer filters, Hyper-V virtual switch plumbing, 6to4/tunnel adapters, and bridge
 devices are filtered before metrics are emitted.
 
+### Network collector fields
+
+- Rates (`bytes_*_per_sec`, `packets_*_per_sec`) are the counter growth since
+  the previous sample divided by the elapsed time. A counter that goes
+  backwards was reset, and what it now holds is used as the growth. The first
+  sample of an interface reports 0.
+- `errors_in`, `errors_out`, `drops_in` and `drops_out` are the **change since
+  the previous sample**, not totals since boot (0 on the first sample).
+- `is_up` is the link state: `IFF_UP` and `IFF_RUNNING` on Linux and BSD, an
+  operational `OperStatus` on Windows.
+- `is_loopback` is set from `IFF_LOOPBACK` (Linux/BSD) or the software
+  loopback interface type (Windows).
+- `ip_address` is the primary address: global IPv4, else global IPv6, else a
+  link-local one. `mac_address` is empty when the interface has no six-byte
+  hardware address.
+- Linux uses `getifaddrs` (flags, addresses, MAC via `AF_PACKET`) plus
+  `/proc/net/dev` (64-bit counters). FreeBSD, OpenBSD, NetBSD and DragonFly use
+  `getifaddrs` with the `AF_LINK` `if_data` counters; BSD reports input queue
+  drops only (`drops_out` is 0). Windows uses `GetIfEntry2` (`MIB_IF_ROW2`),
+  whose octet and packet counters are 64-bit; packet counts include
+  non-unicast packets.
+- The server's default evaluation (no explicit network config) skips
+  loopback, pseudo devices (`lo`, `lo0`, `pflog0`, `pfsync0`, `enc0`, Windows
+  loopback/6to4/ISATAP/Teredo) and interfaces that are down. An interface named
+  in the collector config is always evaluated, and a down one is red.
+
 The agent also fills static system fields in `Agent::fill_static_info()`:
 
 ```text

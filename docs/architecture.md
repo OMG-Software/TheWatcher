@@ -79,8 +79,37 @@ common/windows_service.hpp
 
 Protocol frames are CBOR-encoded `thewatcher::proto::Frame` values (libcbor
 0.13.0). Each frame is a definite-length CBOR array of `[type, agent_id,
-timestamp_ms, payload]`. The payload is itself a CBOR-encoded buffer whose
-shape is determined by `FrameType`.
+timestamp_ms, payload, protocol_version]`. The payload is itself a CBOR-encoded
+buffer whose shape is determined by `FrameType`.
+
+### Protocol versioning and compatibility
+
+`proto::PROTOCOL_VERSION` (currently 2) travels in every frame. It covers the
+messages inside the payload too (enrollment, commands, metrics), because they
+are always carried in a frame. Version 1 is the legacy four-element frame that
+has no version field; a frame without one decodes as version 1.
+
+Rules for every decoder in `common/`:
+
+- Accept an array with **at least** the elements this build knows, never an
+  exact count. Read the known elements and ignore any trailing ones.
+- Optional elements added later (for example `NetworkMetrics.is_loopback`)
+  are read only when present and default sensibly when absent.
+- **Add new fields only by appending them** to the end of an array. Never
+  reorder, remove or change the type of an existing element. A change that
+  follows these rules is compatible in both directions and needs no version
+  bump: old peers ignore the new field, new peers default a missing one.
+- Bump `PROTOCOL_VERSION` only for an incompatible change. A decoder rejects a
+  frame whose version is newer than its own (`Unsupported protocol version`)
+  or is 0, so an incompatible peer fails with an explicit error instead of
+  misreading data.
+
+Compatibility with releases before 0.9.0: a 0.9.0 server reads frames and
+payloads from older agents (a frame without a version, a 12-element
+`NetworkMetrics`). Releases before 0.9.0 required exact array lengths, so they
+cannot read the five-element frames 0.9.0 agents send. This is a one-time
+break: **upgrade the server before the agents**. From 0.9.0 on, peers follow
+the rules above.
 
 Frame types:
 

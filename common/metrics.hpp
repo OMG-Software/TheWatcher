@@ -89,6 +89,9 @@ struct NetworkMetrics
     std::string ip_address;
     std::string mac_address;
     bool is_up = false;
+    // True for loopback interfaces (IFF_LOOPBACK / software loopback type).
+    // Appended wire field 13; absent from older agents (decodes as false).
+    bool is_loopback = false;
 };
 
 struct SystemMetrics
@@ -242,7 +245,7 @@ inline CborPtr to_cbor(const thewatcher::CpuMetrics& m)
 template <>
 inline thewatcher::CpuMetrics from_cbor<thewatcher::CpuMetrics>(cbor_item_t* item)
 {
-    if (!cbor_isa_array(item) || cbor_array_size(item) != 12)
+    if (!cbor_isa_array(item) || cbor_array_size(item) < 12)
     {
         throw std::runtime_error("Invalid CpuMetrics CBOR payload");
     }
@@ -286,7 +289,7 @@ inline CborPtr to_cbor(const thewatcher::MemoryMetrics& m)
 template <>
 inline thewatcher::MemoryMetrics from_cbor<thewatcher::MemoryMetrics>(cbor_item_t* item)
 {
-    if (!cbor_isa_array(item) || cbor_array_size(item) != 10)
+    if (!cbor_isa_array(item) || cbor_array_size(item) < 10)
     {
         throw std::runtime_error("Invalid MemoryMetrics CBOR payload");
     }
@@ -327,7 +330,7 @@ inline CborPtr to_cbor(const thewatcher::DiskMetrics& m)
 template <>
 inline thewatcher::DiskMetrics from_cbor<thewatcher::DiskMetrics>(cbor_item_t* item)
 {
-    if (!cbor_isa_array(item) || cbor_array_size(item) != 9)
+    if (!cbor_isa_array(item) || cbor_array_size(item) < 9)
     {
         throw std::runtime_error("Invalid DiskMetrics CBOR payload");
     }
@@ -361,7 +364,7 @@ inline CborPtr to_cbor(const thewatcher::TemperatureMetrics& m)
 template <>
 inline thewatcher::TemperatureMetrics from_cbor<thewatcher::TemperatureMetrics>(cbor_item_t* item)
 {
-    if (!cbor_isa_array(item) || cbor_array_size(item) != 3)
+    if (!cbor_isa_array(item) || cbor_array_size(item) < 3)
     {
         throw std::runtime_error("Invalid TemperatureMetrics CBOR payload");
     }
@@ -394,7 +397,7 @@ inline CborPtr to_cbor(const thewatcher::ProcessInfo& p)
 template <>
 inline thewatcher::ProcessInfo from_cbor<thewatcher::ProcessInfo>(cbor_item_t* item)
 {
-    if (!cbor_isa_array(item) || cbor_array_size(item) != 8)
+    if (!cbor_isa_array(item) || cbor_array_size(item) < 8)
     {
         throw std::runtime_error("Invalid ProcessInfo CBOR payload");
     }
@@ -415,7 +418,7 @@ inline thewatcher::ProcessInfo from_cbor<thewatcher::ProcessInfo>(cbor_item_t* i
 template <>
 inline CborPtr to_cbor(const thewatcher::NetworkMetrics& m)
 {
-    auto root = adopt(cbor_new_definite_array(12));
+    auto root = adopt(cbor_new_definite_array(13));
 
     push(root.get(), make_string(m.interface_name));
     push(root.get(), make_uint64(m.bytes_sent_per_sec));
@@ -429,6 +432,7 @@ inline CborPtr to_cbor(const thewatcher::NetworkMetrics& m)
     push(root.get(), make_string(m.ip_address));
     push(root.get(), make_string(m.mac_address));
     push(root.get(), make_bool(m.is_up));
+    push(root.get(), make_bool(m.is_loopback));
 
     return root;
 }
@@ -436,7 +440,7 @@ inline CborPtr to_cbor(const thewatcher::NetworkMetrics& m)
 template <>
 inline thewatcher::NetworkMetrics from_cbor<thewatcher::NetworkMetrics>(cbor_item_t* item)
 {
-    if (!cbor_isa_array(item) || cbor_array_size(item) != 12)
+    if (!cbor_isa_array(item) || cbor_array_size(item) < 12)
     {
         throw std::runtime_error("Invalid NetworkMetrics CBOR payload");
     }
@@ -454,6 +458,9 @@ inline thewatcher::NetworkMetrics from_cbor<thewatcher::NetworkMetrics>(cbor_ite
     m.ip_address = read_string(array_get(item, 9));
     m.mac_address = read_string(array_get(item, 10));
     m.is_up = read_bool(array_get(item, 11));
+    // Element 12 (is_loopback) is absent from agents older than 0.9.0.
+    if (cbor_array_size(item) >= 13)
+        m.is_loopback = read_bool(array_get(item, 12));
 
     return m;
 }
@@ -525,7 +532,7 @@ inline CborPtr to_cbor(const thewatcher::SystemMetrics& m)
 template <>
 inline thewatcher::SystemMetrics from_cbor<thewatcher::SystemMetrics>(cbor_item_t* item)
 {
-    if (!cbor_isa_array(item) || cbor_array_size(item) != 11)
+    if (!cbor_isa_array(item) || cbor_array_size(item) < 11)
     {
         throw std::runtime_error("Invalid SystemMetrics CBOR payload");
     }

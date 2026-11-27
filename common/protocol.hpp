@@ -26,6 +26,15 @@ enum class FrameType : uint8_t
     LOG_MATCH = 0x09,
 };
 
+// Wire protocol version carried by every Frame (#102).
+//   1 = legacy: 4-element Frame without a version, exact-length decoders.
+//   2 = versioned Frame; every decoder accepts longer arrays and ignores
+//       unknown trailing fields, so additive changes need no version bump.
+// Bump PROTOCOL_VERSION only for an incompatible change; decoders reject a
+// frame whose version is newer than they understand.
+inline constexpr uint8_t PROTOCOL_VERSION = 2;
+inline constexpr uint8_t LEGACY_PROTOCOL_VERSION = 1;
+
 // Wire frame sent over every ZMQ message (CBOR-encoded).
 struct Frame
 {
@@ -33,6 +42,8 @@ struct Frame
     std::string agent_id;
     int64_t timestamp_ms = 0;
     std::vector<uint8_t> payload; // type-specific CBOR payload
+    // Protocol version of the sender; decoded as 1 when absent (legacy peer).
+    uint8_t protocol_version = PROTOCOL_VERSION;
 };
 
 // Enrollment sub-types (carried in Frame::payload).
@@ -290,12 +301,13 @@ namespace detail
     template <>
     inline CborPtr to_cbor(const Frame& f)
     {
-        auto root = adopt(cbor_new_definite_array(4));
+        auto root = adopt(cbor_new_definite_array(5));
 
         push(root.get(), make_uint8(f.type));
         push(root.get(), make_string(f.agent_id));
         push(root.get(), make_int64(f.timestamp_ms));
         push(root.get(), make_bytes(f.payload));
+        push(root.get(), make_uint8(f.protocol_version));
 
         return root;
     }
@@ -327,12 +339,15 @@ namespace detail
         return root;
     }
 
-    // Decodes a Frame from a 4-element CBOR array: type, agent_id, timestamp_ms,
-    // payload. Throws std::runtime_error on a wrong shape or element type.
+    // Decodes a Frame from a CBOR array of at least four elements: type,
+    // agent_id, timestamp_ms, payload, then the optional protocol version
+    // (absent = legacy version 1). Further elements are unknown future fields
+    // and are ignored. Throws std::runtime_error on a wrong shape or element
+    // type, or on a protocol version this build does not understand.
     template <>
     inline Frame from_cbor<Frame>(cbor_item_t* item)
     {
-        if (!cbor_isa_array(item) || cbor_array_size(item) != 4)
+        if (!cbor_isa_array(item) || cbor_array_size(item) < 4)
         {
             throw std::runtime_error("Invalid Frame CBOR payload");
         }
@@ -342,13 +357,19 @@ namespace detail
         f.agent_id = read_string(array_get(item, 1));
         f.timestamp_ms = read_int64(array_get(item, 2));
         f.payload = read_bytes(array_get(item, 3));
+        f.protocol_version = cbor_array_size(item) >= 5 ? read_uint8(array_get(item, 4)) : LEGACY_PROTOCOL_VERSION;
+        if (f.protocol_version < LEGACY_PROTOCOL_VERSION || f.protocol_version > PROTOCOL_VERSION)
+        {
+            throw std::runtime_error("Unsupported protocol version");
+        }
 
         return f;
     }
 
-    // Decodes an EnrollRequest from a 4- or 5-element CBOR array. The fifth
-    // element is the SEC-05 token; without it enrollment_token stays empty.
-    // Throws std::runtime_error on any other shape or element type.
+    // Decodes an EnrollRequest from a CBOR array of at least four elements.
+    // The fifth element is the SEC-05 token; without it enrollment_token stays
+    // empty. Further elements are ignored. Throws std::runtime_error on any
+    // other shape or element type.
     template <>
     inline EnrollRequest from_cbor<EnrollRequest>(cbor_item_t* item)
     {
@@ -361,7 +382,7 @@ namespace detail
             throw std::runtime_error("Invalid EnrollRequest CBOR payload");
         }
         const auto element_count = cbor_array_size(item);
-        if (element_count != 4 && element_count != 5)
+        if (element_count < 4)
         {
             throw std::runtime_error("Invalid EnrollRequest CBOR payload");
         }
@@ -371,7 +392,7 @@ namespace detail
         r.hostname = read_string(array_get(item, 1));
         r.platform = read_string(array_get(item, 2));
         r.curve_public_key_z85 = read_string(array_get(item, 3));
-        if (element_count == 5)
+        if (element_count >= 5)
         {
             r.enrollment_token = read_string(array_get(item, 4));
         }
@@ -379,12 +400,13 @@ namespace detail
         return r;
     }
 
-    // Decodes an EnrollResponse from a 4-element CBOR array. Throws
-    // std::runtime_error on a wrong shape or element type.
+    // Decodes an EnrollResponse from a CBOR array of at least four elements;
+    // extra elements are ignored. Throws std::runtime_error on a wrong shape or
+    // element type.
     template <>
     inline EnrollResponse from_cbor<EnrollResponse>(cbor_item_t* item)
     {
-        if (!cbor_isa_array(item) || cbor_array_size(item) != 4)
+        if (!cbor_isa_array(item) || cbor_array_size(item) < 4)
         {
             throw std::runtime_error("Invalid EnrollResponse CBOR payload");
         }
