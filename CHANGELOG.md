@@ -76,6 +76,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   category keeps `<windows.h>`/`<winsock2.h>` ahead of the Win32 headers
   that need them (#121). The CI job installs `clang-format` with
   `--only-binary :all:`, so no source-distribution setup script can run.
+  The CI workflow limits `GITHUB_TOKEN` to `contents: read`.
 - SonarCloud leaves test code out of duplication detection
   (`.sonarcloud.properties`); BDD scenarios repeat their setup on purpose.
   Test files are still analysed for bugs and vulnerabilities.

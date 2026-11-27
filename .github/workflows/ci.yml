@@ -12,6 +12,12 @@ on:
   schedule:
     - cron: "32 1 * * 1"
 
+# Least privilege for GITHUB_TOKEN: every job only reads the repository.
+# actions/cache and actions/upload-artifact use the runner's own token and
+# need no extra scopes.
+permissions:
+  contents: read
+
 jobs:
 
   # ── Formatting ─────────────────────────────────────────────────────────────
