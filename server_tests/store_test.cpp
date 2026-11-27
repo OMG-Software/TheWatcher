@@ -1,4 +1,4 @@
-#include "../server/store_sqlite.hpp"
+#include "store_test_backend.hpp"
 #include "test_support/temp_dir.hpp"
 
 #include <catch2/catch_test_macros.hpp>
@@ -9,6 +9,7 @@
 using namespace thewatcher;
 using namespace thewatcher::server;
 
+#ifndef THEWATCHER_STORE_TEST_POSTGRES
 namespace
 {
 std::filesystem::path unique_store_path(const char* name)
@@ -22,17 +23,20 @@ std::filesystem::path unique_store_path(const char* name)
     return path;
 }
 } // namespace
+#endif
 
-// Each SCENARIO creates its own in-memory SQLite database, so tests are
-// fully isolated and leave no files on disk.
+// Every SCENARIO opens its own TestStore (store_test_backend.hpp): an in-memory
+// SQLite database, or, when built with THEWATCHER_STORE_TEST_POSTGRES, a
+// private PostgreSQL schema. The same scenarios therefore run against both
+// backends, which is the parity contract of the Store interface.
 
 // ── Empty store ───────────────────────────────────────────────────────────────
 
 SCENARIO("A freshly created store has no agents or metrics")
 {
-    GIVEN("an in-memory SQLite store")
+    GIVEN("an empty store")
     {
-        SqliteStore store(":memory:");
+        TestStore store;
 
         THEN("list_agents returns an empty vector")
         {
@@ -52,7 +56,7 @@ SCENARIO("An agent can be upserted and retrieved by id")
 {
     GIVEN("an in-memory store and a populated AgentRecord")
     {
-        SqliteStore store(":memory:");
+        TestStore store;
 
         AgentRecord rec;
         rec.agent_id = "agent-001";
@@ -87,7 +91,7 @@ SCENARIO("get_agent returns nullopt for an unknown id")
 {
     GIVEN("an empty store")
     {
-        SqliteStore store(":memory:");
+        TestStore store;
 
         WHEN("get_agent is called with an id that was never inserted")
         {
@@ -105,7 +109,7 @@ SCENARIO("Upserting an existing agent updates mutable fields but preserves first
 {
     GIVEN("a store with an existing agent")
     {
-        SqliteStore store(":memory:");
+        TestStore store;
 
         AgentRecord rec;
         rec.agent_id = "agent-004";
@@ -144,7 +148,7 @@ SCENARIO("list_agents returns all stored agents")
 {
     GIVEN("a store with two agents inserted")
     {
-        SqliteStore store(":memory:");
+        TestStore store;
 
         for (auto id : {"agent-A", "agent-B"})
         {
@@ -173,7 +177,7 @@ SCENARIO("Approving an agent sets the approved flag to true")
 {
     GIVEN("a store with an unapproved agent")
     {
-        SqliteStore store(":memory:");
+        TestStore store;
 
         AgentRecord rec;
         rec.agent_id = "agent-002";
@@ -200,7 +204,7 @@ SCENARIO("Rejecting an agent prevents later enrollment approval")
 {
     GIVEN("a store with a pending agent")
     {
-        SqliteStore store(":memory:");
+        TestStore store;
 
         AgentRecord rec;
         rec.agent_id = "agent-reject";
@@ -229,7 +233,7 @@ SCENARIO("Agent maintenance state is persisted across upserts")
 {
     GIVEN("a store with an approved agent")
     {
-        SqliteStore store(":memory:");
+        TestStore store;
 
         AgentRecord rec;
         rec.agent_id = "agent-maintenance";
@@ -259,7 +263,7 @@ SCENARIO("Agent runtime settings are persisted across upserts")
 {
     GIVEN("a store with an approved agent")
     {
-        SqliteStore store(":memory:");
+        TestStore store;
 
         AgentRecord rec;
         rec.agent_id = "agent-settings";
@@ -292,7 +296,7 @@ SCENARIO("Agent threshold settings are persisted across upserts")
 {
     GIVEN("a store with an approved agent")
     {
-        SqliteStore store(":memory:");
+        TestStore store;
 
         AgentRecord rec;
         rec.agent_id = "agent-thresholds";
@@ -342,7 +346,7 @@ SCENARIO("Agent collector config is persisted across upserts")
 {
     GIVEN("a store with an approved agent")
     {
-        SqliteStore store(":memory:");
+        TestStore store;
 
         AgentRecord rec;
         rec.agent_id = "agent-collector-config";
@@ -403,7 +407,7 @@ SCENARIO("Pending indicator readings are persisted and can be cleared")
 {
     GIVEN("a store with an approved agent")
     {
-        SqliteStore store(":memory:");
+        TestStore store;
 
         AgentRecord rec;
         rec.agent_id = "agent-pending-status";
@@ -439,6 +443,7 @@ SCENARIO("Pending indicator readings are persisted and can be cleared")
     }
 }
 
+#ifndef THEWATCHER_STORE_TEST_POSTGRES // reopening a database file is SQLite-specific
 SCENARIO("Agent maintenance metadata and group membership survive reopening the store")
 {
     GIVEN("a file-backed store with a maintained approved agent assigned to groups")
@@ -489,11 +494,13 @@ SCENARIO("Agent maintenance metadata and group membership survive reopening the 
     }
 }
 
+#endif // THEWATCHER_STORE_TEST_POSTGRES
+
 SCENARIO("A new store bootstraps the default admin user and Admins group")
 {
     GIVEN("an empty in-memory store")
     {
-        SqliteStore store(":memory:");
+        TestStore store;
 
         WHEN("users and groups are listed")
         {
@@ -523,7 +530,7 @@ SCENARIO("Soft-deleted alerts are hidden from active alert queries but remain hi
 {
     GIVEN("a store with an agent and an alert")
     {
-        SqliteStore store(":memory:");
+        TestStore store;
         AgentRecord rec;
         rec.agent_id = "agent-alert";
         rec.approved = true;
@@ -564,7 +571,7 @@ SCENARIO("Approved agents are marked offline after the configured cutoff")
 {
     GIVEN("a store with a connected approved agent last seen before the cutoff")
     {
-        SqliteStore store(":memory:");
+        TestStore store;
 
         AgentRecord rec;
         rec.agent_id = "agent-offline";
@@ -594,7 +601,7 @@ SCENARIO("Deleting an agent removes it from the store")
 {
     GIVEN("a store with a known agent")
     {
-        SqliteStore store(":memory:");
+        TestStore store;
 
         AgentRecord rec;
         rec.agent_id = "agent-003";
@@ -627,7 +634,7 @@ SCENARIO("Metrics can be inserted and retrieved for an agent")
 {
     GIVEN("a store with an agent and one metrics row")
     {
-        SqliteStore store(":memory:");
+        TestStore store;
 
         AgentRecord rec;
         rec.agent_id = "agent-m1";
@@ -660,7 +667,7 @@ SCENARIO("get_metrics respects the row limit and returns newest rows first")
 {
     GIVEN("a store with 5 metrics rows for one agent")
     {
-        SqliteStore store(":memory:");
+        TestStore store;
 
         AgentRecord rec;
         rec.agent_id = "agent-m2";
@@ -699,7 +706,7 @@ SCENARIO("latest_metrics returns one row per agent with their most recent timest
 {
     GIVEN("two agents each with three metrics rows at different timestamps")
     {
-        SqliteStore store(":memory:");
+        TestStore store;
 
         for (auto id : {"alpha", "beta"})
         {
@@ -743,7 +750,7 @@ SCENARIO("Acknowledging an alert stores the operator note alongside the ack meta
 {
     GIVEN("a store with an agent and an active alert")
     {
-        SqliteStore store(":memory:");
+        TestStore store;
 
         AgentRecord rec;
         rec.agent_id = "agent-note";
@@ -796,7 +803,7 @@ SCENARIO("Unacknowledged alerts older than the cutoff are escalated")
 {
     GIVEN("a store with two unacknowledged alerts at different ages")
     {
-        SqliteStore store(":memory:");
+        TestStore store;
 
         AgentRecord rec;
         rec.agent_id = "agent-esc";
@@ -850,7 +857,7 @@ SCENARIO("Bulk acknowledging alerts sets ack metadata on all specified alerts")
 {
     GIVEN("a store with an agent and three active alerts")
     {
-        SqliteStore store(":memory:");
+        TestStore store;
 
         AgentRecord rec;
         rec.agent_id = "agent-bulk";
@@ -906,7 +913,7 @@ SCENARIO("count_metrics_in_window counts only rows within the time window")
 {
     GIVEN("a store with 5 metrics rows for an agent spread over time")
     {
-        SqliteStore store(":memory:");
+        TestStore store;
 
         AgentRecord rec;
         rec.agent_id = "agent-cnt";
@@ -941,7 +948,7 @@ SCENARIO("Maintenance windows can be created, listed, and deleted")
 {
     GIVEN("an empty store")
     {
-        SqliteStore store(":memory:");
+        TestStore store;
 
         WHEN("a maintenance window is created")
         {
@@ -980,7 +987,7 @@ SCENARIO("Bulk soft-deleting alerts hides all specified alerts from active queri
 {
     GIVEN("a store with an agent and four alerts")
     {
-        SqliteStore store(":memory:");
+        TestStore store;
 
         AgentRecord rec;
         rec.agent_id = "agent-bulk-del";
@@ -1025,7 +1032,7 @@ SCENARIO("get_offline_unalerted_agent_ids returns only offline approved agents w
 {
     GIVEN("a store with several agents in different states")
     {
-        SqliteStore store(":memory:");
+        TestStore store;
 
         auto make_agent = [&](const std::string& id, bool approved, bool connected, bool maintenance) {
             AgentRecord r;
@@ -1070,7 +1077,7 @@ SCENARIO("archive_heartbeat_alerts_for_agent removes active Heartbeat alerts for
 {
     GIVEN("two agents each with an active Heartbeat alert")
     {
-        SqliteStore store(":memory:");
+        TestStore store;
 
         for (auto id : {"agent-A", "agent-B"})
         {
@@ -1127,7 +1134,7 @@ SCENARIO("active_maintenance_windows only returns windows that span the current 
 {
     GIVEN("a store with windows in the past, present, and future")
     {
-        SqliteStore store(":memory:");
+        TestStore store;
 
         MaintenanceWindowRecord past;
         past.agent_id = "*";
@@ -1167,7 +1174,7 @@ SCENARIO("set_agent_description stores a description against a known agent")
 {
     GIVEN("a store with an approved agent")
     {
-        SqliteStore store(":memory:");
+        TestStore store;
 
         AgentRecord agent;
         agent.agent_id = "desc-agent";
@@ -1212,7 +1219,7 @@ SCENARIO("disable_user and enable_user toggle the disabled flag")
 {
     GIVEN("a store with a non-built-in user")
     {
-        SqliteStore store(":memory:");
+        TestStore store;
 
         store.create_user("operator1", "hash", "operator");
 
@@ -1260,7 +1267,7 @@ SCENARIO("delete_user removes a non-built-in user")
 {
     GIVEN("a store with two users")
     {
-        SqliteStore store(":memory:");
+        TestStore store;
 
         store.create_user("to-delete", "h1", "viewer");
         store.create_user("to-keep", "h2", "viewer");
@@ -1297,7 +1304,7 @@ SCENARIO("update_user_password changes the stored credential hash")
 {
     GIVEN("a store with a user")
     {
-        SqliteStore store(":memory:");
+        TestStore store;
 
         store.create_user("pwuser", "old-hash", "viewer");
 
@@ -1330,7 +1337,7 @@ SCENARIO("list_approved_agents and list_pending_agents filter by enrollment stat
 {
     GIVEN("a store with approved, pending, and rejected agents")
     {
-        SqliteStore store(":memory:");
+        TestStore store;
 
         AgentRecord pending_agent;
         pending_agent.agent_id = "pending-1";
@@ -1382,7 +1389,7 @@ SCENARIO("session lifecycle: create, retrieve by token, and expire")
 {
     GIVEN("an empty store")
     {
-        SqliteStore store(":memory:");
+        TestStore store;
 
         WHEN("a session is created and retrieved before expiry")
         {
@@ -1461,7 +1468,7 @@ SCENARIO("settings key-value store persists values with fallback for missing key
 {
     GIVEN("an empty store")
     {
-        SqliteStore store(":memory:");
+        TestStore store;
 
         WHEN("a missing key is fetched without a fallback")
         {
@@ -1511,7 +1518,7 @@ SCENARIO("group management: groups can be created and listed")
 {
     GIVEN("a fresh store with only the built-in Admins group")
     {
-        SqliteStore store(":memory:");
+        TestStore store;
         auto initial = store.list_groups();
         REQUIRE(initial.size() == 1);
         REQUIRE(initial[0].name == "Admins");
@@ -1550,7 +1557,7 @@ SCENARIO("agent group membership can be set and retrieved")
 {
     GIVEN("a store with an agent and two groups")
     {
-        SqliteStore store(":memory:");
+        TestStore store;
 
         AgentRecord agent;
         agent.agent_id = "grp-agent";
@@ -1606,7 +1613,7 @@ SCENARIO("user group membership can be set and retrieved")
 {
     GIVEN("a store with a user and two groups")
     {
-        SqliteStore store(":memory:");
+        TestStore store;
 
         int64_t uid = store.create_user("viewer1", "hash", "viewer");
         int64_t gid1 = store.create_group("TeamA");
@@ -1643,7 +1650,7 @@ SCENARIO("status history records transitions and the latest entry is queryable p
 {
     GIVEN("a store with an approved agent")
     {
-        SqliteStore store(":memory:");
+        TestStore store;
 
         AgentRecord agent;
         agent.agent_id = "hist-agent";
@@ -1733,7 +1740,7 @@ SCENARIO("pending status accumulates consecutive readings and clears on recovery
 {
     GIVEN("a store with an approved agent")
     {
-        SqliteStore store(":memory:");
+        TestStore store;
 
         AgentRecord agent;
         agent.agent_id = "pending-agent";
@@ -1792,7 +1799,7 @@ SCENARIO("clear_active_alerts_for_agent archives only that agent's alerts")
 {
     GIVEN("a store with active alerts for two different agents")
     {
-        SqliteStore store(":memory:");
+        TestStore store;
 
         AgentRecord a1;
         a1.agent_id = "agent-one";
@@ -1849,7 +1856,7 @@ SCENARIO("clear_active_alerts_for_agent archives only that agent's alerts")
 
 SCENARIO("Silence rules can be created, listed, and deleted")
 {
-    SqliteStore store(":memory:");
+    TestStore store;
     const int64_t now = 1'000'000;
 
     GIVEN("an empty silences table")
@@ -1905,7 +1912,7 @@ SCENARIO("Silence rules can be created, listed, and deleted")
 
 SCENARIO("Silence rules support wildcard and specific matching")
 {
-    SqliteStore store(":memory:");
+    TestStore store;
     const int64_t now = 2'000'000;
     const int64_t future = now + 3'600'000;
 
@@ -1958,7 +1965,7 @@ SCENARIO("Silence rules support wildcard and specific matching")
 
 SCENARIO("prune_metrics_before removes old metrics rows")
 {
-    SqliteStore store(":memory:");
+    TestStore store;
 
     GIVEN("three metrics rows at different timestamps")
     {
@@ -2026,7 +2033,7 @@ SCENARIO("Acknowledged alerts are not escalated by escalate_old_alerts")
 {
     GIVEN("a store with one acknowledged and one unacknowledged alert both older than the cutoff")
     {
-        SqliteStore store(":memory:");
+        TestStore store;
 
         AgentRecord rec;
         rec.agent_id = "agent-esc-ack";
@@ -2081,7 +2088,7 @@ SCENARIO("Log matches can be inserted and retrieved by agent")
 {
     GIVEN("an empty store")
     {
-        SqliteStore store(":memory:");
+        TestStore store;
 
         AgentRecord agent;
         agent.agent_id = "log-agent";
@@ -2150,7 +2157,7 @@ SCENARIO("Log matches are isolated per agent")
 {
     GIVEN("a store with two agents each with a log match")
     {
-        SqliteStore store(":memory:");
+        TestStore store;
 
         for (auto id : {"agent-A", "agent-B"})
         {
@@ -2190,7 +2197,7 @@ SCENARIO("Views can be created, retrieved, updated, and deleted")
 {
     GIVEN("a store with a user")
     {
-        SqliteStore store(":memory:");
+        TestStore store;
         const int64_t uid = store.create_user("view-owner", "hash", "operator");
 
         WHEN("a private view is created for that user")
@@ -2265,7 +2272,7 @@ SCENARIO("list_views returns own views and public views but not other users' pri
 {
     GIVEN("two users each with a private view, and one user with a public view")
     {
-        SqliteStore store(":memory:");
+        TestStore store;
         const int64_t uid_a = store.create_user("user-a", "ha", "operator");
         const int64_t uid_b = store.create_user("user-b", "hb", "operator");
 
@@ -2337,7 +2344,7 @@ SCENARIO("get_view returns nullopt for an unknown view id")
 {
     GIVEN("an empty store")
     {
-        SqliteStore store(":memory:");
+        TestStore store;
 
         WHEN("get_view is called with a non-existent id")
         {
@@ -2357,7 +2364,7 @@ SCENARIO("get_metrics_in_window uses inclusive boundaries and returns only rows 
 {
     GIVEN("a store with four metrics rows at distinct timestamps")
     {
-        SqliteStore store(":memory:");
+        TestStore store;
 
         AgentRecord agent;
         agent.agent_id = "win-agent";
@@ -2421,7 +2428,7 @@ SCENARIO("get_metrics_in_window returns empty for an agent with no rows in the r
 {
     GIVEN("a store with an agent but no metrics")
     {
-        SqliteStore store(":memory:");
+        TestStore store;
 
         AgentRecord agent;
         agent.agent_id = "no-rows";
@@ -2447,7 +2454,7 @@ SCENARIO("Re-acknowledging an already-acknowledged alert overwrites the note and
 {
     GIVEN("a store with an acknowledged alert")
     {
-        SqliteStore store(":memory:");
+        TestStore store;
 
         AgentRecord rec;
         rec.agent_id = "agent-reack";
@@ -2487,7 +2494,7 @@ SCENARIO("get_session respects the expiry timestamp and rejects disabled users")
 {
     GIVEN("a store with a user and an active session expiring at t=5000")
     {
-        SqliteStore store(":memory:");
+        TestStore store;
 
         // Use the bootstrapped admin user (user_id=1, username="thewatcher").
         auto users = store.list_users();
@@ -2543,7 +2550,7 @@ SCENARIO("get_session returns nullopt when the user account is disabled")
 {
     GIVEN("a store with a disabled user who has an active session")
     {
-        SqliteStore store(":memory:");
+        TestStore store;
 
         const int64_t uid = store.create_user("locked-user", "hash", "operator");
 
@@ -2576,7 +2583,7 @@ SCENARIO("Deleting an agent cascades to remove its metrics, alerts, and status h
 {
     GIVEN("a store with an agent that has metrics, an alert, and status history")
     {
-        SqliteStore store(":memory:");
+        TestStore store;
 
         AgentRecord agent;
         agent.agent_id = "cascade-agent";
@@ -2643,7 +2650,7 @@ SCENARIO("mark_agents_offline_before is a no-op when all agents are within the c
 {
     GIVEN("a store with an agent whose last_seen is recent")
     {
-        SqliteStore store(":memory:");
+        TestStore store;
 
         AgentRecord agent;
         agent.agent_id = "fresh-agent";
@@ -2673,7 +2680,7 @@ SCENARIO("A view with an empty agent list is stored and retrieved correctly")
 {
     GIVEN("a store with a user")
     {
-        SqliteStore store(":memory:");
+        TestStore store;
         const int64_t uid = store.create_user("empty-view-owner", "hash", "operator");
 
         WHEN("a view is created with no agent ids")
@@ -2704,7 +2711,7 @@ SCENARIO("is_silenced uses strict less-than on until_ms so expiry is exact")
 {
     GIVEN("a silence rule expiring at t=10000")
     {
-        SqliteStore store(":memory:");
+        TestStore store;
 
         SilenceRecord rec;
         rec.agent_id = "*";
@@ -2739,7 +2746,7 @@ SCENARIO("approve_agent on a rejected agent clears the rejected flag and approve
 {
     GIVEN("a store with a rejected agent")
     {
-        SqliteStore store(":memory:");
+        TestStore store;
 
         AgentRecord agent;
         agent.agent_id = "rejected-agent";
@@ -2776,7 +2783,7 @@ SCENARIO("list_views returns empty for a user who owns no views and there are no
 {
     GIVEN("a store with two users, neither with views")
     {
-        SqliteStore store(":memory:");
+        TestStore store;
         const int64_t uid_a = store.create_user("user-no-views-a", "ha", "operator");
         const int64_t uid_b = store.create_user("user-no-views-b", "hb", "operator");
 
@@ -2806,7 +2813,7 @@ SCENARIO("Runbooks can be created, listed, and deleted")
 {
     GIVEN("an empty store")
     {
-        SqliteStore store(unique_store_path("runbook-crud.db").string());
+        TestStore store;
 
         WHEN("no runbooks have been created")
         {
@@ -2856,7 +2863,7 @@ SCENARIO("get_runbook returns exact indicator match before wildcard")
 {
     GIVEN("a store with a wildcard runbook and an exact runbook for the same status")
     {
-        SqliteStore store(unique_store_path("runbook-lookup.db").string());
+        TestStore store;
 
         RunbookRecord wildcard;
         wildcard.indicator = "*";
@@ -2898,7 +2905,7 @@ SCENARIO("insert_alert persists runbook_url and list_alerts returns it")
 {
     GIVEN("a store with a runbook for cpu/red")
     {
-        SqliteStore store(unique_store_path("runbook-alert.db").string());
+        TestStore store;
 
         AgentRecord agent;
         agent.agent_id = "agent-rb";
@@ -2943,7 +2950,7 @@ SCENARIO("get_runbook never returns another agent's runbook")
 {
     GIVEN("a store with a runbook scoped to agent-a and a generic runbook")
     {
-        SqliteStore store(":memory:");
+        TestStore store;
 
         RunbookRecord scoped;
         scoped.agent_id = "agent-a";
@@ -2977,7 +2984,7 @@ SCENARIO("get_runbook never returns another agent's runbook")
 
     GIVEN("a store with only a runbook scoped to agent-a")
     {
-        SqliteStore store(":memory:");
+        TestStore store;
 
         RunbookRecord scoped;
         scoped.agent_id = "agent-a";

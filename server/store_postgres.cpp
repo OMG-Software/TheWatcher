@@ -1,5 +1,6 @@
 #ifdef HAVE_LIBPQ
 
+#include "dsn_redaction.hpp"
 #include "store_postgres.hpp"
 
 #include "common/SingleLog.hpp"
@@ -145,21 +146,6 @@ namespace
     std::string s(bool v)
     {
         return v ? "true" : "false";
-    }
-
-    // Strip the password value from a libpq connection string so it is safe
-    // to include in log output.
-    std::string redact_dsn(const std::string& dsn)
-    {
-        std::string out = dsn;
-        const auto kw = out.find("password=");
-        if (kw != std::string::npos)
-        {
-            const auto val_start = kw + 9;
-            const auto val_end = out.find(' ', val_start);
-            out.replace(val_start, val_end == std::string::npos ? std::string::npos : val_end - val_start, "***");
-        }
-        return out;
     }
 
     AgentRecord row_to_agent(PGresult* r, int row)
@@ -647,7 +633,7 @@ std::optional<AgentRecord> PostgresStore::get_agent(const std::string& agent_id)
 
 std::vector<AgentRecord> PostgresStore::list_agents()
 {
-    Res res(PQexec(conn_, (std::string(AGENT_SELECT) + " ORDER BY last_seen DESC;").c_str()));
+    Res res(PQexec(conn_, (std::string(AGENT_SELECT) + " ORDER BY last_seen DESC,agent_id;").c_str()));
     check_res(res.r, "list_agents");
     std::vector<AgentRecord> out;
     for (int i = 0; i < PQntuples(res.r); ++i)
@@ -659,7 +645,7 @@ std::vector<AgentRecord> PostgresStore::list_approved_agents()
 {
     Res res(PQexec(
         conn_,
-        (std::string(AGENT_SELECT) + " WHERE approved=TRUE AND rejected=FALSE ORDER BY last_seen DESC;").c_str()));
+        (std::string(AGENT_SELECT) + " WHERE approved=TRUE AND rejected=FALSE ORDER BY last_seen DESC,agent_id;").c_str()));
     check_res(res.r, "list_approved_agents");
     std::vector<AgentRecord> out;
     for (int i = 0; i < PQntuples(res.r); ++i)
@@ -671,7 +657,7 @@ std::vector<AgentRecord> PostgresStore::list_pending_agents()
 {
     Res res(PQexec(
         conn_,
-        (std::string(AGENT_SELECT) + " WHERE approved=FALSE AND rejected=FALSE ORDER BY first_seen DESC;").c_str()));
+        (std::string(AGENT_SELECT) + " WHERE approved=FALSE AND rejected=FALSE ORDER BY first_seen DESC,agent_id;").c_str()));
     check_res(res.r, "list_pending_agents");
     std::vector<AgentRecord> out;
     for (int i = 0; i < PQntuples(res.r); ++i)
@@ -1172,7 +1158,7 @@ std::optional<StatusHistoryRow> PostgresStore::latest_status_for_indicator(const
     const char* params[] = {agent_id.c_str(), indicator.c_str()};
     Res res(PQexecParams(conn_,
                          "SELECT id,agent_id,indicator,old_status,new_status,message,created_at "
-                         "FROM status_history WHERE agent_id=$1 AND indicator=$2 ORDER BY created_at DESC LIMIT 1;",
+                         "FROM status_history WHERE agent_id=$1 AND indicator=$2 ORDER BY created_at DESC,id DESC LIMIT 1;",
                          2, nullptr, params, nullptr, nullptr, 0));
     check_res(res.r, "latest_status_for_indicator");
     if (PQntuples(res.r) == 0)
@@ -1187,7 +1173,7 @@ std::vector<StatusHistoryRow> PostgresStore::list_status_history(const std::stri
     const char* params[] = {agent_id.c_str(), p_lim.c_str()};
     Res res(PQexecParams(conn_,
                          "SELECT id,agent_id,indicator,old_status,new_status,message,created_at "
-                         "FROM status_history WHERE agent_id=$1 ORDER BY created_at DESC LIMIT $2;",
+                         "FROM status_history WHERE agent_id=$1 ORDER BY created_at DESC,id DESC LIMIT $2;",
                          2, nullptr, params, nullptr, nullptr, 0));
     check_res(res.r, "list_status_history");
     std::vector<StatusHistoryRow> out;
@@ -1443,7 +1429,7 @@ int64_t PostgresStore::create_maintenance_window(const MaintenanceWindowRecord& 
 std::vector<MaintenanceWindowRecord> PostgresStore::list_maintenance_windows()
 {
     Res res(PQexec(conn_, "SELECT window_id,agent_id,start_ms,end_ms,reason,created_by,created_at "
-                          "FROM maintenance_windows ORDER BY start_ms DESC;"));
+                          "FROM maintenance_windows ORDER BY start_ms DESC,window_id DESC;"));
     check_res(res.r, "list_maintenance_windows");
     std::vector<MaintenanceWindowRecord> out;
     for (int i = 0; i < PQntuples(res.r); ++i)
@@ -1467,7 +1453,7 @@ std::vector<MaintenanceWindowRecord> PostgresStore::active_maintenance_windows(i
     const char* params[] = {p.c_str()};
     Res res(PQexecParams(conn_,
                          "SELECT window_id,agent_id,start_ms,end_ms,reason,created_by,created_at "
-                         "FROM maintenance_windows WHERE start_ms<=$1 AND end_ms>$1;",
+                         "FROM maintenance_windows WHERE start_ms<=$1 AND end_ms>$1 ORDER BY start_ms DESC,window_id DESC;",
                          1, nullptr, params, nullptr, nullptr, 0));
     check_res(res.r, "active_maintenance_windows");
     std::vector<MaintenanceWindowRecord> out;
@@ -1519,7 +1505,7 @@ int64_t PostgresStore::create_silence(const SilenceRecord& rec)
 std::vector<SilenceRecord> PostgresStore::list_silences()
 {
     Res res(PQexec(conn_, "SELECT silence_id,agent_id,indicator,reason,until_ms,created_by,created_at "
-                          "FROM silences ORDER BY created_at DESC;"));
+                          "FROM silences ORDER BY created_at DESC,silence_id DESC;"));
     check_res(res.r, "list_silences");
     std::vector<SilenceRecord> out;
     for (int i = 0; i < PQntuples(res.r); ++i)
@@ -1572,7 +1558,7 @@ std::vector<LogMatchRecord> PostgresStore::list_log_matches(const std::string& a
     const char* params[] = {agent_id.c_str(), p_lim.c_str()};
     Res res(PQexecParams(conn_,
                          "SELECT match_id,agent_id,indicator_name,path,matched_line,severity,created_at "
-                         "FROM log_matches WHERE agent_id=$1 ORDER BY created_at DESC LIMIT $2;",
+                         "FROM log_matches WHERE agent_id=$1 ORDER BY created_at DESC,match_id DESC LIMIT $2;",
                          2, nullptr, params, nullptr, nullptr, 0));
     check_res(res.r, "list_log_matches");
     std::vector<LogMatchRecord> out;
@@ -1665,7 +1651,7 @@ std::vector<ViewRecord> PostgresStore::list_views(int64_t user_id)
         FROM views v LEFT JOIN users u ON u.user_id=v.owner_user_id
         WHERE $1::bigint <= 0 OR v.owner_user_id=$1 OR v.is_public=TRUE
            OR EXISTS (SELECT 1 FROM user_groups ug WHERE ug.user_id=$1 AND ug.group_id=v.group_id)
-        ORDER BY v.created_at ASC;
+        ORDER BY v.created_at ASC,v.view_id ASC;
     )",
                          1, nullptr, params, nullptr, nullptr, 0));
     check_res(res.r, "list_views");
@@ -1717,7 +1703,7 @@ int64_t PostgresStore::create_runbook(const RunbookRecord& rec)
 std::vector<RunbookRecord> PostgresStore::list_runbooks()
 {
     Res res(PQexec(conn_, "SELECT runbook_id,agent_id,indicator,status,url,markdown,notes,created_by,created_at "
-                          "FROM runbooks ORDER BY created_at ASC;"));
+                          "FROM runbooks ORDER BY created_at ASC,runbook_id ASC;"));
     check_res(res.r, "list_runbooks");
     std::vector<RunbookRecord> out;
     for (int i = 0; i < PQntuples(res.r); ++i)

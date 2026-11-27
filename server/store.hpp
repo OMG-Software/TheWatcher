@@ -12,6 +12,10 @@
 namespace thewatcher::server
 {
 
+// Rows returned by Store::get_metrics_in_window when the caller gives no limit:
+// 24 h of 30 s samples. The newest rows win, on every backend.
+inline constexpr int kMetricsWindowLimit = 2880;
+
 struct AgentRecord
 {
     std::string agent_id;
@@ -256,8 +260,10 @@ public:
 
     virtual void insert_metrics(const MetricsRow& row) = 0;
     virtual std::vector<MetricsRow> get_metrics(const std::string& agent_id, int limit = 100) = 0;
+    // The newest `limit` rows in [since_ms, until_ms], oldest first. A limit <= 0
+    // returns nothing (every backend; there is no "unlimited").
     virtual std::vector<MetricsRow> get_metrics_in_window(const std::string& agent_id, int64_t since_ms,
-                                                          int64_t until_ms) = 0;
+                                                          int64_t until_ms, int limit = kMetricsWindowLimit) = 0;
     virtual std::vector<MetricsRow> latest_metrics() = 0;
 
     virtual void insert_status_history(const StatusHistoryRow& row) = 0;

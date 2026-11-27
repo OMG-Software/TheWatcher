@@ -56,7 +56,7 @@ public:
     void insert_metrics(const MetricsRow& row) override;
     std::vector<MetricsRow> get_metrics(const std::string& agent_id, int limit) override;
     std::vector<MetricsRow> get_metrics_in_window(const std::string& agent_id, int64_t since_ms,
-                                                  int64_t until_ms) override;
+                                                  int64_t until_ms, int limit = kMetricsWindowLimit) override;
     std::vector<MetricsRow> latest_metrics() override;
 
     void insert_status_history(const StatusHistoryRow& row) override;

@@ -1,5 +1,6 @@
 #include "store_sqlite.hpp"
 
+#include "dsn_redaction.hpp"
 #include "store_synchronized.hpp"
 
 #ifdef HAVE_LIBPQ
@@ -579,7 +580,7 @@ std::optional<AgentRecord> SqliteStore::get_agent(const std::string& agent_id)
 
 std::vector<AgentRecord> SqliteStore::list_agents()
 {
-    const auto sql = std::string("SELECT ") + AGENT_COLUMNS + " FROM agents ORDER BY last_seen DESC;";
+    const auto sql = std::string("SELECT ") + AGENT_COLUMNS + " FROM agents ORDER BY last_seen DESC,agent_id;";
     Stmt st;
     check(sqlite3_prepare_v2(db_, sql.c_str(), -1, &st.s, nullptr), db_, "prepare list_agents");
     std::vector<AgentRecord> out;
@@ -591,7 +592,7 @@ std::vector<AgentRecord> SqliteStore::list_agents()
 std::vector<AgentRecord> SqliteStore::list_approved_agents()
 {
     const auto sql = std::string("SELECT ") + AGENT_COLUMNS +
-                     " FROM agents WHERE approved=1 AND rejected=0 ORDER BY last_seen DESC;";
+                     " FROM agents WHERE approved=1 AND rejected=0 ORDER BY last_seen DESC,agent_id;";
     Stmt st;
     check(sqlite3_prepare_v2(db_, sql.c_str(), -1, &st.s, nullptr), db_, "prepare list_approved_agents");
     std::vector<AgentRecord> out;
@@ -603,7 +604,7 @@ std::vector<AgentRecord> SqliteStore::list_approved_agents()
 std::vector<AgentRecord> SqliteStore::list_pending_agents()
 {
     const auto sql = std::string("SELECT ") + AGENT_COLUMNS +
-                     " FROM agents WHERE approved=0 AND rejected=0 ORDER BY first_seen DESC;";
+                     " FROM agents WHERE approved=0 AND rejected=0 ORDER BY first_seen DESC,agent_id;";
     Stmt st;
     check(sqlite3_prepare_v2(db_, sql.c_str(), -1, &st.s, nullptr), db_, "prepare list_pending_agents");
     std::vector<AgentRecord> out;
@@ -1415,7 +1416,7 @@ std::vector<MaintenanceWindowRecord> SqliteStore::list_maintenance_windows()
     Stmt st;
     check(sqlite3_prepare_v2(db_,
                              "SELECT window_id,agent_id,start_ms,end_ms,reason,created_by,created_at FROM "
-                             "maintenance_windows ORDER BY start_ms DESC;",
+                             "maintenance_windows ORDER BY start_ms DESC,window_id DESC;",
                              -1, &st.s, nullptr),
           db_, "prepare list_maintenance_windows");
     std::vector<MaintenanceWindowRecord> out;
@@ -1438,7 +1439,7 @@ std::vector<MaintenanceWindowRecord> SqliteStore::active_maintenance_windows(int
     Stmt st;
     check(sqlite3_prepare_v2(db_,
                              "SELECT window_id,agent_id,start_ms,end_ms,reason,created_by,created_at FROM "
-                             "maintenance_windows WHERE start_ms<=? AND end_ms>? ORDER BY start_ms DESC;",
+                             "maintenance_windows WHERE start_ms<=? AND end_ms>? ORDER BY start_ms DESC,window_id DESC;",
                              -1, &st.s, nullptr),
           db_, "prepare active_maintenance_windows");
     sqlite3_bind_int64(st.s, 1, now_ms);
@@ -1512,7 +1513,7 @@ std::vector<SilenceRecord> SqliteStore::list_silences()
     Stmt st;
     check(sqlite3_prepare_v2(db_,
                              "SELECT silence_id,agent_id,indicator,reason,until_ms,created_by,created_at "
-                             "FROM silences ORDER BY created_at DESC;",
+                             "FROM silences ORDER BY created_at DESC,silence_id DESC;",
                              -1, &st.s, nullptr),
           db_, "prepare list_silences");
     std::vector<SilenceRecord> out;
@@ -1577,7 +1578,7 @@ std::vector<LogMatchRecord> SqliteStore::list_log_matches(const std::string& age
     Stmt st;
     check(sqlite3_prepare_v2(db_,
                              "SELECT match_id,agent_id,indicator_name,path,matched_line,severity,created_at "
-                             "FROM log_matches WHERE agent_id=? ORDER BY created_at DESC LIMIT ?;",
+                             "FROM log_matches WHERE agent_id=? ORDER BY created_at DESC,match_id DESC LIMIT ?;",
                              -1, &st.s, nullptr),
           db_, "prepare list_log_matches");
     sqlite3_bind_text(st.s, 1, agent_id.c_str(), -1, SQLITE_TRANSIENT);
@@ -1679,7 +1680,7 @@ std::vector<ViewRecord> SqliteStore::list_views(int64_t user_id)
                              "FROM views v LEFT JOIN users u ON u.user_id=v.owner_user_id "
                              "WHERE ? <= 0 OR v.owner_user_id=? OR v.is_public=1 OR EXISTS ("
                              "SELECT 1 FROM user_groups ug WHERE ug.user_id=? AND ug.group_id=v.group_id) "
-                             "ORDER BY v.created_at ASC;",
+                             "ORDER BY v.created_at ASC,v.view_id ASC;",
                              -1, &st.s, nullptr),
           db_, "prepare list_views");
     sqlite3_bind_int64(st.s, 1, user_id);
@@ -1760,7 +1761,7 @@ std::vector<RunbookRecord> SqliteStore::list_runbooks()
     Stmt st;
     check(sqlite3_prepare_v2(db_,
                              "SELECT runbook_id,agent_id,indicator,status,url,markdown,notes,created_by,created_at "
-                             "FROM runbooks ORDER BY created_at ASC;",
+                             "FROM runbooks ORDER BY created_at ASC,runbook_id ASC;",
                              -1, &st.s, nullptr),
           db_, "prepare list_runbooks");
     std::vector<RunbookRecord> out;
@@ -1806,7 +1807,9 @@ std::optional<RunbookRecord> SqliteStore::get_runbook(const std::string& agent_i
 // The returned store is safe to share between threads (see SynchronizedStore).
 std::unique_ptr<Store> make_store(const std::string& db_type, const std::string& db_path_or_dsn)
 {
-    LOGF_DEBUG("Creating store db_type=%s target=%s", db_type.c_str(), db_path_or_dsn.c_str());
+    // The PostgreSQL target is a DSN that may carry a password: never log it raw.
+    const auto logged_target = db_type == "postgres" ? redact_dsn(db_path_or_dsn) : db_path_or_dsn;
+    LOGF_DEBUG("Creating store db_type=%s target=%s", db_type.c_str(), logged_target.c_str());
     if (db_type == "sqlite")
         return std::make_unique<SynchronizedStore>(std::make_unique<SqliteStore>(db_path_or_dsn));
 #ifdef HAVE_LIBPQ
