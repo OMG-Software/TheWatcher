@@ -24,6 +24,9 @@ project(
     'libsodium:werror=false',
     'libzmq:warning_level=0',
     'libzmq:werror=false',
+    # Third-party test suites must not run under `meson test` (#126).
+    'catch2:tests=false',
+    'cppzmq:tests=disabled',
     'force_fallback_for=libcbor,sqlite3,nlohmann_json,cpp-httplib,catch2-with-main,cppzmq',
   ],
 )
@@ -38,6 +41,13 @@ third_party_default_options = [
 add_project_arguments(
   '-DCBOR_BUILD_STATIC=1',
   language: ['c', 'cpp'],
+)
+
+# meson.build is the single source of truth for the version (#127). The
+# binaries report it through common/version.hpp.
+add_project_arguments(
+  '-DTHEWATCHER_VERSION="@0@"'.format(meson.project_version()),
+  language: 'cpp',
 )
 
 if host_machine.system() == 'windows'
@@ -76,7 +86,8 @@ if host_machine.system() == 'windows'
 endif
 
 # Local static deps: subprojects/<name>.wrap downloads source archives and builds
-# the libraries in this build tree. System/vcpkg packages are not used.
+# the libraries in this build tree. System/vcpkg packages are not used (the only
+# opt-in exception is -Dsystem_zeromq=true below).
 cbor_dep   = dependency('libcbor',          fallback: ['libcbor',       'libcbor_dep'],
                         default_options: third_party_default_options)
 sqlite_dep = dependency('sqlite3',          fallback: ['sqlite3',       'sqlite3_dep'],
@@ -95,18 +106,19 @@ http_dep   = dependency('cpp-httplib',      fallback: ['cpp-httplib',   'cpp_htt
 catch2_dep = dependency('catch2-with-main', fallback: ['catch2',        'catch2_with_main_dep'],
                         default_options: third_party_default_options)
 
-# Prefer system-installed zeromq + libsodium (e.g. FreeBSD pkg install zeromq libsodium)
-# and fall back to building from source via cmake subproject when not available.
-zmq_system    = dependency('libzmq',    required: false, static: false, method: 'pkg-config')
-sodium_system = dependency('libsodium', required: false, static: false, method: 'pkg-config')
-
-if zmq_system.found() and sodium_system.found()
+# libzmq + libsodium are built as local static subprojects by default, which
+# is the documented and CI-tested configuration. -Dsystem_zeromq=true opts in
+# to the pkg-config packages instead (for distro packaging); it fails loudly
+# when they are missing or too old rather than silently falling back.
+if get_option('system_zeromq')
+  # CURVE needs libzmq 4.x built with libsodium; 1.0.18 is the oldest
+  # libsodium providing every primitive in common/crypto.
+  zmq_system    = dependency('libzmq',    version: '>=4.3.2',   static: false, method: 'pkg-config')
+  sodium_system = dependency('libsodium', version: '>=1.0.18', static: false, method: 'pkg-config')
   sodium_dep = sodium_system
   zmq_dep    = declare_dependency(dependencies: [zmq_system, sodium_system])
   meson.override_dependency('libzmq',  zmq_dep)
   meson.override_dependency('zeromq',  zmq_dep)
-  # zmq.hpp ships alongside zmq.h in the same package; reuse the include path.
-  cppzmq_dep = declare_dependency(dependencies: [zmq_system])
 else
   libsodium_project = subproject(
     'libsodium',
@@ -156,9 +168,12 @@ else
   meson.override_dependency('libzmq', zmq_dep)
   meson.override_dependency('zeromq', zmq_dep)
 
-  cppzmq_dep = dependency('cppzmq', fallback: ['cppzmq', 'cppzmq_dep'],
-                          default_options: third_party_default_options)
 endif
+
+# zmq.hpp comes from cppzmq, never from libzmq's own package. The wrap's
+# meson.build resolves its libzmq dependency to zmq_dep via the override above.
+cppzmq_dep = dependency('cppzmq', fallback: ['cppzmq', 'cppzmq_dep'],
+                        default_options: third_party_default_options)
 
 subdir('common')
 subdir('agent/collectors')
@@ -169,3 +184,18 @@ subdir('common_tests')
 subdir('agent_tests')
 subdir('server_tests')
 subdir('integration_tests')
+
+# Repository-level checks. Both run under `meson test --suite thewatcher`.
+python_exe = find_program('python3', 'python', required: false)
+if python_exe.found()
+  test(
+    'version_consistency',
+    python_exe,
+    args: [files('scripts/check_version_consistency.py'), meson.project_source_root()],
+  )
+  test(
+    'cli_version',
+    python_exe,
+    args: [files('scripts/check_binary_version.py'), meson.project_version(), server_exe, agent_exe],
+  )
+endif

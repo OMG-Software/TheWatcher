@@ -27,14 +27,18 @@ subprojects/        Meson wrap files and packagefile overlays for libsodium,
 
 ```bash
 meson compile -C builddir-release TheWatcherServer TheWatcherAgent
-meson test    -C builddir-release config_test
-meson test    -C builddir-release store_test
-meson test    -C builddir-release status_engine_test
-meson test    -C builddir-release server_lifecycle_test
-meson test    -C builddir-release zap_handler_test
-meson test    -C builddir-release server_agent_integration_test --print-errorlogs
-meson test    -C builddir-release --print-errorlogs
+meson test    -C builddir-release server_config
+meson test    -C builddir-release store
+meson test    -C builddir-release status_engine
+meson test    -C builddir-release server_lifecycle
+meson test    -C builddir-release zap_handler
+meson test    -C builddir-release server_agent_integration --print-errorlogs
+meson test    -C builddir-release --suite thewatcher --print-errorlogs
 ```
+
+Names after `meson test -C <dir>` are Meson test names, not executable target
+names (`server_config`, not `config_test`). List them with
+`meson test -C builddir-release --list`.
 
 Dashboard:
 
@@ -67,7 +71,13 @@ npm.cmd test
   change set.
 - Meson builds ZeroMQ and libsodium as local static subprojects from
   `subprojects/*.wrap` plus `subprojects/packagefiles/`; do not add vcpkg,
-  pkg-config, or system package assumptions for these dependencies.
+  pkg-config, or system package assumptions for these dependencies. The opt-in
+  `-Dsystem_zeromq=true` option is for packagers only.
+- `meson.build` owns the version. Keep `dashboard/package.json`,
+  `dashboard/package-lock.json`, `packaging/windows/TheWatcher.iss` and
+  `CHANGELOG.md` in step; the `version_consistency` test fails otherwise.
+- PostgreSQL support is controlled by `-Dpostgres=auto|enabled|disabled`; see
+  [Build Environment](build-environment.md#build-options).
 - Keep persistence/status tests on the lighter `server_store_lib` target when
   they do not need ZeroMQ. Use `server_lib` only for tests that exercise the
   full server runtime.
@@ -146,7 +156,7 @@ usage, services, packages, or custom application health.
 
    ```powershell
    clang-format -i <changed-cpp-files>
-   meson test -C builddir-release collector_contract_test server_agent_integration_test --print-errorlogs
+   meson test -C builddir-release collector_contract server_agent_integration --print-errorlogs
    cd dashboard
    npm.cmd run build
    npm.cmd test

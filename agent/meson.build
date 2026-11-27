@@ -27,7 +27,7 @@ agent_dep = declare_dependency(
   ],
 )
 
-executable(
+agent_exe = executable(
   'TheWatcherAgent',
   'main.cpp',
   dependencies: agent_dep,

@@ -63,6 +63,29 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   unprivileged writers, and root-reserved blocks count as used (#158).
 - Encoding a frame with an empty payload no longer passes a null pointer to
   libcbor (undefined behaviour reported by UBSan on every heartbeat) (#162).
+- `meson-build.cmd` locates Visual Studio 2022 or newer with `vswhere.exe`
+  instead of a hard-coded "18" BuildTools path, uses an already-available
+  `cl.exe`, and says what to install when none is found. Its failure
+  handling was broken: `|| exit /b %ERRORLEVEL%` expands the stale value
+  while the line is parsed, so a failed `meson setup` still exited 0. Every
+  step is now followed by `if errorlevel 1 exit /b %ERRORLEVEL%` on its own
+  line, which reports the real exit code (#124).
+  The wrappers only pass `--reconfigure` to an already-configured build
+  directory.
+- The documented `meson test` names were executable targets, not test names
+  (`config_test`, `store_test`, `server_agent_integration_test`); README.md
+  and the docs now use the real names (`server_config`, `store`,
+  `server_agent_integration`, ...) (#132).
+- Build and CI descriptions match the scripts and wraps: Windows CI comment,
+  Linux Meson install via pipx/venv, libcbor sourced from GitHub with a
+  local overlay (#136).
+- The BSD setup script no longer pins package versions that go stale
+  (`py39-pip`, `gcc%11`, `autoconf-2.71`, `python311`); it uses unversioned
+  names, picks the newest libpq client, and installs the rest of the
+  optional packages one by one (#129).
+- `meson.build` no longer silently prefers system libzmq/libsodium over the
+  documented local static subprojects; a wrongly wired `cppzmq` on that
+  path is gone too (#125).
 
 ### Changed
 
@@ -79,6 +102,26 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   history. `*.cmd`/`*.bat` are checked out with CRLF (#128).
 - Version bumped to 0.9.0 in `meson.build`, `dashboard/package.json` and
   the Windows installer.
+- `-Dsystem_zeromq=true` opts in to pkg-config libzmq (>= 4.3.2) and
+  libsodium (>= 1.0.18); it fails when they are missing, and cppzmq always
+  comes from its wrap (#125).
+- Catch2 and cppzmq test suites are disabled, and the wrappers and CI run
+  `meson test --suite thewatcher`, so third-party suites no longer run with
+  ours (#126).
+
+### Added
+
+- `-Dpostgres=auto|enabled|disabled` Meson feature option (default `auto`);
+  `enabled` fails configuration without libpq. The setup scripts install
+  libpq, the docs list the package per platform, and CI builds with
+  `-Dpostgres=enabled` (#123).
+- `TheWatcherServer --version` and `TheWatcherAgent --version`. The version
+  comes from `meson.build` through `common/version.hpp`; the server also
+  reports whether PostgreSQL support is compiled in. A `version_consistency`
+  test and a CI job check `dashboard/package.json`, `package-lock.json`,
+  `packaging/windows/TheWatcher.iss` and `CHANGELOG.md` against it (#127).
+- CI job `Linux (ASan + UBSan, debug)` runs the whole suite with
+  AddressSanitizer and UndefinedBehaviorSanitizer in a debug build (#122).
 
 ## [0.8.0] - 2026-11-02
 

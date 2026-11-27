@@ -125,7 +125,7 @@ Get-Content C:\ProgramData\TheWatcher\TheWatcherAgent.log -Tail 50
 Run the end-to-end integration test:
 
 ```powershell
-meson test -C builddir-release server_agent_integration_test --print-errorlogs
+meson test -C builddir-release server_agent_integration --print-errorlogs
 ```
 
 That test starts an isolated server, enrolls and approves an agent, verifies

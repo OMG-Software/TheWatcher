@@ -17,6 +17,8 @@
 #   --skip-packages   Do not install packages.
 #   --skip-meson      Do not pip-install Meson/Ninja.
 #   --skip-node       Do not install Node.js/npm (dashboard build).
+#   --skip-postgres   Do not install the libpq client library (the server is
+#                     then built without PostgreSQL support).
 #   --no-verify       Skip the post-install verification step.
 #   -h | --help       Show this help and exit.
 
@@ -28,6 +30,7 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 SKIP_PACKAGES=0
 SKIP_MESON=0
 SKIP_NODE=0
+SKIP_POSTGRES=0
 NO_VERIFY=0
 
 usage() {
@@ -39,6 +42,7 @@ for arg in "$@"; do
         --skip-packages) SKIP_PACKAGES=1 ;;
         --skip-meson)    SKIP_MESON=1 ;;
         --skip-node)     SKIP_NODE=1 ;;
+        --skip-postgres) SKIP_POSTGRES=1 ;;
         --no-verify)     NO_VERIFY=1 ;;
         -h|--help)       usage; exit 0 ;;
         *) echo "Unknown option: $arg" >&2; usage >&2; exit 2 ;;
@@ -101,26 +105,46 @@ install_packages_freebsd() {
         pkgconf \
         autoconf automake libtool gmake cmake ninja \
         unzip zip curl ca_root_nss \
-        python3 py39-pip \
+        python3 meson \
         gawk
     if [ "$SKIP_NODE" -eq 0 ]; then
         $SUDO pkg install -y node npm
+    fi
+    if [ "$SKIP_POSTGRES" -eq 0 ]; then
+        # FreeBSD only ships versioned PostgreSQL packages (postgresql16-client
+        # and so on), so pick the newest one the repository offers instead of
+        # pinning a number that goes stale.
+        pg_pkg=$(pkg search -q '^postgresql[0-9]+-client-[0-9]' 2>/dev/null \
+            | sed 's/-[0-9][^-]*$//' | sort -u -V | tail -n 1)
+        if [ -n "$pg_pkg" ]; then
+            $SUDO pkg install -y "$pg_pkg" || log_warn "Could not install $pg_pkg; the server will build without PostgreSQL."
+        else
+            log_warn "No postgresql*-client package found; the server will build without PostgreSQL."
+        fi
     fi
 }
 
 install_packages_openbsd() {
     # OpenBSD's pkg_add is interactive only when ambiguous; -I picks the first.
+    # Unversioned package names only: pinned versions go stale and one missing
+    # package would fail the whole call. Multi-version packages (autoconf,
+    # automake, gcc) are optional, installed one by one below.
     $SUDO pkg_add -I \
         bash \
-        gcc%11 g++%11 \
         llvm \
         git \
-        autoconf-2.71 automake-1.16.5 libtool gmake cmake ninja \
+        libtool gmake cmake ninja \
         unzip zip curl \
         python%3 py3-pip \
         gawk
+    for optional in autoconf automake gcc g++; do
+        $SUDO pkg_add -I "$optional" || log_warn "Optional package $optional was not installed."
+    done
     if [ "$SKIP_NODE" -eq 0 ]; then
         $SUDO pkg_add -I node
+    fi
+    if [ "$SKIP_POSTGRES" -eq 0 ]; then
+        $SUDO pkg_add -I postgresql-client || log_warn "postgresql-client not installed; the server will build without PostgreSQL."
     fi
 }
 
@@ -130,16 +154,28 @@ install_packages_netbsd() {
     fi
     $SUDO pkgin -y install \
         bash \
-        gcc12 \
         clang \
         git \
         pkgconf \
         autoconf automake libtool gmake cmake ninja-build \
         unzip zip curl mozilla-rootcerts \
-        python311 py311-pip \
         gawk
+    # pkgsrc has no unversioned python package: try the newest first.
+    for ver in 313 312 311 310; do
+        if $SUDO pkgin -y install "python${ver}" "py${ver}-pip"; then
+            break
+        fi
+    done
     if [ "$SKIP_NODE" -eq 0 ]; then
         $SUDO pkgin -y install nodejs npm
+    fi
+    if [ "$SKIP_POSTGRES" -eq 0 ]; then
+        for ver in 17 16 15 14; do
+            if $SUDO pkgin -y install "postgresql${ver}-client"; then
+                break
+            fi
+        done
+        has_cmd pg_config || log_warn "No postgresql*-client package installed; the server will build without PostgreSQL."
     fi
 }
 
@@ -162,8 +198,13 @@ install_meson() {
     if python3 -m pip --version >/dev/null 2>&1; then
         python3 -m pip install --user --upgrade "meson>=1.4" ninja
     else
-        log_warn "pip is not available; skipping Meson/Ninja installation. Install the python pip package and rerun."
-        return
+        python3 -m ensurepip --user >/dev/null 2>&1 || true
+        if python3 -m pip --version >/dev/null 2>&1; then
+            python3 -m pip install --user --upgrade "meson>=1.4" ninja
+        else
+            log_warn "pip is not available; skipping Meson/Ninja installation. Use the meson and ninja packages or install pip and rerun."
+            return
+        fi
     fi
 
     case ":${PATH}:" in

@@ -1,5 +1,6 @@
 #include "common/SingleLog.hpp"
 #include "common/crypto.hpp"
+#include "common/version.hpp"
 #include "common/windows_service.hpp"
 #include "config.hpp"
 #include "server.hpp"
@@ -40,6 +41,7 @@ static void print_usage(const char* prog)
               << "  --service-name <n> Service name (default: TheWatcherServer)\n"
               << "  --install-service Install the Windows service and exit\n"
               << "  --uninstall-service Remove the Windows service and exit\n"
+              << "  --version         Print the version and exit\n"
               << "  --help            Show this help\n";
 }
 
@@ -61,6 +63,16 @@ int main(int argc, char* argv[])
         if (arg == "--help" || arg == "-h")
         {
             print_usage(argv[0]);
+            return 0;
+        }
+        else if (arg == "--version")
+        {
+            std::cout << "TheWatcherServer " << thewatcher::kVersion << '\n';
+#ifdef HAVE_LIBPQ
+            std::cout << "PostgreSQL support: enabled\n";
+#else
+            std::cout << "PostgreSQL support: disabled\n";
+#endif
             return 0;
         }
         else if (arg == "--genkey")

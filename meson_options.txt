@@ -1,0 +1,13 @@
+option(
+  'postgres',
+  type: 'feature',
+  value: 'auto',
+  description: 'PostgreSQL storage backend (needs libpq headers and library). '
+               + 'auto builds it when libpq is found; enabled fails when libpq is missing; disabled omits it.',
+)
+option(
+  'system_zeromq',
+  type: 'boolean',
+  value: false,
+  description: 'Use pkg-config libzmq and libsodium instead of building the local static subprojects.',
+)

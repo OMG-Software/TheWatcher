@@ -101,7 +101,7 @@ More end-to-end extension guidance is in [Development](development.md).
 Run collector and integration tests:
 
 ```powershell
-meson test -C builddir-release collector_contract_test server_agent_integration_test --print-errorlogs
+meson test -C builddir-release collector_contract server_agent_integration --print-errorlogs
 ```
 
 If dashboard status mapping changes:

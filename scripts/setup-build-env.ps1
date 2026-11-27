@@ -81,7 +81,7 @@ function Test-VisualCppTools {
         return $false
     }
 
-    $install = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+    $install = & $vswhere -latest -products * -version "[17.0,)" -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
     return -not [string]::IsNullOrWhiteSpace($install)
 }
 
