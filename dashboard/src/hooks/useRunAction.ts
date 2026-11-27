@@ -33,28 +33,32 @@ export function useRunAction(refresh: () => Promise<string | null | void>) {
 
   const runAction = React.useCallback<RunAction>(
     async (key, action, options) => {
+      // Busy covers the mutation and the refresh after it, so a control guarded by
+      // `busyAction` cannot fire the same change twice while the result is still loading.
       setBusyAction(key);
       setFailure(null);
       try {
-        await action();
-      } catch (err) {
-        setFailure({ key, message: errorMessage(err, 'Action failed'), inline: options?.inline ?? false });
-        return false;
+        try {
+          await action();
+        } catch (err) {
+          setFailure({ key, message: errorMessage(err, 'Action failed'), inline: options?.inline ?? false });
+          return false;
+        }
+        // The change is saved. A failed refresh is a load problem, not a failed action:
+        // reporting the action as failed would invite a retry that duplicates the change.
+        let refreshError: string | null;
+        try {
+          refreshError = (await refresh()) ?? null;
+        } catch (err) {
+          refreshError = errorMessage(err, 'refresh failed');
+        }
+        if (refreshError !== null) {
+          setFailure({ key: `${key}:refresh`, message: `Saved, but the dashboard could not be refreshed: ${refreshError}`, inline: false });
+        }
+        return true;
       } finally {
         setBusyAction(null);
       }
-      // The change is saved. A failed refresh is a load problem, not a failed action:
-      // reporting the action as failed would invite a retry that duplicates the change.
-      let refreshError: string | null;
-      try {
-        refreshError = (await refresh()) ?? null;
-      } catch (err) {
-        refreshError = errorMessage(err, 'refresh failed');
-      }
-      if (refreshError !== null) {
-        setFailure({ key: `${key}:refresh`, message: `Saved, but the dashboard could not be refreshed: ${refreshError}`, inline: false });
-      }
-      return true;
     },
     [refresh],
   );

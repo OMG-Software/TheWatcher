@@ -70,6 +70,23 @@ describe('GIVEN a settings save that is still in flight', () => {
   });
 });
 
+describe('GIVEN a settings save whose reload fails', () => {
+  it('WHEN the save succeeds but the reload fails THEN the saved values stay visible with a refresh warning', async () => {
+    let gets = 0;
+    const api = new FakeApi('global_admin')
+      .on('GET /api/settings', () => (++gets === 1 ? ok(settings) : fail(500, 'config unreadable')))
+      .on('PUT /api/settings', ok());
+    await openDashboard(api);
+    goTo('Settings');
+    fireEvent.change(await screen.findByLabelText('Offline after (seconds)'), { target: { value: '90' } });
+
+    fireEvent.click(screen.getByRole('button', { name: 'Save Settings' }));
+
+    expect(await screen.findByText(/Could not refresh settings: config unreadable/)).toBeInTheDocument();
+    expect(screen.getByLabelText('Offline after (seconds)')).toHaveValue(90);
+  });
+});
+
 describe('GIVEN a dialog whose request is still running', () => {
   const startAck = async (api: FakeApi) => {
     await openDashboard(api);
