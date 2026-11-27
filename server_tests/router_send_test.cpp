@@ -93,6 +93,23 @@ SCENARIO("A full send queue makes the send fail instead of blocking")
             {
                 REQUIRE(refused);
             }
+
+            AND_THEN("everything the peer receives is a whole [empty][payload] message")
+            {
+                dealer.set(zmq::sockopt::rcvtimeo, 200);
+                int whole = 0;
+                zmq::message_t part;
+                while (dealer.recv(part, zmq::recv_flags::none))
+                {
+                    REQUIRE(part.size() == 0); // delimiter first
+                    REQUIRE(dealer.get(zmq::sockopt::rcvmore));
+                    REQUIRE(dealer.recv(part, zmq::recv_flags::none));
+                    REQUIRE(part.size() == payload.size());
+                    REQUIRE_FALSE(dealer.get(zmq::sockopt::rcvmore)); // and nothing after the payload
+                    ++whole;
+                }
+                REQUIRE(whole >= 1);
+            }
         }
     }
 }

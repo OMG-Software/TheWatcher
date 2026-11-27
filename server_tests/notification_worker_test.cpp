@@ -223,3 +223,37 @@ SCENARIO("Destroying the worker does not wait for queued notifications")
         }
     }
 }
+
+SCENARIO("A notification waiting to retry does not block producers (issue #48)")
+{
+    GIVEN("a worker whose endpoint fails and whose retry backoff is two seconds")
+    {
+        NotificationWorker::Options options;
+        options.retry_backoff = 2000ms;
+        std::atomic<int> calls{0};
+        NotificationWorker worker(options, [&](const Notification&) {
+            ++calls;
+            return 500;
+        });
+        worker.submit(make_notification(1, 3));
+        REQUIRE(eventually(
+            [&] {
+                return calls.load() >= 1;
+            },
+            5s, 5ms));
+
+        WHEN("another notification is submitted while the first sits in its backoff")
+        {
+            const auto begin = std::chrono::steady_clock::now();
+            const bool accepted = worker.submit(make_notification(2));
+            const auto elapsed = std::chrono::steady_clock::now() - begin;
+
+            THEN("submit returns promptly")
+            {
+                REQUIRE(accepted);
+                REQUIRE(elapsed < 500ms);
+                REQUIRE(worker.pending() >= 1);
+            }
+        }
+    }
+}
