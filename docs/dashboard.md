@@ -180,6 +180,7 @@ Agents inside a view are still filtered by the same agent visibility rules.
 
 ## API Contract
 
+[api.md](api.md) is the full reference (roles, bodies, error codes, limits).
 The dashboard consumes:
 
 | Endpoint | Purpose |

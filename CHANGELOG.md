@@ -47,6 +47,35 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 
+- REST API errors are consistent: a malformed numeric id in a path or
+  query (`/api/alerts/abc/ack`, `?limit=x`) is a 400 and an unknown id (alert,
+  agent, user, window, silence, runbook, view, or an agent or group named in a
+  body) is a 404, where before they were an empty 500, a 400 carrying exception
+  text, or a silent success. A duplicate user or group name is a 409. Every
+  error is `{"error": "<message>"}` and a server fault is a generic
+  `internal error` (#67).
+- Input limits are now one shared set (`server/api_validation.hpp`) applied on
+  every endpoint: maintenance, silence and window reasons, silence agent and
+  indicator, timestamps, collection interval, readings, list sizes, view name
+  and agents, runbook url and notes, settings webhook URL (#69).
+- Approving an agent with an invalid body no longer leaves it approved without
+  groups; the body is validated first (#67).
+- `/api/alerts` and `/api/alerts/unacknowledged` filter by the caller's groups
+  and page (`limit`, `offset`, default and maximum 1000) in one SQL query,
+  and ack, archive and the bulk routes look alerts up by id instead of loading
+  the whole table. One undecodable metrics row is skipped and logged instead
+  of failing `/api/metrics` (#68).
+- Deleting an agent also deletes its silences, maintenance windows and
+  agent runbooks and removes its id from views, in one transaction, so an
+  agent that re-enrolls with the same id starts clean (#146).
+- `GET /api/settings` no longer fails with a 500 when a stored numeric setting
+  is corrupt, and `/api/uptime` no longer divides by zero for an agent with a
+  stored interval of 0 (#67).
+- Server config values are validated at load with errors that name the key
+  and line (`API_PORT: not a number (line 3)`): port range, offline interval
+  range, `DB_TYPE`, a Postgres DSN, and a complete, matching CURVE keypair.
+  Unknown keys log a warning. The Windows default path no longer reads an
+  uninitialised buffer if the shell call fails (#58).
 - Alert notes longer than 4,096 bytes are cut on a UTF-8 character
   boundary. Oversize `runbook_markdown` (collector config) and
   `reports_webhook_url` (settings) are rejected with 400 instead of being
@@ -66,6 +95,16 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Changed
 
+- **Behaviour change:** `/api/alerts` returns at most 1000 alerts per request
+  (newest first); use `limit` and `offset` to page. `limit` values above a
+  route's maximum are clamped and non-numeric or non-positive values are
+  rejected with 400 (#68, #67).
+- **Behaviour change:** a negative `OFFLINE_AFTER_SECONDS` and a half-set or
+  mismatched `SERVER_PUBLIC_KEY`/`SERVER_SECRET_KEY` now stop startup. `0`
+  still disables offline detection, with a warning (#58).
+- The default server config path on FreeBSD, OpenBSD, NetBSD and DragonFly is
+  `/usr/local/etc/thewatcher/TheWatcherServer.conf`; an existing
+  `/etc/thewatcher` config is still used when the new file is absent (#58).
 - The whole C++ tree is formatted with the root `.clang-format`, and CI
   fails any PR whose C++ is not (`clang-format` 22.1.5, pinned). The
   formatting commit is listed in `.git-blame-ignore-revs`. A new include
@@ -79,6 +118,14 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   history. `*.cmd`/`*.bat` are checked out with CRLF (#128).
 - Version bumped to 0.9.0 in `meson.build`, `dashboard/package.json` and
   the Windows installer.
+
+### Added
+
+- `docs/api.md`: a reference for every REST route (role, request and response
+  shapes, error codes, limits, paging). The README index now lists it, the
+  threat model and the HA topology guide (#134).
+- Store methods `query_alerts` (filter, group visibility, paging) and
+  `get_alert` for SQLite and PostgreSQL (#68).
 
 ## [0.8.0] - 2026-11-02
 

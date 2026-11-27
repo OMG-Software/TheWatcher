@@ -6,6 +6,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <stdexcept>
 #include <string>
 
@@ -212,20 +213,20 @@ namespace
     AlertRecord row_to_alert(PGresult* r, int row)
     {
         return {
-            col_int64(r, row, 0),  // alert_id
-            col(r, row, 1),        // agent_id
-            col(r, row, 2),        // indicator
-            col(r, row, 3),        // old_status
-            col(r, row, 4),        // new_status
-            col(r, row, 5),        // message
-            col_int64(r, row, 6),  // created_at
-            col(r, row, 7),        // acknowledged_by
-            col_int64(r, row, 8),  // acknowledged_at
-            col_int64(r, row, 9),  // deleted_at
-            col(r, row, 10),       // note
-            col_int64(r, row, 11), // escalated_at
-            col(r, row, 12),       // runbook_url
-            {},                    // runbook_markdown
+            col_int64(r, row, 0),                                // alert_id
+            col(r, row, 1),                                      // agent_id
+            col(r, row, 2),                                      // indicator
+            col(r, row, 3),                                      // old_status
+            col(r, row, 4),                                      // new_status
+            col(r, row, 5),                                      // message
+            col_int64(r, row, 6),                                // created_at
+            col(r, row, 7),                                      // acknowledged_by
+            col_int64(r, row, 8),                                // acknowledged_at
+            col_int64(r, row, 9),                                // deleted_at
+            col(r, row, 10),                                     // note
+            col_int64(r, row, 11),                               // escalated_at
+            col(r, row, 12),                                     // runbook_url
+            PQnfields(r) > 13 ? col(r, row, 13) : std::string{}, // runbook_markdown (joined from agents)
         };
     }
 
@@ -707,11 +708,71 @@ void PostgresStore::reject_agent(const std::string& agent_id)
     check_res(res.r, "reject_agent");
 }
 
+namespace
+{
+    ViewRecord pg_row_to_view(PGresult* r, int row); // defined with the view queries below
+} // namespace
+
 void PostgresStore::delete_agent(const std::string& agent_id)
 {
+    // Rolls back unless commit() ran, so a failure part-way leaves the agent
+    // and its silences, windows, runbooks and views all in place.
+    struct Transaction
+    {
+        explicit Transaction(PostgresStore& store)
+            : store_(store)
+        {
+            store_.exec("BEGIN;");
+        }
+        ~Transaction()
+        {
+            if (!committed_)
+            {
+                Res res(PQexec(store_.conn_, "ROLLBACK;"));
+            }
+        }
+        Transaction(const Transaction&) = delete;
+        Transaction& operator=(const Transaction&) = delete;
+        void commit()
+        {
+            store_.exec("COMMIT;");
+            committed_ = true;
+        }
+        PostgresStore& store_;
+        bool committed_ = false;
+    } tx(*this);
+
     const char* params[] = {agent_id.c_str()};
-    Res res(PQexecParams(conn_, "DELETE FROM agents WHERE agent_id=$1;", 1, nullptr, params, nullptr, nullptr, 0));
-    check_res(res.r, "delete_agent");
+    // silences, maintenance_windows and runbooks have no foreign key to agents.
+    for (const char* sql :
+         {"DELETE FROM silences WHERE agent_id=$1;", "DELETE FROM maintenance_windows WHERE agent_id=$1;",
+          "DELETE FROM runbooks WHERE agent_id=$1;", "DELETE FROM agents WHERE agent_id=$1;"})
+    {
+        Res res(PQexecParams(conn_, sql, 1, nullptr, params, nullptr, nullptr, 0));
+        check_res(res.r, "delete_agent");
+    }
+
+    // Views keep their agent ids inside config_json: drop the deleted id.
+    std::vector<ViewRecord> affected;
+    {
+        Res res(PQexec(conn_,
+                       "SELECT v.view_id,v.name,v.owner_user_id,'',v.is_public,v.group_id,v.created_at,v.config_json "
+                       "FROM views v;"));
+        check_res(res.r, "delete_agent views");
+        for (int i = 0; i < PQntuples(res.r); ++i)
+        {
+            auto view = pg_row_to_view(res.r, i);
+            if (std::find(view.agent_ids.begin(), view.agent_ids.end(), agent_id) == view.agent_ids.end())
+                continue;
+            view.agent_ids.erase(std::remove(view.agent_ids.begin(), view.agent_ids.end(), agent_id),
+                                 view.agent_ids.end());
+            affected.push_back(std::move(view));
+        }
+    }
+    for (const auto& view : affected)
+        update_view(view);
+
+    tx.commit();
 }
 
 void PostgresStore::mark_agents_offline_before(int64_t cutoff_ms)
@@ -1239,6 +1300,73 @@ std::vector<AlertRecord> PostgresStore::list_unacknowledged_alerts()
     for (int i = 0; i < PQntuples(res.r); ++i)
         out.push_back(row_to_alert(res.r, i));
     return out;
+}
+
+namespace
+{
+    // Alert columns plus the agent's runbook, read by row_to_alert.
+    constexpr const char* ALERT_JOIN_SELECT =
+        "SELECT a.alert_id,a.agent_id,a.indicator,a.old_status,a.new_status,a.message,a.created_at,"
+        "a.acknowledged_by,a.acknowledged_at,a.deleted_at,a.note,a.escalated_at,a.runbook_url,"
+        "COALESCE(g.runbook_markdown,'') FROM alerts a LEFT JOIN agents g ON g.agent_id=a.agent_id";
+} // namespace
+
+std::vector<AlertRecord> PostgresStore::query_alerts(const AlertQuery& query)
+{
+    std::string sql = ALERT_JOIN_SELECT;
+    sql += " WHERE TRUE";
+    // Parameters are collected in order; each placeholder gets the next number.
+    std::vector<std::string> values;
+    const auto placeholder = [&values](std::string value) {
+        values.push_back(std::move(value));
+        return "$" + std::to_string(values.size());
+    };
+    if (!query.include_deleted)
+        sql += " AND a.deleted_at=0";
+    if (query.unacknowledged_only)
+        sql += " AND a.acknowledged_at=0";
+    if (query.visible_to_user_id > 0)
+        sql += " AND a.agent_id IN (SELECT ag.agent_id FROM agent_groups ag JOIN user_groups ug ON "
+               "ug.group_id=ag.group_id WHERE ug.user_id=" +
+               placeholder(s(query.visible_to_user_id)) + "::bigint)";
+    if (!query.alert_ids.empty())
+    {
+        // A PostgreSQL array literal such as {1,2,3}.
+        std::string ids = "{";
+        for (std::size_t i = 0; i < query.alert_ids.size(); ++i)
+            ids += (i ? "," : "") + std::to_string(query.alert_ids[i]);
+        ids += "}";
+        sql += " AND a.alert_id = ANY(" + placeholder(ids) + "::bigint[])";
+    }
+    sql += " ORDER BY a.created_at DESC,a.alert_id DESC";
+    if (query.limit > 0)
+        sql += " LIMIT " + placeholder(s(query.limit)) + "::bigint";
+    if (query.offset > 0)
+        sql += " OFFSET " + placeholder(s(query.offset)) + "::bigint";
+    sql += ";";
+
+    std::vector<const char*> params;
+    for (const auto& v : values)
+        params.push_back(v.c_str());
+    Res res(
+        PQexecParams(conn_, sql.c_str(), static_cast<int>(params.size()), nullptr, params.data(), nullptr, nullptr, 0));
+    check_res(res.r, "query_alerts");
+    std::vector<AlertRecord> out;
+    for (int i = 0; i < PQntuples(res.r); ++i)
+        out.push_back(row_to_alert(res.r, i));
+    return out;
+}
+
+std::optional<AlertRecord> PostgresStore::get_alert(int64_t alert_id)
+{
+    const std::string sql = std::string(ALERT_JOIN_SELECT) + " WHERE a.alert_id=$1;";
+    const auto p = s(alert_id);
+    const char* params[] = {p.c_str()};
+    Res res(PQexecParams(conn_, sql.c_str(), 1, nullptr, params, nullptr, nullptr, 0));
+    check_res(res.r, "get_alert");
+    if (PQntuples(res.r) == 0)
+        return std::nullopt;
+    return row_to_alert(res.r, 0);
 }
 
 void PostgresStore::acknowledge_alert(int64_t alert_id, const std::string& username, int64_t acknowledged_at,

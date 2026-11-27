@@ -129,9 +129,9 @@ column checks in `SqliteStore::init_schema()`.
 
 ## REST API
 
-Implemented in `server/api.cpp`.
-
-Important endpoints:
+Implemented in `server/api.cpp`. The complete route list with roles, request
+and response shapes, error codes and input limits is in [api.md](api.md); the
+table below is a summary of the main endpoints.
 
 | Endpoint | Purpose |
 | --- | --- |

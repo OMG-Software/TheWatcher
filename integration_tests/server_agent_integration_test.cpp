@@ -539,6 +539,8 @@ SCENARIO("Alert silence rules can be created, listed, and deleted via the HTTP A
 
         WHEN("a silence scoped to a specific agent and indicator is created")
         {
+            // A silence may only name an agent that exists.
+            REQUIRE(fx.enroll_and_approve("my-agent"));
             const int64_t until_ms = now_ms() + 7'200'000;
             const auto result = post_json(fx.client, "/api/silences",
                                           {

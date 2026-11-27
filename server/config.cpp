@@ -3,14 +3,19 @@
 #include "common/SingleLog.hpp"
 #include "common/crypto.hpp"
 
+#include <algorithm>
+#include <array>
 #include <cctype>
 #include <cerrno>
+#include <charconv>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <sstream>
 #include <stdexcept>
+#include <string_view>
 #include <system_error>
 #include <unordered_map>
 #include <utility>
@@ -68,10 +73,20 @@ namespace
         return out;
     }
 
-    // Parses KEY=VALUE lines into a map. Keys and values are trimmed; blank lines,
-    // '#' comments and lines without '=' are skipped. Throws std::runtime_error
-    // if the file is over 1 MiB, a line is over 8 KiB, or it cannot be opened.
-    std::unordered_map<std::string, std::string> read_key_value_file(const fs::path& path)
+    // One KEY=VALUE line: trimmed key and value plus its 1-based line number,
+    // so a validation error can point at the line to fix.
+    struct ConfigEntry
+    {
+        std::string key;
+        std::string value;
+        std::size_t line = 0;
+    };
+
+    // Parses KEY=VALUE lines in file order. Keys and values are trimmed; blank
+    // lines, '#' comments and lines without '=' are skipped. Throws
+    // std::runtime_error if the file is over 1 MiB, a line is over 8 KiB, or it
+    // cannot be opened.
+    std::vector<ConfigEntry> read_key_value_file(const fs::path& path)
     {
         std::error_code ec;
         const auto file_size = fs::file_size(path, ec);
@@ -82,10 +97,12 @@ namespace
         if (!f)
             throw std::runtime_error("Cannot open " + path.string());
 
-        std::unordered_map<std::string, std::string> values;
+        std::vector<ConfigEntry> entries;
         std::string line;
+        std::size_t line_number = 0;
         while (std::getline(f, line))
         {
+            ++line_number;
             if (line.size() > max_config_line_bytes)
                 throw std::runtime_error("Config line is too long: " + path.string());
             line = trim(line);
@@ -94,42 +111,131 @@ namespace
             const auto pos = line.find('=');
             if (pos == std::string::npos)
                 continue;
-            auto key = trim(line.substr(0, pos));
-            auto value = trim(line.substr(pos + 1));
-            values[key] = value;
+            entries.push_back({trim(line.substr(0, pos)), trim(line.substr(pos + 1)), line_number});
         }
-        return values;
+        return entries;
     }
 
-    // Copies recognised keys onto cfg; absent keys keep their defaults. Throws
-    // std::invalid_argument or std::out_of_range if API_PORT or
-    // OFFLINE_AFTER_SECONDS is not a valid integer.
-    void apply_key_value(ServerConfig& cfg, const std::unordered_map<std::string, std::string>& values)
+    // Error shared by every per-key validation: "KEY: reason (line N)".
+    std::invalid_argument entry_error(const ConfigEntry& entry, const std::string& reason)
     {
-        if (auto it = values.find("BIND_ADDRESS"); it != values.end())
-            cfg.bind_address = it->second;
-        if (auto it = values.find("ENROLLMENT_ADDRESS"); it != values.end())
-            cfg.enrollment_address = it->second;
-        if (auto it = values.find("API_HOST"); it != values.end())
-            cfg.api_host = it->second;
-        if (auto it = values.find("API_PORT"); it != values.end())
-            cfg.api_port = std::stoi(it->second);
-        if (auto it = values.find("DB_PATH"); it != values.end())
-            cfg.db_path = it->second;
-        if (auto it = values.find("DB_TYPE"); it != values.end())
-            cfg.db_type = it->second;
-        if (auto it = values.find("POSTGRES_DSN"); it != values.end())
-            cfg.postgres_dsn = it->second;
-        if (auto it = values.find("OFFLINE_AFTER_SECONDS"); it != values.end())
-            cfg.offline_after_seconds = std::stoi(it->second);
-        if (auto it = values.find("SERVER_PUBLIC_KEY"); it != values.end())
-            cfg.server_public_key = it->second;
-        if (auto it = values.find("SERVER_SECRET_KEY"); it != values.end())
-            cfg.server_secret_key = it->second;
-        if (auto it = values.find("ENROLLMENT_TOKEN"); it != values.end())
-            cfg.enrollment_token = it->second;
-        if (auto it = values.find("TRUSTED_PROXIES"); it != values.end())
-            cfg.trusted_proxies = split_csv(it->second);
+        return std::invalid_argument(entry.key + ": " + reason + " (line " + std::to_string(entry.line) + ")");
+    }
+
+    // Parses entry.value as a base-10 integer in [min, max]. Rejects empty
+    // input, trailing characters and out-of-range values, naming key and line.
+    int parse_int_entry(const ConfigEntry& entry, int min, int max)
+    {
+        long long parsed = 0;
+        const auto* first = entry.value.data();
+        const auto* last = first + entry.value.size();
+        const auto [ptr, ec] = std::from_chars(first, last, parsed);
+        if (ec == std::errc::result_out_of_range)
+            throw entry_error(entry, "must be between " + std::to_string(min) + " and " + std::to_string(max));
+        if (entry.value.empty() || ec != std::errc{} || ptr != last)
+            throw entry_error(entry, "not a number");
+        if (parsed < min || parsed > max)
+            throw entry_error(entry, "must be between " + std::to_string(min) + " and " + std::to_string(max));
+        return static_cast<int>(parsed);
+    }
+
+    // A z85 CURVE key is exactly 40 characters from the z85 alphabet.
+    bool is_z85_key(const std::string& key)
+    {
+        if (key.size() != 40)
+            return false;
+        const std::string_view alphabet(thewatcher::crypto::z85_alphabet);
+        return std::all_of(key.begin(), key.end(), [&](char c) {
+            return alphabet.find(c) != std::string_view::npos;
+        });
+    }
+
+    // True when public_z85 is the public half of secret_z85 (Curve25519 base-point multiplication).
+    bool keypair_matches(const std::string& public_z85, const std::string& secret_z85)
+    {
+        thewatcher::crypto::init();
+        const auto secret = thewatcher::crypto::z85_decode(secret_z85);
+        std::array<unsigned char, 32> derived{};
+        if (crypto_scalarmult_base(derived.data(), secret.data()) != 0)
+            return false;
+        return thewatcher::crypto::z85_encode(derived) == public_z85;
+    }
+
+    // Copies recognised keys onto cfg and validates them. Absent keys keep their
+    // defaults; the last occurrence of a repeated key wins. Unknown keys are
+    // recorded in cfg.unknown_keys and logged, not rejected: a config written
+    // by a newer release must still load after a downgrade. Throws
+    // std::invalid_argument naming the key and line for a bad value, or the
+    // keys involved for an inconsistent combination.
+    void apply_key_value(ServerConfig& cfg, const std::vector<ConfigEntry>& entries)
+    {
+        const ConfigEntry* public_key_entry = nullptr;
+        const ConfigEntry* secret_key_entry = nullptr;
+
+        for (const auto& entry : entries)
+        {
+            const auto& key = entry.key;
+            if (key == "BIND_ADDRESS")
+                cfg.bind_address = entry.value;
+            else if (key == "ENROLLMENT_ADDRESS")
+                cfg.enrollment_address = entry.value;
+            else if (key == "API_HOST")
+                cfg.api_host = entry.value;
+            else if (key == "API_PORT")
+                cfg.api_port = parse_int_entry(entry, 1, 65535);
+            else if (key == "DB_PATH")
+                cfg.db_path = entry.value;
+            else if (key == "DB_TYPE")
+            {
+                if (entry.value != "sqlite" && entry.value != "postgres")
+                    throw entry_error(entry, "must be 'sqlite' or 'postgres'");
+                cfg.db_type = entry.value;
+            }
+            else if (key == "POSTGRES_DSN")
+                cfg.postgres_dsn = entry.value;
+            else if (key == "OFFLINE_AFTER_SECONDS")
+                // 0 is the documented way to turn offline detection off.
+                cfg.offline_after_seconds = parse_int_entry(entry, 0, 7 * 24 * 60 * 60);
+            else if (key == "SERVER_PUBLIC_KEY")
+            {
+                cfg.server_public_key = entry.value;
+                public_key_entry = &entry;
+            }
+            else if (key == "SERVER_SECRET_KEY")
+            {
+                cfg.server_secret_key = entry.value;
+                secret_key_entry = &entry;
+            }
+            else if (key == "ENROLLMENT_TOKEN")
+                cfg.enrollment_token = entry.value;
+            else if (key == "TRUSTED_PROXIES")
+                cfg.trusted_proxies = split_csv(entry.value);
+            else if (std::find(cfg.unknown_keys.begin(), cfg.unknown_keys.end(), key) == cfg.unknown_keys.end())
+            {
+                cfg.unknown_keys.push_back(key);
+                LOGF_WARNING("Ignoring unknown server config key %s (line %zu); check it for a typo", key.c_str(),
+                             entry.line);
+            }
+        }
+
+        if (cfg.db_type == "postgres" && cfg.postgres_dsn.empty())
+            throw std::invalid_argument("POSTGRES_DSN: required when DB_TYPE=postgres");
+
+        // Both keys empty means CURVE is off; one without the other would
+        // silently run without encryption.
+        if (cfg.server_public_key.empty() != cfg.server_secret_key.empty())
+            throw std::invalid_argument("SERVER_PUBLIC_KEY and SERVER_SECRET_KEY must be set together");
+        if (!cfg.server_public_key.empty())
+        {
+            if (!is_z85_key(cfg.server_public_key))
+                throw entry_error(*public_key_entry, "must be a 40 character z85 key");
+            if (!is_z85_key(cfg.server_secret_key))
+                throw entry_error(*secret_key_entry, "must be a 40 character z85 key");
+            if (!keypair_matches(cfg.server_public_key, cfg.server_secret_key))
+                throw std::invalid_argument("SERVER_PUBLIC_KEY does not match SERVER_SECRET_KEY");
+        }
+        if (cfg.offline_after_seconds == 0)
+            LOG_WARNING("OFFLINE_AFTER_SECONDS=0: offline detection is disabled; dead agents stay marked connected");
     }
 
     // Returns a normalised sqlite path. An empty db_path means "thewatcher.db".
@@ -310,9 +416,26 @@ fs::path ServerConfig::default_path()
 {
     LOG_FUNCTION_TRACE
 #ifdef _WIN32
-    char buf[MAX_PATH];
-    SHGetFolderPathA(nullptr, CSIDL_COMMON_APPDATA, nullptr, 0, buf);
+    char buf[MAX_PATH] = {};
+    // Fall back to %ProgramData% (then its usual location) if the shell call fails.
+    if (FAILED(SHGetFolderPathA(nullptr, CSIDL_COMMON_APPDATA, nullptr, 0, buf)) || buf[0] == '\0')
+    {
+        char program_data[MAX_PATH] = {};
+        const DWORD length = GetEnvironmentVariableA("ProgramData", program_data, MAX_PATH);
+        const fs::path base = (length > 0 && length < MAX_PATH) ? fs::path(program_data) : fs::path("C:\\ProgramData");
+        return base / "TheWatcher" / "TheWatcherServer.conf";
+    }
     return fs::path(buf) / "TheWatcher" / "TheWatcherServer.conf";
+#elif defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__) || defined(__DragonFly__)
+    // BSD convention is /usr/local/etc for add-on software. An existing config
+    // under the old /etc/thewatcher location keeps being used so upgrades do
+    // not lose their settings.
+    const fs::path bsd_path("/usr/local/etc/thewatcher/TheWatcherServer.conf");
+    const fs::path legacy_path("/etc/thewatcher/TheWatcherServer.conf");
+    std::error_code ec;
+    if (!fs::exists(bsd_path, ec) && fs::exists(legacy_path, ec))
+        return legacy_path;
+    return bsd_path;
 #else
     return fs::path("/etc/thewatcher/TheWatcherServer.conf");
 #endif
@@ -320,7 +443,7 @@ fs::path ServerConfig::default_path()
 
 // Loads the KEY=VALUE config at path, or creates it with a new CURVE keypair
 // when missing. Throws std::runtime_error if the file cannot be read or written,
-// and std::invalid_argument or std::out_of_range for a non-numeric port or interval.
+// and std::invalid_argument ("KEY: reason (line N)") for an invalid value.
 // On POSIX it warns when group or others can read an existing file.
 ServerConfig ServerConfig::load_or_create(const fs::path& path)
 {

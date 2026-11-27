@@ -65,6 +65,8 @@ public:
     int64_t insert_alert(const AlertRecord& alert) override;
     std::vector<AlertRecord> list_alerts(bool include_deleted) override;
     std::vector<AlertRecord> list_unacknowledged_alerts() override;
+    std::vector<AlertRecord> query_alerts(const AlertQuery& query) override;
+    std::optional<AlertRecord> get_alert(int64_t alert_id) override;
     void acknowledge_alert(int64_t alert_id, const std::string& username, int64_t acknowledged_at,
                            const std::string& note = "") override;
     void bulk_acknowledge_alerts(const std::vector<int64_t>& alert_ids, const std::string& username,

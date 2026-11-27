@@ -11,8 +11,13 @@ Default paths:
 
 ```text
 Windows: C:\ProgramData\TheWatcher\TheWatcherServer.conf
-Linux/BSD: /etc/thewatcher/TheWatcherServer.conf
+Linux: /etc/thewatcher/TheWatcherServer.conf
+FreeBSD/OpenBSD/NetBSD/DragonFly: /usr/local/etc/thewatcher/TheWatcherServer.conf
 ```
+
+On the BSDs an existing `/etc/thewatcher/TheWatcherServer.conf` is still used
+when no file exists under `/usr/local/etc/thewatcher/`, so upgrades keep their
+settings.
 
 The server uses `--config <path>` when provided. Otherwise it uses the platform
 default path. If the file does not exist, the server creates it and generates a
@@ -41,11 +46,11 @@ Options:
 | `BIND_ADDRESS` | `tcp://*:5555` | ZeroMQ ROUTER endpoint for approved agents. Agents connect to this endpoint and submit metrics, heartbeats, command ACKs, and config requests. |
 | `ENROLLMENT_ADDRESS` | `tcp://*:5556` | ZeroMQ REP endpoint for plaintext enrollment requests. |
 | `API_HOST` | `0.0.0.0` | HTTP REST API bind host. |
-| `API_PORT` | `8080` | HTTP REST API port consumed by the dashboard. |
+| `API_PORT` | `8080` | HTTP REST API port consumed by the dashboard. Must be a number from 1 to 65535. |
 | `DB_PATH` | `thewatcher.db` | SQLite database path when `DB_TYPE` is `sqlite`. Relative paths resolve beside the active server config file so server restarts from different working directories keep using the same database. |
-| `DB_TYPE` | `sqlite` | Storage backend. `sqlite` is implemented. `postgres` is reserved in config but not implemented by the current build. |
+| `DB_TYPE` | `sqlite` | Storage backend, `sqlite` or `postgres` (any other value fails startup; `postgres` also needs `POSTGRES_DSN`). `sqlite` is implemented. `postgres` is reserved in config but not implemented by the current build. |
 | `POSTGRES_DSN` | empty | Reserved for future PostgreSQL support. |
-| `OFFLINE_AFTER_SECONDS` | `60` | Approved connected agents are marked disconnected when `last_seen` is older than this number of seconds. Set `0` or a negative value to disable automatic offline marking. |
+| `OFFLINE_AFTER_SECONDS` | `60` | Approved connected agents are marked disconnected when `last_seen` is older than this number of seconds. Must be a number from 0 to 604800. `0` disables automatic offline marking (a warning is logged at startup); negative values are rejected. |
 | `SERVER_PUBLIC_KEY` | generated | Server CURVE public key. Approved enrollment responses include this key and its fingerprint so agents can learn and pin it. |
 | `SERVER_SECRET_KEY` | generated | Server CURVE secret key. Keep this private. |
 | `ENROLLMENT_TOKEN` | empty | Optional pre-shared token. When set, every enrollment request must carry a matching token (`ENROLLMENT_TOKEN` in the agent config), so arbitrary hosts cannot create pending-agent records. Leave empty for tokenless first-run enrollment. |
@@ -53,6 +58,23 @@ Options:
 
 If `server_public_key` is empty, the server does not enable CURVE on the data
 socket. The default generated config enables CURVE.
+
+`SERVER_PUBLIC_KEY` and `SERVER_SECRET_KEY` must be set together, each a
+40-character z85 key, and the public key must belong to the secret key; a
+half-set or mismatched pair fails startup instead of silently running without
+encryption.
+
+### Validation
+
+The config is checked when it loads. A bad value stops startup with an error
+that names the key and the line, for example `API_PORT: not a number (line 4)`
+or `API_PORT: must be between 1 and 65535 (line 4)`. Cross-key problems name
+the keys involved (`POSTGRES_DSN: required when DB_TYPE=postgres`).
+
+A key the server does not know (usually a typo such as `OFFLNE_AFTER_SECONDS`)
+is ignored with a warning in the log that names the key and line. It does not
+stop startup, so a config written for a newer release still loads after a
+downgrade; check the log after editing the file.
 
 When the server writes its config (first run, or after a change), it writes to
 a uniquely named temporary file in the same directory that is created

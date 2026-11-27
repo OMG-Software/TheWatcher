@@ -112,7 +112,22 @@ working document for audit, design review, and regression testing.
 - Approval and revocation are enforced per frame: rejected or deleted agents
   stop contributing data on their live session without waiting for a
   reconnect.
-- Config parser file and line sizes are bounded to avoid unbounded local input.
+- Config parser file and line sizes are bounded to avoid unbounded local input,
+  and values are range-checked at load (ports, offline interval, database type,
+  CURVE keypair), so a typo cannot silently disable offline detection or
+  encryption. Unknown keys only warn, so a config from a newer release still
+  loads after a downgrade; the residual risk is a typo in an optional key being
+  noticed only in the log.
+- REST API inputs are bounded by one set of limits (`server/api_validation.hpp`,
+  listed in [api.md](api.md)): string lengths, list sizes, numeric ranges and
+  timestamps, so oversized records cannot bloat the database or the dashboard
+  poll. Ids are parsed strictly (400 for malformed, 404 for unknown) and errors
+  never carry exception text. Alert lists are filtered, scoped to the caller's
+  groups and paged inside the database, so one request cannot load the whole
+  alerts table.
+- Deleting an agent also deletes its silences, maintenance windows, runbooks and
+  view references in one transaction, so a re-enrolled agent with the same id
+  cannot inherit a silence that suppresses its alerts.
 - The API still needs a global request-body size limit in httplib or a fronting
   reverse proxy; this is a residual risk.
 - Metrics and alert retention settings should be configured to limit database

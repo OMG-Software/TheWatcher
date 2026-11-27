@@ -32,13 +32,23 @@ struct ServerConfig
     // Config key TRUSTED_PROXIES (comma-separated).
     std::vector<std::string> trusted_proxies;
 
+    // Keys found in the loaded file that this release does not recognise
+    // (usually typos). Set by load_or_create, which also logs a warning for
+    // each; they are not an error so a config written by a newer release still
+    // loads after a downgrade. Never written by save().
+    std::vector<std::string> unknown_keys;
+
     static std::filesystem::path default_path();
     // Loads the KEY=VALUE config at path, or creates it with a new CURVE keypair
     // when missing. A relative sqlite DB_PATH resolves against the config
     // directory. Throws std::runtime_error if the file is over 1 MiB, a line is
-    // over 8 KiB, or the file cannot be read or written. A non-numeric port or
-    // interval throws std::invalid_argument or std::out_of_range. SEC-15: warns
-    // when group or others can read an existing file.
+    // over 8 KiB, or the file cannot be read or written. Throws
+    // std::invalid_argument for a bad value: "API_PORT: not a number (line 3)",
+    // a port outside 1-65535, OFFLINE_AFTER_SECONDS outside 0-604800 (0 disables
+    // offline detection), a DB_TYPE other than sqlite/postgres, postgres without
+    // POSTGRES_DSN, or a CURVE keypair that is half set, malformed or mismatched.
+    // Unknown keys only warn (see unknown_keys). SEC-15: warns when group or
+    // others can read an existing file.
     static ServerConfig load_or_create(const std::filesystem::path& path);
     // Writes the config to path atomically (SEC-15): an owner-only temp file is
     // flushed, then renamed over the target, so a crash cannot truncate an

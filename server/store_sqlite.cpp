@@ -8,6 +8,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <cctype>
 #include <stdexcept>
 #include <string>
@@ -162,7 +163,7 @@ namespace
                 text_col(s, 10),
                 sqlite3_column_int64(s, 11),
                 text_col(s, 12),
-                {}};
+                sqlite3_column_count(s) > 13 ? text_col(s, 13) : std::string{}};
     }
 
     MaintenanceWindowRecord row_to_maintenance_window(sqlite3_stmt* s)
@@ -648,13 +649,73 @@ void SqliteStore::reject_agent(const std::string& agent_id)
     check(sqlite3_step(st.s), db_, "step reject_agent");
 }
 
+namespace
+{
+    ViewRecord row_to_view(sqlite3_stmt* s); // defined with the view queries below
+} // namespace
+
 void SqliteStore::delete_agent(const std::string& agent_id)
 {
-    Stmt st;
-    check(sqlite3_prepare_v2(db_, "DELETE FROM agents WHERE agent_id=?;", -1, &st.s, nullptr), db_,
-          "prepare delete_agent");
-    sqlite3_bind_text(st.s, 1, agent_id.c_str(), -1, SQLITE_TRANSIENT);
-    check(sqlite3_step(st.s), db_, "step delete_agent");
+    // Rolls back unless commit() ran, so a failure part-way leaves the agent
+    // and its silences, windows, runbooks and views all in place.
+    struct Transaction
+    {
+        explicit Transaction(SqliteStore& store)
+            : store_(store)
+        {
+            store_.exec("BEGIN IMMEDIATE;");
+        }
+        ~Transaction()
+        {
+            if (!committed_)
+                sqlite3_exec(store_.db_, "ROLLBACK;", nullptr, nullptr, nullptr);
+        }
+        Transaction(const Transaction&) = delete;
+        Transaction& operator=(const Transaction&) = delete;
+        void commit()
+        {
+            store_.exec("COMMIT;");
+            committed_ = true;
+        }
+        SqliteStore& store_;
+        bool committed_ = false;
+    } tx(*this);
+
+    // silences, maintenance_windows and runbooks have no foreign key to agents.
+    for (const char* sql :
+         {"DELETE FROM silences WHERE agent_id=?;", "DELETE FROM maintenance_windows WHERE agent_id=?;",
+          "DELETE FROM runbooks WHERE agent_id=?;", "DELETE FROM agents WHERE agent_id=?;"})
+    {
+        Stmt st;
+        check(sqlite3_prepare_v2(db_, sql, -1, &st.s, nullptr), db_, "prepare delete_agent");
+        sqlite3_bind_text(st.s, 1, agent_id.c_str(), -1, SQLITE_TRANSIENT);
+        check(sqlite3_step(st.s), db_, "step delete_agent");
+    }
+
+    // Views keep their agent ids inside config_json: drop the deleted id.
+    std::vector<ViewRecord> affected;
+    {
+        Stmt st;
+        check(sqlite3_prepare_v2(db_,
+                                 "SELECT v.view_id,v.name,v.owner_user_id,'',v.is_public,v.group_id,v.created_at,"
+                                 "v.config_json FROM views v;",
+                                 -1, &st.s, nullptr),
+              db_, "prepare delete_agent views");
+        while (sqlite3_step(st.s) == SQLITE_ROW)
+        {
+            auto view = row_to_view(st.s);
+            const auto it = std::find(view.agent_ids.begin(), view.agent_ids.end(), agent_id);
+            if (it == view.agent_ids.end())
+                continue;
+            view.agent_ids.erase(std::remove(view.agent_ids.begin(), view.agent_ids.end(), agent_id),
+                                 view.agent_ids.end());
+            affected.push_back(std::move(view));
+        }
+    }
+    for (const auto& view : affected)
+        update_view(view);
+
+    tx.commit();
 }
 
 void SqliteStore::mark_agents_offline_before(int64_t cutoff_ms)
@@ -1181,6 +1242,68 @@ std::vector<AlertRecord> SqliteStore::list_unacknowledged_alerts()
     while (sqlite3_step(st.s) == SQLITE_ROW)
         out.push_back(row_to_alert(st.s));
     return out;
+}
+
+namespace
+{
+    // Alert columns plus the agent's runbook, read by row_to_alert.
+    constexpr const char* ALERT_JOIN_SELECT =
+        "SELECT a.alert_id,a.agent_id,a.indicator,a.old_status,a.new_status,a.message,a.created_at,"
+        "a.acknowledged_by,a.acknowledged_at,a.deleted_at,a.note,a.escalated_at,a.runbook_url,"
+        "COALESCE(g.runbook_markdown,'') FROM alerts a LEFT JOIN agents g ON g.agent_id=a.agent_id";
+} // namespace
+
+std::vector<AlertRecord> SqliteStore::query_alerts(const AlertQuery& query)
+{
+    std::string sql = ALERT_JOIN_SELECT;
+    sql += " WHERE 1=1";
+    if (!query.include_deleted)
+        sql += " AND a.deleted_at=0";
+    if (query.unacknowledged_only)
+        sql += " AND a.acknowledged_at=0";
+    if (query.visible_to_user_id > 0)
+        sql += " AND a.agent_id IN (SELECT ag.agent_id FROM agent_groups ag JOIN user_groups ug ON "
+               "ug.group_id=ag.group_id WHERE ug.user_id=?)";
+    if (!query.alert_ids.empty())
+    {
+        sql += " AND a.alert_id IN (?";
+        for (std::size_t i = 1; i < query.alert_ids.size(); ++i)
+            sql += ",?";
+        sql += ")";
+    }
+    sql += " ORDER BY a.created_at DESC,a.alert_id DESC";
+    // SQLite needs a LIMIT before OFFSET; -1 means unlimited.
+    if (query.limit > 0 || query.offset > 0)
+        sql += " LIMIT ? OFFSET ?";
+    sql += ";";
+
+    Stmt st;
+    check(sqlite3_prepare_v2(db_, sql.c_str(), -1, &st.s, nullptr), db_, "prepare query_alerts");
+    int bind = 1;
+    if (query.visible_to_user_id > 0)
+        sqlite3_bind_int64(st.s, bind++, query.visible_to_user_id);
+    for (const auto id : query.alert_ids)
+        sqlite3_bind_int64(st.s, bind++, id);
+    if (query.limit > 0 || query.offset > 0)
+    {
+        sqlite3_bind_int64(st.s, bind++, query.limit > 0 ? query.limit : -1);
+        sqlite3_bind_int64(st.s, bind++, query.offset);
+    }
+    std::vector<AlertRecord> out;
+    while (sqlite3_step(st.s) == SQLITE_ROW)
+        out.push_back(row_to_alert(st.s));
+    return out;
+}
+
+std::optional<AlertRecord> SqliteStore::get_alert(int64_t alert_id)
+{
+    const std::string sql = std::string(ALERT_JOIN_SELECT) + " WHERE a.alert_id=?;";
+    Stmt st;
+    check(sqlite3_prepare_v2(db_, sql.c_str(), -1, &st.s, nullptr), db_, "prepare get_alert");
+    sqlite3_bind_int64(st.s, 1, alert_id);
+    if (sqlite3_step(st.s) == SQLITE_ROW)
+        return row_to_alert(st.s);
+    return std::nullopt;
 }
 
 void SqliteStore::acknowledge_alert(int64_t alert_id, const std::string& username, int64_t acknowledged_at,

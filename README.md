@@ -69,6 +69,12 @@ the agent writes back to `TheWatcherAgent.conf`.
   dashboard, storage, and command/config data flow.
 - [Dashboard](docs/dashboard.md): UI behavior, API contract, and development
   commands.
+- [REST API](docs/api.md): every route with its role, request and response
+  shapes, error codes, input limits and paging.
+- [Threat model](docs/threat-model.md): assets, trust boundaries, threats,
+  mitigations and residual risks.
+- [High availability](docs/ha-topology.md): topology for running the server
+  with PostgreSQL behind a load balancer.
 - [Development](docs/development.md): repository layout, build/test targets,
   coding workflow, and how to extend the product end to end.
 - [Progress Tracker](docs/01-progress-tracker.md): alpha, beta, and v1
