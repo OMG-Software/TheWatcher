@@ -11,13 +11,34 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
+#include <cstddef>
 #include <cstdint>
+#include <initializer_list>
+#include <span>
 #include <vector>
 
 using namespace thewatcher::proto;
 
 namespace
 {
+
+// Joins byte sequences into one buffer that is sized before anything is
+// copied. Appending with vector::insert onto a small vector instead trips a
+// GCC 11 -O3 false positive (-Wstringop-overread) in the reallocation path,
+// which -Werror turns into a build failure on the Linux CI job.
+std::vector<uint8_t> concat(std::initializer_list<std::span<const uint8_t>> parts)
+{
+    std::size_t total = 0;
+    for (const auto part : parts)
+        total += part.size();
+
+    std::vector<uint8_t> bytes(total);
+    auto out = bytes.begin();
+    for (const auto part : parts)
+        out = std::copy(part.begin(), part.end(), out);
+    return bytes;
+}
 
 // CBOR array header with a 64-bit definite element count (major type 4,
 // additional info 27) followed by the count bytes 0x0000000100000000
@@ -175,21 +196,18 @@ namespace
 // replaced by the raw CBOR bytes under test.
 std::vector<uint8_t> temperature_payload(const std::vector<uint8_t>& value)
 {
-    std::vector<uint8_t> bytes{0x83, 0x61, 'a', 0x61, 'b'};
-    bytes.insert(bytes.end(), value.begin(), value.end());
-    return bytes;
+    const std::vector<uint8_t> prefix{0x83, 0x61, 'a', 0x61, 'b'};
+    return concat({prefix, value});
 }
 
 // PercentThresholds is [<double>, <double>, <double>]; the first item is
 // replaced by the raw CBOR bytes under test.
 std::vector<uint8_t> thresholds_payload(const std::vector<uint8_t>& value)
 {
-    std::vector<uint8_t> bytes{0x83};
-    bytes.insert(bytes.end(), value.begin(), value.end());
+    const std::vector<uint8_t> prefix{0x83};
     const std::vector<uint8_t> two_doubles{0xFB, 0x40, 0x59, 0, 0, 0, 0, 0, 0,  // 100.0
                                            0xFB, 0x40, 0x59, 0, 0, 0, 0, 0, 0}; // 100.0
-    bytes.insert(bytes.end(), two_doubles.begin(), two_doubles.end());
-    return bytes;
+    return concat({prefix, value, two_doubles});
 }
 
 } // namespace
