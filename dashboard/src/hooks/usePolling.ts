@@ -19,9 +19,10 @@ export interface PollingState<T> {
  *   result is then dropped; so does unmounting.
  * - The poll pauses while the tab is hidden and runs at once when it is shown again.
  *
+ * `enabled: false` neither loads nor polls (data from an earlier enabled period is kept).
  * `fetcher` may change between renders; the latest one is always used.
  */
-export function usePolling<T>(fetcher: () => Promise<T>, intervalMs?: number) {
+export function usePolling<T>(fetcher: () => Promise<T>, { intervalMs, enabled = true }: { intervalMs?: number; enabled?: boolean } = {}) {
   const [state, setState] = React.useState<PollingState<T>>({ data: null, error: null, loading: true, loadedAt: null });
   const fetcherRef = React.useRef(fetcher);
   const ticketRef = React.useRef(0); // id of the newest request; older responses are stale
@@ -47,14 +48,16 @@ export function usePolling<T>(fetcher: () => Promise<T>, intervalMs?: number) {
     }
   }, []);
 
+  // Drops whatever is in flight: its response will be treated as stale.
+  const invalidate = React.useCallback(() => {
+    ticketRef.current++;
+    runningRef.current = 0;
+  }, []);
+
   React.useEffect(() => {
+    if (!enabled) return;
     void load(true);
-    if (!intervalMs) {
-      return () => {
-        ticketRef.current++;
-        runningRef.current = 0;
-      };
-    }
+    if (!intervalMs) return invalidate;
     const poll = () => {
       if (!document.hidden) void load(false);
     };
@@ -63,10 +66,9 @@ export function usePolling<T>(fetcher: () => Promise<T>, intervalMs?: number) {
     return () => {
       window.clearInterval(timer);
       document.removeEventListener('visibilitychange', poll);
-      ticketRef.current++; // drop anything still in flight
-      runningRef.current = 0;
+      invalidate();
     };
-  }, [intervalMs, load]);
+  }, [enabled, intervalMs, invalidate, load]);
 
   const refresh = React.useCallback(() => load(true), [load]);
 

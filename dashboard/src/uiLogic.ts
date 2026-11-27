@@ -140,3 +140,14 @@ export function parseViewHash(hash: string): number | null {
   const match = hash.match(/^#view-(\d+)$/);
   return match ? parseInt(match[1], 10) : null;
 }
+
+/**
+ * True when the page is served over plain HTTP from a non-local host. The
+ * session cookie is `Secure`, so the browser drops it there and every call
+ * after login would be rejected as unauthenticated.
+ */
+export function isInsecureOrigin(location: { protocol: string; hostname: string }): boolean {
+  if (location.protocol !== 'http:') return false;
+  const host = location.hostname.toLowerCase();
+  return !(host === 'localhost' || host.endsWith('.localhost') || host === '127.0.0.1' || host === '[::1]' || host === '::1');
+}

@@ -1,52 +1,53 @@
 import React from 'react';
-import { fetchViews, loadDashboardData } from '../api';
-import type { AlertRecord, DashboardAgent, GroupRecord, MaintenanceWindowRecord, SessionInfo, SilenceRecord, UserRecord, ViewRecord } from '../models';
+import { loadDashboardData, type DashboardData } from '../api';
 import { toDashboardAgents } from '../status';
+import { usePolling } from './usePolling';
 
 const POLL_INTERVAL_MS = 5000;
 
-/** Loads everything the dashboard shows and re-polls while a session is active. */
-export function useDashboardData(session: SessionInfo | null) {
-  const [agents, setAgents] = React.useState<DashboardAgent[]>([]);
-  const [pending, setPending] = React.useState<DashboardAgent[]>([]);
-  const [groups, setGroups] = React.useState<GroupRecord[]>([]);
-  const [alerts, setAlerts] = React.useState<AlertRecord[]>([]);
-  const [allAlerts, setAllAlerts] = React.useState<AlertRecord[]>([]);
-  const [users, setUsers] = React.useState<UserRecord[]>([]);
-  const [maintenanceWindows, setMaintenanceWindows] = React.useState<MaintenanceWindowRecord[]>([]);
-  const [silences, setSilences] = React.useState<SilenceRecord[]>([]);
-  const [customViews, setCustomViews] = React.useState<ViewRecord[]>([]);
-  const [loadedAt, setLoadedAt] = React.useState<Date | null>(null);
-  const [error, setError] = React.useState<string | null>(null);
-  const [loading, setLoading] = React.useState(true);
+const SECTION_KEYS = ['pending', 'groups', 'alerts', 'allAlerts', 'users', 'maintenanceWindows', 'silences', 'views'] as const;
 
-  const refresh = React.useCallback(async () => {
-    if (!session) return;
-    try {
-      setError(null);
-      const [data, views] = await Promise.all([loadDashboardData(), fetchViews().catch(() => [] as ViewRecord[])]);
-      setAgents(toDashboardAgents(data.agents, data.metrics, data.alerts));
-      setPending(toDashboardAgents(data.pending, [], []));
-      setGroups(data.groups);
-      setAlerts(data.alerts);
-      setAllAlerts(data.allAlerts);
-      setUsers(data.users);
-      setMaintenanceWindows(data.maintenanceWindows);
-      setSilences(data.silences);
-      setCustomViews(views);
-      setLoadedAt(new Date());
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to load dashboard data');
-    } finally {
-      setLoading(false);
-    }
-  }, [session]);
+/**
+ * A section that failed this time keeps its last good value, so a transient error
+ * cannot turn a list of alerts into an empty (all-clear looking) one.
+ */
+export function keepFailedSections(next: DashboardData, previous: DashboardData | null): DashboardData {
+  if (!previous) return next;
+  const merged = { ...next };
+  for (const key of SECTION_KEYS) {
+    if (next.errors[key]) (merged[key] as unknown) = previous[key];
+  }
+  return merged;
+}
 
-  React.useEffect(() => {
-    void refresh();
-    const timer = window.setInterval(() => void refresh(), POLL_INTERVAL_MS);
-    return () => window.clearInterval(timer);
-  }, [refresh]);
+/** Loads everything the dashboard shows and re-polls every few seconds. */
+export function useDashboardData() {
+  const previous = React.useRef<DashboardData | null>(null);
+  const fetcher = React.useCallback(async () => {
+    const data = keepFailedSections(await loadDashboardData(), previous.current);
+    previous.current = data;
+    return data;
+  }, []);
+  const { data, error, loading, loadedAt, refresh } = usePolling(fetcher, { intervalMs: POLL_INTERVAL_MS });
 
-  return { agents, pending, groups, alerts, allAlerts, users, maintenanceWindows, silences, customViews, loadedAt, error, setError, loading, refresh };
+  const agents = React.useMemo(() => (data ? toDashboardAgents(data.agents, data.metrics, data.alerts) : []), [data]);
+  const pending = React.useMemo(() => (data ? toDashboardAgents(data.pending, [], []) : []), [data]);
+
+  return {
+    agents,
+    pending,
+    groups: data?.groups ?? [],
+    alerts: data?.alerts ?? [],
+    allAlerts: data?.allAlerts ?? [],
+    users: data?.users ?? [],
+    maintenanceWindows: data?.maintenanceWindows ?? [],
+    silences: data?.silences ?? [],
+    customViews: data?.views ?? [],
+    /** Per-section load failures; the section's list is its last good value (or empty). */
+    sectionErrors: data?.errors ?? {},
+    loadedAt,
+    error,
+    loading,
+    refresh,
+  };
 }

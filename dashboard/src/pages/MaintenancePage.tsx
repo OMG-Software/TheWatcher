@@ -1,6 +1,7 @@
 import React from 'react';
 import { Plus, Trash2 } from 'lucide-react';
 import { createMaintenanceWindow, deleteMaintenanceWindow } from '../api';
+import { ActionError } from '../components/ActionError';
 import { ActionButton } from '../components/ActionButton';
 import { AgentIdentity } from '../components/AgentIdentity';
 import type { RunAction } from '../hooks/useRunAction';
@@ -10,6 +11,7 @@ export function MaintenancePage({
   agents,
   busyAction,
   global,
+  loadFailed = false,
   operator,
   runAction,
   windows,
@@ -17,6 +19,7 @@ export function MaintenancePage({
   agents: DashboardAgent[];
   busyAction: string | null;
   global: boolean;
+  loadFailed?: boolean;
   operator: boolean;
   runAction: RunAction;
   windows: MaintenanceWindowRecord[];
@@ -45,8 +48,9 @@ export function MaintenancePage({
             const startMs = new Date(`${startDate}T${startTime}`).getTime();
             const endMs = startMs + durationHours * 3600_000;
             if (Number.isNaN(startMs) || endMs <= startMs) return;
-            void runAction('mw:create', () => createMaintenanceWindow(agentId, startMs, endMs, reason)).then(() => {
-              setReason('');
+            void runAction('mw:create', () => createMaintenanceWindow(agentId, startMs, endMs, reason), { inline: true }).then((saved) => {
+              // Keep what the user typed when the save failed.
+              if (saved) setReason('');
             });
           }}
         >
@@ -87,6 +91,7 @@ export function MaintenancePage({
           <ActionButton busy={busyAction === 'mw:create'} disabled={!operator} icon={<Plus size={14} />} label="Schedule" onClick={() => undefined} type="submit" />
         </form>
       ) : null}
+      <ActionError actionKey="mw:create" />
       <div className="table-container">
         <table className="management-table">
           <thead>
@@ -100,7 +105,7 @@ export function MaintenancePage({
             </tr>
           </thead>
           <tbody>
-            {windows.length === 0 ? (
+            {windows.length === 0 && !loadFailed ? (
               <tr><td colSpan={6} className="uptime">No maintenance windows scheduled.</td></tr>
             ) : null}
             {windows.map((w) => {

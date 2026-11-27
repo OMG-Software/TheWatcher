@@ -1,7 +1,9 @@
 import React from 'react';
 import { X } from 'lucide-react';
+import { ActionError } from './ActionError';
 
-export function AcknowledgeModal({ onClose, onSubmit, bulk }: { onClose: () => void; onSubmit: (note: string, andArchive: boolean) => void; bulk: boolean }) {
+/** Stays open (with the note) until the parent closes it, so a failed save loses nothing; the parent shows the failure under `errorKey`. */
+export function AcknowledgeModal({ busy, bulk, errorKey, onClose, onSubmit }: { busy: boolean; bulk: boolean; errorKey: string; onClose: () => void; onSubmit: (note: string, andArchive: boolean) => void }) {
   const [note, setNote] = React.useState('');
   const [andArchive, setAndArchive] = React.useState(false);
   return (
@@ -26,9 +28,10 @@ export function AcknowledgeModal({ onClose, onSubmit, bulk }: { onClose: () => v
           <input type="checkbox" checked={andArchive} onChange={(e) => setAndArchive(e.target.checked)} />
           Also archive after acknowledging
         </label>
+        <ActionError actionKey={errorKey} />
         <div className="button-row modal-actions">
           <button className="text-button secondary" onClick={onClose}>Cancel</button>
-          <button className="text-button" onClick={() => onSubmit(note, andArchive)}>
+          <button className="text-button" disabled={busy} onClick={() => onSubmit(note, andArchive)}>
             {andArchive ? 'Acknowledge & Archive' : 'Acknowledge'}
           </button>
         </div>
