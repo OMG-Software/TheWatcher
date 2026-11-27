@@ -8,6 +8,7 @@
 #include "collectors/process_collector.hpp"
 #include "common/SingleLog.hpp"
 #include "common/zmq_limits.hpp"
+#include "common/zmq_retry.hpp"
 #include "enrollment.hpp"
 
 #include <chrono>
@@ -240,12 +241,18 @@ void Agent::io_loop(std::stop_token st)
             }
         }
 
-        zmq::poll(items, 1, std::chrono::milliseconds{100});
+        thewatcher::zmqutil::retry_on_eintr([&] {
+            return zmq::poll(items, 1, std::chrono::milliseconds{100});
+        });
         if (items[0].revents & ZMQ_POLLIN)
         {
             zmq::message_t delim, payload;
-            const auto delim_size = dealer_.recv(delim, zmq::recv_flags::none);
-            const auto payload_size = dealer_.recv(payload, zmq::recv_flags::none);
+            const auto delim_size = thewatcher::zmqutil::retry_on_eintr([&] {
+                return dealer_.recv(delim, zmq::recv_flags::none);
+            });
+            const auto payload_size = thewatcher::zmqutil::retry_on_eintr([&] {
+                return dealer_.recv(payload, zmq::recv_flags::none);
+            });
             if (!delim_size || !payload_size)
             {
                 LOG_WARNING("Agent failed to receive a complete server frame");

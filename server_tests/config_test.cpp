@@ -320,3 +320,66 @@ SCENARIO("Server config rejects oversized KEY=VALUE config input")
         }
     }
 }
+
+SCENARIO("Server config LOG_* keys control the log level and rotation (issue #99)")
+{
+    GIVEN("a config with no LOG_* keys")
+    {
+        auto dir = unique_temp_dir("server-config-log-default");
+        auto path = dir / "server.conf";
+        {
+            std::ofstream f(path);
+            f << "API_PORT=8080\n";
+        }
+
+        THEN("logging defaults to INFO with 10 MiB files and 5 backups")
+        {
+            const auto cfg = ServerConfig::load_or_create(path);
+            REQUIRE(cfg.log.level == thewatcher::logging::LogLevel::L_INFO);
+            REQUIRE(cfg.log.max_size_mib == 10);
+            REQUIRE(cfg.log.max_files == 5);
+        }
+    }
+
+    GIVEN("a config that sets all LOG_* keys")
+    {
+        auto dir = unique_temp_dir("server-config-log-set");
+        auto path = dir / "server.conf";
+        {
+            std::ofstream f(path);
+            f << "LOG_LEVEL=debug\nLOG_MAX_SIZE_MB=2\nLOG_MAX_FILES=3\n";
+        }
+
+        WHEN("the config is loaded, saved and loaded again")
+        {
+            auto cfg = ServerConfig::load_or_create(path);
+            cfg.save(path);
+            const auto reloaded = ServerConfig::load_or_create(path);
+
+            THEN("the values are read and survive the round trip")
+            {
+                REQUIRE(cfg.log.level == thewatcher::logging::LogLevel::L_DEBUG);
+                REQUIRE(cfg.log.max_size_mib == 2);
+                REQUIRE(cfg.log.max_files == 3);
+                REQUIRE(reloaded.log.level == thewatcher::logging::LogLevel::L_DEBUG);
+                REQUIRE(reloaded.log.max_size_mib == 2);
+                REQUIRE(reloaded.log.max_files == 3);
+            }
+        }
+    }
+
+    GIVEN("a config with an invalid LOG_LEVEL")
+    {
+        auto dir = unique_temp_dir("server-config-log-bad");
+        auto path = dir / "server.conf";
+        {
+            std::ofstream f(path);
+            f << "LOG_LEVEL=chatty\n";
+        }
+
+        THEN("loading fails with a clear error instead of silently logging at the wrong level")
+        {
+            REQUIRE_THROWS_AS(ServerConfig::load_or_create(path), std::invalid_argument);
+        }
+    }
+}

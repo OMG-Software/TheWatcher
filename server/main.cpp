@@ -1,12 +1,13 @@
 #include "common/SingleLog.hpp"
 #include "common/crypto.hpp"
+#include "common/signal_guard.hpp"
+#include "common/stop_relay.hpp"
 #include "common/windows_service.hpp"
 #include "config.hpp"
 #include "server.hpp"
 #include "startup_signal.hpp"
 
 #include <atomic>
-#include <csignal>
 #include <filesystem>
 #include <iostream>
 #include <memory>
@@ -17,12 +18,6 @@
 
 namespace
 {
-volatile std::sig_atomic_t g_stop = 0;
-void handle_signal(int)
-{
-    g_stop = 1;
-}
-
 std::filesystem::path log_path_for_config(const std::filesystem::path& config_path, const char* filename)
 {
     auto directory = config_path.has_parent_path() ? config_path.parent_path() : std::filesystem::current_path();
@@ -35,6 +30,8 @@ static void print_usage(const char* prog)
     std::cout << "Usage: " << prog << " [options]\n"
               << "Options:\n"
               << "  --config <path>   Config file path (default: platform-specific)\n"
+              << "  --log-level <l>   Log file level: trace, debug, info, notice, warning, error,\n"
+              << "                    critical or off (overrides LOG_LEVEL in the config)\n"
               << "  --genkey          Print a new CURVE keypair and exit\n"
               << "  --service         Run under Windows Service Control Manager\n"
               << "  --service-name <n> Service name (default: TheWatcherServer)\n"
@@ -48,7 +45,12 @@ int main(int argc, char* argv[])
     namespace fs = std::filesystem;
     using namespace thewatcher::server;
 
+    // First, before any thread exists, so every later thread inherits the
+    // blocked SIGINT/SIGTERM mask (issue #84).
+    thewatcher::process::SignalGuard signals;
+
     std::string config_path;
+    std::string cli_log_level;
     std::string service_name = "TheWatcherServer";
     bool do_genkey = false;
     bool service_mode = false;
@@ -83,6 +85,10 @@ int main(int argc, char* argv[])
         {
             service_name = argv[++i];
         }
+        else if (arg == "--log-level" && i + 1 < argc)
+        {
+            cli_log_level = argv[++i];
+        }
         else if (arg == "--config" && i + 1 < argc)
         {
             config_path = argv[++i];
@@ -108,7 +114,19 @@ int main(int argc, char* argv[])
     auto log_path = log_path_for_config(cfg_path, "TheWatcherServer.log");
     auto& logger = thewatcher::logging::SingleLog::GetInstance();
     logger.SetConsoleLogLevel(thewatcher::logging::LogLevel::L_INFO);
-    logger.SetFileLogLevel(thewatcher::logging::LogLevel::L_TRACE);
+    // Defaults until the config is read; --log-level also applies from here on.
+    thewatcher::logging::LogSettings log_settings;
+    try
+    {
+        if (!cli_log_level.empty())
+            log_settings.set_level(cli_log_level);
+    }
+    catch (const std::exception& e)
+    {
+        std::cerr << e.what() << "\n";
+        return 1;
+    }
+    log_settings.apply(logger);
     logger.SetLogFilePath(log_path.string());
 
     if (install_service)
@@ -155,32 +173,40 @@ int main(int argc, char* argv[])
         return 1;
     }
 
+    // The config's log settings take effect now; --log-level still wins.
+    log_settings = config.log;
+    if (!cli_log_level.empty())
+        log_settings.set_level(cli_log_level);
+    log_settings.apply(logger);
+
     LOGF_INFO("Public key: %s", config.server_public_key.c_str());
     LOGF_DEBUG("Server bind=%s enrollment=%s api=%s:%d db_type=%s db_path=%s offline_after_seconds=%d",
                config.bind_address.c_str(), config.enrollment_address.c_str(), config.api_host.c_str(), config.api_port,
                config.db_type.c_str(), config.db_path.c_str(), config.offline_after_seconds);
-
-    std::signal(SIGINT, handle_signal);
-    std::signal(SIGTERM, handle_signal);
 
     try
     {
         if (service_mode)
         {
             LOGF_INFO("Starting Windows service mode as %s", service_name.c_str());
-            std::shared_ptr<Server> server;
+            // The SCM calls the stop callback on its own thread, possibly before
+            // the worker has built the server; the relay keeps that request.
+            thewatcher::process::StopRelay stop_relay;
             return thewatcher::service::run_windows_service(
                 service_name,
                 [&] {
                     LOG_DEBUG("Service worker constructing server");
-                    server = std::make_shared<Server>(std::move(config));
+                    Server service_server(std::move(config));
+                    // Detached again before service_server is destroyed.
+                    const auto attachment = stop_relay.attach_scoped([&] {
+                        service_server.stop();
+                    });
                     LOG_DEBUG("Service worker running server");
-                    server->run();
+                    service_server.run();
                 },
                 [&] {
                     LOG_DEBUG("Service stop callback received");
-                    if (server)
-                        server->stop();
+                    stop_relay.request_stop();
                 });
         }
 
@@ -218,8 +244,9 @@ int main(int argc, char* argv[])
         }
 
         LOG_INFO("Running. Press Ctrl+C to stop.");
-        while (!g_stop && !server_failed.load())
-            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        while (!server_failed.load() && !signals.wait_for(std::chrono::milliseconds(200)))
+        {
+        }
 
         if (server_failed.load())
         {
@@ -248,6 +275,9 @@ int main(int argc, char* argv[])
         LOG_INFO("Shutting down...");
         server.stop();
         srv_thread.join();
+        // A worker that died is a failure, whatever the supervisor does next.
+        if (server_failed.load())
+            return 1;
     }
     catch (const std::exception& e)
     {

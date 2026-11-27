@@ -4,6 +4,7 @@
 #include "common/crypto.hpp"
 #include "common/protocol.hpp"
 #include "common/zmq_limits.hpp"
+#include "common/zmq_retry.hpp"
 #include "config.hpp"
 
 #include <chrono>
@@ -179,7 +180,9 @@ void enroll(AgentConfig& config, zmq::context_t& ctx, const std::atomic<bool>& s
         }
 
         zmq::message_t resp;
-        auto rc = req.recv(resp, zmq::recv_flags::none);
+        auto rc = thewatcher::zmqutil::retry_on_eintr([&] {
+            return req.recv(resp, zmq::recv_flags::none);
+        });
         if (!rc)
         {
             LOGF_DEBUG("Enrollment response timed out; retrying in %d seconds", poll_interval_seconds);

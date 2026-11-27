@@ -15,6 +15,8 @@
 #include <catch2/catch_test_macros.hpp>
 #include <nlohmann/json.hpp>
 
+#include <chrono>
+#include <future>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -292,6 +294,49 @@ SCENARIO("Only real loopback addresses get the loopback origin exception (issue 
             {
                 REQUIRE(res);
                 REQUIRE(res->status == 200);
+            }
+        }
+    }
+}
+
+SCENARIO("ApiServer::stop returns promptly when called right after start (issue #50)")
+{
+    GIVEN("an API server that has just been started")
+    {
+        zmq::context_t ctx{1};
+        auto store = thewatcher::server::make_store("sqlite", ":memory:");
+        thewatcher::server::ZapHandler zap{ctx};
+        ApiServer api(*store, zap, "127.0.0.1", free_http_port());
+        api.start();
+
+        WHEN("stop() is called before the accept loop has had time to run")
+        {
+            auto stopped = std::async(std::launch::async, [&] {
+                api.stop();
+            });
+
+            THEN("stop() returns instead of waiting on a listener that never ends")
+            {
+                REQUIRE(stopped.wait_for(std::chrono::seconds(10)) == std::future_status::ready);
+            }
+        }
+    }
+}
+
+SCENARIO("ApiServer::stop without start is harmless (issue #50)")
+{
+    GIVEN("an API server that was never started")
+    {
+        zmq::context_t ctx{1};
+        auto store = thewatcher::server::make_store("sqlite", ":memory:");
+        thewatcher::server::ZapHandler zap{ctx};
+        ApiServer api(*store, zap, "127.0.0.1", free_http_port());
+
+        WHEN("stop() is called")
+        {
+            THEN("it returns without error")
+            {
+                REQUIRE_NOTHROW(api.stop());
             }
         }
     }

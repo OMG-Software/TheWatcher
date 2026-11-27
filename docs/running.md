@@ -39,6 +39,23 @@ pending and the agent keeps retrying.
 
 Stop foreground mode with `Ctrl+C`.
 
+## Signals And Exit Status
+
+On Linux and the BSDs, `SIGINT` and `SIGTERM` are blocked in every thread and
+picked up by one watcher thread (`common/signal_guard.hpp`), so a signal can
+never interrupt a ZeroMQ call on a worker thread. Interrupted ZeroMQ calls
+caused by anything else (for example `SIGSTOP`/`SIGCONT`) are retried
+(`common/zmq_retry.hpp`). Both binaries exit `0` after a signal and `1` on a
+startup or fatal runtime failure. A Windows service stop that arrives while the
+server or agent is still starting is remembered and applied as soon as it is
+ready (`common/stop_relay.hpp`).
+
+The server keeps running when one loop iteration fails, for example a database
+error or a corrupt stored setting: the error is logged and the iteration is
+retried with a growing pause. After 50 failures in a row it stops and exits
+`1`. A stored numeric setting that is not a number logs a warning and uses its
+default.
+
 ## Start And Stop Windows Services
 
 ```powershell

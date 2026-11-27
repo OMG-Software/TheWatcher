@@ -32,7 +32,9 @@ Uninstall:
 .\builddir-release\server\TheWatcherServer.exe --uninstall-service
 ```
 
-The installed command line runs the same executable with `--service`.
+The installed command line runs the same executable with `--service`. Every
+argument is quoted following the Windows `CommandLineToArgvW` rules, so paths
+that end in a backslash or contain quotes reach the service unchanged.
 
 ## Agent Service
 

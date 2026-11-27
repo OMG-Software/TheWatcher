@@ -75,6 +75,10 @@ common/metrics.hpp
 common/crypto.hpp
 common/logging.hpp
 common/windows_service.hpp
+common/signal_guard.hpp
+common/stop_relay.hpp
+common/zmq_retry.hpp
+common/log_settings.hpp
 ```
 
 Protocol frames are CBOR-encoded `thewatcher::proto::Frame` values (libcbor

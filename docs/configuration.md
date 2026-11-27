@@ -49,6 +49,9 @@ Options:
 | `SERVER_PUBLIC_KEY` | generated | Server CURVE public key. Approved enrollment responses include this key and its fingerprint so agents can learn and pin it. |
 | `SERVER_SECRET_KEY` | generated | Server CURVE secret key. Keep this private. |
 | `ENROLLMENT_TOKEN` | empty | Optional pre-shared token. When set, every enrollment request must carry a matching token (`ENROLLMENT_TOKEN` in the agent config), so arbitrary hosts cannot create pending-agent records. Leave empty for tokenless first-run enrollment. |
+| `LOG_LEVEL` | `info` | Minimum level written to the log file: `trace`, `debug`, `info`, `notice`, `warning`, `error`, `critical` or `off` (case-insensitive). The console stays at `info` unless this is set higher. Overridden by `--log-level`. An invalid value stops startup. |
+| `LOG_MAX_SIZE_MB` | `10` | Size at which the log file is rotated. `0` disables rotation. |
+| `LOG_MAX_FILES` | `5` | Rotated backups kept (`<log>.1` newest to `<log>.N`). `0` keeps none: the file is emptied at the size limit. |
 | `TRUSTED_PROXIES` | empty | Comma-separated list of reverse-proxy addresses whose `X-Forwarded-For` / `X-Real-IP` headers the API trusts when attributing login attempts for throttling. Whitespace around entries is ignored and empty entries are skipped. Empty (the default) trusts no proxy, so those headers are ignored and the TCP peer address is used. Omitted from the saved file when empty. |
 
 If `server_public_key` is empty, the server does not enable CURVE on the data
@@ -263,6 +266,9 @@ Options:
 | `COLLECTION_INTERVAL` | `30` | Seconds between periodic metrics submissions. The server can update this through the dashboard. |
 | `HEARTBEAT_INTERVAL` | `5` | Seconds between heartbeat frames. The server can update this through the dashboard; valid values are 1 through 60. |
 | `PROCESS_LIMIT` | `25` | Number of top processes collected by the process collector. The server can update this through the dashboard. |
+| `LOG_LEVEL` | `info` | Minimum level written to the log file: `trace`, `debug`, `info`, `notice`, `warning`, `error`, `critical` or `off` (case-insensitive). The console stays at `info` unless this is set higher. Overridden by `--log-level`. An invalid value stops startup. |
+| `LOG_MAX_SIZE_MB` | `10` | Size at which the log file is rotated. `0` disables rotation. |
+| `LOG_MAX_FILES` | `5` | Rotated backups kept (`<log>.1` newest to `<log>.N`). `0` keeps none: the file is emptied at the size limit. |
 
 The log monitor additionally respects the `LOG_ALLOWED_DIRS` environment
 variable: a list of directories (separated by `;` on Windows, `:` elsewhere)
@@ -288,6 +294,7 @@ Agent command-line options override loaded config values for that process:
 --enrollment <tcp-endpoint>
 --server-key <40-character-z85-key>
 --insecure
+--log-level <level>
 --service
 --service-name <name>
 --install-service
@@ -326,6 +333,7 @@ fails enrollment unless the agent runs with `--insecure` / `ALLOW_INSECURE=1`.
 
 ```text
 --config <path>
+--log-level <level>
 --service
 --service-name <name>
 --install-service
@@ -334,7 +342,16 @@ fails enrollment unless the agent runs with `--insecure` / `ALLOW_INSECURE=1`.
 --help
 ```
 
-`--genkey` prints a new CURVE keypair and exits.
+`--genkey` prints a new CURVE keypair and exits. `--log-level` sets the log
+file level for this process and wins over `LOG_LEVEL` in the config.
+
+### Exit status
+
+The server exits `0` after a clean stop (Ctrl+C, SIGTERM or a service stop)
+and `1` after a startup failure (bad config, a port that cannot be bound, a
+bad `--log-level`) or when the server worker fails while running. Restart
+policies such as systemd `Restart=on-failure` and Windows service recovery
+therefore act on real failures.
 
 ## Runtime Settings Flow
 

@@ -1,5 +1,7 @@
 #pragma once
 
+#include "common/log_settings.hpp"
+
 #include <filesystem>
 #include <string>
 #include <vector>
@@ -31,6 +33,11 @@ struct ServerConfig
     // API trusts for login throttling. Empty = trust none.
     // Config key TRUSTED_PROXIES (comma-separated).
     std::vector<std::string> trusted_proxies;
+
+    // Log file level and rotation. Config keys LOG_LEVEL, LOG_MAX_SIZE_MB and
+    // LOG_MAX_FILES; an invalid value makes load_or_create throw
+    // std::invalid_argument.
+    thewatcher::logging::LogSettings log;
 
     static std::filesystem::path default_path();
     // Loads the KEY=VALUE config at path, or creates it with a new CURVE keypair

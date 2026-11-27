@@ -1,6 +1,7 @@
 #include "zap_handler.hpp"
 
 #include "common/SingleLog.hpp"
+#include "common/zmq_retry.hpp"
 
 #include <array>
 #include <chrono>
@@ -72,7 +73,9 @@ void ZapHandler::run(std::stop_token st)
 
     while (!st.stop_requested())
     {
-        zmq::poll(items, 1, std::chrono::milliseconds{100});
+        thewatcher::zmqutil::retry_on_eintr([&] {
+            return zmq::poll(items, 1, std::chrono::milliseconds{100});
+        });
         if (!(items[0].revents & ZMQ_POLLIN))
             continue;
 
@@ -82,7 +85,9 @@ void ZapHandler::run(std::stop_token st)
         while (more)
         {
             parts.emplace_back();
-            if (!zap.recv(parts.back(), zmq::recv_flags::none))
+            if (!thewatcher::zmqutil::retry_on_eintr([&] {
+                    return zap.recv(parts.back(), zmq::recv_flags::none);
+                }))
             {
                 parts.pop_back();
                 break;

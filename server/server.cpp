@@ -5,12 +5,16 @@
 #include "common/crypto.hpp"
 #include "common/metrics.hpp"
 #include "common/zmq_limits.hpp"
+#include "common/zmq_retry.hpp"
 #include "report_generator.hpp"
+#include "setting_parse.hpp"
 #include "status_engine.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <ctime>
 #include <stdexcept>
+#include <thread>
 
 namespace thewatcher::server
 {
@@ -192,7 +196,8 @@ void Server::run(StartupSignal* startup)
     api_->start();
     LOGF_INFO("REST API on %s:%d", config_.api_host.c_str(), config_.api_port);
 
-    running_.store(true);
+    // A stop() that arrived while the sockets were binding stays in effect:
+    // stop_requested_ is only ever set by stop(), never cleared here.
     if (startup)
         startup->succeed();
     auto next_offline_scan = std::chrono::steady_clock::now();
@@ -202,120 +207,147 @@ void Server::run(StartupSignal* startup)
         {static_cast<void*>(enroll), 0, ZMQ_POLLIN, 0},
     };
 
-    while (running_.load())
+    // Issue #47: nothing thrown by one iteration (a SQLite/Postgres error, a
+    // socket error) may end the loop. The failure is logged and retried after
+    // a growing pause. Only a run of kFatalFailureStreak failures in a row is
+    // treated as fatal and rethrown so the process exits non-zero and the
+    // supervisor restarts it.
+    constexpr int kFatalFailureStreak = 50;
+    int failure_streak = 0;
+    while (!stop_requested_.load())
     {
-        zmq::poll(items, 2, std::chrono::milliseconds{100});
-
-        if (items[0].revents & ZMQ_POLLIN)
+        try
         {
-            // SEC-01: no handler exception may escape run() — the ROUTER has
-            // no reply state, so logging and continuing is always safe.
-            try
-            {
-                handle_router_frame(router);
-            }
-            catch (const std::exception& e)
-            {
-                LOGF_ERROR("ROUTER handler error: %s", e.what());
-            }
-        }
+            // EINTR from a signal is a retry, not an error (issue #84).
+            thewatcher::zmqutil::retry_on_eintr([&] {
+                return zmq::poll(items, 2, std::chrono::milliseconds{100});
+            });
 
-        if (items[1].revents & ZMQ_POLLIN)
-        {
-            // handle_enrollment guarantees a reply on every path; this is a
-            // last-resort backstop for failures before its internal try block.
-            try
+            if (items[0].revents & ZMQ_POLLIN)
             {
-                handle_enrollment(enroll);
-            }
-            catch (const std::exception& e)
-            {
-                LOGF_ERROR("Enrollment handler error: %s", e.what());
-            }
-        }
-
-        dispatch_commands(router);
-        if (std::chrono::steady_clock::now() >= next_offline_scan)
-        {
-            const auto now = now_ms();
-            if (config_.offline_after_seconds > 0)
-            {
-                const auto cutoff = now - (static_cast<int64_t>(config_.offline_after_seconds) * 1000);
-                LOGF_TRACE("Scanning for offline agents cutoff_ms=%lld", static_cast<long long>(cutoff));
-                store_->mark_agents_offline_before(cutoff);
-                expire_routes();
-                const auto ts = now_ms();
-                for (const auto& agent_id : store_->get_offline_unalerted_agent_ids())
+                // SEC-01: no handler exception may escape run() — the ROUTER has
+                // no reply state, so logging and continuing is always safe.
+                try
                 {
-                    AlertRecord alert;
-                    alert.agent_id = agent_id;
-                    alert.indicator = "Heartbeat";
-                    alert.old_status = "green";
-                    alert.new_status = "red";
-                    alert.message = "Agent has gone offline (no heartbeat received)";
-                    alert.created_at = ts;
-                    store_->insert_alert(alert);
-                    LOGF_INFO("Created dead-agent alert for agent_id=%s", agent_id.c_str());
+                    handle_router_frame(router);
+                }
+                catch (const std::exception& e)
+                {
+                    LOGF_ERROR("ROUTER handler error: %s", e.what());
                 }
             }
 
-            // Escalate unacknowledged alerts older than the configurable timeout.
-            const auto escalation_seconds_str = store_->get_setting("escalation_timeout_seconds", "3600");
-            const auto escalation_seconds = std::stoi(escalation_seconds_str);
-            if (escalation_seconds > 0)
+            if (items[1].revents & ZMQ_POLLIN)
             {
-                const auto esc_cutoff = now - (static_cast<int64_t>(escalation_seconds) * 1000LL);
-                store_->escalate_old_alerts(esc_cutoff, now);
+                // handle_enrollment guarantees a reply on every path; this is a
+                // last-resort backstop for failures before its internal try block.
+                try
+                {
+                    handle_enrollment(enroll);
+                }
+                catch (const std::exception& e)
+                {
+                    LOGF_ERROR("Enrollment handler error: %s", e.what());
+                }
             }
 
-            // Apply scheduled maintenance windows: start or end maintenance for affected agents.
-            const auto active_windows = store_->active_maintenance_windows(now);
-            for (const auto& agent : store_->list_approved_agents())
+            dispatch_commands(router);
+            if (std::chrono::steady_clock::now() >= next_offline_scan)
             {
-                bool in_window = false;
-                std::string window_reason;
-                for (const auto& win : active_windows)
+                // Advance first so a failing check is retried once a second
+                // instead of on every poll.
+                next_offline_scan = std::chrono::steady_clock::now() + std::chrono::seconds{1};
+                const auto now = now_ms();
+                if (config_.offline_after_seconds > 0)
                 {
-                    if (win.agent_id == "*" || win.agent_id == agent.agent_id)
+                    const auto cutoff = now - (static_cast<int64_t>(config_.offline_after_seconds) * 1000);
+                    LOGF_TRACE("Scanning for offline agents cutoff_ms=%lld", static_cast<long long>(cutoff));
+                    store_->mark_agents_offline_before(cutoff);
+                    expire_routes();
+                    const auto ts = now_ms();
+                    for (const auto& agent_id : store_->get_offline_unalerted_agent_ids())
                     {
-                        in_window = true;
-                        window_reason = win.reason;
-                        break;
+                        AlertRecord alert;
+                        alert.agent_id = agent_id;
+                        alert.indicator = "Heartbeat";
+                        alert.old_status = "green";
+                        alert.new_status = "red";
+                        alert.message = "Agent has gone offline (no heartbeat received)";
+                        alert.created_at = ts;
+                        store_->insert_alert(alert);
+                        LOGF_INFO("Created dead-agent alert for agent_id=%s", agent_id.c_str());
                     }
                 }
-                if (in_window && !agent.maintenance)
+
+                // Escalate unacknowledged alerts older than the configurable timeout.
+                const auto escalation_seconds = parse_int_setting(
+                    store_->get_setting("escalation_timeout_seconds", "3600"), 3600, "escalation_timeout_seconds");
+                if (escalation_seconds > 0)
                 {
-                    store_->set_agent_maintenance(agent.agent_id, true, "mw:" + window_reason, 0);
-                    store_->clear_active_alerts_for_agent(agent.agent_id, now);
-                    LOGF_INFO("Scheduled maintenance started agent_id=%s reason=%s", agent.agent_id.c_str(),
-                              window_reason.c_str());
+                    const auto esc_cutoff = now - (static_cast<int64_t>(escalation_seconds) * 1000LL);
+                    store_->escalate_old_alerts(esc_cutoff, now);
                 }
-                else if (!in_window && agent.maintenance && agent.maintenance_reason.rfind("mw:", 0) == 0)
+
+                // Apply scheduled maintenance windows: start or end maintenance for affected agents.
+                const auto active_windows = store_->active_maintenance_windows(now);
+                for (const auto& agent : store_->list_approved_agents())
                 {
-                    // Only auto-resume agents put into maintenance by a window (prefix "mw:").
-                    store_->set_agent_maintenance(agent.agent_id, false, "", 0);
-                    LOGF_INFO("Scheduled maintenance ended agent_id=%s", agent.agent_id.c_str());
+                    bool in_window = false;
+                    std::string window_reason;
+                    for (const auto& win : active_windows)
+                    {
+                        if (win.agent_id == "*" || win.agent_id == agent.agent_id)
+                        {
+                            in_window = true;
+                            window_reason = win.reason;
+                            break;
+                        }
+                    }
+                    if (in_window && !agent.maintenance)
+                    {
+                        store_->set_agent_maintenance(agent.agent_id, true, "mw:" + window_reason, 0);
+                        store_->clear_active_alerts_for_agent(agent.agent_id, now);
+                        LOGF_INFO("Scheduled maintenance started agent_id=%s reason=%s", agent.agent_id.c_str(),
+                                  window_reason.c_str());
+                    }
+                    else if (!in_window && agent.maintenance && agent.maintenance_reason.rfind("mw:", 0) == 0)
+                    {
+                        // Only auto-resume agents put into maintenance by a window (prefix "mw:").
+                        store_->set_agent_maintenance(agent.agent_id, false, "", 0);
+                        LOGF_INFO("Scheduled maintenance ended agent_id=%s", agent.agent_id.c_str());
+                    }
                 }
+
+                // Evict dispatched commands that never received an ACK (M-8).
+                constexpr int64_t command_ttl_ms = 5LL * 60LL * 1000LL;
+                for (auto it = dispatched_commands_.begin(); it != dispatched_commands_.end();)
+                {
+                    if (now - it->second.dispatched_at_ms > command_ttl_ms)
+                    {
+                        LOGF_DEBUG("Evicting stale dispatched command id=%s", it->first.c_str());
+                        it = dispatched_commands_.erase(it);
+                    }
+                    else
+                    {
+                        ++it;
+                    }
+                }
+
+                maybe_send_report(now);
             }
-
-            // Evict dispatched commands that never received an ACK (M-8).
-            constexpr int64_t command_ttl_ms = 5LL * 60LL * 1000LL;
-            for (auto it = dispatched_commands_.begin(); it != dispatched_commands_.end();)
-            {
-                if (now - it->second.dispatched_at_ms > command_ttl_ms)
-                {
-                    LOGF_DEBUG("Evicting stale dispatched command id=%s", it->first.c_str());
-                    it = dispatched_commands_.erase(it);
-                }
-                else
-                {
-                    ++it;
-                }
-            }
-
-            maybe_send_report(now);
-
-            next_offline_scan = std::chrono::steady_clock::now() + std::chrono::seconds{1};
+            failure_streak = 0;
+        }
+        catch (const std::exception& e)
+        {
+            ++failure_streak;
+            LOGF_ERROR("Server loop error (%d in a row): %s", failure_streak, e.what());
+            if (failure_streak >= kFatalFailureStreak)
+                throw;
+            // Back off up to 5 s, in short slices so stop() stays responsive.
+            const auto pause = std::chrono::milliseconds{std::min(failure_streak * 100, 5000)};
+            for (auto waited = std::chrono::milliseconds{0}; waited < pause && !stop_requested_.load();
+                 waited += std::chrono::milliseconds{50})
+                std::this_thread::sleep_for(std::chrono::milliseconds{50});
         }
     }
 
@@ -326,7 +358,7 @@ void Server::run(StartupSignal* startup)
 void Server::stop()
 {
     LOG_FUNCTION_TRACE
-    running_.store(false);
+    stop_requested_.store(true);
 }
 
 // ── ROUTER handler ────────────────────────────────────────────────────────────
@@ -346,21 +378,27 @@ void Server::handle_router_frame(zmq::socket_t& router)
     // parts would otherwise make the next blocking recv() wait for a later
     // message and stall this thread (enrollment, commands, offline scans).
     zmq::message_t identity_msg, delim_msg, payload_msg;
-    if (!router.recv(identity_msg, zmq::recv_flags::none))
+    if (!thewatcher::zmqutil::retry_on_eintr([&] {
+            return router.recv(identity_msg, zmq::recv_flags::none);
+        }))
         return;
     if (!router.get(zmq::sockopt::rcvmore))
     {
         LOG_DEBUG("Dropping ROUTER message with no delimiter or payload frame");
         return;
     }
-    if (!router.recv(delim_msg, zmq::recv_flags::none))
+    if (!thewatcher::zmqutil::retry_on_eintr([&] {
+            return router.recv(delim_msg, zmq::recv_flags::none);
+        }))
         return;
     if (!router.get(zmq::sockopt::rcvmore))
     {
         LOG_DEBUG("Dropping ROUTER message with no payload frame");
         return;
     }
-    if (!router.recv(payload_msg, zmq::recv_flags::none))
+    if (!thewatcher::zmqutil::retry_on_eintr([&] {
+            return router.recv(payload_msg, zmq::recv_flags::none);
+        }))
         return;
 
     // Drain unexpected extra frames so the socket state stays clean.
@@ -1045,8 +1083,9 @@ void Server::maybe_send_report(int64_t now_ms)
         return;
 
     const auto schedule = store_->get_setting("reports.schedule", "daily"); // "daily" or "weekly"
-    const int target_hour = std::stoi(store_->get_setting("reports.hour", "8"));
-    const int target_dow = std::stoi(store_->get_setting("reports.day_of_week", "1")); // 0=Sun
+    const int target_hour = parse_int_setting(store_->get_setting("reports.hour", "8"), 8, "reports.hour");
+    const int target_dow =
+        parse_int_setting(store_->get_setting("reports.day_of_week", "1"), 1, "reports.day_of_week"); // 0=Sun
 
     // Minimum gap: 23 h for daily, 6 days 23 h for weekly.
     const int64_t min_gap_ms = (schedule == "weekly") ? 6LL * 86'400'000LL + 23LL * 3'600'000LL : 23LL * 3'600'000LL;

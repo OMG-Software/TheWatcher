@@ -63,9 +63,37 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   unprivileged writers, and root-reserved blocks count as used (#158).
 - Encoding a frame with an empty payload no longer passes a null pointer to
   libcbor (undefined behaviour reported by UBSan on every heartbeat) (#162).
+- Signals no longer abort threads on Linux and the BSDs. `SIGINT` and
+  `SIGTERM` are blocked in every thread and handled by one watcher thread,
+  and ZeroMQ calls interrupted by anything else (`EINTR`) are retried
+  instead of throwing, in the server loop, the ZAP handler, the agent I/O
+  loop and agent enrollment (#84).
+- A Windows service Stop that arrives while the server or agent is still
+  starting is no longer lost: it is remembered and applied once the worker
+  exists. `Server::stop()` before or during startup also stays in effect
+  (`run()` used to overwrite it), and a service worker that fails now makes
+  the process exit non-zero (#84).
+- The server survives a failing loop iteration (a database error, a
+  corrupt stored setting such as `escalation_timeout_seconds` or
+  `reports.hour`): it logs, backs off and retries, and a non-numeric
+  setting uses its default. After 50 failures in a row it exits. The
+  foreground server now exits `1`, not `0`, after a worker error (#47).
+- `ApiServer::stop()` straight after `start()` returns promptly and
+  `stop()` without `start()` is harmless; regression tests added. The
+  bind-failure part of #50 was fixed by #138 (#50).
+- Windows service command lines quote arguments with the
+  `CommandLineToArgvW` backslash rules, so a path ending in `\` or a value
+  with an embedded `"` no longer swallows the following arguments (#161).
+- The Windows service helpers close their `SC_HANDLE`s through an RAII
+  wrapper (part of #100), and the test server runner uses `std::jthread`.
+- Log files are no longer truncated on every start (#99).
 
 ### Changed
 
+- Log files default to `INFO` instead of `TRACE`, are appended to, and
+  rotate by size (default 10 MiB, 5 backups). New `LOG_LEVEL`,
+  `LOG_MAX_SIZE_MB` and `LOG_MAX_FILES` config keys and a `--log-level`
+  option on both binaries; set `LOG_LEVEL=trace` to get the old output (#99).
 - The whole C++ tree is formatted with the root `.clang-format`, and CI
   fails any PR whose C++ is not (`clang-format` 22.1.5, pinned). The
   formatting commit is listed in `.git-blame-ignore-revs`. A new include

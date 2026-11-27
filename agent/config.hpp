@@ -1,5 +1,7 @@
 #pragma once
 
+#include "common/log_settings.hpp"
+
 #include <filesystem>
 #include <optional>
 #include <string>
@@ -26,6 +28,10 @@ struct AgentConfig
     int collection_interval = 30;
     int heartbeat_interval = 5;
     int process_limit = 25;
+    // Log file level and rotation. Config keys LOG_LEVEL, LOG_MAX_SIZE_MB and
+    // LOG_MAX_FILES; an invalid value makes load_or_create throw
+    // std::invalid_argument.
+    thewatcher::logging::LogSettings log;
     std::string config_path;
     // SEC-05: pre-shared enrollment token, required by servers that
     // configure ENROLLMENT_TOKEN. Empty when unused.

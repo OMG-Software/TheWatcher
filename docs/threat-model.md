@@ -81,6 +81,10 @@ working document for audit, design review, and regression testing.
   acting username where the current API contract supports it.
 - Logs record security-relevant actions such as login failures, agent approval,
   command queueing, and webhook rejection.
+- Log files are appended to and rotated by size (`LOG_MAX_SIZE_MB`,
+  `LOG_MAX_FILES`), so a restart or crash does not erase earlier evidence and
+  the default `INFO` level cannot fill the disk. Residual risk: an operator
+  who sets `LOG_LEVEL=trace` with rotation off can still exhaust disk space.
 
 ### Information Disclosure
 

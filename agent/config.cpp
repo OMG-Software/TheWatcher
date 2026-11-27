@@ -138,6 +138,12 @@ namespace
             cfg.heartbeat_interval = std::stoi(it->second);
         if (auto it = values.find("PROCESS_LIMIT"); it != values.end())
             cfg.process_limit = std::stoi(it->second);
+        if (auto it = values.find("LOG_LEVEL"); it != values.end())
+            cfg.log.set_level(it->second);
+        if (auto it = values.find("LOG_MAX_SIZE_MB"); it != values.end())
+            cfg.log.set_max_size_mib(it->second);
+        if (auto it = values.find("LOG_MAX_FILES"); it != values.end())
+            cfg.log.set_max_files(it->second);
     }
 
 } // namespace
@@ -278,6 +284,9 @@ void AgentConfig::save(const std::filesystem::path& path) const
     f << "COLLECTION_INTERVAL=" << collection_interval << '\n';
     f << "HEARTBEAT_INTERVAL=" << heartbeat_interval << '\n';
     f << "PROCESS_LIMIT=" << process_limit << '\n';
+    f << "LOG_LEVEL=" << thewatcher::logging::LogSettings::level_name(log.level) << '\n';
+    f << "LOG_MAX_SIZE_MB=" << log.max_size_mib << '\n';
+    f << "LOG_MAX_FILES=" << log.max_files << '\n';
     f.close();
 
     // M-6: Restrict config file to owner read/write only — it contains the CURVE secret key.
