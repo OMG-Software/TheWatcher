@@ -3,7 +3,7 @@ import { Pause, Play, Plus, SlidersHorizontal, Trash2, X } from 'lucide-react';
 import { changeUserPassword, createGroup, createUser, deleteUser, disableUser, enableUser } from '../api';
 import { ActionError } from '../components/ActionError';
 import { ActionButton } from '../components/ActionButton';
-import type { RunAction } from '../hooks/useRunAction';
+import { ActionFailureContext, type RunAction } from '../hooks/useRunAction';
 import type { GroupRecord, SessionInfo, UserRecord } from '../models';
 import { canManageGroups, canManageUsers, isGlobal } from '../permissions';
 import { accountTypeLabel } from '../uiLogic';
@@ -28,6 +28,15 @@ export function UsersPage({
   const [groupId, setGroupId] = React.useState<number>(groups[0]?.group_id ?? 0);
   const [pwUserId, setPwUserId] = React.useState<number | null>(null);
   const [pwValue, setPwValue] = React.useState('');
+  const { clear } = React.useContext(ActionFailureContext);
+  const pwKey = `user:${pwUserId}:pw`;
+  const pwBusy = busyAction === pwKey;
+  // The password dialog cannot be dismissed while saving; dismissing drops its old failure.
+  const closePw = () => {
+    if (pwBusy) return;
+    clear(pwKey);
+    setPwUserId(null);
+  };
 
   const admin = canManageUsers(session.role);
   const globalAdmin = session.role === 'global_admin';
@@ -43,11 +52,11 @@ export function UsersPage({
   return (
     <main className="table-wrap management-wrap">
       {pwUserId !== null ? (
-        <div className="modal-backdrop" onClick={() => setPwUserId(null)}>
+        <div className="modal-backdrop" onClick={closePw}>
           <div className="modal-panel" onClick={(e) => e.stopPropagation()}>
             <div className="modal-header">
               <h2>Change Password</h2>
-              <button className="icon-button" onClick={() => setPwUserId(null)}><X size={14} /></button>
+              <button className="icon-button" disabled={pwBusy} onClick={closePw} aria-label="Close"><X size={14} /></button>
             </div>
             <label>
               New password
@@ -60,7 +69,7 @@ export function UsersPage({
             </label>
             <ActionError actionKey={`user:${pwUserId}:pw`} />
             <div className="button-row modal-actions">
-              <button className="text-button secondary" onClick={() => setPwUserId(null)}>Cancel</button>
+              <button className="text-button secondary" disabled={pwBusy} onClick={closePw}>Cancel</button>
               <button
                 className="text-button"
                 disabled={!pwValue || busyAction === `user:${pwUserId}:pw`}

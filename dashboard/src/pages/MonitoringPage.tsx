@@ -28,30 +28,36 @@ export function MonitoringPage({
 }) {
   const [agentHistory, setAgentHistory] = React.useState<Record<string, MetricsSnapshot[]>>({});
   const [agentLogMatches, setAgentLogMatches] = React.useState<Record<string, LogMatchRecord[]>>({});
-  const [detailErrors, setDetailErrors] = React.useState<Record<string, string>>({});
+  // History and log matches load separately, so one failing never hides the other.
+  const [historyErrors, setHistoryErrors] = React.useState<Record<string, string>>({});
+  const [logErrors, setLogErrors] = React.useState<Record<string, string>>({});
   const [historyAgent, setHistoryAgent] = React.useState<{ id: string; name: string } | null>(null);
   const requested = React.useRef(new Set<string>()); // agents whose detail is loaded or loading
 
-  // Load detail once per expanded agent. A failure is shown in the detail row and
-  // retried the next time the row is expanded.
+  // Load detail once per expanded agent. Each part keeps its own result and error; an error is
+  // shown in the detail row, and the agent is loaded again the next time its row is expanded.
   React.useEffect(() => {
+    const track = <T,>(id: string, load: Promise<T>, onData: (value: T) => void, setErrors: React.Dispatch<React.SetStateAction<Record<string, string>>>, fallback: string) =>
+      load.then(
+        (value) => {
+          onData(value);
+          setErrors((prev) => withoutKey(prev, id));
+          return true;
+        },
+        (err: unknown) => {
+          setErrors((prev) => ({ ...prev, [id]: errorMessage(err, fallback) }));
+          return false;
+        },
+      );
     for (const id of expanded) {
       if (requested.current.has(id)) continue;
       requested.current.add(id);
-      void Promise.all([fetchMetricHistory(id, 20), fetchLogMatches(id, 20)])
-        .then(([snapshots, rows]) => {
-          setAgentHistory((prev) => ({ ...prev, [id]: snapshots }));
-          setAgentLogMatches((prev) => ({ ...prev, [id]: rows }));
-          setDetailErrors((prev) => {
-            const next = { ...prev };
-            delete next[id];
-            return next;
-          });
-        })
-        .catch((err: unknown) => {
-          requested.current.delete(id);
-          setDetailErrors((prev) => ({ ...prev, [id]: errorMessage(err, 'Failed to load history') }));
-        });
+      void Promise.all([
+        track(id, fetchMetricHistory(id, 20), (snapshots) => setAgentHistory((prev) => ({ ...prev, [id]: snapshots })), setHistoryErrors, 'Failed to load history'),
+        track(id, fetchLogMatches(id, 20), (rows) => setAgentLogMatches((prev) => ({ ...prev, [id]: rows })), setLogErrors, 'Failed to load log matches'),
+      ]).then((results) => {
+        if (!results.every(Boolean)) requested.current.delete(id);
+      });
     }
   }, [expanded]);
 
@@ -133,7 +139,8 @@ export function MonitoringPage({
                     <tr className={`detail-row ${expanded.has(agent.id) ? '' : 'hidden'}`}>
                       <td colSpan={4 + COMPONENT_LABELS.length}>
                         <div className="detail-inner">
-                          {detailErrors[agent.id] ? <div className="banner error detail-card-wide" role="alert">Could not load history for {agent.name}: {detailErrors[agent.id]}</div> : null}
+                          {historyErrors[agent.id] ? <div className="banner error detail-card-wide" role="alert">Could not load metric history for {agent.name}: {historyErrors[agent.id]}</div> : null}
+                          {logErrors[agent.id] ? <div className="banner error detail-card-wide" role="alert">Could not load log matches for {agent.name}: {logErrors[agent.id]}</div> : null}
                           {agent.components.map((component) => {
                             const history = agentHistory[agent.id];
                             const sparkData = history
@@ -216,6 +223,12 @@ export function MonitoringPage({
       ) : null}
     </main>
   );
+}
+
+function withoutKey(record: Record<string, string>, key: string): Record<string, string> {
+  const rest = { ...record };
+  delete rest[key];
+  return rest;
 }
 
 const COMPONENT_LABELS = ['CPU', 'Memory', 'Disk', 'Network', 'Proc', 'Heartbeat'];

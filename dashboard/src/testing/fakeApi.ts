@@ -10,7 +10,7 @@ export interface FakeReply {
 export const ok = (body: unknown = { ok: true }): FakeReply => ({ status: 200, body });
 export const fail = (status: number, error: string): FakeReply => ({ status, body: { error } });
 
-type Handler = FakeReply | (() => FakeReply);
+type Handler = FakeReply | (() => FakeReply | Promise<FakeReply>);
 
 /**
  * A fake REST server for UI tests. Routes are keyed "METHOD /path"; anything
@@ -37,7 +37,7 @@ export class FakeApi {
       const path = String(url);
       this.calls.push({ method, path, body: init?.body ? JSON.parse(String(init.body)) : undefined });
       const handler = this.routes.get(`${method} ${path}`);
-      const reply = typeof handler === 'function' ? handler() : (handler ?? ok([]));
+      const reply = typeof handler === 'function' ? await handler() : (handler ?? ok([]));
       return new Response(JSON.stringify(reply.body), { status: reply.status });
     });
     vi.stubGlobal('fetch', fetchMock);
@@ -70,4 +70,13 @@ export function agentRecord(id: string, hostname: string) {
     runbook_markdown: '',
     group_ids: [],
   };
+}
+
+/** A promise the test settles by hand, to hold a request open and control response order. */
+export function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((res) => {
+    resolve = res;
+  });
+  return { promise, resolve };
 }

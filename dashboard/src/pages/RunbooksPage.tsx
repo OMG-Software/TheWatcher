@@ -18,7 +18,7 @@ export function RunbooksPage({
   const [url, setUrl] = React.useState('');
   const [notes, setNotes] = React.useState('');
 
-  const { data, error, refresh } = usePolling(fetchRunbooks);
+  const { data, error, loading, refresh } = usePolling(fetchRunbooks);
   const runbooks = data ?? [];
 
   return (
@@ -84,7 +84,9 @@ export function RunbooksPage({
         <table className="agent-table">
           <thead><tr><th>Indicator</th><th>Status</th><th>URL</th><th>Notes</th><th>Created By</th><th>Actions</th></tr></thead>
           <tbody>
-            {runbooks.length === 0 && !error ? (
+            {loading ? (
+              <tr><td colSpan={6} className="uptime">Loading runbooks...</td></tr>
+            ) : runbooks.length === 0 && !error ? (
               <tr><td colSpan={6} className="uptime">No runbooks configured.</td></tr>
             ) : runbooks.map((rb) => (
               <tr key={rb.runbook_id}>
