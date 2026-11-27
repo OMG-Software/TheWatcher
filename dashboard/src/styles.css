@@ -1428,3 +1428,17 @@ td {
 .history-table .history-msg {
   color: var(--text);
 }
+
+/* Shared small layout helpers (moved out of inline styles). */
+.sparkline { overflow: visible; }
+.duration-input { width: 60px; }
+.banner-action { margin-left: 1rem; }
+.empty-row { text-align: center; padding: 1rem; }
+
+/* Views page forms. */
+.view-form { display: flex; flex-wrap: wrap; align-items: center; gap: 0.5rem; }
+.view-form-create { align-items: flex-start; gap: 0.75rem; padding: 1rem; }
+.view-form-check { display: flex; align-items: center; gap: 0.25rem; }
+.view-agent-select { min-width: 14rem; }
+.view-name-input { min-width: 12rem; }
+.view-create { margin-top: 1rem; }

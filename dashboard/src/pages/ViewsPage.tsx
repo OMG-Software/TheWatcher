@@ -79,13 +79,13 @@ export function ViewsPage({
                 {editId === v.view_id ? (
                   <>
                     <td colSpan={5}>
-                      <div className="form-grid" style={{ display: 'flex', gap: '0.5rem', flexWrap: 'wrap', alignItems: 'center' }}>
+                      <div className="view-form view-form-inline">
                         <input value={editName} placeholder="View name" onChange={(e) => setEditName(e.target.value)} />
-                        <label style={{ display: 'flex', gap: '0.25rem', alignItems: 'center' }}>
+                        <label className="view-form-check">
                           <input type="checkbox" checked={editPublic} onChange={(e) => setEditPublic(e.target.checked)} />
                           Public
                         </label>
-                        <select multiple size={Math.min(agents.length, 6)} style={{ minWidth: '14rem' }}
+                        <select multiple size={Math.min(agents.length, 6)} className="view-agent-select"
                           value={editAgentIds}
                           onChange={(e) => setEditAgentIds(Array.from(e.target.selectedOptions, (o) => o.value))}>
                           {agents.map((a) => <option key={a.id} value={a.id}>{a.name}</option>)}
@@ -125,15 +125,15 @@ export function ViewsPage({
               </tr>
             ))}
             {views.length === 0 ? (
-              <tr><td colSpan={7} style={{ textAlign: 'center', padding: '1rem' }}>No views yet. Create one below.</td></tr>
+              <tr><td colSpan={7} className="empty-row">No views yet. Create one below.</td></tr>
             ) : null}
           </tbody>
         </table>
       </div>
 
       {operator ? (
-        <div className="table-container" style={{ marginTop: '1rem' }}>
-          <form
+        <div className="table-container view-create">
+          <form className="view-form view-form-create"
             onSubmit={(e) => {
               e.preventDefault();
               void runAction('view:create', () => createView(newName, newAgentIds, newPublic, newGroupId).then(() => {})).then(() => {
@@ -142,14 +142,13 @@ export function ViewsPage({
                 setNewAgentIds([]);
               });
             }}
-            style={{ padding: '1rem', display: 'flex', gap: '0.75rem', flexWrap: 'wrap', alignItems: 'flex-start' }}
           >
-            <input required value={newName} placeholder="New view name" onChange={(e) => setNewName(e.target.value)} style={{ minWidth: '12rem' }} />
-            <label style={{ display: 'flex', gap: '0.25rem', alignItems: 'center' }}>
+            <input required value={newName} placeholder="New view name" onChange={(e) => setNewName(e.target.value)} className="view-name-input" />
+            <label className="view-form-check">
               <input type="checkbox" checked={newPublic} onChange={(e) => setNewPublic(e.target.checked)} />
               Public
             </label>
-            <select multiple size={Math.min(agents.length, 6)} style={{ minWidth: '14rem' }}
+            <select multiple size={Math.min(agents.length, 6)} className="view-agent-select"
               value={newAgentIds}
               onChange={(e) => setNewAgentIds(Array.from(e.target.selectedOptions, (o) => o.value))}>
               {agents.map((a) => <option key={a.id} value={a.id}>{a.name}</option>)}

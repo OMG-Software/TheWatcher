@@ -81,7 +81,7 @@ export function MaintenancePage({
               type="number"
               value={durationHours}
               onChange={(event) => setDurationHours(Math.max(1, Number(event.target.value)))}
-              style={{ width: 60 }}
+              className="duration-input"
             />
           </label>
           <ActionButton busy={busyAction === 'mw:create'} disabled={!operator} icon={<Plus size={14} />} label="Schedule" onClick={() => undefined} type="submit" />
