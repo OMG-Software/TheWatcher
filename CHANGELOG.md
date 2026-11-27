@@ -47,6 +47,26 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 
+- The status engine is now one long-lived object owned by the server instead
+  of being rebuilt for every metrics frame, so stale-metric detection and the
+  anomaly baseline cache work and metrics are no longer pruned on every frame
+  (#43).
+- One maintenance state machine now serves manual, timed and scheduled
+  maintenance. Entering maintenance marks the agent's real indicators Blue
+  (not the phantom `disk`, `network`, `processes`); Blue no longer suppresses
+  the first alert after maintenance ends; scheduled windows go through the
+  same enter/exit code as manual maintenance (#44).
+- Timed manual maintenance (`until_ms`) now ends when its time passes (#45).
+- The dashboard `offline_after_seconds` setting now takes effect (the setting
+  page shows the real default, 60), and the offline timeout per agent is
+  `max(setting, 3 x heartbeat_interval)`, so a slow heartbeat no longer makes
+  an agent flap offline (#46).
+- A NaN or infinite reading no longer raises a "grey" alert: Grey means no
+  data and never alerts (#55).
+- Alerts, status history, log matches, expired silences and ended
+  maintenance windows are now pruned by an hourly server job that does not
+  depend on metrics arriving. New settings `status_history_retention_days`,
+  `alerts_retention_days` and `log_matches_retention_days` (#76).
 - Alert notes longer than 4,096 bytes are cut on a UTF-8 character
   boundary. Oversize `runbook_markdown` (collector config) and
   `reports_webhook_url` (settings) are rejected with 400 instead of being

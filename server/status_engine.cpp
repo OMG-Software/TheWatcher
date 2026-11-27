@@ -145,9 +145,19 @@ IndicatorStatus status_from_string(const std::string& value)
 
 bool is_worse_status(IndicatorStatus previous, IndicatorStatus current)
 {
-    if (current == IndicatorStatus::Blue || previous == IndicatorStatus::Blue)
+    // Grey and Blue are not severities: never alert on arriving at them.
+    if (current == IndicatorStatus::Grey || current == IndicatorStatus::Blue)
         return false;
+    // Leaving Grey/Blue there is no earlier problem to compare with, so any
+    // real problem (Yellow or worse) is a worsening and Green is not.
+    if (previous == IndicatorStatus::Grey || previous == IndicatorStatus::Blue)
+        return static_cast<int>(current) >= static_cast<int>(IndicatorStatus::Yellow);
     return static_cast<int>(current) > static_cast<int>(previous);
+}
+
+int effective_offline_timeout_seconds(int offline_after_seconds, int heartbeat_interval_seconds)
+{
+    return std::max(offline_after_seconds, kOfflineHeartbeatMultiple * std::max(0, heartbeat_interval_seconds));
 }
 
 StatusEngine::StatusEngine(Store& store)
@@ -157,17 +167,6 @@ StatusEngine::StatusEngine(Store& store)
 
 void StatusEngine::evaluate_metrics(const std::string& agent_id, const SystemMetrics& metrics, int64_t timestamp_ms)
 {
-    constexpr int64_t prune_interval_ms = 3'600'000; // prune once per hour
-    if (timestamp_ms - last_prune_ms_ >= prune_interval_ms)
-    {
-        last_prune_ms_ = timestamp_ms;
-        const auto retention_days_str = store_.get_setting("metrics_retention_days", "30");
-        const int retention_days = std::max(1, std::stoi(retention_days_str));
-        const int64_t cutoff_ms = timestamp_ms - static_cast<int64_t>(retention_days) * 86'400'000LL;
-        store_.prune_metrics_before(cutoff_ms);
-        LOGF_DEBUG("Pruned metrics older than %d days", retention_days);
-    }
-
     auto agent = store_.get_agent(agent_id);
     if (agent && agent->maintenance)
     {
@@ -301,13 +300,112 @@ void StatusEngine::enter_maintenance(const std::string& agent_id, const std::str
 {
     store_.set_agent_maintenance(agent_id, true, reason, until_ms);
     store_.clear_active_alerts_for_agent(agent_id, now_ms);
-    for (const auto& indicator : {"cpu", "memory", "disk", "network", "processes"})
-        record_transition(agent_id, indicator, IndicatorStatus::Blue, "maintenance mode", now_ms);
+    mark_indicators_blue(agent_id, now_ms);
+    maintenance_marked_.insert(agent_id);
 }
 
+// Indicators stay Blue until the next evaluation replaces them. Blue carries no
+// severity (see is_worse_status), so the first real reading after maintenance
+// alerts normally.
 void StatusEngine::exit_maintenance(const std::string& agent_id)
 {
     store_.set_agent_maintenance(agent_id, false, "", 0);
+    maintenance_marked_.erase(agent_id);
+}
+
+void StatusEngine::mark_indicators_blue(const std::string& agent_id, int64_t now_ms)
+{
+    // cpu and memory are always evaluated; the rest are the indicators the
+    // agent really has (disk:<mount>, network:<iface>, process:<name>, ...).
+    std::vector<std::string> indicators = {"cpu", "memory"};
+    for (const auto& row : store_.latest_status_per_indicator(agent_id))
+    {
+        if (std::find(indicators.begin(), indicators.end(), row.indicator) == indicators.end())
+            indicators.push_back(row.indicator);
+    }
+    for (const auto& indicator : indicators)
+        record_transition(agent_id, indicator, IndicatorStatus::Blue, "maintenance mode", now_ms);
+}
+
+void StatusEngine::reconcile_maintenance(int64_t now_ms)
+{
+    const auto active_windows = store_.active_maintenance_windows(now_ms);
+    for (const auto& agent : store_.list_approved_agents())
+    {
+        // #45: timed manual maintenance ends when its until time passes.
+        if (agent.maintenance && agent.maintenance_until > 0 && now_ms >= agent.maintenance_until)
+        {
+            exit_maintenance(agent.agent_id);
+            LOGF_INFO("Timed maintenance expired agent_id=%s", agent.agent_id.c_str());
+            continue;
+        }
+
+        const MaintenanceWindowRecord* window = nullptr;
+        for (const auto& candidate : active_windows)
+        {
+            if (candidate.agent_id == "*" || candidate.agent_id == agent.agent_id)
+            {
+                window = &candidate;
+                break;
+            }
+        }
+
+        if (window && !agent.maintenance)
+        {
+            enter_maintenance(agent.agent_id, "mw:" + window->reason, 0, now_ms);
+            LOGF_INFO("Scheduled maintenance started agent_id=%s reason=%s", agent.agent_id.c_str(),
+                      window->reason.c_str());
+        }
+        else if (!window && agent.maintenance && agent.maintenance_reason.rfind("mw:", 0) == 0)
+        {
+            // Only maintenance started by a window (prefix "mw:") ends with it.
+            exit_maintenance(agent.agent_id);
+            LOGF_INFO("Scheduled maintenance ended agent_id=%s", agent.agent_id.c_str());
+        }
+        else if (agent.maintenance && maintenance_marked_.insert(agent.agent_id).second)
+        {
+            // Maintenance set outside the engine (API, restart): mark indicators once.
+            mark_indicators_blue(agent.agent_id, now_ms);
+        }
+        else if (!agent.maintenance)
+        {
+            maintenance_marked_.erase(agent.agent_id);
+        }
+    }
+}
+
+std::vector<std::string> StatusEngine::mark_offline_agents(int64_t now_ms, int default_offline_after_seconds)
+{
+    std::vector<std::string> gone;
+    if (default_offline_after_seconds <= 0)
+        return gone;
+
+    int base_seconds = default_offline_after_seconds;
+    const auto setting = store_.get_setting("offline_after_seconds", "");
+    if (!setting.empty())
+    {
+        try
+        {
+            base_seconds = std::stoi(setting);
+        }
+        catch (const std::exception&)
+        {
+            LOGF_WARNING("Ignoring invalid offline_after_seconds setting '%s'", setting.c_str());
+        }
+    }
+
+    for (const auto& agent : store_.list_approved_agents())
+    {
+        if (!agent.connected || agent.maintenance || agent.last_seen <= 0)
+            continue;
+        const auto timeout_s = effective_offline_timeout_seconds(base_seconds, agent.heartbeat_interval);
+        if (agent.last_seen < now_ms - static_cast<int64_t>(timeout_s) * 1000)
+        {
+            store_.mark_agent_offline(agent.agent_id);
+            gone.push_back(agent.agent_id);
+        }
+    }
+    return gone;
 }
 
 IndicatorStatus StatusEngine::classify_percent(double value, const PercentThresholds& thresholds) const
@@ -356,7 +454,9 @@ IndicatorStatus StatusEngine::confirm_numeric_status(const std::string& agent_id
         store_.set_pending_status(agent_id, indicator, target, count);
         LOGF_DEBUG("Pending status confirmation agent_id=%s indicator=%s target=%s count=%d required=%d",
                    agent_id.c_str(), indicator.c_str(), target.c_str(), count, required);
-        return previous == IndicatorStatus::Grey ? IndicatorStatus::Green : previous;
+        // Grey/Blue carry no state worth keeping while the reading is unconfirmed.
+        return previous == IndicatorStatus::Grey || previous == IndicatorStatus::Blue ? IndicatorStatus::Green
+                                                                                      : previous;
     }
 
     store_.clear_pending_status(agent_id, indicator);

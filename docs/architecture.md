@@ -29,11 +29,85 @@ Responsibilities:
 - Approve/reject/delete enrolled agents.
 - Dispatch queued commands to agents over the existing agent connection.
 - Respond to agent config refresh requests.
-- Mark approved connected agents offline after `offline_after_seconds`.
+- Mark approved connected agents offline after their effective offline
+  timeout (see Server Maintenance Tick).
 - Evaluate submitted metrics, record status transitions, and create alerts only
   on worsening transitions.
 
 The server does not initiate network connections to agents.
+
+### Status Engine Lifecycle
+
+The server owns one long-lived `StatusEngine`. Its per-agent state (stale-value
+clocks and the anomaly baseline cache, keyed by agent and indicator) therefore
+survives from one metrics frame to the next. The engine is only used from the
+server's run loop thread. `evaluate_metrics` no longer prunes anything.
+
+Status rules:
+
+- Grey means "no data" (for example a NaN or infinite reading). A transition to
+  Grey never raises an alert.
+- Blue means maintenance. A transition to Blue never raises an alert.
+- Grey and Blue carry no severity when they are the previous state: leaving
+  either for Yellow, Amber or Red is a worsening and alerts (after the
+  configured consecutive readings), leaving them for Green does not.
+
+### Maintenance State Machine
+
+Manual, timed and scheduled maintenance share one state machine in
+`StatusEngine`:
+
+- `enter_maintenance(agent, reason, until_ms, now)` sets the flag, clears the
+  agent's active alerts and marks the agent's real indicators Blue: `cpu`,
+  `memory` and every indicator already in its status history (`disk:<mount>`,
+  `network:<iface>`, `process:<name>`, ...).
+- `exit_maintenance(agent)` clears the flag. Indicators stay Blue until the
+  next metrics frame replaces them; the first real reading after maintenance
+  alerts normally even if it is already Red.
+- Timed manual maintenance (`until_ms > 0`) ends when `now >= until_ms`.
+  `until_ms = 0` is open ended and ends only on resume.
+- A scheduled maintenance window covering an agent (`agent_id` or `*`) starts
+  maintenance with the reason `mw:<window reason>` and ends it when the window
+  is over. Only maintenance whose reason starts with `mw:` is ended by a
+  window; manual maintenance is never ended by the absence of a window.
+- Maintenance set by the API (`POST /api/agents/:id/maintenance`, pause) only
+  sets the flag; the next tick marks the indicators Blue.
+
+### Server Maintenance Tick
+
+`Server::run_periodic_maintenance` runs about once a second from the run loop,
+independent of any agent traffic. It:
+
+1. reconciles maintenance (above);
+2. runs the retention job at most once an hour (`run_retention`).
+
+The once-a-second offline scan sits next to it:
+
+- Base timeout: the `offline_after_seconds` server setting (dashboard Settings,
+  10-86400), falling back to the `OFFLINE_AFTER_SECONDS` config value (default
+  60) when the setting was never saved. A non-positive config value disables
+  offline detection.
+- Effective timeout per agent: `max(base, 3 x heartbeat_interval)`. With the
+  default 5 s heartbeat the base applies; a 60 s heartbeat gets 180 s, so an
+  agent heartbeating on time never flaps offline.
+- Agents in maintenance are never marked offline.
+- A newly offline agent gets one open `Heartbeat` alert, archived when it
+  reconnects.
+
+### Data Retention
+
+`run_retention` prunes, per run (hourly, and once at server start):
+
+| Data | Setting (days) | Default | Rule |
+| --- | --- | --- | --- |
+| Metrics | `metrics_retention_days` | 30 | older rows are deleted |
+| Status history | `status_history_retention_days` | 90 | older rows are deleted, except the newest row of every agent/indicator (it is the current state) |
+| Alerts | `alerts_retention_days` | 90 | older alerts are deleted only once acknowledged or soft-deleted; open alerts are never pruned |
+| Log matches | `log_matches_retention_days` | 30 | older rows are deleted |
+| Silences, maintenance windows | `alerts_retention_days` | 90 | deleted once expired / ended for longer than the period |
+
+Invalid or non-positive values fall back to the default. Sessions are not
+pruned by this job.
 
 ## Agent
 

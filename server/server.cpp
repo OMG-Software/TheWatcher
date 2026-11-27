@@ -6,6 +6,7 @@
 #include "common/metrics.hpp"
 #include "common/zmq_limits.hpp"
 #include "report_generator.hpp"
+#include "retention.hpp"
 #include "status_engine.hpp"
 
 #include <chrono>
@@ -121,6 +122,7 @@ Server::Server(ServerConfig config)
                config_.api_port, config_.db_type.c_str(), config_.db_path.c_str(), config_.offline_after_seconds);
     const auto& db_target = (config_.db_type == "postgres") ? config_.postgres_dsn : config_.db_path;
     store_ = make_store(config_.db_type, db_target);
+    status_engine_ = std::make_unique<StatusEngine>(*store_);
     zap_ = std::make_unique<ZapHandler>(ctx_);
     api_ = std::make_unique<ApiServer>(*store_, *zap_, config_.api_host, config_.api_port);
     // SEC-12: login throttling honours X-Forwarded-For / X-Real-IP only from these peers.
@@ -240,9 +242,8 @@ void Server::run(StartupSignal* startup)
             const auto now = now_ms();
             if (config_.offline_after_seconds > 0)
             {
-                const auto cutoff = now - (static_cast<int64_t>(config_.offline_after_seconds) * 1000);
-                LOGF_TRACE("Scanning for offline agents cutoff_ms=%lld", static_cast<long long>(cutoff));
-                store_->mark_agents_offline_before(cutoff);
+                // #46: the cutoff is per agent (dashboard setting, heartbeat interval).
+                status_engine_->mark_offline_agents(now, config_.offline_after_seconds);
                 expire_routes();
                 const auto ts = now_ms();
                 for (const auto& agent_id : store_->get_offline_unalerted_agent_ids())
@@ -268,35 +269,7 @@ void Server::run(StartupSignal* startup)
                 store_->escalate_old_alerts(esc_cutoff, now);
             }
 
-            // Apply scheduled maintenance windows: start or end maintenance for affected agents.
-            const auto active_windows = store_->active_maintenance_windows(now);
-            for (const auto& agent : store_->list_approved_agents())
-            {
-                bool in_window = false;
-                std::string window_reason;
-                for (const auto& win : active_windows)
-                {
-                    if (win.agent_id == "*" || win.agent_id == agent.agent_id)
-                    {
-                        in_window = true;
-                        window_reason = win.reason;
-                        break;
-                    }
-                }
-                if (in_window && !agent.maintenance)
-                {
-                    store_->set_agent_maintenance(agent.agent_id, true, "mw:" + window_reason, 0);
-                    store_->clear_active_alerts_for_agent(agent.agent_id, now);
-                    LOGF_INFO("Scheduled maintenance started agent_id=%s reason=%s", agent.agent_id.c_str(),
-                              window_reason.c_str());
-                }
-                else if (!in_window && agent.maintenance && agent.maintenance_reason.rfind("mw:", 0) == 0)
-                {
-                    // Only auto-resume agents put into maintenance by a window (prefix "mw:").
-                    store_->set_agent_maintenance(agent.agent_id, false, "", 0);
-                    LOGF_INFO("Scheduled maintenance ended agent_id=%s", agent.agent_id.c_str());
-                }
-            }
+            run_periodic_maintenance(now);
 
             // Evict dispatched commands that never received an ACK (M-8).
             constexpr int64_t command_ttl_ms = 5LL * 60LL * 1000LL;
@@ -321,6 +294,36 @@ void Server::run(StartupSignal* startup)
 
     api_->stop();
     LOG_INFO("Stopped.");
+}
+
+// Runs the traffic-independent periodic jobs (see server.hpp). Exceptions are
+// logged so a failing job cannot stop the server loop.
+void Server::run_periodic_maintenance(int64_t now_ms)
+{
+    try
+    {
+        // Timed manual maintenance and scheduled windows share one state machine.
+        status_engine_->reconcile_maintenance(now_ms);
+    }
+    catch (const std::exception& e)
+    {
+        LOGF_ERROR("Maintenance reconcile failed: %s", e.what());
+    }
+
+    constexpr int64_t retention_interval_ms = 3'600'000; // once an hour
+    if (now_ms - last_retention_run_ms_ >= retention_interval_ms)
+    {
+        // Set first: a failing prune is retried next hour, not every second.
+        last_retention_run_ms_ = now_ms;
+        try
+        {
+            run_retention(*store_, now_ms);
+        }
+        catch (const std::exception& e)
+        {
+            LOGF_ERROR("Retention run failed: %s", e.what());
+        }
+    }
 }
 
 void Server::stop()
@@ -462,8 +465,7 @@ void Server::handle_router_frame(zmq::socket_t& router)
             row.timestamp_ms = server_now;
             row.metrics_cbor = frame.payload; // already CBOR-encoded SystemMetrics; store verbatim.
             store_->insert_metrics(row);
-            StatusEngine status_engine(*store_);
-            status_engine.evaluate_metrics(agent_id, metrics, server_now);
+            status_engine_->evaluate_metrics(agent_id, metrics, server_now);
             LOGF_DEBUG("Stored metrics agent_id=%s timestamp_ms=%lld payload_size=%zu", agent_id.c_str(),
                        static_cast<long long>(server_now), row.metrics_cbor.size());
         }
@@ -553,13 +555,11 @@ void Server::handle_router_frame(zmq::socket_t& router)
                             store_->upsert_agent(*command_agent);
                             if (command->second.type == CommandType::PAUSE)
                             {
-                                StatusEngine status_engine(*store_);
-                                status_engine.enter_maintenance(agent_id, "command", 0, command_agent->last_seen);
+                                status_engine_->enter_maintenance(agent_id, "command", 0, command_agent->last_seen);
                             }
                             else if (command->second.type == CommandType::RESUME)
                             {
-                                StatusEngine status_engine(*store_);
-                                status_engine.exit_maintenance(agent_id);
+                                status_engine_->exit_maintenance(agent_id);
                             }
                         }
                     }

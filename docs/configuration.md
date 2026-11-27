@@ -45,7 +45,7 @@ Options:
 | `DB_PATH` | `thewatcher.db` | SQLite database path when `DB_TYPE` is `sqlite`. Relative paths resolve beside the active server config file so server restarts from different working directories keep using the same database. |
 | `DB_TYPE` | `sqlite` | Storage backend. `sqlite` is implemented. `postgres` is reserved in config but not implemented by the current build. |
 | `POSTGRES_DSN` | empty | Reserved for future PostgreSQL support. |
-| `OFFLINE_AFTER_SECONDS` | `60` | Approved connected agents are marked disconnected when `last_seen` is older than this number of seconds. Set `0` or a negative value to disable automatic offline marking. |
+| `OFFLINE_AFTER_SECONDS` | `60` | Default offline timeout. Approved connected agents are marked disconnected when `last_seen` is older than the effective timeout `max(base, 3 x the agent's heartbeat interval)`, where base is the `offline_after_seconds` runtime setting if saved in the dashboard, else this value. Set `0` or a negative value to disable automatic offline marking. |
 | `SERVER_PUBLIC_KEY` | generated | Server CURVE public key. Approved enrollment responses include this key and its fingerprint so agents can learn and pin it. |
 | `SERVER_SECRET_KEY` | generated | Server CURVE secret key. Keep this private. |
 | `ENROLLMENT_TOKEN` | empty | Optional pre-shared token. When set, every enrollment request must carry a matching token (`ENROLLMENT_TOKEN` in the agent config), so arbitrary hosts cannot create pending-agent records. Leave empty for tokenless first-run enrollment. |
@@ -73,6 +73,11 @@ dedicated dashboard controls exist.
 
 | Key | Default | Description |
 | --- | --- | --- |
+| `offline_after_seconds` | `OFFLINE_AFTER_SECONDS` (60) | Base offline timeout in seconds (10-86400), editable in the dashboard Settings. The effective timeout for an agent is `max(this, 3 x heartbeat_interval)`. |
+| `metrics_retention_days` | `30` | Metrics older than this are deleted by the hourly retention job (1-365). |
+| `status_history_retention_days` | `90` | Status history older than this is deleted, except the newest row per indicator (1-3650). |
+| `alerts_retention_days` | `90` | Acknowledged or deleted alerts older than this are deleted; open alerts are kept. Also applies to expired silences and ended maintenance windows (1-3650). |
+| `log_matches_retention_days` | `30` | Log matches older than this are deleted (1-3650). |
 | `notifications.webhook_url` | empty | Optional HTTP webhook URL. The server posts alert JSON when an alert is generated. `http://` URLs are supported by the current build. Localhost, private, link-local, multicast, documentation, benchmark, malformed authority, userinfo, and invalid-port targets are rejected before sending. |
 
 ## Per-Agent Collector Configuration
@@ -158,8 +163,8 @@ Status colors:
 | Yellow | Warning |
 | Amber | Degraded |
 | Red | Critical or failure |
-| Grey | No data |
-| Blue | Maintenance |
+| Grey | No data. Entering Grey (for example a NaN reading) never raises an alert. |
+| Blue | Maintenance. Entering Blue never raises an alert, and the first real reading after maintenance alerts normally. |
 
 ## Authentication And RBAC
 

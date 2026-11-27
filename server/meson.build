@@ -1,6 +1,7 @@
 libpq_dep = dependency('libpq', required: false, static: false)
 
 server_store_sources = [
+  'retention.cpp',
   'status_engine.cpp',
   'store_sqlite.cpp',
   'webhook_security.cpp',

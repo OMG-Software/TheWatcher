@@ -4,6 +4,7 @@
 #include "common/protocol.hpp"
 #include "config.hpp"
 #include "startup_signal.hpp"
+#include "status_engine.hpp"
 #include "store.hpp"
 #include "zap_handler.hpp"
 
@@ -83,9 +84,19 @@ private:
     // Send a scheduled digest report if one is due.
     void maybe_send_report(int64_t now_ms);
 
+    // The periodic server maintenance tick, run about once a second from run()
+    // whether or not any agent is sending data. It ends timed and scheduled
+    // maintenance (#44, #45) and, at most once an hour, prunes data past its
+    // retention period (#76). Other periodic jobs that must not depend on
+    // traffic belong here.
+    void run_periodic_maintenance(int64_t now_ms);
+
     ServerConfig config_;
     zmq::context_t ctx_{2}; // 2 IO threads
     std::unique_ptr<Store> store_;
+    // #43: one engine for the life of the server, so its per-agent stale and
+    // baseline caches survive between frames. Only used from the run() thread.
+    std::unique_ptr<StatusEngine> status_engine_;
     std::unique_ptr<ZapHandler> zap_;
     std::unique_ptr<ApiServer> api_;
     // command_id -> dispatched command; evicted on matching ACK or TTL expiry
@@ -110,6 +121,7 @@ private:
     std::unordered_map<std::string, int64_t> enrollment_peer_last_request_ms_;
     std::atomic<bool> running_{false};
     int64_t last_report_ms_ = 0;
+    int64_t last_retention_run_ms_ = 0;
 };
 
 } // namespace thewatcher::server
