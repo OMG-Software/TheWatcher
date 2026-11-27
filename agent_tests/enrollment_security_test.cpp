@@ -16,6 +16,8 @@
 #include <atomic>
 #include <stdexcept>
 #include <string>
+#include <utility>
+#include <vector>
 
 #include <zmq.hpp>
 
@@ -222,6 +224,45 @@ SCENARIO("A --server-key override enrolls against the new key, not the file's ol
                 REQUIRE(cfg.file_server_public_key == old_kp.public_key_z85);
                 REQUIRE(cfg.file_server_public_key_fingerprint ==
                         thewatcher::crypto::server_public_key_fingerprint(old_kp.public_key_z85));
+            }
+        }
+    }
+}
+
+// Issue #148: the reply's server key is attacker-controlled text.
+
+SCENARIO("Enrollment rejects a server key that is not a 40 character Z85 CURVE key (issue #148)")
+{
+    GIVEN("an agent config with no server key yet")
+    {
+        thewatcher::crypto::init();
+        const auto valid_key = thewatcher::crypto::generate_curve_keypair().public_key_z85;
+
+        const std::vector<std::pair<std::string, std::string>> bad_keys = {
+            {"a key followed by injected config lines",
+             valid_key + "\nSERVER_ADDRESS=tcp://attacker:5555\nALLOW_INSECURE=1"},
+            {"a key that is too short", valid_key.substr(0, 39)},
+            {"a key that is too long", valid_key + "a"},
+            {"a key with characters outside the Z85 alphabet", std::string(40, '"')},
+            {"a key whose groups overflow 32 bits", std::string(40, '#')},
+        };
+
+        for (const auto& [description, key] : bad_keys)
+        {
+            WHEN("the approved reply carries " + description)
+            {
+                EnrollReplyServer server;
+                auto cfg = make_agent_config("enroll-sec-bad-key", server);
+                server.reply_once(cfg.agent_id, true, key);
+
+                const auto error = enroll_error(cfg);
+
+                THEN("enrollment fails and nothing from the reply is stored")
+                {
+                    REQUIRE(error == "Enrollment server key is not a valid CURVE public key");
+                    REQUIRE(cfg.server_public_key.empty());
+                    REQUIRE(cfg.server_public_key_fingerprint.empty());
+                }
             }
         }
     }
