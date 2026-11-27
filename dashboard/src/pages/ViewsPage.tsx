@@ -31,26 +31,19 @@ export function ViewsPage({
   const { clear } = React.useContext(ActionFailureContext);
   const [newName, setNewName] = React.useState('');
   const [newPublic, setNewPublic] = React.useState(false);
-  const [newGroupId, setNewGroupId] = React.useState<number>(groups[0]?.group_id ?? 0);
+  const [newGroupChoice, setNewGroupId] = React.useState<number>(groups[0]?.group_id ?? 0);
   const [newAgentIds, setNewAgentIds] = React.useState<string[]>([]);
   const [editId, setEditId] = React.useState<number | null>(null);
   const [editName, setEditName] = React.useState('');
   const [editPublic, setEditPublic] = React.useState(false);
-  const [editGroupId, setEditGroupId] = React.useState(0);
+  const [editGroupChoice, setEditGroupId] = React.useState(0);
   const [editAgentIds, setEditAgentIds] = React.useState<string[]>([]);
   const globalAccount = isGlobal(session.role);
 
-  React.useEffect(() => {
-    if (!globalAccount && groups.length > 0 && !groups.some((group) => group.group_id === newGroupId)) {
-      setNewGroupId(groups[0].group_id);
-    }
-  }, [globalAccount, groups, newGroupId]);
-
-  React.useEffect(() => {
-    if (!globalAccount && editId !== null && groups.length > 0 && !groups.some((group) => group.group_id === editGroupId)) {
-      setEditGroupId(groups[0].group_id);
-    }
-  }, [editGroupId, editId, globalAccount, groups]);
+  // A group user must pick one of their groups, so fall back to the first when the choice is gone.
+  const fallbackGroup = (choice: number) => (!globalAccount && groups.length > 0 && !groups.some((group) => group.group_id === choice) ? groups[0].group_id : choice);
+  const newGroupId = fallbackGroup(newGroupChoice);
+  const editGroupId = fallbackGroup(editGroupChoice);
 
   const startEdit = (v: ViewRecord) => {
     if (editId !== null) clear(`view:save:${editId}`); // the editor being replaced takes its old failure with it

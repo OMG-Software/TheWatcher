@@ -24,6 +24,8 @@ export interface AgentRecord {
   group_ids?: number[];
   thresholds?: AgentThresholds;
   collector_config?: CollectorConfig;
+  /** The status engine's latest status per indicator (`cpu`, `memory`, `disk:<mount>`, `network:<iface>`, `process:<name>`). Absent on servers that predate it. */
+  indicator_status?: Record<string, string>;
 }
 
 export interface ServerSettings {
@@ -31,6 +33,10 @@ export interface ServerSettings {
   offline_after_seconds: number;
   escalation_timeout_seconds: number;
   metrics_retention_days: number;
+  /** Retention keys added with the status-engine lifecycle work; a server without it neither reports nor stores them. */
+  status_history_retention_days?: number;
+  alerts_retention_days?: number;
+  log_matches_retention_days?: number;
   reports_enabled: boolean;
   reports_schedule: 'daily' | 'weekly';
   reports_hour: number;

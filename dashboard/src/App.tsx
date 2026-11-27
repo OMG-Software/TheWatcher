@@ -182,6 +182,7 @@ function Dashboard({ session, onSignOut }: { session: SessionInfo; onSignOut: ()
       ) : null}
       {configAgent ? (
         <AgentConfigModal
+          key={configAgent.id}
           agent={configAgent}
           busy={busyAction === `${configAgent.id}:collector_config`}
           onClose={() => setConfigAgentId(null)}

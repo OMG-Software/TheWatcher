@@ -25,7 +25,7 @@ export function UsersPage({
   const [username, setUsername] = React.useState('');
   const [password, setPassword] = React.useState('');
   const [role, setRole] = React.useState<UserRecord['role']>('group_viewer');
-  const [groupId, setGroupId] = React.useState<number>(groups[0]?.group_id ?? 0);
+  const [groupChoice, setGroupId] = React.useState<number>(groups[0]?.group_id ?? 0);
   const [pwUserId, setPwUserId] = React.useState<number | null>(null);
   const [pwValue, setPwValue] = React.useState('');
   const { clear } = React.useContext(ActionFailureContext);
@@ -42,12 +42,8 @@ export function UsersPage({
   const globalAdmin = session.role === 'global_admin';
   const globalAccount = isGlobal(session.role);
   const currentUser = users.find((u) => u.username === session.username);
-
-  React.useEffect(() => {
-    if (!globalAccount && groups.length > 0 && !groups.some((group) => group.group_id === groupId)) {
-      setGroupId(groups[0].group_id);
-    }
-  }, [globalAccount, groupId, groups]);
+  // A group user must pick one of their groups, so fall back to the first when the choice is gone.
+  const groupId = !globalAccount && groups.length > 0 && !groups.some((group) => group.group_id === groupChoice) ? groups[0].group_id : groupChoice;
 
   return (
     <main className="table-wrap management-wrap">
