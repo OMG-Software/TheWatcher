@@ -7,7 +7,8 @@ export interface FakeReply {
   body: unknown;
 }
 
-export const ok = (body: unknown = { ok: true }): FakeReply => ({ status: 200, body });
+const OK_BODY = { ok: true };
+export const ok = (body: unknown = OK_BODY): FakeReply => ({ status: 200, body });
 export const fail = (status: number, error: string): FakeReply => ({ status, body: { error } });
 
 type Handler = FakeReply | (() => FakeReply | Promise<FakeReply>);
@@ -75,8 +76,10 @@ export function agentRecord(id: string, hostname: string) {
 /** A promise the test settles by hand, to hold a request open and control response order. */
 export function deferred<T>() {
   let resolve!: (value: T) => void;
-  const promise = new Promise<T>((res) => {
+  let reject!: (reason: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
     resolve = res;
+    reject = rej;
   });
-  return { promise, resolve };
+  return { promise, resolve, reject };
 }
