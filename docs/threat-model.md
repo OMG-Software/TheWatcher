@@ -125,7 +125,7 @@ working document for audit, design review, and regression testing.
   hash runs.
 - A trusted range only matches peers of its own address family (`::/0` does not
   trust IPv4 peers, and IPv4-mapped IPv6 peers count as IPv4). A forwarding
-  header that is present but empty or holds no address is treated as
+  header that is present but empty, holds no address, or contains any empty entry (for example a trailing comma) is treated as
   malformed (own bucket), never as "no header".
 - A login attempt holds a slot in the throttle counters while its password is
   verified; the slot is returned on success or on an unexpected error, and

@@ -573,3 +573,42 @@ SCENARIO("A successful login only releases its own throttle reservation")
         }
     }
 }
+
+SCENARIO("A forwarded chain with an empty entry is malformed even next to a trusted hop")
+{
+    GIVEN("an API server that trusts 127.0.0.1 as a reverse proxy")
+    {
+        ApiFixture fx(60'000, {"127.0.0.1"});
+
+        WHEN("ten failures send a trusted hop followed by an empty entry")
+        {
+            for (int i = 0; i < 10; ++i)
+                REQUIRE(attempt_login_via_proxy(fx.client, "127.0.0.1,", "spray-user-" + std::to_string(i),
+                                                "wrong-password") == 401);
+
+            THEN("they are throttled on their own and the proxy address stays usable")
+            {
+                REQUIRE(attempt_login_via_proxy(fx.client, "127.0.0.1,", "thewatcher", "look_at_me") == 429);
+                REQUIRE(attempt_login(fx.client, "thewatcher", "look_at_me") == 200);
+            }
+        }
+    }
+
+    GIVEN("a second API server that trusts 127.0.0.1 as a reverse proxy")
+    {
+        ApiFixture fx(60'000, {"127.0.0.1"});
+
+        WHEN("ten failures send an empty entry followed by a trusted hop")
+        {
+            for (int i = 0; i < 10; ++i)
+                REQUIRE(attempt_login_via_proxy(fx.client, ",127.0.0.1", "spray-user-" + std::to_string(i),
+                                                "wrong-password") == 401);
+
+            THEN("they are throttled on their own and the proxy address stays usable")
+            {
+                REQUIRE(attempt_login_via_proxy(fx.client, ",127.0.0.1", "thewatcher", "look_at_me") == 429);
+                REQUIRE(attempt_login(fx.client, "thewatcher", "look_at_me") == 200);
+            }
+        }
+    }
+}

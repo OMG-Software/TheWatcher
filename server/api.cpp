@@ -297,25 +297,35 @@ std::string ApiServer::client_ip(const httplib::Request& req)
         xff += req.get_header_value("X-Forwarded-For", "", i);
     }
 
+    // A header that was sent must be a list of non-empty entries; one empty
+    // entry (",", "a,", ",a") makes it malformed, however many valid hops
+    // sit beside it. Absent means no header line at all.
+    if (xff_lines > 0)
+    {
+        std::string_view all = xff;
+        for (;;)
+        {
+            const auto comma = all.find(',');
+            if (trim_ws(all.substr(0, comma)).empty())
+                return std::string(unknown_client);
+            if (comma == std::string_view::npos)
+                break;
+            all.remove_prefix(comma + 1);
+        }
+    }
+
     std::string_view rest = xff;
-    bool saw_entry = false;
     while (!rest.empty())
     {
         const auto comma = rest.rfind(',');
         const auto entry = trim_ws(comma == std::string_view::npos ? rest : rest.substr(comma + 1));
         rest = comma == std::string_view::npos ? std::string_view{} : rest.substr(0, comma);
-        if (entry.empty())
-            continue;
-        saw_entry = true;
         const auto ip = parse_ip(entry);
         if (!ip)
             return std::string(unknown_client);
         if (!is_trusted(*ip))
             return format_ip(*ip);
     }
-    // A header that was sent but holds no address is malformed, not absent.
-    if (xff_lines > 0 && !saw_entry)
-        return std::string(unknown_client);
     // No forwarding header, or only trusted hops: the proxy itself.
     return remote;
 }
