@@ -74,26 +74,70 @@ describe('GIVEN a polling hook', () => {
     expect(fetcher).toHaveBeenCalledTimes(2);
   });
 
-  it('WHEN a manual refresh overtakes an older request THEN the older response is ignored', async () => {
+  it('WHEN refresh is called while a request is in flight THEN it waits for it, and the follow-up result is the final one', async () => {
     const older = deferred<string>();
-    const newer = deferred<string>();
-    const fetcher = vi.fn().mockReturnValueOnce(older.promise).mockReturnValueOnce(newer.promise);
+    const fetcher = vi.fn().mockReturnValueOnce(older.promise).mockResolvedValueOnce('fresh');
     const { result } = renderHook(() => usePolling(fetcher, { intervalMs: 1000 }));
 
     let refreshing!: Promise<unknown>;
     act(() => {
       refreshing = result.current.refresh();
     });
+    expect(fetcher).toHaveBeenCalledTimes(1); // the older request is not duplicated
     await act(async () => {
-      newer.resolve('fresh');
+      older.resolve('older');
       await refreshing;
     });
+
+    expect(fetcher).toHaveBeenCalledTimes(2);
+    expect(result.current.data).toBe('fresh');
+  });
+
+  it('WHEN refresh is called three times during one pending request THEN exactly one follow-up runs and all three calls get its result', async () => {
+    const first = deferred<string>();
+    const fetcher = vi.fn().mockReturnValueOnce(first.promise).mockRejectedValueOnce(new Error('follow-up failed'));
+    const { result } = renderHook(() => usePolling(fetcher));
+
+    const results: Promise<string | null>[] = [];
+    act(() => {
+      results.push(result.current.refresh(), result.current.refresh(), result.current.refresh());
+    });
     await act(async () => {
-      older.resolve('stale');
-      await Promise.resolve();
+      first.resolve('first');
+      await Promise.all(results);
     });
 
-    expect(result.current.data).toBe('fresh');
+    expect(fetcher).toHaveBeenCalledTimes(2);
+    expect(await Promise.all(results)).toEqual(['follow-up failed', 'follow-up failed', 'follow-up failed']);
+  });
+
+  it('WHEN a poll tick arrives while a request is in flight or a follow-up is queued THEN it makes no call', async () => {
+    const first = deferred<string>();
+    const fetcher = vi.fn().mockReturnValueOnce(first.promise).mockResolvedValue('later');
+    const { result } = renderHook(() => usePolling(fetcher, { intervalMs: 1000 }));
+    act(() => {
+      void result.current.refresh();
+    });
+
+    await advance(3000);
+
+    expect(fetcher).toHaveBeenCalledTimes(1);
+  });
+
+  it('WHEN the hook is unmounted with a follow-up queued THEN the follow-up never runs and refresh still resolves', async () => {
+    const first = deferred<string>();
+    const fetcher = vi.fn().mockReturnValueOnce(first.promise).mockResolvedValue('later');
+    const { result, unmount } = renderHook(() => usePolling(fetcher));
+    let refreshing!: Promise<string | null>;
+    act(() => {
+      refreshing = result.current.refresh();
+    });
+
+    unmount();
+    first.resolve('first');
+
+    expect(await refreshing).toBeNull();
+    expect(fetcher).toHaveBeenCalledTimes(1);
   });
 
   it('WHEN a refresh fails after a good load THEN the data is kept and the error is reported, then cleared by the next success', async () => {
