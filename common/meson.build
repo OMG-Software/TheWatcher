@@ -1,4 +1,5 @@
 common_sources = [
+  'secure_file.cpp',
   # Stays cross-platform: windows_service.cpp has #ifdef _WIN32 stubs
   # that return "only available on Windows" on Linux/BSD so the
   # server/agent main.cpp call sites still link.
