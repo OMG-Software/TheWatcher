@@ -16,6 +16,9 @@ namespace thewatcher::server
 // 24 h of 30 s samples. The newest rows win, on every backend.
 inline constexpr int kMetricsWindowLimit = 2880;
 
+// Rows deleted per statement by prune_metrics_before.
+inline constexpr int kPruneBatchRows = 5000;
+
 struct AgentRecord
 {
     std::string agent_id;

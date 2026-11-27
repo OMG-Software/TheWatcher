@@ -2999,3 +2999,319 @@ SCENARIO("get_runbook never returns another agent's runbook")
         }
     }
 }
+
+// ── Backend parity (#74 #75 #77 #80) ──────────────────────────────────────────
+// These scenarios pin behaviour that used to differ between SQLite and
+// PostgreSQL. They run on whichever backend TestStore selects.
+
+namespace
+{
+void add_agent(Store& store, const std::string& id)
+{
+    AgentRecord rec;
+    rec.agent_id = id;
+    rec.hostname = "host-" + id;
+    store.upsert_agent(rec);
+}
+
+void add_metric(Store& store, const std::string& agent_id, int64_t timestamp_ms, uint8_t marker = 0)
+{
+    MetricsRow row;
+    row.agent_id = agent_id;
+    row.timestamp_ms = timestamp_ms;
+    row.metrics_cbor = {marker};
+    store.insert_metrics(row);
+}
+} // namespace
+
+SCENARIO("A metrics window larger than its limit returns the newest rows, oldest first")
+{
+    GIVEN("an agent with 3000 metric rows at timestamps 1..3000")
+    {
+        TestStore store;
+        add_agent(store, "win-limit");
+        for (int64_t ts = 1; ts <= 3000; ++ts)
+            add_metric(store, "win-limit", ts);
+
+        WHEN("the window is read with the default limit")
+        {
+            const auto rows = store.get_metrics_in_window("win-limit", 0, 10000);
+
+            THEN("it holds the newest 2880 rows in ascending order")
+            {
+                REQUIRE(rows.size() == static_cast<size_t>(kMetricsWindowLimit));
+                CHECK(rows.front().timestamp_ms == 3000 - kMetricsWindowLimit + 1);
+                CHECK(rows.back().timestamp_ms == 3000);
+                CHECK(std::is_sorted(rows.begin(), rows.end(), [](const auto& a, const auto& b) {
+                    return a.timestamp_ms < b.timestamp_ms;
+                }));
+            }
+        }
+
+        WHEN("the window is read with an explicit limit of 3")
+        {
+            const auto rows = store.get_metrics_in_window("win-limit", 0, 10000, 3);
+
+            THEN("it holds the three newest rows, oldest first")
+            {
+                REQUIRE(rows.size() == 3);
+                CHECK(rows[0].timestamp_ms == 2998);
+                CHECK(rows[2].timestamp_ms == 3000);
+            }
+        }
+
+        WHEN("the window is read with a zero or negative limit")
+        {
+            THEN("nothing is returned")
+            {
+                CHECK(store.get_metrics_in_window("win-limit", 0, 10000, 0).empty());
+                CHECK(store.get_metrics_in_window("win-limit", 0, 10000, -1).empty());
+            }
+        }
+    }
+}
+
+SCENARIO("A non-positive limit returns nothing from every limited read")
+{
+    GIVEN("an agent with metrics, status history and log matches")
+    {
+        TestStore store;
+        add_agent(store, "neg-limit");
+        add_metric(store, "neg-limit", 1);
+        StatusHistoryRow history;
+        history.agent_id = "neg-limit";
+        history.indicator = "cpu";
+        history.old_status = "green";
+        history.new_status = "red";
+        history.created_at = 1;
+        store.insert_status_history(history);
+        LogMatchRecord match;
+        match.agent_id = "neg-limit";
+        match.indicator_name = "log";
+        match.created_at = 1;
+        store.insert_log_match(match);
+
+        WHEN("each is read with limit -1 or 0")
+        {
+            THEN("none returns rows, rather than SQLite returning all and PostgreSQL failing")
+            {
+                CHECK(store.get_metrics("neg-limit", -1).empty());
+                CHECK(store.get_metrics("neg-limit", 0).empty());
+                CHECK(store.list_status_history("neg-limit", -1).empty());
+                CHECK(store.list_log_matches("neg-limit", -1).empty());
+                CHECK(store.get_metrics("neg-limit", 1).size() == 1);
+            }
+        }
+    }
+}
+
+SCENARIO("Status transitions in the same millisecond keep a deterministic order")
+{
+    GIVEN("two transitions for one indicator with the same created_at")
+    {
+        TestStore store;
+        add_agent(store, "tie-agent");
+        StatusHistoryRow first;
+        first.agent_id = "tie-agent";
+        first.indicator = "cpu";
+        first.old_status = "green";
+        first.new_status = "yellow";
+        first.created_at = 5000;
+        store.insert_status_history(first);
+        StatusHistoryRow second = first;
+        second.old_status = "yellow";
+        second.new_status = "red";
+        store.insert_status_history(second);
+
+        WHEN("the latest status and the history are read")
+        {
+            const auto latest = store.latest_status_for_indicator("tie-agent", "cpu");
+            const auto history = store.list_status_history("tie-agent", 10);
+
+            THEN("the transition inserted last wins and is listed first")
+            {
+                REQUIRE(latest.has_value());
+                CHECK(latest->new_status == "red");
+                REQUIRE(history.size() == 2);
+                CHECK(history[0].new_status == "red");
+                CHECK(history[1].new_status == "yellow");
+            }
+        }
+    }
+}
+
+SCENARIO("latest_metrics returns one row per agent even when timestamps tie")
+{
+    GIVEN("two agents, one with two rows at the same newest timestamp")
+    {
+        TestStore store;
+        add_agent(store, "lm-b");
+        add_agent(store, "lm-a");
+        add_metric(store, "lm-a", 100, 1);
+        add_metric(store, "lm-a", 200, 2);
+        add_metric(store, "lm-a", 200, 3);
+        add_metric(store, "lm-b", 50, 9);
+
+        WHEN("latest_metrics is read")
+        {
+            const auto rows = store.latest_metrics();
+
+            THEN("each agent appears once, the later insert wins a tie, and agents are sorted by id")
+            {
+                REQUIRE(rows.size() == 2);
+                CHECK(rows[0].agent_id == "lm-a");
+                CHECK(rows[0].metrics_cbor == std::vector<uint8_t>{3});
+                CHECK(rows[1].agent_id == "lm-b");
+            }
+        }
+    }
+}
+
+SCENARIO("Groups and users are listed in byte order of their names on every backend")
+{
+    GIVEN("groups and users whose names differ in case")
+    {
+        TestStore store;
+        store.create_group("zeta");
+        store.create_group("Beta");
+        store.create_group("alpha");
+        store.create_user("zed", "hash", "viewer");
+        store.create_user("Amy", "hash", "viewer");
+        store.create_user("bob", "hash", "viewer");
+
+        WHEN("they are listed")
+        {
+            const auto groups = store.list_groups();
+            const auto users = store.list_users();
+
+            THEN("capital letters sort before lower case, regardless of the database collation")
+            {
+                std::vector<std::string> group_names;
+                for (const auto& g : groups)
+                    group_names.push_back(g.name);
+                CHECK(std::is_sorted(group_names.begin(), group_names.end()));
+                CHECK(group_names.front() == "Admins");
+                CHECK(group_names.back() == "zeta");
+
+                std::vector<std::string> user_names;
+                for (const auto& u : users)
+                    user_names.push_back(u.username);
+                CHECK(std::is_sorted(user_names.begin(), user_names.end()));
+                CHECK(user_names.front() == "Amy");
+            }
+        }
+    }
+}
+
+SCENARIO("Active maintenance windows are listed newest start first")
+{
+    GIVEN("three overlapping windows")
+    {
+        TestStore store;
+        MaintenanceWindowRecord w;
+        w.agent_id = "*";
+        w.end_ms = 10000;
+        w.start_ms = 100;
+        store.create_maintenance_window(w);
+        w.start_ms = 300;
+        store.create_maintenance_window(w);
+        w.start_ms = 200;
+        store.create_maintenance_window(w);
+
+        WHEN("the active windows are read")
+        {
+            const auto windows = store.active_maintenance_windows(500);
+
+            THEN("they are ordered by start time, newest first")
+            {
+                REQUIRE(windows.size() == 3);
+                CHECK(windows[0].start_ms == 300);
+                CHECK(windows[1].start_ms == 200);
+                CHECK(windows[2].start_ms == 100);
+            }
+        }
+    }
+}
+
+SCENARIO("Creating a session with an existing token replaces that session")
+{
+    GIVEN("a stored session")
+    {
+        TestStore store;
+        const auto admin = store.get_user_by_username("thewatcher");
+        REQUIRE(admin.has_value());
+        SessionRecord session;
+        session.token = "dup-token";
+        session.user_id = admin->user_id;
+        session.created_at = 1000;
+        session.expires_at = 5000;
+        store.create_session(session);
+
+        WHEN("another session is created with the same token and a later expiry")
+        {
+            session.expires_at = 9000;
+            store.create_session(session);
+
+            THEN("the new expiry is the one that applies")
+            {
+                const auto got = store.get_session("dup-token", 6000);
+                REQUIRE(got.has_value());
+                CHECK(got->expires_at == 9000);
+            }
+        }
+    }
+}
+
+SCENARIO("Pruning metrics removes every row before the cutoff, across batches")
+{
+    GIVEN("more old rows than one prune batch, plus newer rows for two agents")
+    {
+        TestStore store;
+        add_agent(store, "prune-a");
+        add_agent(store, "prune-b");
+        const int old_rows = kPruneBatchRows + 500;
+        for (int i = 1; i <= old_rows; ++i)
+            add_metric(store, i % 2 ? "prune-a" : "prune-b", i);
+        add_metric(store, "prune-a", 1'000'000);
+        add_metric(store, "prune-b", 1'000'000);
+
+        WHEN("metrics before the cutoff are pruned")
+        {
+            store.prune_metrics_before(500'000);
+
+            THEN("only the rows at or after the cutoff remain")
+            {
+                CHECK(store.count_metrics_in_window("prune-a", 0, 2'000'000) == 1);
+                CHECK(store.count_metrics_in_window("prune-b", 0, 2'000'000) == 1);
+            }
+        }
+    }
+}
+
+SCENARIO("Agents with equal last_seen are listed in a stable order")
+{
+    GIVEN("three agents seen at the same instant")
+    {
+        TestStore store;
+        for (const char* id : {"stable-c", "stable-a", "stable-b"})
+        {
+            AgentRecord rec;
+            rec.agent_id = id;
+            rec.last_seen = 777;
+            store.upsert_agent(rec);
+        }
+
+        WHEN("agents are listed")
+        {
+            const auto agents = store.list_agents();
+
+            THEN("ties are broken by agent id")
+            {
+                REQUIRE(agents.size() == 3);
+                CHECK(agents[0].agent_id == "stable-a");
+                CHECK(agents[1].agent_id == "stable-b");
+                CHECK(agents[2].agent_id == "stable-c");
+            }
+        }
+    }
+}

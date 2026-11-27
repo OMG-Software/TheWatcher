@@ -1,54 +1,30 @@
+// PostgreSQL-specific store behaviour: migration, reconnection, schema
+// handling and multi-node use. The shared Store contract (every scenario in
+// store_test.cpp) is run against PostgreSQL by the store_postgres_suite test.
+//
+// Each scenario gets its own throwaway schema (postgres_test_support.hpp), so
+// the tests are isolated, order-independent and safe to re-run on a used
+// database. See docs/development.md for how to point them at a server.
 #ifdef HAVE_LIBPQ
 
-#include "../server/store_postgres.hpp"
 #include "../server/store_synchronized.hpp"
+#include "postgres_test_support.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
 #include <atomic>
-#include <cstdlib>
 #include <memory>
 #include <thread>
 #include <vector>
 
 using namespace thewatcher;
 using namespace thewatcher::server;
-
-// ── Helpers ──────────────────────────────────────────────────────────────────
+using thewatcher::server::test::run_sql;
+using thewatcher::server::test::TestSchema;
 
 namespace
 {
-
-// Returns DSN from environment or a sensible local default.
-const char* test_dsn()
-{
-    const char* env = std::getenv("THEWATCHER_POSTGRES_TEST_DSN");
-    if (env && *env)
-        return env;
-    return "host=localhost dbname=thewatcher_test user=thewatcher_test password=thewatcher_test";
-}
-
-// Returns true if a PostgreSQL server is reachable at the test DSN.
-// Result is cached after the first probe so subsequent calls are free.
-bool postgres_is_available()
-{
-    static bool checked = false;
-    static bool available = false;
-    if (!checked)
-    {
-        checked = true;
-        try
-        {
-            PostgresStore store(test_dsn());
-            available = true;
-        }
-        catch (...)
-        {
-        }
-    }
-    return available;
-}
 
 AgentRecord make_agent(const std::string& id)
 {
@@ -57,10 +33,6 @@ AgentRecord make_agent(const std::string& id)
     r.hostname = "host-" + id;
     r.platform = "linux";
     r.curve_public_key_z85 = std::string(40, 'A');
-    r.approved = false;
-    r.rejected = false;
-    r.connected = false;
-    r.maintenance = false;
     r.collection_interval = 30;
     r.process_limit = 50;
     r.first_seen = 1000;
@@ -68,737 +40,394 @@ AgentRecord make_agent(const std::string& id)
     return r;
 }
 
+// Runs a query that returns one value and returns it as text.
+std::string query_scalar(const std::string& sql)
+{
+    postgres::Connection conn(test::postgres_test_dsn());
+    PGresult* res = PQexec(conn, sql.c_str());
+    std::string value;
+    if (PQresultStatus(res) == PGRES_TUPLES_OK && PQntuples(res) > 0 && !PQgetisnull(res, 0, 0))
+        value = PQgetvalue(res, 0, 0);
+    PQclear(res);
+    return value;
+}
+
+AlertRecord heartbeat_alert(const std::string& agent_id)
+{
+    AlertRecord alert;
+    alert.agent_id = agent_id;
+    alert.indicator = "Heartbeat";
+    alert.old_status = "green";
+    alert.new_status = "red";
+    alert.created_at = 2000;
+    return alert;
+}
+
 } // namespace
 
-// ── Bootstrap ─────────────────────────────────────────────────────────────────
+// ── Connecting ───────────────────────────────────────────────────────────────
 
-SCENARIO("[postgres] A freshly opened PostgresStore bootstraps the default admin user")
+SCENARIO("[postgres] Opening a store on an unreachable server fails with an error")
 {
-    if (!postgres_is_available())
-        SKIP("PostgreSQL not available");
-    GIVEN("a connected PostgresStore")
+    GIVEN("a DSN that points at a closed port")
     {
-        PostgresStore store(test_dsn());
-
-        THEN("the default admin user exists")
+        WHEN("a PostgresStore is constructed")
         {
-            auto user = store.get_user_by_username("thewatcher");
-            REQUIRE(user.has_value());
-            CHECK(user->role == "global_admin");
-        }
-
-        THEN("list_users returns at least the built-in admin")
-        {
-            auto users = store.list_users();
-            REQUIRE_FALSE(users.empty());
-            auto it = std::find_if(users.begin(), users.end(), [](const UserRecord& u) {
-                return u.username == "thewatcher";
-            });
-            REQUIRE(it != users.end());
+            THEN("it throws instead of returning a half-usable store")
+            {
+                REQUIRE_THROWS(PostgresStore("host=127.0.0.1 port=1 dbname=none user=none connect_timeout=2"));
+            }
         }
     }
 }
 
-// ── Agent CRUD ────────────────────────────────────────────────────────────────
+// ── Migration ────────────────────────────────────────────────────────────────
 
-SCENARIO("[postgres] Agents can be upserted and retrieved")
+SCENARIO("[postgres] A database created by an older version is migrated in place")
 {
-    if (!postgres_is_available())
-        SKIP("PostgreSQL not available");
-    GIVEN("a PostgresStore and a new agent record")
+    test::TestSchema schema;
+    GIVEN("a legacy schema whose tables lack the newer columns, holding one row each")
     {
-        PostgresStore store(test_dsn());
-        const std::string id = "pg-test-agent-crud";
+        const auto& n = schema.name();
+        run_sql("CREATE TABLE " + n + ".agents (agent_id TEXT PRIMARY KEY, hostname TEXT NOT NULL DEFAULT '', "
+                "platform TEXT NOT NULL DEFAULT '', curve_public_key_z85 TEXT NOT NULL DEFAULT '', "
+                "approved BOOLEAN NOT NULL DEFAULT FALSE, first_seen BIGINT NOT NULL DEFAULT 0, "
+                "last_seen BIGINT NOT NULL DEFAULT 0)");
+        run_sql("INSERT INTO " + n + ".agents(agent_id,hostname,approved,first_seen,last_seen) "
+                "VALUES('old-agent','old-host',TRUE,5,6)");
+        run_sql("CREATE TABLE " + n + ".alerts (alert_id BIGSERIAL PRIMARY KEY, "
+                "agent_id TEXT NOT NULL REFERENCES " + n + ".agents(agent_id) ON DELETE CASCADE, "
+                "indicator TEXT NOT NULL, old_status TEXT NOT NULL, new_status TEXT NOT NULL, "
+                "message TEXT NOT NULL DEFAULT '', created_at BIGINT NOT NULL, "
+                "acknowledged_by TEXT NOT NULL DEFAULT '', acknowledged_at BIGINT NOT NULL DEFAULT 0, "
+                "deleted_at BIGINT NOT NULL DEFAULT 0)");
+        run_sql("INSERT INTO " + n + ".alerts(agent_id,indicator,old_status,new_status,created_at) "
+                "VALUES('old-agent','cpu','green','red',7)");
+        run_sql("CREATE TABLE " + n + ".runbooks (runbook_id BIGSERIAL PRIMARY KEY, "
+                "indicator TEXT NOT NULL DEFAULT '*', status TEXT NOT NULL, url TEXT NOT NULL, "
+                "notes TEXT NOT NULL DEFAULT '', created_by TEXT NOT NULL DEFAULT '', "
+                "created_at BIGINT NOT NULL DEFAULT 0)");
+        run_sql("INSERT INTO " + n + ".runbooks(indicator,status,url) VALUES('cpu','red','http://old')");
 
-        // Clean up from any prior run.
-        try
+        WHEN("a store is opened on it")
         {
-            store.delete_agent(id);
-        }
-        catch (...)
-        {
-        }
+            PostgresStore store(schema.dsn());
 
-        AgentRecord rec = make_agent(id);
-
-        WHEN("the agent is upserted")
-        {
-            store.upsert_agent(rec);
-
-            THEN("get_agent returns the record")
+            THEN("the old rows survive and the new columns carry their defaults")
             {
-                auto got = store.get_agent(id);
-                REQUIRE(got.has_value());
-                CHECK(got->hostname == rec.hostname);
-                CHECK(got->platform == rec.platform);
+                const auto agent = store.get_agent("old-agent");
+                REQUIRE(agent.has_value());
+                CHECK(agent->hostname == "old-host");
+                CHECK(agent->approved);
+                CHECK(agent->collection_interval == 30);
+                CHECK(agent->runbook_markdown.empty());
+
+                const auto alerts = store.list_alerts(false);
+                REQUIRE(alerts.size() == 1);
+                CHECK(alerts[0].note.empty());
+                CHECK(alerts[0].escalated_at == 0);
+
+                const auto runbooks = store.list_runbooks();
+                REQUIRE(runbooks.size() == 1);
+                CHECK(runbooks[0].agent_id.empty());
+                CHECK(runbooks[0].url == "http://old");
             }
 
-            THEN("list_agents includes the record")
+            AND_WHEN("the migrated database is opened again")
             {
-                auto agents = store.list_agents();
-                auto it = std::find_if(agents.begin(), agents.end(), [&](const AgentRecord& a) {
-                    return a.agent_id == id;
-                });
-                REQUIRE(it != agents.end());
-            }
-
-            AND_WHEN("the agent is approved")
-            {
-                store.approve_agent(id);
-
-                THEN("list_approved_agents includes it")
+                THEN("the migration is idempotent")
                 {
-                    auto approved = store.list_approved_agents();
-                    auto it = std::find_if(approved.begin(), approved.end(), [&](const AgentRecord& a) {
-                        return a.agent_id == id;
-                    });
-                    REQUIRE(it != approved.end());
-                }
-
-                THEN("list_pending_agents does not include it")
-                {
-                    auto pending = store.list_pending_agents();
-                    auto it = std::find_if(pending.begin(), pending.end(), [&](const AgentRecord& a) {
-                        return a.agent_id == id;
-                    });
-                    REQUIRE(it == pending.end());
-                }
-            }
-
-            AND_WHEN("the agent is deleted")
-            {
-                store.delete_agent(id);
-
-                THEN("get_agent returns nullopt")
-                {
-                    REQUIRE_FALSE(store.get_agent(id).has_value());
+                    REQUIRE_NOTHROW(PostgresStore(schema.dsn()));
+                    PostgresStore again(schema.dsn());
+                    REQUIRE(again.get_agent("old-agent").has_value());
                 }
             }
         }
     }
 }
 
-SCENARIO("[postgres] get_agent returns nullopt for an unknown id")
+SCENARIO("[postgres] The store lives in the schema its search_path selects, not in public")
 {
-    if (!postgres_is_available())
-        SKIP("PostgreSQL not available");
-    GIVEN("a PostgresStore")
+    test::TestSchema schema;
+    GIVEN("a DSN whose search_path is a private schema")
     {
-        PostgresStore store(test_dsn());
-        THEN("get_agent for a non-existent id returns nullopt")
+        WHEN("the store is opened twice (the second open re-runs every migration)")
         {
-            REQUIRE_FALSE(store.get_agent("pg-no-such-agent-xyz").has_value());
-        }
-    }
-}
+            PostgresStore first(schema.dsn());
+            first.upsert_agent(make_agent("schema-agent"));
 
-// ── Metrics ───────────────────────────────────────────────────────────────────
-
-SCENARIO("[postgres] Metrics can be inserted and retrieved")
-{
-    if (!postgres_is_available())
-        SKIP("PostgreSQL not available");
-    GIVEN("a PostgresStore with a registered agent")
-    {
-        PostgresStore store(test_dsn());
-        const std::string id = "pg-test-agent-metrics";
-        try
-        {
-            store.delete_agent(id);
-        }
-        catch (...)
-        {
-        }
-        store.upsert_agent(make_agent(id));
-
-        WHEN("a metrics row is inserted")
-        {
-            MetricsRow row;
-            row.agent_id = id;
-            row.timestamp_ms = 5000;
-            row.metrics_cbor = {1, 2, 3, 4};
-            store.insert_metrics(row);
-
-            THEN("get_metrics returns the row")
+            THEN("the second open does not fail trying to re-add existing columns")
             {
-                auto rows = store.get_metrics(id, 10);
-                REQUIRE_FALSE(rows.empty());
-                CHECK(rows.front().timestamp_ms == 5000);
-                CHECK(rows.front().metrics_cbor == row.metrics_cbor);
+                REQUIRE_NOTHROW(PostgresStore(schema.dsn()));
             }
 
-            THEN("count_metrics_in_window counts it")
+            AND_THEN("the tables are in the private schema")
             {
-                auto count = store.count_metrics_in_window(id, 4000, 6000);
-                CHECK(count == 1);
-            }
-
-            THEN("latest_metrics includes this agent")
-            {
-                auto latest = store.latest_metrics();
-                auto it = std::find_if(latest.begin(), latest.end(), [&](const MetricsRow& r) {
-                    return r.agent_id == id;
-                });
-                REQUIRE(it != latest.end());
-                CHECK(it->timestamp_ms == 5000);
-            }
-        }
-
-        store.delete_agent(id);
-    }
-}
-
-// ── Alerts ────────────────────────────────────────────────────────────────────
-
-SCENARIO("[postgres] Alerts can be inserted, listed, acknowledged, and soft-deleted")
-{
-    if (!postgres_is_available())
-        SKIP("PostgreSQL not available");
-    GIVEN("a PostgresStore with a registered agent")
-    {
-        PostgresStore store(test_dsn());
-        const std::string agent_id = "pg-test-agent-alerts";
-        try
-        {
-            store.delete_agent(agent_id);
-        }
-        catch (...)
-        {
-        }
-        store.upsert_agent(make_agent(agent_id));
-
-        AlertRecord alert;
-        alert.agent_id = agent_id;
-        alert.indicator = "cpu";
-        alert.old_status = "green";
-        alert.new_status = "red";
-        alert.message = "CPU spike";
-        alert.created_at = 10000;
-
-        WHEN("an alert is inserted")
-        {
-            const int64_t aid = store.insert_alert(alert);
-            REQUIRE(aid > 0);
-
-            THEN("list_alerts includes the alert")
-            {
-                auto alerts = store.list_alerts(false);
-                auto it = std::find_if(alerts.begin(), alerts.end(), [aid](const AlertRecord& a) {
-                    return a.alert_id == aid;
-                });
-                REQUIRE(it != alerts.end());
-                CHECK(it->indicator == "cpu");
-                CHECK(it->new_status == "red");
-            }
-
-            THEN("list_unacknowledged_alerts includes the alert")
-            {
-                auto unacked = store.list_unacknowledged_alerts();
-                auto it = std::find_if(unacked.begin(), unacked.end(), [aid](const AlertRecord& a) {
-                    return a.alert_id == aid;
-                });
-                REQUIRE(it != unacked.end());
-            }
-
-            AND_WHEN("the alert is acknowledged")
-            {
-                store.acknowledge_alert(aid, "thewatcher", 20000, "checked");
-
-                THEN("it no longer appears in list_unacknowledged_alerts")
-                {
-                    auto unacked = store.list_unacknowledged_alerts();
-                    auto it = std::find_if(unacked.begin(), unacked.end(), [aid](const AlertRecord& a) {
-                        return a.alert_id == aid;
-                    });
-                    CHECK(it == unacked.end());
-                }
-            }
-
-            AND_WHEN("the alert is soft-deleted")
-            {
-                store.soft_delete_alert(aid, 30000);
-
-                THEN("list_alerts(false) excludes it")
-                {
-                    auto active = store.list_alerts(false);
-                    auto it = std::find_if(active.begin(), active.end(), [aid](const AlertRecord& a) {
-                        return a.alert_id == aid;
-                    });
-                    CHECK(it == active.end());
-                }
-
-                THEN("list_alerts(true) includes it")
-                {
-                    auto all = store.list_alerts(true);
-                    auto it = std::find_if(all.begin(), all.end(), [aid](const AlertRecord& a) {
-                        return a.alert_id == aid;
-                    });
-                    REQUIRE(it != all.end());
-                    CHECK(it->deleted_at == 30000);
-                }
-            }
-        }
-
-        store.delete_agent(agent_id);
-    }
-}
-
-// ── Runbooks ──────────────────────────────────────────────────────────────────
-
-SCENARIO("[postgres] Runbooks can be created, listed, and deleted")
-{
-    if (!postgres_is_available())
-        SKIP("PostgreSQL not available");
-    GIVEN("a PostgresStore")
-    {
-        PostgresStore store(test_dsn());
-
-        // Remove any runbooks left over from prior runs.
-        for (auto& rb : store.list_runbooks())
-            if (rb.indicator == "pg-test-cpu")
-                store.delete_runbook(rb.runbook_id);
-
-        WHEN("a runbook is created")
-        {
-            RunbookRecord rec;
-            rec.indicator = "pg-test-cpu";
-            rec.status = "red";
-            rec.url = "https://example.com/runbook";
-            rec.notes = "Check disk pressure";
-            rec.created_by = "thewatcher";
-            rec.created_at = 1000;
-
-            const int64_t rid = store.create_runbook(rec);
-            REQUIRE(rid > 0);
-
-            THEN("list_runbooks includes the record")
-            {
-                auto books = store.list_runbooks();
-                auto it = std::find_if(books.begin(), books.end(), [rid](const RunbookRecord& r) {
-                    return r.runbook_id == rid;
-                });
-                REQUIRE(it != books.end());
-                CHECK(it->url == rec.url);
-                CHECK(it->notes == rec.notes);
-            }
-
-            THEN("get_runbook finds it by exact indicator+status")
-            {
-                auto rb = store.get_runbook("", "pg-test-cpu", "red");
-                REQUIRE(rb.has_value());
-                CHECK(rb->url == rec.url);
-            }
-
-            AND_WHEN("the runbook is deleted")
-            {
-                store.delete_runbook(rid);
-
-                THEN("list_runbooks no longer includes it")
-                {
-                    auto books = store.list_runbooks();
-                    auto it = std::find_if(books.begin(), books.end(), [rid](const RunbookRecord& r) {
-                        return r.runbook_id == rid;
-                    });
-                    CHECK(it == books.end());
-                }
-
-                THEN("get_runbook returns nullopt")
-                {
-                    CHECK_FALSE(store.get_runbook("", "pg-test-cpu", "red").has_value());
-                }
+                CHECK(query_scalar("SELECT count(*) FROM information_schema.tables WHERE table_schema='" +
+                                   schema.name() + "' AND table_name='agents'") == "1");
+                CHECK(query_scalar("SELECT count(*) FROM " + schema.name() + ".agents") == "1");
             }
         }
     }
 }
 
-SCENARIO("[postgres] get_runbook returns exact indicator match before wildcard")
+SCENARIO("[postgres] The hot-path indexes exist")
 {
-    if (!postgres_is_available())
-        SKIP("PostgreSQL not available");
-    GIVEN("a PostgresStore with a wildcard and an exact runbook for the same status")
+    test::TestSchema schema;
+    GIVEN("a freshly migrated store")
     {
-        PostgresStore store(test_dsn());
+        PostgresStore store(schema.dsn());
 
-        for (auto& rb : store.list_runbooks())
-            if (rb.indicator == "pg-test-exact" || rb.indicator == "*")
-                store.delete_runbook(rb.runbook_id);
-
-        RunbookRecord wildcard;
-        wildcard.indicator = "*";
-        wildcard.status = "amber";
-        wildcard.url = "https://example.com/wildcard";
-        wildcard.created_at = 1;
-        const int64_t wid = store.create_runbook(wildcard);
-
-        RunbookRecord exact;
-        exact.indicator = "pg-test-exact";
-        exact.status = "amber";
-        exact.url = "https://example.com/exact";
-        exact.created_at = 2;
-        const int64_t eid = store.create_runbook(exact);
-
-        THEN("get_runbook for the exact indicator returns the exact match")
+        THEN("the indexes for pruning, alert lookups, group cascades and sessions exist")
         {
-            auto rb = store.get_runbook("", "pg-test-exact", "amber");
-            REQUIRE(rb.has_value());
-            CHECK(rb->url == "https://example.com/exact");
-        }
-
-        THEN("get_runbook for an unknown indicator returns the wildcard")
-        {
-            auto rb = store.get_runbook("", "pg-some-other-indicator", "amber");
-            REQUIRE(rb.has_value());
-            CHECK(rb->url == "https://example.com/wildcard");
-        }
-
-        store.delete_runbook(wid);
-        store.delete_runbook(eid);
-    }
-}
-
-// ── Settings ──────────────────────────────────────────────────────────────────
-
-SCENARIO("[postgres] Settings key-value store persists values with fallback")
-{
-    if (!postgres_is_available())
-        SKIP("PostgreSQL not available");
-    GIVEN("a PostgresStore")
-    {
-        PostgresStore store(test_dsn());
-
-        THEN("an unset key returns the fallback")
-        {
-            auto val = store.get_setting("pg_test_nonexistent_key", "default");
-            CHECK(val == "default");
-        }
-
-        WHEN("a value is set")
-        {
-            store.set_setting("pg_test_key", "hello_postgres");
-
-            THEN("it is returned by get_setting")
+            for (const char* index : {"idx_metrics_ts", "idx_alerts_agent_indicator", "idx_agent_groups_group",
+                                      "idx_user_groups_group", "idx_sessions_expires", "idx_sessions_user"})
             {
-                auto val = store.get_setting("pg_test_key", "default");
-                CHECK(val == "hello_postgres");
-            }
-
-            AND_WHEN("it is overwritten")
-            {
-                store.set_setting("pg_test_key", "updated");
-                auto val = store.get_setting("pg_test_key", "default");
-                CHECK(val == "updated");
+                INFO(index);
+                CHECK(query_scalar("SELECT count(*) FROM pg_indexes WHERE schemaname='" + schema.name() +
+                                   "' AND indexname='" + index + "'") == "1");
             }
         }
     }
 }
 
-// ── Sessions ──────────────────────────────────────────────────────────────────
-
-SCENARIO("[postgres] Session lifecycle: create, retrieve, and expire")
+SCENARIO("[postgres] Several nodes starting at once migrate the schema exactly once")
 {
-    if (!postgres_is_available())
-        SKIP("PostgreSQL not available");
-    GIVEN("a PostgresStore")
+    test::TestSchema schema;
+    GIVEN("an empty schema and four nodes starting together")
     {
-        PostgresStore store(test_dsn());
+        std::atomic<bool> go{false};
+        std::atomic<int> failures{0};
+        std::vector<std::thread> nodes;
 
-        SessionRecord session;
-        session.token = "pg-test-session-token-xyz";
-        session.user_id = 1;
-        session.username = "thewatcher";
-        session.role = "global_admin";
-        session.expires_at = 9999999999LL;
-
-        store.create_session(session);
-
-        WHEN("the token is looked up before expiry")
+        WHEN("each node opens a store on the same schema at the same moment")
         {
-            auto got = store.get_session(session.token, 1000);
-            REQUIRE(got.has_value());
-            CHECK(got->username == "thewatcher");
-            CHECK(got->role == "global_admin");
-        }
-
-        WHEN("the token is looked up after expiry")
-        {
-            auto got = store.get_session(session.token, 99999999999LL);
-            CHECK_FALSE(got.has_value());
-        }
-
-        store.delete_session(session.token);
-    }
-}
-
-// ── Maintenance windows ───────────────────────────────────────────────────────
-
-SCENARIO("[postgres] Maintenance windows can be created, listed, and deleted")
-{
-    if (!postgres_is_available())
-        SKIP("PostgreSQL not available");
-    GIVEN("a PostgresStore")
-    {
-        PostgresStore store(test_dsn());
-
-        MaintenanceWindowRecord rec;
-        rec.agent_id = "*";
-        rec.start_ms = 1000;
-        rec.end_ms = 9000;
-        rec.reason = "pg test maintenance";
-        rec.created_by = "thewatcher";
-        rec.created_at = 500;
-
-        WHEN("a maintenance window is created")
-        {
-            const int64_t wid = store.create_maintenance_window(rec);
-            REQUIRE(wid > 0);
-
-            THEN("list_maintenance_windows includes it")
+            for (int i = 0; i < 4; ++i)
             {
-                auto windows = store.list_maintenance_windows();
-                auto it = std::find_if(windows.begin(), windows.end(), [wid](const MaintenanceWindowRecord& w) {
-                    return w.window_id == wid;
+                nodes.emplace_back([&] {
+                    while (!go.load())
+                        std::this_thread::yield();
+                    try
+                    {
+                        PostgresStore store(schema.dsn());
+                    }
+                    catch (...)
+                    {
+                        ++failures;
+                    }
                 });
-                REQUIRE(it != windows.end());
-                CHECK(it->reason == rec.reason);
             }
+            go = true;
+            for (auto& node : nodes)
+                node.join();
 
-            THEN("active_maintenance_windows at time 5000 includes it")
+            THEN("no node fails and there is exactly one default admin and one Admins group")
             {
-                auto active = store.active_maintenance_windows(5000);
-                auto it = std::find_if(active.begin(), active.end(), [wid](const MaintenanceWindowRecord& w) {
-                    return w.window_id == wid;
-                });
-                REQUIRE(it != active.end());
-            }
-
-            THEN("active_maintenance_windows at time 10000 excludes it")
-            {
-                auto active = store.active_maintenance_windows(10000);
-                auto it = std::find_if(active.begin(), active.end(), [wid](const MaintenanceWindowRecord& w) {
-                    return w.window_id == wid;
-                });
-                CHECK(it == active.end());
-            }
-
-            AND_WHEN("the window is deleted")
-            {
-                store.delete_maintenance_window(wid);
-                auto windows = store.list_maintenance_windows();
-                auto it = std::find_if(windows.begin(), windows.end(), [wid](const MaintenanceWindowRecord& w) {
-                    return w.window_id == wid;
-                });
-                CHECK(it == windows.end());
+                CHECK(failures == 0);
+                CHECK(query_scalar("SELECT count(*) FROM " + schema.name() + ".users WHERE username='thewatcher'") ==
+                      "1");
+                CHECK(query_scalar("SELECT count(*) FROM " + schema.name() + ".groups WHERE name='Admins'") == "1");
+                CHECK(query_scalar("SELECT count(*) FROM " + schema.name() + ".user_groups") == "1");
             }
         }
     }
 }
 
-// ── Silence rules ─────────────────────────────────────────────────────────────
-
-SCENARIO("[postgres] Silence rules can be created, listed, deleted, and matched")
-{
-    if (!postgres_is_available())
-        SKIP("PostgreSQL not available");
-    GIVEN("a PostgresStore")
-    {
-        PostgresStore store(test_dsn());
-
-        // Remove any leftover silences from prior runs.
-        for (auto& s : store.list_silences())
-            if (s.agent_id == "pg-silence-agent")
-                store.delete_silence(s.silence_id);
-
-        SilenceRecord rec;
-        rec.agent_id = "pg-silence-agent";
-        rec.indicator = "cpu";
-        rec.reason = "pg test silence";
-        rec.until_ms = 9999999999LL;
-        rec.created_by = "thewatcher";
-        rec.created_at = 1000;
-
-        WHEN("a silence is created")
-        {
-            const int64_t sid = store.create_silence(rec);
-            REQUIRE(sid > 0);
-
-            THEN("list_silences includes it")
-            {
-                auto silences = store.list_silences();
-                auto it = std::find_if(silences.begin(), silences.end(), [sid](const SilenceRecord& s) {
-                    return s.silence_id == sid;
-                });
-                REQUIRE(it != silences.end());
-            }
-
-            THEN("is_silenced returns true for matching agent+indicator before expiry")
-            {
-                CHECK(store.is_silenced("pg-silence-agent", "cpu", 5000));
-            }
-
-            THEN("is_silenced returns false for non-matching agent")
-            {
-                CHECK_FALSE(store.is_silenced("other-agent", "cpu", 5000));
-            }
-
-            AND_WHEN("the silence is deleted")
-            {
-                store.delete_silence(sid);
-                CHECK_FALSE(store.is_silenced("pg-silence-agent", "cpu", 5000));
-            }
-        }
-    }
-}
-
-// ── Atomicity and concurrency (#72, #73, #79, #51) ───────────────────────────
+// ── Reconnecting ─────────────────────────────────────────────────────────────
 
 namespace
 {
-// Removes the agent and the groups a test created so reruns start clean.
-void cleanup_pg(PostgresStore& store, const std::string& agent_id)
+// Terminates every backend that belongs to the store tagged `application`,
+// as a pgBouncer restart or failover would.
+void kill_connections(const std::string& application)
 {
-    try
-    {
-        store.delete_agent(agent_id);
-    }
-    catch (...)
-    {
-    }
+    run_sql("SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE application_name='" + application +
+            "' AND pid<>pg_backend_pid()");
 }
 } // namespace
 
-SCENARIO("[postgres] A failed group assignment leaves the previous memberships intact")
+SCENARIO("[postgres] The store recovers after its connection is cut")
 {
-    if (!postgres_is_available())
-        SKIP("PostgreSQL not available");
-    GIVEN("an agent in group A")
+    test::TestSchema schema;
+    GIVEN("a store whose server connection is then terminated")
     {
-        PostgresStore store(test_dsn());
-        const std::string id = "pg-atomic-groups";
-        cleanup_pg(store, id);
-        store.upsert_agent(make_agent(id));
-        const auto group_a = store.create_group("pg-atomic-A");
-        store.set_agent_groups(id, {group_a});
+        const std::string application = "tw_reconnect_" + schema.name();
+        PostgresStore store(schema.dsn("application_name=" + application));
+        store.upsert_agent(make_agent("reconnect-agent"));
+        kill_connections(application);
 
-        WHEN("an assignment names a group that does not exist")
+        WHEN("a read is issued")
         {
-            THEN("it throws and the agent is still in A")
+            THEN("it is retried on a fresh connection and succeeds")
             {
-                REQUIRE_THROWS(store.set_agent_groups(id, {group_a, 999999999}));
-                REQUIRE(store.get_agent_groups(id) == std::vector<int64_t>{group_a});
+                const auto agent = store.get_agent("reconnect-agent");
+                REQUIRE(agent.has_value());
+                CHECK(agent->hostname == "host-reconnect-agent");
             }
         }
 
-        WHEN("the configure-modal save names a group that does not exist")
+        WHEN("a write is issued")
         {
-            AgentConfigUpdate update;
-            update.collection_interval = 77;
-            update.heartbeat_interval = 9;
-            update.process_limit = 3;
-            update.collector_config = default_collector_config();
-            update.group_ids = std::vector<int64_t>{999999999};
-
-            THEN("it throws and no part is stored")
+            // A write that dies with the connection may or may not have been
+            // applied, so it is reported instead of silently repeated.
+            try
             {
-                REQUIRE_THROWS(store.save_agent_configuration(id, update));
-                const auto rec = store.get_agent(id);
-                CHECK(rec->collection_interval == 30);
-                CHECK(rec->heartbeat_interval == 5);
-                CHECK(store.get_agent_groups(id) == std::vector<int64_t>{group_a});
+                store.set_setting("reconnect", "first");
+            }
+            catch (const std::exception&)
+            {
+            }
+
+            THEN("the next write succeeds without restarting the process")
+            {
+                REQUIRE_NOTHROW(store.set_setting("reconnect", "second"));
+                CHECK(store.get_setting("reconnect") == "second");
             }
         }
-        cleanup_pg(store, id);
+
+        WHEN("the connection is cut again while the store is idle")
+        {
+            REQUIRE(store.get_agent("reconnect-agent").has_value());
+            kill_connections(application);
+
+            THEN("the store keeps working")
+            {
+                REQUIRE(store.get_agent("reconnect-agent").has_value());
+            }
+        }
     }
 }
 
-SCENARIO("[postgres] A heartbeat touch does not revert saved settings")
+SCENARIO("[postgres] A cut connection inside a transaction rolls it back and later calls recover")
 {
-    if (!postgres_is_available())
-        SKIP("PostgreSQL not available");
-    GIVEN("an agent with a saved heartbeat interval and runbook")
+    test::TestSchema schema;
+    GIVEN("a group-assignment transaction whose connection dies halfway")
     {
-        PostgresStore store(test_dsn());
-        const std::string id = "pg-touch";
-        cleanup_pg(store, id);
-        store.upsert_agent(make_agent(id));
-        store.set_agent_heartbeat_interval(id, 17);
-        store.set_agent_runbook(id, "# rb");
+        const std::string application = "tw_txn_" + schema.name();
+        PostgresStore store(schema.dsn("application_name=" + application));
+        store.upsert_agent(make_agent("txn-agent"));
+        const auto group = store.create_group("txn-group");
+        store.set_agent_groups("txn-agent", {group});
+        kill_connections(application);
 
-        WHEN("a heartbeat touches the agent")
+        WHEN("the transactional call is made")
         {
-            store.touch_agent(id, 9999, true);
-
-            THEN("only last_seen and connected change")
+            try
             {
-                const auto rec = store.get_agent(id);
-                CHECK(rec->last_seen == 9999);
-                CHECK(rec->connected);
-                CHECK(rec->heartbeat_interval == 17);
-                CHECK(rec->runbook_markdown == "# rb");
+                store.set_agent_groups("txn-agent", {});
+            }
+            catch (const std::exception&)
+            {
+            }
+
+            THEN("the old membership is intact and the store works again")
+            {
+                REQUIRE(store.get_agent_groups("txn-agent") == std::vector<int64_t>{group});
             }
         }
-        cleanup_pg(store, id);
     }
 }
 
-SCENARIO("[postgres] A dead-agent heartbeat alert is created once and bulk alert changes are atomic")
+// ── Multiple nodes ───────────────────────────────────────────────────────────
+
+SCENARIO("[postgres] Two server nodes on one database share agent state and metrics")
 {
-    if (!postgres_is_available())
-        SKIP("PostgreSQL not available");
-    GIVEN("an agent with no alerts")
+    test::TestSchema schema;
+    GIVEN("two stores connected to the same schema")
     {
-        PostgresStore store(test_dsn());
-        const std::string id = "pg-heartbeat-alert";
-        cleanup_pg(store, id);
-        store.upsert_agent(make_agent(id));
-        AlertRecord alert;
-        alert.agent_id = id;
-        alert.indicator = "Heartbeat";
-        alert.old_status = "green";
-        alert.new_status = "red";
-        alert.created_at = 2000;
+        PostgresStore node_a(schema.dsn());
+        PostgresStore node_b(schema.dsn());
 
-        WHEN("the heartbeat alert is inserted twice")
+        WHEN("node A records an agent and metrics")
         {
-            const bool first = store.insert_heartbeat_alert_if_absent(alert);
-            const bool second = store.insert_heartbeat_alert_if_absent(alert);
+            node_a.upsert_agent(make_agent("shared-agent"));
+            MetricsRow row;
+            row.agent_id = "shared-agent";
+            row.timestamp_ms = 5000;
+            row.metrics_cbor = {0x01, 0x02, 0x03};
+            node_a.insert_metrics(row);
 
-            THEN("only the first creates a row")
+            THEN("node B sees them at once, and a change by B is visible to A")
             {
-                CHECK(first);
-                CHECK_FALSE(second);
+                REQUIRE(node_b.get_agent("shared-agent").has_value());
+                const auto metrics = node_b.get_metrics("shared-agent", 10);
+                REQUIRE(metrics.size() == 1);
+                CHECK(metrics[0].metrics_cbor == std::vector<uint8_t>{0x01, 0x02, 0x03});
+
+                node_b.approve_agent("shared-agent");
+                CHECK(node_a.get_agent("shared-agent")->approved);
             }
         }
-
-        WHEN("alerts are acknowledged in bulk")
-        {
-            std::vector<int64_t> ids;
-            for (int i = 0; i < 3; ++i)
-            {
-                alert.indicator = "cpu";
-                ids.push_back(store.insert_alert(alert));
-            }
-            store.bulk_acknowledge_alerts(ids, "bob", 5000);
-
-            THEN("all are acknowledged")
-            {
-                for (const auto& a : store.list_alerts(false))
-                    if (a.agent_id == id)
-                        CHECK(a.acknowledged_at == 5000);
-            }
-        }
-        cleanup_pg(store, id);
     }
 }
+
+SCENARIO("[postgres] Two server nodes racing to raise a dead-agent alert create exactly one")
+{
+    test::TestSchema schema;
+    GIVEN("two connections to one database and several offline agents")
+    {
+        PostgresStore node_a(schema.dsn());
+        PostgresStore node_b(schema.dsn());
+        std::vector<std::string> ids;
+        for (int i = 0; i < 20; ++i)
+        {
+            ids.push_back("race-" + std::to_string(i));
+            node_a.upsert_agent(make_agent(ids.back()));
+        }
+
+        WHEN("both nodes insert the heartbeat alert for every agent at the same time")
+        {
+            std::atomic<bool> go{false};
+            std::atomic<int> errors{0};
+            std::atomic<int> inserted{0};
+            auto race = [&](PostgresStore& node) {
+                while (!go.load())
+                    std::this_thread::yield();
+                for (const auto& id : ids)
+                {
+                    try
+                    {
+                        if (node.insert_heartbeat_alert_if_absent(heartbeat_alert(id)))
+                            ++inserted;
+                    }
+                    catch (...)
+                    {
+                        ++errors;
+                    }
+                }
+            };
+            std::thread a(race, std::ref(node_a));
+            std::thread b(race, std::ref(node_b));
+            go = true;
+            a.join();
+            b.join();
+
+            THEN("each agent has exactly one live heartbeat alert")
+            {
+                CHECK(errors == 0);
+                CHECK(inserted == static_cast<int>(ids.size()));
+                for (const auto& id : ids)
+                {
+                    int live = 0;
+                    for (const auto& alert : node_a.list_alerts(false))
+                        if (alert.agent_id == id && alert.indicator == "Heartbeat")
+                            ++live;
+                    CHECK(live == 1);
+                }
+            }
+        }
+    }
+}
+
+// ── Threads ──────────────────────────────────────────────────────────────────
 
 SCENARIO("[postgres] Eight threads can use one synchronized store at the same time")
 {
-    if (!postgres_is_available())
-        SKIP("PostgreSQL not available");
+    test::TestSchema schema;
     GIVEN("a shared store with an agent and two groups")
     {
-        SynchronizedStore store(std::make_unique<PostgresStore>(test_dsn()));
+        SynchronizedStore store(std::make_unique<PostgresStore>(schema.dsn()));
         const std::string id = "pg-concurrent";
-        store.delete_agent(id);
         store.upsert_agent(make_agent(id));
         const auto group_a = store.create_group("pg-conc-A");
         const auto group_b = store.create_group("pg-conc-B");
@@ -839,75 +468,6 @@ SCENARIO("[postgres] Eight threads can use one synchronized store at the same ti
                 REQUIRE((groups == std::vector<int64_t>{group_a} || groups == std::vector<int64_t>{group_a, group_b}));
             }
         }
-        store.delete_agent(id);
-    }
-}
-
-SCENARIO("[postgres] Two server nodes racing to raise a dead-agent alert create exactly one")
-{
-    if (!postgres_is_available())
-        SKIP("PostgreSQL not available");
-    GIVEN("two connections to one database and several offline agents")
-    {
-        PostgresStore node_a(test_dsn());
-        PostgresStore node_b(test_dsn());
-        std::vector<std::string> ids;
-        for (int i = 0; i < 20; ++i)
-        {
-            ids.push_back("pg-race-" + std::to_string(i));
-            cleanup_pg(node_a, ids.back());
-            node_a.upsert_agent(make_agent(ids.back()));
-        }
-
-        WHEN("both nodes insert the heartbeat alert for every agent at the same time")
-        {
-            std::atomic<bool> go{false};
-            std::atomic<int> errors{0};
-            std::atomic<int> inserted{0};
-            auto race = [&](PostgresStore& node) {
-                while (!go.load())
-                    std::this_thread::yield();
-                for (const auto& id : ids)
-                {
-                    try
-                    {
-                        AlertRecord alert;
-                        alert.agent_id = id;
-                        alert.indicator = "Heartbeat";
-                        alert.old_status = "green";
-                        alert.new_status = "red";
-                        alert.created_at = 2000;
-                        if (node.insert_heartbeat_alert_if_absent(alert))
-                            ++inserted;
-                    }
-                    catch (...)
-                    {
-                        ++errors;
-                    }
-                }
-            };
-            std::thread a(race, std::ref(node_a));
-            std::thread b(race, std::ref(node_b));
-            go = true;
-            a.join();
-            b.join();
-
-            THEN("each agent has exactly one live heartbeat alert")
-            {
-                CHECK(errors == 0);
-                CHECK(inserted == static_cast<int>(ids.size()));
-                for (const auto& id : ids)
-                {
-                    int live = 0;
-                    for (const auto& alert : node_a.list_alerts(false))
-                        if (alert.agent_id == id && alert.indicator == "Heartbeat")
-                            ++live;
-                    CHECK(live == 1);
-                }
-            }
-        }
-        for (const auto& id : ids)
-            cleanup_pg(node_a, id);
     }
 }
 

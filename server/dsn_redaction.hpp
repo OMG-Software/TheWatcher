@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cctype>
 #include <string>
+#include <string_view>
 
 namespace thewatcher::server
 {
@@ -17,7 +18,7 @@ inline std::string redact_dsn(const std::string& dsn)
     constexpr const char* kMask = "***";
     const auto is_space = [](char c) { return std::isspace(static_cast<unsigned char>(c)) != 0; };
 
-    const bool is_uri = dsn.rfind("postgresql://", 0) == 0 || dsn.rfind("postgres://", 0) == 0;
+    const bool is_uri = std::string_view(dsn).starts_with("postgresql://") || std::string_view(dsn).starts_with("postgres://");
     if (is_uri)
     {
         std::string out = dsn;
