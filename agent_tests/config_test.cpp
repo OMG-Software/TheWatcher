@@ -3,11 +3,24 @@
 #include "test_support/temp_dir.hpp"
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/matchers/catch_matchers_string.hpp>
 
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <stdexcept>
 #include <string>
+#include <system_error>
+#include <vector>
+
+#ifdef _WIN32
+#include <windows.h>
+// windows.h first: aclapi.h and sddl.h depend on its declarations.
+#include <aclapi.h>
+#include <sddl.h>
+#else
+#include <sys/stat.h>
+#endif
 
 namespace fs = std::filesystem;
 using namespace thewatcher::agent;
@@ -417,64 +430,289 @@ SCENARIO("An endpoint-only override does not save the other server's key pin (is
     }
 }
 
-SCENARIO("Agent config LOG_* keys control the log level and rotation (issue #99)")
-{
-    GIVEN("a config with no LOG_* keys")
-    {
-        auto path = thewatcher::test::process_temp_dir().path() / "thewatcher_test_agent_log_default.conf";
-        {
-            std::ofstream f(path);
-            f << "COLLECTION_INTERVAL=30\n";
-        }
+// Issue #98: IPv6 server addresses.
 
-        THEN("logging defaults to INFO with 10 MiB files and 5 backups")
+namespace
+{
+
+// Writes a config file with the given THEWATCHER_SERVER value and an identity.
+fs::path write_server_config(const std::string& name, const std::string& server_value)
+{
+    auto path = thewatcher::test::process_temp_dir().path() / name;
+    fs::remove(path);
+    std::ofstream f(path);
+    f << "THEWATCHER_SERVER=" << server_value << "\n";
+    f << "AGENT_ID=agent-ipv6\n";
+    f << "AGENT_PUBLIC_KEY=1234567890123456789012345678901234567890\n";
+    f << "AGENT_SECRET_KEY=abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMN\n";
+    return path;
+}
+
+std::string read_all(const fs::path& path)
+{
+    std::ifstream f(path, std::ios::binary);
+    return {std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>()};
+}
+
+// Names of the files in `dir` other than `keep`.
+std::vector<std::string> other_files(const fs::path& dir, const fs::path& keep)
+{
+    std::vector<std::string> names;
+    for (const auto& entry : fs::directory_iterator(dir))
+        if (entry.path() != keep)
+            names.push_back(entry.path().filename().string());
+    return names;
+}
+
+} // namespace
+
+SCENARIO("A bracketed IPv6 THEWATCHER_SERVER keeps its brackets and replaces the port (issue #98)")
+{
+    GIVEN("THEWATCHER_SERVER with a bracketed IPv6 address and a port")
+    {
+        const auto path = write_server_config("ipv6_bracketed_port.conf", "[2001:db8::1]:5555");
+
+        WHEN("the config loads")
         {
             const auto cfg = AgentConfig::load_or_create(path);
-            REQUIRE(cfg.log.level == thewatcher::logging::LogLevel::L_INFO);
-            REQUIRE(cfg.log.max_size_mib == 10);
-            REQUIRE(cfg.log.max_files == 5);
-        }
-        fs::remove(path);
-    }
 
-    GIVEN("a config that sets all LOG_* keys")
-    {
-        auto path = thewatcher::test::process_temp_dir().path() / "thewatcher_test_agent_log_set.conf";
-        {
-            std::ofstream f(path);
-            f << "LOG_LEVEL=warning\nLOG_MAX_SIZE_MB=0\nLOG_MAX_FILES=1\n";
-        }
-
-        WHEN("the config is loaded, saved and loaded again")
-        {
-            auto cfg = AgentConfig::load_or_create(path);
-            cfg.save(path);
-            const auto reloaded = AgentConfig::load_or_create(path);
-
-            THEN("the values are read and survive the round trip")
+            THEN("the endpoints are the data and enrollment ports of that address")
             {
-                REQUIRE(cfg.log.level == thewatcher::logging::LogLevel::L_WARNING);
-                REQUIRE(cfg.log.max_size_mib == 0);
-                REQUIRE(cfg.log.max_files == 1);
-                REQUIRE(reloaded.log.level == thewatcher::logging::LogLevel::L_WARNING);
-                REQUIRE(reloaded.log.max_size_mib == 0);
-                REQUIRE(reloaded.log.max_files == 1);
+                REQUIRE(cfg.server_address == "tcp://[2001:db8::1]:5555");
+                REQUIRE(cfg.enrollment_address == "tcp://[2001:db8::1]:5556");
             }
         }
         fs::remove(path);
     }
 
-    GIVEN("a config with an invalid LOG_MAX_FILES")
+    GIVEN("THEWATCHER_SERVER with a tcp:// scheme and a bracketed IPv6 address without a port")
     {
-        auto path = thewatcher::test::process_temp_dir().path() / "thewatcher_test_agent_log_bad.conf";
+        const auto path = write_server_config("ipv6_bracketed_noport.conf", "tcp://[::1]");
+
+        WHEN("the config loads")
         {
-            std::ofstream f(path);
-            f << "LOG_MAX_FILES=lots\n";
+            const auto cfg = AgentConfig::load_or_create(path);
+
+            THEN("the default ports are used")
+            {
+                REQUIRE(cfg.server_address == "tcp://[::1]:5555");
+                REQUIRE(cfg.enrollment_address == "tcp://[::1]:5556");
+            }
+        }
+        fs::remove(path);
+    }
+}
+
+SCENARIO("An unbracketed IPv6 THEWATCHER_SERVER is rejected with a clear error (issue #98)")
+{
+    GIVEN("THEWATCHER_SERVER=2001:db8::1")
+    {
+        const auto path = write_server_config("ipv6_unbracketed.conf", "2001:db8::1");
+
+        WHEN("the config loads")
+        {
+            THEN("loading fails instead of silently dropping the last hextet")
+            {
+                REQUIRE_THROWS_WITH(AgentConfig::load_or_create(path), Catch::Matchers::ContainsSubstring("IPv6"));
+            }
+        }
+        fs::remove(path);
+    }
+
+    GIVEN("THEWATCHER_SERVER with a bracketed address followed by junk")
+    {
+        const auto path = write_server_config("ipv6_junk.conf", "[::1]x:5555");
+
+        WHEN("the config loads")
+        {
+            THEN("loading fails")
+            {
+                REQUIRE_THROWS_AS(AgentConfig::load_or_create(path), std::invalid_argument);
+            }
+        }
+        fs::remove(path);
+    }
+}
+
+SCENARIO("An IPv6 server address survives a save and reload (issue #98)")
+{
+    GIVEN("a config whose server address is an IPv6 endpoint")
+    {
+        const auto path = write_server_config("ipv6_roundtrip.conf", "[::1]:5555");
+        auto cfg = AgentConfig::load_or_create(path);
+
+        WHEN("it is saved and loaded again")
+        {
+            cfg.save(path);
+            const auto reloaded = AgentConfig::load_or_create(path);
+
+            THEN("both endpoints are unchanged")
+            {
+                REQUIRE(reloaded.server_address == "tcp://[::1]:5555");
+                REQUIRE(reloaded.enrollment_address == "tcp://[::1]:5556");
+            }
+        }
+        fs::remove(path);
+    }
+}
+
+// Issue #148: a value containing a line break must not inject config lines.
+
+SCENARIO("Saving refuses any value that contains a line break (issue #148)")
+{
+    GIVEN("a saved config")
+    {
+        const auto path = thewatcher::test::process_temp_dir().path() / "injection_agent.conf";
+        fs::remove(path);
+        auto cfg = AgentConfig::load_or_create(path);
+        const auto before = read_all(path);
+
+        WHEN("the server key carries an injected SERVER_ADDRESS and ALLOW_INSECURE line")
+        {
+            cfg.server_public_key = std::string(40, 'a') + "\nSERVER_ADDRESS=tcp://attacker:5555\nALLOW_INSECURE=1";
+
+            THEN("save throws and the file on disk is untouched")
+            {
+                REQUIRE_THROWS_AS(cfg.save(path), std::runtime_error);
+                REQUIRE(read_all(path) == before);
+            }
         }
 
-        THEN("loading fails with a clear error")
+        WHEN("any string field contains a carriage return")
         {
-            REQUIRE_THROWS_AS(AgentConfig::load_or_create(path), std::invalid_argument);
+            using Field = std::string AgentConfig::*;
+            const Field fields[] = {&AgentConfig::agent_id,
+                                    &AgentConfig::server_address,
+                                    &AgentConfig::enrollment_address,
+                                    &AgentConfig::server_public_key,
+                                    &AgentConfig::server_public_key_fingerprint,
+                                    &AgentConfig::agent_public_key,
+                                    &AgentConfig::agent_secret_key,
+                                    &AgentConfig::enrollment_token};
+
+            THEN("save throws for each of them and the file on disk is untouched")
+            {
+                for (const Field field : fields)
+                {
+                    auto bad = cfg;
+                    bad.*field = "value\rx";
+                    REQUIRE_THROWS_AS(bad.save(path), std::runtime_error);
+                    REQUIRE(read_all(path) == before);
+                }
+            }
+        }
+
+        WHEN("a value kept for a command-line override contains a line break")
+        {
+            cfg.file_server_address = "tcp://ok:5555\nALLOW_INSECURE=1";
+
+            THEN("save throws")
+            {
+                REQUIRE_THROWS_AS(cfg.save(path), std::runtime_error);
+            }
+        }
+        fs::remove(path);
+    }
+}
+
+// Issue #149: atomic save, checked errors, owner-only file.
+
+SCENARIO("Saving replaces the config atomically and leaves no temporary files (issue #149)")
+{
+    GIVEN("a saved config in its own directory")
+    {
+        const auto dir = thewatcher::test::process_temp_dir().path() / "atomic_agent_conf";
+        fs::remove_all(dir);
+        const auto path = dir / "TheWatcherAgent.conf";
+        auto cfg = AgentConfig::load_or_create(path);
+
+        WHEN("it is changed and saved again")
+        {
+            cfg.collection_interval = 77;
+            cfg.save(path);
+
+            THEN("the new value is on disk and the directory holds only the config")
+            {
+                REQUIRE(AgentConfig::load_or_create(path).collection_interval == 77);
+                REQUIRE(other_files(dir, path).empty());
+            }
+        }
+
+        WHEN("the target cannot be replaced because it is a directory")
+        {
+            fs::remove(path);
+            fs::create_directory(path);
+
+            THEN("save throws and leaves no temporary file behind")
+            {
+                REQUIRE_THROWS_AS(cfg.save(path), std::runtime_error);
+                REQUIRE(other_files(dir, path).empty());
+            }
+        }
+        fs::remove_all(dir);
+    }
+}
+
+SCENARIO("Saving reports a directory that cannot be created (issue #149)")
+{
+    GIVEN("a config path whose parent is an existing regular file")
+    {
+        const auto blocker = thewatcher::test::process_temp_dir().path() / "agent_conf_blocker";
+        fs::remove_all(blocker);
+        std::ofstream(blocker) << "not a directory";
+        AgentConfig cfg;
+        cfg.agent_id = "agent-err";
+
+        WHEN("the config is saved")
+        {
+            THEN("save throws instead of failing silently")
+            {
+                REQUIRE_THROWS(cfg.save(blocker / "TheWatcherAgent.conf"));
+            }
+        }
+        fs::remove(blocker);
+    }
+}
+
+SCENARIO("The saved config holding the CURVE secret key is restricted to its owner (issue #149)")
+{
+    GIVEN("a config that was created, then saved again over the existing file")
+    {
+        const auto path = thewatcher::test::process_temp_dir().path() / "private_agent.conf";
+        fs::remove(path);
+        auto cfg = AgentConfig::load_or_create(path);
+        cfg.save(path);
+
+        WHEN("its access rights are inspected")
+        {
+#ifdef _WIN32
+            PSECURITY_DESCRIPTOR sd = nullptr;
+            const auto status = ::GetNamedSecurityInfoW(path.c_str(), SE_FILE_OBJECT, DACL_SECURITY_INFORMATION,
+                                                        nullptr, nullptr, nullptr, nullptr, &sd);
+            REQUIRE(status == ERROR_SUCCESS);
+            LPWSTR sddl = nullptr;
+            REQUIRE(::ConvertSecurityDescriptorToStringSecurityDescriptorW(sd, SDDL_REVISION_1,
+                                                                           DACL_SECURITY_INFORMATION, &sddl, nullptr));
+            const std::wstring text(sddl);
+            ::LocalFree(sddl);
+            ::LocalFree(sd);
+
+            THEN("the DACL is protected and grants nothing to Users, Everyone or Authenticated Users")
+            {
+                REQUIRE(text.rfind(L"D:P", 0) == 0);
+                REQUIRE(text.find(L";;;BU)") == std::wstring::npos);
+                REQUIRE(text.find(L";;;WD)") == std::wstring::npos);
+                REQUIRE(text.find(L";;;AU)") == std::wstring::npos);
+            }
+#else
+            struct stat st{};
+            REQUIRE(::stat(path.c_str(), &st) == 0);
+
+            THEN("only the owner can read and write it")
+            {
+                REQUIRE((st.st_mode & 0777) == 0600);
+            }
+#endif
         }
         fs::remove(path);
     }

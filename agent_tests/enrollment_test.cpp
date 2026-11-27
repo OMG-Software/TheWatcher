@@ -8,7 +8,10 @@
 
 #include <atomic>
 #include <chrono>
+#include <string>
 #include <thread>
+#include <utility>
+#include <vector>
 
 #include <zmq.hpp>
 
@@ -175,6 +178,170 @@ SCENARIO("Enrollment recovers after a transient server non-response")
             THEN("enrollment completed successfully after socket recovery")
             {
                 REQUIRE(enrolled.load());
+            }
+        }
+    }
+}
+
+// Issues #86 and #160: a bad reply must not end enrollment.
+
+namespace
+{
+
+// Answers each request with the next canned raw reply, then answers one more
+// request with a genuine approval. Raw replies model garbled or foreign answers.
+class ScriptedEnrollServer
+{
+public:
+    ScriptedEnrollServer(std::vector<std::string> raw_replies, const std::string& agent_id,
+                         const std::string& approved_key)
+    {
+        rep_.set(zmq::sockopt::linger, 0);
+        rep_.set(zmq::sockopt::rcvtimeo, 5000);
+        rep_.bind("tcp://127.0.0.1:*");
+        endpoint_ = rep_.get(zmq::sockopt::last_endpoint);
+        thread_ = std::thread([this, raw_replies = std::move(raw_replies), agent_id, approved_key] {
+            for (const auto& raw : raw_replies)
+            {
+                zmq::message_t req;
+                if (!rep_.recv(req, zmq::recv_flags::none))
+                    return;
+                ++requests_;
+                rep_.send(zmq::message_t(raw.data(), raw.size()), zmq::send_flags::none);
+            }
+            zmq::message_t req;
+            if (!rep_.recv(req, zmq::recv_flags::none))
+                return;
+            ++requests_;
+            send_enroll_response(rep_, agent_id, true, approved_key);
+        });
+    }
+
+    ~ScriptedEnrollServer()
+    {
+        if (thread_.joinable())
+            thread_.join();
+    }
+
+    const std::string& endpoint() const
+    {
+        return endpoint_;
+    }
+
+    int requests() const
+    {
+        return requests_.load();
+    }
+
+private:
+    zmq::context_t ctx_{1};
+    zmq::socket_t rep_{ctx_, ZMQ_REP};
+    std::string endpoint_;
+    std::atomic<int> requests_{0};
+    std::thread thread_;
+};
+
+// Encodes an ENROLL_RESPONSE frame carrying `payload`.
+std::string response_frame_bytes(const std::string& agent_id, const std::vector<uint8_t>& payload)
+{
+    Frame frame;
+    frame.type = static_cast<uint8_t>(FrameType::ENROLL_RESPONSE);
+    frame.agent_id = agent_id;
+    frame.payload = payload;
+    const auto encoded = encode_frame(frame);
+    return std::string(encoded.begin(), encoded.end());
+}
+
+AgentConfig make_config(const std::string& agent_id)
+{
+    const auto agent_kp = thewatcher::crypto::generate_curve_keypair();
+    AgentConfig cfg;
+    cfg.agent_id = agent_id;
+    cfg.agent_public_key = agent_kp.public_key_z85;
+    cfg.agent_secret_key = agent_kp.secret_key_z85;
+    return cfg;
+}
+
+} // namespace
+
+SCENARIO("Enrollment retries after a malformed reply instead of exiting (issue #160)")
+{
+    GIVEN("a server that first sends bytes that are not a frame and then approves")
+    {
+        thewatcher::crypto::init();
+        const auto server_kp = thewatcher::crypto::generate_curve_keypair();
+        auto cfg = make_config("enroll-test-malformed");
+        ScriptedEnrollServer server({"definitely not a frame", std::string(3, '\0')}, cfg.agent_id,
+                                    server_kp.public_key_z85);
+        cfg.enrollment_address = server.endpoint();
+
+        WHEN("enroll is called")
+        {
+            std::atomic<bool> stop{false};
+            zmq::context_t agent_ctx(1);
+            thewatcher::agent::enroll(cfg, agent_ctx, stop, /*poll_interval=*/0, /*recv_timeout_ms=*/2000);
+
+            THEN("it keeps asking until the genuine approval arrives")
+            {
+                REQUIRE(server.requests() == 3);
+                REQUIRE(cfg.server_public_key == server_kp.public_key_z85);
+            }
+        }
+    }
+}
+
+SCENARIO("Enrollment retries after a reply whose payload does not decode (issue #160)")
+{
+    GIVEN("a server that first answers with a valid frame carrying a garbage payload")
+    {
+        thewatcher::crypto::init();
+        const auto server_kp = thewatcher::crypto::generate_curve_keypair();
+        auto cfg = make_config("enroll-test-bad-payload");
+        ScriptedEnrollServer server({response_frame_bytes(cfg.agent_id, {0xff, 0xff, 0xff})}, cfg.agent_id,
+                                    server_kp.public_key_z85);
+        cfg.enrollment_address = server.endpoint();
+
+        WHEN("enroll is called")
+        {
+            std::atomic<bool> stop{false};
+            zmq::context_t agent_ctx(1);
+            thewatcher::agent::enroll(cfg, agent_ctx, stop, /*poll_interval=*/0, /*recv_timeout_ms=*/2000);
+
+            THEN("the second request is answered and enrollment succeeds")
+            {
+                REQUIRE(server.requests() == 2);
+                REQUIRE(cfg.server_public_key == server_kp.public_key_z85);
+            }
+        }
+    }
+}
+
+SCENARIO("Enrollment keeps asking while the server answers pending (issue #86)")
+{
+    GIVEN("a server that answers pending twice and then approves")
+    {
+        thewatcher::crypto::init();
+        const auto server_kp = thewatcher::crypto::generate_curve_keypair();
+        auto cfg = make_config("enroll-test-pending");
+
+        EnrollResponse pending;
+        pending.approved = false;
+        pending.message = "pending approval";
+        const auto pending_bytes = response_frame_bytes(cfg.agent_id, pack(pending));
+
+        ScriptedEnrollServer server({pending_bytes, pending_bytes}, cfg.agent_id, server_kp.public_key_z85);
+        cfg.enrollment_address = server.endpoint();
+
+        WHEN("enroll is called")
+        {
+            std::atomic<bool> stop{false};
+            zmq::context_t agent_ctx(1);
+            thewatcher::agent::enroll(cfg, agent_ctx, stop, /*poll_interval=*/0, /*recv_timeout_ms=*/2000);
+
+            THEN("it enrolls on the third request")
+            {
+                REQUIRE(server.requests() == 3);
+                REQUIRE(cfg.server_public_key == server_kp.public_key_z85);
             }
         }
     }
