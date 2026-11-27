@@ -32,7 +32,7 @@ struct NetworkThresholds
 // baseline_mean * multiplier (computed over the rolling window).
 struct AnomalyConfig
 {
-    double multiplier = 0.0;        // 0 = disabled
+    double multiplier = 0.0; // 0 = disabled
     int baseline_window_hours = 24;
 };
 

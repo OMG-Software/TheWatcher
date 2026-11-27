@@ -3,10 +3,11 @@
 #include <array>
 #include <cstdint>
 #include <iomanip>
-#include <sodium.h>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+
+#include <sodium.h>
 
 namespace thewatcher::crypto
 {

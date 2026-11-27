@@ -1,7 +1,8 @@
 #include "common/crypto.hpp"
 
-#include <array>
 #include <catch2/catch_test_macros.hpp>
+
+#include <array>
 #include <stdexcept>
 
 using namespace thewatcher::crypto;

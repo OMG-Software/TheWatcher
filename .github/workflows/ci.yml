@@ -6,14 +6,39 @@ on:
       - master
       - 'claude/**'
       - 'codex/**'
+  # Every PR is built, whatever its base, so stacked PRs (based on another
+  # feature branch rather than main) are verified before they land.
   pull_request:
-    branches:
-      - main
-      - master
   schedule:
     - cron: "32 1 * * 1"
 
+# Least privilege for GITHUB_TOKEN: every job only reads the repository.
+# actions/cache and actions/upload-artifact use the runner's own token and
+# need no extra scopes.
+permissions:
+  contents: read
+
 jobs:
+
+  # ── Formatting ─────────────────────────────────────────────────────────────
+  # The version is pinned so a new clang-format release cannot fail CI on
+  # code that was formatted correctly with the project's toolchain.
+  format:
+    name: clang-format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install clang-format 22.1.5
+        # --only-binary: install the published wheel only, never run a
+        # source distribution's setup script.
+        run: |
+          python3 -m pip install --user --only-binary :all: clang-format==22.1.5
+
+      - name: Check formatting
+        run: |
+          git ls-files '*.cpp' '*.hpp' '*.h' ':!:subprojects/**' \
+            | xargs ~/.local/bin/clang-format --dry-run --Werror
 
   # ── Linux ──────────────────────────────────────────────────────────────────
   linux:

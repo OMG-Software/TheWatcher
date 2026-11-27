@@ -1,11 +1,11 @@
 #include "../server/status_engine.hpp"
 #include "../server/store_sqlite.hpp"
-
 #include "common/metrics.hpp"
 #include "common/protocol.hpp"
 
-#include <algorithm>
 #include <catch2/catch_test_macros.hpp>
+
+#include <algorithm>
 
 using namespace thewatcher;
 using namespace thewatcher::server;
@@ -346,12 +346,12 @@ SCENARIO("status_to_string and status_from_string are mutual inverses for all st
     GIVEN("each IndicatorStatus value")
     {
         const std::vector<std::pair<IndicatorStatus, std::string>> cases = {
-            {IndicatorStatus::Green,  "green"},
-            {IndicatorStatus::Grey,   "grey"},
+            {IndicatorStatus::Green,  "green" },
+            {IndicatorStatus::Grey,   "grey"  },
             {IndicatorStatus::Yellow, "yellow"},
-            {IndicatorStatus::Amber,  "amber"},
-            {IndicatorStatus::Red,    "red"},
-            {IndicatorStatus::Blue,   "blue"},
+            {IndicatorStatus::Amber,  "amber" },
+            {IndicatorStatus::Red,    "red"   },
+            {IndicatorStatus::Blue,   "blue"  },
         };
 
         WHEN("each status is converted to string and back")
@@ -393,13 +393,13 @@ SCENARIO("is_worse_status returns true only when severity strictly increases")
         {
             THEN("is_worse_status returns true")
             {
-                REQUIRE(is_worse_status(IndicatorStatus::Green,  IndicatorStatus::Yellow));
-                REQUIRE(is_worse_status(IndicatorStatus::Green,  IndicatorStatus::Amber));
-                REQUIRE(is_worse_status(IndicatorStatus::Green,  IndicatorStatus::Red));
+                REQUIRE(is_worse_status(IndicatorStatus::Green, IndicatorStatus::Yellow));
+                REQUIRE(is_worse_status(IndicatorStatus::Green, IndicatorStatus::Amber));
+                REQUIRE(is_worse_status(IndicatorStatus::Green, IndicatorStatus::Red));
                 REQUIRE(is_worse_status(IndicatorStatus::Yellow, IndicatorStatus::Amber));
                 REQUIRE(is_worse_status(IndicatorStatus::Yellow, IndicatorStatus::Red));
-                REQUIRE(is_worse_status(IndicatorStatus::Amber,  IndicatorStatus::Red));
-                REQUIRE(is_worse_status(IndicatorStatus::Grey,   IndicatorStatus::Yellow));
+                REQUIRE(is_worse_status(IndicatorStatus::Amber, IndicatorStatus::Red));
+                REQUIRE(is_worse_status(IndicatorStatus::Grey, IndicatorStatus::Yellow));
             }
         }
 
@@ -407,12 +407,12 @@ SCENARIO("is_worse_status returns true only when severity strictly increases")
         {
             THEN("is_worse_status returns false")
             {
-                REQUIRE_FALSE(is_worse_status(IndicatorStatus::Red,    IndicatorStatus::Red));
-                REQUIRE_FALSE(is_worse_status(IndicatorStatus::Red,    IndicatorStatus::Amber));
-                REQUIRE_FALSE(is_worse_status(IndicatorStatus::Red,    IndicatorStatus::Green));
-                REQUIRE_FALSE(is_worse_status(IndicatorStatus::Amber,  IndicatorStatus::Green));
+                REQUIRE_FALSE(is_worse_status(IndicatorStatus::Red, IndicatorStatus::Red));
+                REQUIRE_FALSE(is_worse_status(IndicatorStatus::Red, IndicatorStatus::Amber));
+                REQUIRE_FALSE(is_worse_status(IndicatorStatus::Red, IndicatorStatus::Green));
+                REQUIRE_FALSE(is_worse_status(IndicatorStatus::Amber, IndicatorStatus::Green));
                 REQUIRE_FALSE(is_worse_status(IndicatorStatus::Yellow, IndicatorStatus::Green));
-                REQUIRE_FALSE(is_worse_status(IndicatorStatus::Green,  IndicatorStatus::Green));
+                REQUIRE_FALSE(is_worse_status(IndicatorStatus::Green, IndicatorStatus::Green));
             }
         }
 
@@ -420,9 +420,9 @@ SCENARIO("is_worse_status returns true only when severity strictly increases")
         {
             THEN("is_worse_status always returns false")
             {
-                REQUIRE_FALSE(is_worse_status(IndicatorStatus::Blue,  IndicatorStatus::Red));
+                REQUIRE_FALSE(is_worse_status(IndicatorStatus::Blue, IndicatorStatus::Red));
                 REQUIRE_FALSE(is_worse_status(IndicatorStatus::Green, IndicatorStatus::Blue));
-                REQUIRE_FALSE(is_worse_status(IndicatorStatus::Blue,  IndicatorStatus::Blue));
+                REQUIRE_FALSE(is_worse_status(IndicatorStatus::Blue, IndicatorStatus::Blue));
             }
         }
     }
@@ -467,10 +467,10 @@ SCENARIO("A silence rule suppresses alert generation on status degradation")
 
         const int64_t now = 10'000;
         SilenceRecord silence;
-        silence.agent_id   = "*";
-        silence.indicator  = "*";
-        silence.reason     = "maintenance window";
-        silence.until_ms   = now + 3'600'000;
+        silence.agent_id = "*";
+        silence.indicator = "*";
+        silence.reason = "maintenance window";
+        silence.until_ms = now + 3'600'000;
         silence.created_by = "admin";
         silence.created_at = now;
         store.create_silence(silence);
@@ -538,8 +538,8 @@ SCENARIO("Status engine raises a yellow alert when CPU crosses the warning thres
                     auto history = store.list_status_history("agent-yellow", 10);
                     bool saw_recovery = false;
                     for (const auto& row : history)
-                        saw_recovery = saw_recovery || (row.indicator == "cpu" && row.old_status == "yellow"
-                                                        && row.new_status == "green");
+                        saw_recovery = saw_recovery || (row.indicator == "cpu" && row.old_status == "yellow" &&
+                                                        row.new_status == "green");
                     REQUIRE(saw_recovery);
                 }
             }
@@ -576,8 +576,10 @@ SCENARIO("Status engine steps through yellow then amber as CPU worsens")
                 bool saw_yellow = false, saw_amber = false;
                 for (const auto& row : history)
                 {
-                    if (row.indicator == "cpu" && row.old_status == "green"  && row.new_status == "yellow") saw_yellow = true;
-                    if (row.indicator == "cpu" && row.old_status == "yellow" && row.new_status == "amber")  saw_amber  = true;
+                    if (row.indicator == "cpu" && row.old_status == "green" && row.new_status == "yellow")
+                        saw_yellow = true;
+                    if (row.indicator == "cpu" && row.old_status == "yellow" && row.new_status == "amber")
+                        saw_amber = true;
                 }
                 REQUIRE(saw_yellow);
                 REQUIRE(saw_amber);
@@ -596,18 +598,18 @@ SCENARIO("Metrics pruning is triggered by evaluate_metrics after one hour")
         // Use timestamps far enough apart that the 30-day cutoff at eval_time
         // falls between old_row and recent_row.
         // eval_time = ~30.0042 days; cutoff = eval_time - 30 days ≈ 364 seconds.
-        const int64_t eval_time   = 2'600'000'000LL + 3'600'001LL; // ~30 days + ~1 hour in ms
-        const int64_t recent_ts   = 2'600'000'000LL;               // within retention window
-        const int64_t old_ts      = 1'000LL;                       // well before cutoff
+        const int64_t eval_time = 2'600'000'000LL + 3'600'001LL; // ~30 days + ~1 hour in ms
+        const int64_t recent_ts = 2'600'000'000LL;               // within retention window
+        const int64_t old_ts = 1'000LL;                          // well before cutoff
 
         MetricsRow old_row;
-        old_row.agent_id     = "agent-prune";
+        old_row.agent_id = "agent-prune";
         old_row.timestamp_ms = old_ts;
         old_row.metrics_cbor = {0x01};
         store.insert_metrics(old_row);
 
         MetricsRow recent_row;
-        recent_row.agent_id     = "agent-prune";
+        recent_row.agent_id = "agent-prune";
         recent_row.timestamp_ms = recent_ts;
         recent_row.metrics_cbor = {0x02};
         store.insert_metrics(recent_row);
@@ -643,14 +645,15 @@ SCENARIO("Metrics pruning is triggered by evaluate_metrics after one hour")
 
 SCENARIO("Anomaly detection upgrades a green CPU reading to yellow when it exceeds multiplier times the baseline mean")
 {
-    GIVEN("an approved agent with CPU anomaly detection enabled (multiplier=2.0, window=1h) and an established green state")
+    GIVEN("an approved agent with CPU anomaly detection enabled (multiplier=2.0, window=1h) and an established green "
+          "state")
     {
         SqliteStore store(":memory:");
         insert_approved_agent(store, "agent-anomaly");
 
         auto agent = store.get_agent("agent-anomaly");
         REQUIRE(agent.has_value());
-        agent->collector_config.cpu_anomaly.multiplier            = 2.0;
+        agent->collector_config.cpu_anomaly.multiplier = 2.0;
         agent->collector_config.cpu_anomaly.baseline_window_hours = 1;
         store.set_agent_collector_config(agent->agent_id, agent->collector_config);
 
@@ -676,8 +679,9 @@ SCENARIO("Anomaly detection upgrades a green CPU reading to yellow when it excee
             THEN("an anomaly alert fires with yellow status even though 25% is below the warning threshold")
             {
                 auto alerts = store.list_unacknowledged_alerts();
-                auto cpu_it = std::find_if(alerts.begin(), alerts.end(),
-                    [](const AlertRecord& a) { return a.indicator == "cpu"; });
+                auto cpu_it = std::find_if(alerts.begin(), alerts.end(), [](const AlertRecord& a) {
+                    return a.indicator == "cpu";
+                });
                 REQUIRE(cpu_it != alerts.end());
                 REQUIRE(cpu_it->old_status == "green");
                 REQUIRE(cpu_it->new_status == "yellow");
@@ -692,8 +696,9 @@ SCENARIO("Anomaly detection upgrades a green CPU reading to yellow when it excee
             THEN("no anomaly alert is raised")
             {
                 auto alerts = store.list_unacknowledged_alerts();
-                bool cpu_yellow = std::any_of(alerts.begin(), alerts.end(),
-                    [](const AlertRecord& a) { return a.indicator == "cpu" && a.new_status == "yellow"; });
+                bool cpu_yellow = std::any_of(alerts.begin(), alerts.end(), [](const AlertRecord& a) {
+                    return a.indicator == "cpu" && a.new_status == "yellow";
+                });
                 REQUIRE_FALSE(cpu_yellow);
             }
         }
@@ -709,7 +714,7 @@ SCENARIO("Anomaly detection does not fire when fewer than 10 baseline samples ar
 
         auto agent = store.get_agent("agent-few-samples");
         REQUIRE(agent.has_value());
-        agent->collector_config.cpu_anomaly.multiplier            = 2.0;
+        agent->collector_config.cpu_anomaly.multiplier = 2.0;
         agent->collector_config.cpu_anomaly.baseline_window_hours = 1;
         store.set_agent_collector_config(agent->agent_id, agent->collector_config);
 
@@ -733,8 +738,9 @@ SCENARIO("Anomaly detection does not fire when fewer than 10 baseline samples ar
             THEN("no anomaly alert is raised because the baseline is too sparse")
             {
                 auto alerts = store.list_unacknowledged_alerts();
-                bool cpu_yellow = std::any_of(alerts.begin(), alerts.end(),
-                    [](const AlertRecord& a) { return a.indicator == "cpu" && a.new_status == "yellow"; });
+                bool cpu_yellow = std::any_of(alerts.begin(), alerts.end(), [](const AlertRecord& a) {
+                    return a.indicator == "cpu" && a.new_status == "yellow";
+                });
                 REQUIRE_FALSE(cpu_yellow);
             }
         }
@@ -885,8 +891,9 @@ SCENARIO("CPU jumps directly from green to red without intermediate states when 
             THEN("only one alert is raised and it is green-to-red")
             {
                 auto alerts = store.list_unacknowledged_alerts();
-                auto cpu_it = std::find_if(alerts.begin(), alerts.end(),
-                    [](const AlertRecord& a) { return a.indicator == "cpu"; });
+                auto cpu_it = std::find_if(alerts.begin(), alerts.end(), [](const AlertRecord& a) {
+                    return a.indicator == "cpu";
+                });
                 REQUIRE(cpu_it != alerts.end());
                 REQUIRE(cpu_it->old_status == "green");
                 REQUIRE(cpu_it->new_status == "red");
@@ -920,7 +927,7 @@ SCENARIO("Process monitoring fires alerts only for watched processes, not arbitr
         auto agent = store.get_agent("agent-proc-scope");
         REQUIRE(agent.has_value());
         ProcessWatchConfig watch;
-        watch.name           = "monitored.exe";
+        watch.name = "monitored.exe";
         watch.expected_count = 1;
         agent->collector_config.processes.push_back(watch);
         store.set_agent_collector_config(agent->agent_id, agent->collector_config);
@@ -962,8 +969,9 @@ SCENARIO("Process monitoring fires alerts only for watched processes, not arbitr
             THEN("no alerts fire because the watched process is present")
             {
                 auto alerts = store.list_unacknowledged_alerts();
-                bool watched_alert = std::any_of(alerts.begin(), alerts.end(),
-                    [](const AlertRecord& a) { return a.indicator == "process:monitored.exe"; });
+                bool watched_alert = std::any_of(alerts.begin(), alerts.end(), [](const AlertRecord& a) {
+                    return a.indicator == "process:monitored.exe";
+                });
                 REQUIRE_FALSE(watched_alert);
             }
         }
@@ -980,7 +988,7 @@ SCENARIO("Process monitoring with process_readings=1 fires red on the very first
         auto agent = store.get_agent("agent-proc-fast");
         REQUIRE(agent.has_value());
         ProcessWatchConfig watch;
-        watch.name           = "critical.exe";
+        watch.name = "critical.exe";
         watch.expected_count = 1;
         agent->collector_config.processes.push_back(watch);
         agent->collector_config.process_readings = 1; // first miss → immediate red
@@ -1002,8 +1010,9 @@ SCENARIO("Process monitoring with process_readings=1 fires red on the very first
             THEN("a red alert fires immediately without waiting for multiple readings")
             {
                 auto alerts = store.list_unacknowledged_alerts();
-                auto it = std::find_if(alerts.begin(), alerts.end(),
-                    [](const AlertRecord& a) { return a.indicator == "process:critical.exe"; });
+                auto it = std::find_if(alerts.begin(), alerts.end(), [](const AlertRecord& a) {
+                    return a.indicator == "process:critical.exe";
+                });
                 REQUIRE(it != alerts.end());
                 REQUIRE(it->new_status == "red");
             }
@@ -1102,9 +1111,9 @@ SCENARIO("record_transition attaches a runbook URL to alerts when a matching run
         insert_approved_agent(store, "agent-runbook");
 
         RunbookRecord rb;
-        rb.indicator  = "cpu";
-        rb.status     = "red";
-        rb.url        = "https://wiki.example.com/cpu-runbook";
+        rb.indicator = "cpu";
+        rb.status = "red";
+        rb.url = "https://wiki.example.com/cpu-runbook";
         rb.created_at = 1000;
         store.create_runbook(rb);
 

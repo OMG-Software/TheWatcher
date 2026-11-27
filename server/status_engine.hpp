@@ -60,8 +60,8 @@ private:
                                          const std::string& indicator, double current_value,
                                          const AnomalyConfig& anomaly_cfg, int64_t now_ms);
     IndicatorStatus maybe_stale_status(IndicatorStatus threshold_status, const std::string& agent_id,
-                                       const std::string& indicator, double current_value,
-                                       int stale_after_seconds, int64_t now_ms);
+                                       const std::string& indicator, double current_value, int stale_after_seconds,
+                                       int64_t now_ms);
 
     Store& store_;
     int64_t last_prune_ms_ = 0;

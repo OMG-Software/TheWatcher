@@ -2,13 +2,13 @@
 
 #include "protocol.hpp"
 
-#include <cbor.h>
-
 #include <cstdint>
 #include <limits>
 #include <stdexcept>
 #include <string>
 #include <vector>
+
+#include <cbor.h>
 
 namespace thewatcher
 {

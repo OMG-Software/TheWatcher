@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <string>
+
 #include <zmq.hpp>
 
 namespace thewatcher::agent

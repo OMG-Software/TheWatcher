@@ -15,8 +15,8 @@
 // JSON support intentionally absent: TheWatcherAgent.conf is KEY=VALUE only.
 
 #ifdef _WIN32
-#include <shlobj.h>
 #include <windows.h>
+#include <shlobj.h>
 #else
 #include <pwd.h>
 #include <unistd.h>

@@ -171,8 +171,8 @@ SCENARIO("Behind a trusted proxy, throttling is per client address")
 
             THEN("a spoofed leftmost X-Forwarded-For entry does not evade the lockout")
             {
-                REQUIRE(attempt_login_via_proxy(fx.client, "192.0.2.66, 203.0.113.10", "thewatcher", "wrong-password") ==
-                        429);
+                REQUIRE(attempt_login_via_proxy(fx.client, "192.0.2.66, 203.0.113.10", "thewatcher",
+                                                "wrong-password") == 429);
             }
 
             THEN("a different client address can still log in as the same user")

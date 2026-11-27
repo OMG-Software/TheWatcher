@@ -112,9 +112,16 @@ IncludeCategories:
   # STL/system angle includes
   - Regex: '^<[[:alnum:]_]+>'
     Priority: 3
+  # Win32 umbrella headers. psapi.h, tlhelp32.h, sysinfoapi.h, iphlpapi.h and
+  # friends do not compile unless <windows.h> (or <winsock2.h>) comes first,
+  # so these sort ahead of the other platform headers in the same block.
+  - Regex: '^<(winsock2|ws2tcpip|windows)\.h>'
+    Priority: 4
+    SortPriority: 4
   # Fallback
   - Regex: '.*'
     Priority: 4
+    SortPriority: 5
 IncludeIsMainRegex: '(Test)?$'
 IncludeIsMainSourceRegex: ''
 IndentAccessModifiers: false
