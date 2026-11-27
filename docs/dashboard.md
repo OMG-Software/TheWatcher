@@ -143,7 +143,9 @@ server) over HTTPS, because the session cookie is `Secure`. Set
   a request is in flight, drops the result of a request that a newer one (for
   example a manual refresh after an action) overtook, and pauses while the tab
   is hidden, refreshing as soon as it is visible again. `useDashboardData` polls
-  every 5 s with it. An optional `merge(next, previous)` combines an accepted
+  every 5 s with it. `refresh()` resolves to the load error message (null on
+  success, or when a newer request overtook it) and never rejects; `runAction`
+  uses that to report a failed post-action refresh. An optional `merge(next, previous)` combines an accepted
   result with the previous data and never sees a stale one; `useDashboardData`
   uses it to keep the last good value of a failed section. `useSession` ignores
   a slow startup session probe that settles after a sign-in or sign-out.

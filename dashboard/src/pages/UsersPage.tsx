@@ -52,7 +52,7 @@ export function UsersPage({
   return (
     <main className="table-wrap management-wrap">
       {pwUserId !== null ? (
-        <div className="modal-backdrop" onClick={closePw}>
+        <div className="modal-backdrop" role="presentation" onClick={closePw}>
           <div className="modal-panel" onClick={(e) => e.stopPropagation()}>
             <div className="modal-header">
               <h2>Change Password</h2>
