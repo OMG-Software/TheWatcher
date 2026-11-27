@@ -92,7 +92,7 @@ public:
     BusyLoad()
         : worker_([this] {
             volatile uint64_t sink = 0;
-            while (running_.load(std::memory_order_relaxed))
+            while (running_.load())
             {
                 sink = sink + 1;
             }
