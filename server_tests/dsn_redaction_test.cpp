@@ -1,4 +1,5 @@
 #include "../server/dsn_redaction.hpp"
+#include "postgres_dsn.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -84,6 +85,75 @@ SCENARIO("A PostgreSQL DSN is redacted before it is logged")
                 REQUIRE(redact_dsn("postgresql://db/tw") == "postgresql://db/tw");
                 REQUIRE(redact_dsn("") == "");
             }
+        }
+    }
+}
+
+// ── Building the per-test DSN ─────────────────────────────────────────────────
+
+SCENARIO("A test DSN is pinned to a schema in both libpq DSN forms")
+{
+    using thewatcher::server::test::dsn_with_search_path;
+
+    GIVEN("a keyword/value DSN")
+    {
+        WHEN("a search_path is added")
+        {
+            const auto dsn = dsn_with_search_path("host=db dbname=tw user=tw", "tw_test_1");
+
+            THEN("it is appended as an options keyword")
+            {
+                REQUIRE(dsn == "host=db dbname=tw user=tw options=-csearch_path=tw_test_1");
+            }
+        }
+    }
+
+    GIVEN("a URI DSN without a query")
+    {
+        WHEN("a search_path is added")
+        {
+            const auto dsn = dsn_with_search_path("postgresql://tw:pw@db:5432/tw", "tw_test_1");
+
+            THEN("it becomes a URL-encoded query parameter, and the URI stays a URI")
+            {
+                REQUIRE(dsn == "postgresql://tw:pw@db:5432/tw?options=-csearch_path%3Dtw_test_1");
+            }
+        }
+    }
+
+    GIVEN("a URI DSN that already has a query")
+    {
+        WHEN("a search_path is added")
+        {
+            const auto dsn = dsn_with_search_path("postgres://db/tw?sslmode=require&connect_timeout=5", "tw_test_1");
+
+            THEN("the existing query is kept and the parameter is appended with an ampersand")
+            {
+                REQUIRE(dsn == "postgres://db/tw?sslmode=require&connect_timeout=5&options=-csearch_path%3Dtw_test_1");
+            }
+        }
+    }
+
+    GIVEN("a keyword/value DSN with trailing whitespace")
+    {
+        THEN("no doubled separator is produced")
+        {
+            REQUIRE(dsn_with_search_path("host=db  ", "s") == "host=db options=-csearch_path=s");
+        }
+    }
+}
+
+SCENARIO("Extra DSN parameters are added in the DSN's own syntax")
+{
+    using thewatcher::server::test::dsn_with_param;
+
+    GIVEN("a value with a space")
+    {
+        THEN("a keyword/value DSN quotes it and a URI percent-encodes it")
+        {
+            REQUIRE(dsn_with_param("host=db", "application_name", "a b") == "host=db application_name='a b'");
+            REQUIRE(dsn_with_param("postgresql://db/tw", "application_name", "a b") ==
+                    "postgresql://db/tw?application_name=a%20b");
         }
     }
 }

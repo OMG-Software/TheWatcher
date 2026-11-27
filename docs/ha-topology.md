@@ -184,8 +184,17 @@ Make both scripts executable: `chmod +x /usr/local/bin/thewatcher-*.sh`
 4. The `notify_master` script starts TheWatcherServer on the standby.
 5. Agents reconnect automatically — their ZeroMQ sockets will retry until
    the new endpoint accepts connections.
-6. TheWatcherServer reconnects to PostgreSQL through pgBouncer (the store resets a dead connection by itself; no process restart) and resumes
-   normal operation.  Because all state is in PostgreSQL, no data is lost.
+6. TheWatcherServer reconnects to PostgreSQL through pgBouncer (the store
+   resets a dead connection by itself; no process restart) and resumes
+   normal operation. Committed state is in PostgreSQL, so failover does not
+   lose committed data. A write that was in flight when the connection died
+   is not retried, because it may already have been applied, so it can fail:
+   the server logs it and carries on (the periodic scan catches the error
+   instead of ending the server loop). A dropped metrics sample is
+   simply missing (the agent sends the next one); the periodic scans
+   (offline detection, dead-agent and heartbeat alerts, escalation) and
+   agent heartbeats re-derive their writes from stored state and repeat on
+   the next tick. Reads are retried once on the new connection.
 
 Typical failover time is **5–15 seconds** depending on `advert_int` and
 agent reconnect intervals.

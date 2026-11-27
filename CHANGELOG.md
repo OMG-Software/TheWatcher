@@ -169,6 +169,14 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
     first `get_agent`) (#81).
   - The PostgreSQL tests no longer skip silently or share a database: see
     Added (#82).
+  - The server's periodic scan (offline marking, dead-agent alerts,
+    escalation, maintenance windows, report) catches store errors, logs them
+    and retries on the next tick; a database error used to leave `run()` and
+    stop the server. `docs/ha-topology.md` no longer says failover loses no
+    data: committed data survives, an in-flight write can fail (#81).
+  - The PostgreSQL test DSN helper accepts both libpq DSN forms: a
+    `postgresql://` URI gets `options` as a URL-encoded query parameter
+    instead of a keyword (#82).
 
 ### Changed
 

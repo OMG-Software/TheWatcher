@@ -259,7 +259,7 @@ SCENARIO("[postgres] The store recovers after its connection is cut")
     GIVEN("a store whose server connection is then terminated")
     {
         const std::string application = "tw_reconnect_" + schema.name();
-        PostgresStore store(schema.dsn("application_name=" + application));
+        PostgresStore store(schema.dsn(application));
         store.upsert_agent(make_agent("reconnect-agent"));
         kill_connections(application);
 
@@ -311,7 +311,7 @@ SCENARIO("[postgres] A cut connection inside a transaction rolls it back and lat
     GIVEN("a group-assignment transaction whose connection dies halfway")
     {
         const std::string application = "tw_txn_" + schema.name();
-        PostgresStore store(schema.dsn("application_name=" + application));
+        PostgresStore store(schema.dsn(application));
         store.upsert_agent(make_agent("txn-agent"));
         const auto group = store.create_group("txn-group");
         store.set_agent_groups("txn-agent", {group});

@@ -11,6 +11,7 @@
 #ifdef HAVE_LIBPQ
 
 #include "../server/store_postgres.hpp"
+#include "postgres_dsn.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -122,9 +123,14 @@ public:
         return name_;
     }
     // DSN of the test server with search_path pinned to this schema.
-    std::string dsn(const std::string& extra = "") const
+    // `application_name`, when given, tags the connection so a test can find and
+    // terminate it.
+    std::string dsn(const std::string& application_name = "") const
     {
-        return postgres_test_dsn() + " options=-csearch_path=" + name_ + (extra.empty() ? "" : " " + extra);
+        auto result = dsn_with_search_path(postgres_test_dsn(), name_);
+        if (!application_name.empty())
+            result = dsn_with_param(result, "application_name", application_name);
+        return result;
     }
 
 private:
