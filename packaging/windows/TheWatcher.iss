@@ -51,16 +51,78 @@ Name: "{group}\TheWatcher Dashboard"; Filename: "{app}\dashboard\index.html"; Ch
 [Code]
 // Upgrades: stop the running services before any file is replaced, so the
 // executables are not locked and the service registration can be deleted and
-// recreated immediately afterwards. `net stop` waits until the service has
-// stopped. Its exit code is ignored: on a fresh install the services do not
-// exist, so it fails harmlessly.
-function PrepareToInstall(var NeedsRestart: Boolean): String;
+// recreated immediately afterwards.
+// - A service that does not exist (fresh install) is skipped: sc query fails
+//   with 1060 (ERROR_SERVICE_DOES_NOT_EXIST).
+// - Any other failure to query or stop an existing service aborts the install
+//   with a message, so files are never replaced under a running service.
+// `net stop` is only the request; the loop waits up to 30 seconds for sc query
+// to report STOPPED. `net stop`'s own exit code is not used: it is also
+// non-zero when the service was already stopped.
+function StopServiceIfPresent(const Name: String): String;
 var
-  ResultCode: Integer;
+  ResultCode, I: Integer;
 begin
-  Exec(ExpandConstant('{sys}\net.exe'), 'stop TheWatcherAgent', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
-  Exec(ExpandConstant('{sys}\net.exe'), 'stop TheWatcherServer', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
   Result := '';
+  if not Exec(ExpandConstant('{sys}\sc.exe'), 'query ' + Name, '', SW_HIDE,
+              ewWaitUntilTerminated, ResultCode) then
+  begin
+    Result := 'Could not run sc.exe to check the ' + Name + ' service.';
+    Exit;
+  end;
+  if ResultCode = 1060 then
+    Exit;
+  if ResultCode <> 0 then
+  begin
+    Result := 'Could not query the ' + Name + ' service (sc.exe exit code ' + IntToStr(ResultCode) + ').';
+    Exit;
+  end;
+
+  Exec(ExpandConstant('{sys}\net.exe'), 'stop ' + Name, '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  for I := 1 to 30 do
+  begin
+    if Exec(ExpandConstant('{sys}\cmd.exe'), '/C sc query ' + Name + ' | find "STOPPED" >nul', '', SW_HIDE,
+            ewWaitUntilTerminated, ResultCode) and (ResultCode = 0) then
+      Exit;
+    Sleep(1000);
+  end;
+  Result := 'The ' + Name + ' service did not stop. Stop it manually and run the installer again.';
+end;
+
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+begin
+  Result := StopServiceIfPresent('TheWatcherAgent');
+  if Result = '' then
+    Result := StopServiceIfPresent('TheWatcherServer');
+end;
+
+// True when FileName has a non-comment KEY=VALUE line whose trimmed key is
+// SERVER_SECRET_KEY and whose value is not empty. This mirrors the parsing
+// rules of the server (trimmed keys and values, '#' comments, lines without
+// '=' skipped), so a JSON file that merely mentions the key does not match.
+function HasServerSecretKey(const FileName: String): Boolean;
+var
+  Lines: TArrayOfString;
+  I, P: Integer;
+  Line: String;
+begin
+  Result := False;
+  if not LoadStringsFromFile(FileName, Lines) then
+    Exit;
+  for I := 0 to GetArrayLength(Lines) - 1 do
+  begin
+    Line := Trim(Lines[I]);
+    if (Line = '') or (Line[1] = '#') then
+      Continue;
+    P := Pos('=', Line);
+    if P = 0 then
+      Continue;
+    if (Trim(Copy(Line, 1, P - 1)) = 'SERVER_SECRET_KEY') and (Trim(Copy(Line, P + 1, Length(Line))) <> '') then
+    begin
+      Result := True;
+      Exit;
+    end;
+  end;
 end;
 
 function DashboardExists(): Boolean;
@@ -97,8 +159,6 @@ begin
   end;
 end;
 
-// The server parser trims keys and values, so 'SERVER_SECRET_KEY = value' is
-// valid; the migration therefore only looks for the key name.
 // Older installers registered the server service with server.json. The server
 // wrote a KEY=VALUE file there (the same format as TheWatcherServer.conf), so
 // on upgrade the file is COPIED to TheWatcherServer.conf. If that were not
@@ -112,13 +172,12 @@ end;
 procedure MigrateServerConfig(const Dir: String);
 var
   OldConf, NewConf: String;
-  Raw: AnsiString;
 begin
   OldConf := AddBackslash(Dir) + 'server.json';
   NewConf := AddBackslash(Dir) + 'TheWatcherServer.conf';
   if FileExists(NewConf) or not FileExists(OldConf) then
     Exit;
-  if not LoadStringFromFile(OldConf, Raw) or (Pos('SERVER_SECRET_KEY', String(Raw)) = 0) then
+  if not HasServerSecretKey(OldConf) then
   begin
     Log('server.json is not a KEY=VALUE server config; not migrated');
     Exit;

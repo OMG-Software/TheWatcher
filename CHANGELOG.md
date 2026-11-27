@@ -81,7 +81,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - The Windows installer registers the server service with
   `TheWatcherServer.conf`, the file the server actually reads, instead of a
   non-existent `server.json`; the docs name the same file and
-  `OFFLINE_AFTER_SECONDS` key (#131).
+  `OFFLINE_AFTER_SECONDS` key (#131). On upgrade the installer stops the
+  services (aborting if one cannot be stopped), copies a KEY=VALUE
+  `server.json` that has a `SERVER_SECRET_KEY` line to
+  `TheWatcherServer.conf` without overwriting an existing one, and
+  re-registers the service so agents keep the same server identity (#131).
 - The CPU collector reports a real usage value on its first `update()` and
   after a collector restart. The constructor takes a baseline and the first
   update waits until it is at least 100 ms old. Calls closer than 100 ms to

@@ -265,17 +265,22 @@ Older Windows installers registered the server service with
 `KEY=VALUE` file at that path, the same format as `TheWatcherServer.conf`. The
 current installer therefore:
 
-0. stops the running TheWatcher services before replacing any files;
-1. copies `server.json` to `TheWatcherServer.conf` when the old file exists
-   and has a `SERVER_SECRET_KEY` line (spaces around `=` are fine) and `TheWatcherServer.conf` does not
+0. stops the TheWatcher agent and server services before replacing any
+   files, waiting up to 30 seconds for each to stop. A service that is not
+   installed is skipped; if an installed service cannot be stopped the
+   installer aborts with a message, so stop it manually and run the installer
+   again;
+1. copies `server.json` to `TheWatcherServer.conf` when the old file exists,
+   has a non-comment `SERVER_SECRET_KEY=<value>` line (spaces around `=` are
+   fine, as in the server parser), and `TheWatcherServer.conf` does not
    exist (an existing `.conf` is never overwritten, and `server.json` is kept
    as a backup), so the server keeps its CURVE identity and agents keep
    working;
 2. removes the old service registration and registers it again so the service
    command line points at `TheWatcherServer.conf`.
 
-If `server.json` is not a `KEY=VALUE` file (for example you wrote JSON by
-hand), it is not converted. Copy the settings into `TheWatcherServer.conf`
+If `server.json` has no such line (for example JSON you wrote by hand, even if
+it mentions `SERVER_SECRET_KEY`), it is not converted and is left untouched. Copy the settings into `TheWatcherServer.conf`
 yourself before starting the service, and keep the old `SERVER_PUBLIC_KEY` and
 `SERVER_SECRET_KEY` if you have them: without them the server generates a new
 keypair and every agent must be re-enrolled.
