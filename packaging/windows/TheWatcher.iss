@@ -107,8 +107,10 @@ var
   Line: String;
 begin
   Result := False;
+  // An unreadable legacy config aborts the install: carrying on would let the
+  // server start on a missing .conf and generate a new keypair.
   if not LoadStringsFromFile(FileName, Lines) then
-    Exit;
+    RaiseException('Could not read ' + FileName + '; the upgrade cannot preserve the server config.');
   for I := 0 to GetArrayLength(Lines) - 1 do
   begin
     Line := Trim(Lines[I]);

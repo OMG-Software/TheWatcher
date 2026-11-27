@@ -93,24 +93,29 @@ usage, services, packages, or custom application health.
    struct. Agents send metrics to the server as CBOR (the `cbor` helpers live
    in `common/protocol.hpp`), and `SystemMetrics` is encoded as a fixed-length
    positional array. Today `from_cbor<SystemMetrics>` accepts exactly 11
-   elements and there is no protocol version negotiation, so adding a field
-   changes the array length and an agent and server on different layouts
-   cannot decode each other's frames. Stored `metrics_cbor` rows are never
-   rewritten, so they would also stop decoding. Until the decoder accepts the
-   previous length and defaults the new fields (protocol versioning work in
-   #57 and #102), a new `SystemMetrics` field needs a coordinated upgrade of
-   server and all agents, and old stored rows will not decode. Do not add a
-   field without addressing that.
+   elements and there is no protocol version negotiation. The server decodes
+   agent frames (`server/server.cpp`) and also re-decodes stored
+   `metrics_cbor` rows, which are never rewritten (`server/api.cpp`,
+   `server/status_engine.cpp`). Changing the exact-length check therefore
+   breaks every existing 11-element frame and stored row. A new
+   `SystemMetrics` field must keep decoding the previous layouts: the decoder
+   must reject arrays shorter than the oldest supported length, read the new
+   indices only when present, and default the field otherwise (protocol
+   versioning work in #57 and #102 covers the mechanism). Do not add a field
+   until the decoder does that, or you accept a coordinated upgrade of server
+   and all agents with old stored rows no longer decoding.
 
    To add the field itself, in `common/metrics.hpp`: (a) in
    `to_cbor<SystemMetrics>`, `push` the new value (build it first, as the
-   other members are, and `release()` it into the array) at the position you
-   choose and raise `cbor_new_definite_array(11)` to the new count; (b) in
-   `from_cbor<SystemMetrics>`, read it with `array_get(item, <index>)` at the
-   same position, shift the later indices if you inserted in the middle
-   (appending at the end avoids that), and raise the
-   `cbor_array_size(item) != 11` check to the same count. The count and the
-   indices must match in both functions. The REST API serialises the same structs as JSON; add the
+   other members are, and `release()` it into the array) at the
+   position you choose and raise `cbor_new_definite_array(11)` to the new
+   count (this is the length new agents send); (b) in `from_cbor<SystemMetrics>`,
+   append the field at the end (inserting in the middle shifts the indices of
+   old frames), and replace the `cbor_array_size(item) != 11` equality check
+   with a minimum-length check that still accepts every older count, reading
+   `array_get(item, <index>)` for the new field only when
+   `cbor_array_size(item)` is large enough and leaving its default otherwise.
+   The indices must match in both functions. The REST API serialises the same structs as JSON; add the
    `NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT` mapping for the new
    struct, and the new `SystemMetrics` field, in `server/api_json.hpp`.
 
