@@ -170,8 +170,9 @@ namespace
     // keys involved for an inconsistent combination.
     void apply_key_value(ServerConfig& cfg, const std::vector<ConfigEntry>& entries)
     {
-        const ConfigEntry* public_key_entry = nullptr;
-        const ConfigEntry* secret_key_entry = nullptr;
+        // Copies of the key lines, kept for error messages (no pointers to dereference).
+        ConfigEntry public_key_entry{"SERVER_PUBLIC_KEY", "", 0};
+        ConfigEntry secret_key_entry{"SERVER_SECRET_KEY", "", 0};
 
         for (const auto& entry : entries)
         {
@@ -200,12 +201,12 @@ namespace
             else if (key == "SERVER_PUBLIC_KEY")
             {
                 cfg.server_public_key = entry.value;
-                public_key_entry = &entry;
+                public_key_entry = entry;
             }
             else if (key == "SERVER_SECRET_KEY")
             {
                 cfg.server_secret_key = entry.value;
-                secret_key_entry = &entry;
+                secret_key_entry = entry;
             }
             else if (key == "ENROLLMENT_TOKEN")
                 cfg.enrollment_token = entry.value;
@@ -229,9 +230,9 @@ namespace
         if (!cfg.server_public_key.empty())
         {
             if (!is_z85_key(cfg.server_public_key))
-                throw entry_error(*public_key_entry, "must be a 40 character z85 key");
+                throw entry_error(public_key_entry, "must be a 40 character z85 key");
             if (!is_z85_key(cfg.server_secret_key))
-                throw entry_error(*secret_key_entry, "must be a 40 character z85 key");
+                throw entry_error(secret_key_entry, "must be a 40 character z85 key");
             if (!keypair_matches(cfg.server_public_key, cfg.server_secret_key))
                 throw std::invalid_argument("SERVER_PUBLIC_KEY does not match SERVER_SECRET_KEY");
         }

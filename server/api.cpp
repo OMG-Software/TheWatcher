@@ -249,11 +249,11 @@ namespace
     void validate_thresholds(double warning, double degraded, double critical, const std::string& indicator)
     {
         if (!std::isfinite(warning) || !std::isfinite(degraded) || !std::isfinite(critical))
-            throw std::runtime_error(indicator + " thresholds must be finite numbers");
+            throw validation::ValidationError(indicator + " thresholds must be finite numbers");
         if (warning <= 0.0 || degraded <= 0.0 || critical <= 0.0)
-            throw std::runtime_error(indicator + " thresholds must be greater than zero");
+            throw validation::ValidationError(indicator + " thresholds must be greater than zero");
         if (!(warning < degraded && degraded < critical))
-            throw std::runtime_error(indicator + " thresholds must be ordered warning < degraded < critical");
+            throw validation::ValidationError(indicator + " thresholds must be ordered warning < degraded < critical");
     }
 
     void validate_percent_thresholds(const PercentThresholds& thresholds, const std::string& label)
@@ -261,7 +261,7 @@ namespace
         validate_thresholds(thresholds.warning_percent, thresholds.degraded_percent, thresholds.critical_percent,
                             label);
         if (thresholds.critical_percent > 100.0)
-            throw std::runtime_error(label + " critical threshold must be less than or equal to 100");
+            throw validation::ValidationError(label + " critical threshold must be less than or equal to 100");
     }
 
     void validate_network_thresholds(const NetworkThresholds& thresholds, const std::string& label)
@@ -281,8 +281,8 @@ namespace
                                    config.network_readings, config.process_readings})
         {
             if (readings <= 0 || readings > validation::limits::max_readings)
-                throw std::runtime_error("collector readings must be between 1 and " +
-                                         std::to_string(validation::limits::max_readings));
+                throw validation::ValidationError("collector readings must be between 1 and " +
+                                                  std::to_string(validation::limits::max_readings));
         }
         require_valid(validation::check_count("disks", config.disks.size(), validation::limits::max_collector_entries));
         require_valid(
@@ -294,37 +294,37 @@ namespace
         for (const auto& disk : config.disks)
         {
             if (disk.mount_point.empty())
-                throw std::runtime_error("disk mount_point is required");
+                throw validation::ValidationError("disk mount_point is required");
             validate_percent_thresholds(disk.thresholds, "disk " + disk.mount_point);
         }
         for (const auto& network : config.networks)
         {
             if (network.interface_name.empty())
-                throw std::runtime_error("network interface_name is required");
+                throw validation::ValidationError("network interface_name is required");
             validate_network_thresholds(network.thresholds, "network " + network.interface_name);
         }
         for (const auto& process : config.processes)
         {
             if (process.name.empty())
-                throw std::runtime_error("process name is required");
+                throw validation::ValidationError("process name is required");
             if (process.expected_count <= 0 || process.expected_count > validation::limits::max_expected_processes)
-                throw std::runtime_error("process expected_count must be between 1 and " +
-                                         std::to_string(validation::limits::max_expected_processes));
+                throw validation::ValidationError("process expected_count must be between 1 and " +
+                                                  std::to_string(validation::limits::max_expected_processes));
         }
         // SEC-10: log-monitor entries name files the agent will read whose
         // contents then surface on the dashboard — validate them strictly.
         for (const auto& log : config.logs)
         {
             if (log.path.empty())
-                throw std::runtime_error("log path is required");
+                throw validation::ValidationError("log path is required");
             if (log.path.size() > 4096)
-                throw std::runtime_error("log path is too long");
+                throw validation::ValidationError("log path is too long");
             if (log.pattern.empty() || log.pattern.size() > 256)
-                throw std::runtime_error("log pattern must be 1-256 characters");
+                throw validation::ValidationError("log pattern must be 1-256 characters");
             if (log.indicator_name.empty() || log.indicator_name.size() > 64)
-                throw std::runtime_error("log indicator_name must be 1-64 characters");
+                throw validation::ValidationError("log indicator_name must be 1-64 characters");
             if (log.severity != "yellow" && log.severity != "amber" && log.severity != "red")
-                throw std::runtime_error("log severity must be yellow, amber, or red");
+                throw validation::ValidationError("log severity must be yellow, amber, or red");
         }
     }
 
@@ -815,12 +815,34 @@ namespace
         send_error(res, 500, "internal error");
     }
 
-    // Throws std::runtime_error (which handlers answer with 400) when a
+    // Maps an exception thrown inside a handler to its response. A malformed
+    // body (JSON error) or a failed validation is the client's fault: 400 with
+    // the message. A uniqueness violation from the store is a conflict: 409.
+    // Anything else is a storage or runtime fault: logged, generic 500.
+    void respond_to_exception(const httplib::Request& req, httplib::Response& res, const std::exception& e)
+    {
+        if (dynamic_cast<const validation::ValidationError*>(&e) != nullptr ||
+            dynamic_cast<const json::exception*>(&e) != nullptr)
+        {
+            send_error(res, 400, e.what());
+        }
+        else if (dynamic_cast<const UniqueViolation*>(&e) != nullptr)
+        {
+            send_error(res, 409, "an entry with this name already exists");
+        }
+        else
+        {
+            LOGF_WARNING("%s %s failed: %s", req.method.c_str(), req.path.c_str(), e.what());
+            send_internal_error(res);
+        }
+    }
+
+    // Throws validation::ValidationError (answered 400) when a
     // validation::check_* helper returned a message.
     void require_valid(const std::optional<std::string>& error)
     {
         if (error)
-            throw std::runtime_error(*error);
+            throw validation::ValidationError(*error);
     }
 
     // Parses the numeric :id path parameter. Answers 400 itself and returns
@@ -1296,7 +1318,7 @@ void ApiServer::setup_routes()
             auto body = json::parse(req.body);
             const auto name = body.at("name").get<std::string>();
             if (name.empty() || name.size() > validation::limits::name_bytes)
-                throw std::runtime_error("group name must be between 1 and 64 characters");
+                throw validation::ValidationError("group name must be between 1 and 64 characters");
             for (const auto& existing : store_.list_groups())
             {
                 if (existing.name == name)
@@ -1312,10 +1334,7 @@ void ApiServer::setup_routes()
         }
         catch (const std::exception& e)
         {
-            res.status = 400;
-            set_json(res, json{
-                              {"error", e.what()}
-            });
+            respond_to_exception(req, res, e);
         }
     });
 
@@ -1368,11 +1387,11 @@ void ApiServer::setup_routes()
             const auto password = body.at("password").get<std::string>();
             const auto role = body.value("role", "group_viewer");
             if (username.empty() || password.empty())
-                throw std::runtime_error("username and password are required");
+                throw validation::ValidationError("username and password are required");
             require_valid(validation::check_text("username", username, validation::limits::username_bytes));
             require_valid(validation::check_text("password", password, validation::limits::password_bytes));
             if (!is_valid_role(role))
-                throw std::runtime_error("invalid role");
+                throw validation::ValidationError("invalid role");
 
             std::vector<int64_t> group_ids;
             if (body.contains("group_ids"))
@@ -1394,11 +1413,11 @@ void ApiServer::setup_routes()
                 for (const auto group_id : group_ids)
                 {
                     if (std::find(allowed_groups.begin(), allowed_groups.end(), group_id) == allowed_groups.end())
-                        throw std::runtime_error("group admins can only assign users to their own groups");
+                        throw validation::ValidationError("group admins can only assign users to their own groups");
                 }
                 const auto normalized = normalize_role(role);
                 if (normalized == "global_admin" || normalized == "global_operator" || normalized == "global_viewer")
-                    throw std::runtime_error("group admins can only create group-scoped users");
+                    throw validation::ValidationError("group admins can only create group-scoped users");
             }
 
             const auto user_id = store_.create_user(username, hash_password(password), normalize_role(role));
@@ -1411,10 +1430,7 @@ void ApiServer::setup_routes()
         }
         catch (const std::exception& e)
         {
-            res.status = 400;
-            set_json(res, json{
-                              {"error", e.what()}
-            });
+            respond_to_exception(req, res, e);
         }
     });
 
@@ -1559,7 +1575,16 @@ void ApiServer::setup_routes()
         const auto allowed_ids = bulk_alert_ids(req, res, *session, body);
         if (!allowed_ids)
             return;
-        std::string note = (body.contains("note") && body["note"].is_string()) ? body["note"].get<std::string>() : "";
+        std::string note;
+        if (body.contains("note"))
+        {
+            if (!body["note"].is_string())
+            {
+                send_error(res, 400, "note must be a string");
+                return;
+            }
+            note = body["note"].get<std::string>();
+        }
         truncate_utf8(note, max_note_bytes);
         store_.bulk_acknowledge_alerts(*allowed_ids, session->username, now_ms(), note);
         set_json(res, json{
@@ -1677,8 +1702,15 @@ void ApiServer::setup_routes()
                     try
                     {
                         auto body = json::parse(req.body);
+                        if (!body.is_object())
+                            throw validation::ValidationError("body must be a JSON object");
                         if (body.contains("group_ids"))
                             group_ids = body["group_ids"].get<std::vector<int64_t>>();
+                    }
+                    catch (const validation::ValidationError& e)
+                    {
+                        send_error(res, 400, e.what());
+                        return;
                     }
                     catch (const json::exception& e)
                     {
@@ -1826,11 +1858,7 @@ void ApiServer::setup_routes()
         }
         catch (const std::exception& e)
         {
-            LOGF_WARNING("POST /api/agents/:id/groups failed: %s", e.what());
-            res.status = 400;
-            set_json(res, json{
-                              {"error", e.what()}
-            });
+            respond_to_exception(req, res, e);
         }
     });
 
@@ -1948,13 +1976,13 @@ void ApiServer::setup_routes()
             for (auto t : valid_command_types)
                 valid_type = valid_type || (t == cmd.command_type);
             if (!valid_type)
-                throw std::runtime_error("unknown command_type");
+                throw validation::ValidationError("unknown command_type");
             // args is optional raw bytes packed by caller; default empty
             if (body.contains("args"))
             {
                 cmd.args = body["args"].get<std::vector<uint8_t>>();
                 if (cmd.args.size() > 4096)
-                    throw std::runtime_error("args payload too large (max 4096 bytes)");
+                    throw validation::ValidationError("args payload too large (max 4096 bytes)");
             }
 
             {
@@ -1973,14 +2001,7 @@ void ApiServer::setup_routes()
         }
         catch (const std::exception& e)
         {
-            LOGF_WARNING("POST /api/agents/:id/command failed: %s", e.what());
-            res.status = 400;
-            res.set_content(
-                json{
-                    {"error", e.what()}
-            }
-                    .dump(),
-                "application/json");
+            respond_to_exception(req, res, e);
         }
     });
 
@@ -2025,14 +2046,7 @@ void ApiServer::setup_routes()
         }
         catch (const std::exception& e)
         {
-            LOGF_WARNING("POST /api/agents/:id/set_interval failed: %s", e.what());
-            res.status = 400;
-            res.set_content(
-                json{
-                    {"error", e.what()}
-            }
-                    .dump(),
-                "application/json");
+            respond_to_exception(req, res, e);
         }
     });
 
@@ -2077,14 +2091,7 @@ void ApiServer::setup_routes()
         }
         catch (const std::exception& e)
         {
-            LOGF_WARNING("POST /api/agents/:id/set_process_limit failed: %s", e.what());
-            res.status = 400;
-            res.set_content(
-                json{
-                    {"error", e.what()}
-            }
-                    .dump(),
-                "application/json");
+            respond_to_exception(req, res, e);
         }
     });
 
@@ -2115,11 +2122,7 @@ void ApiServer::setup_routes()
         }
         catch (const std::exception& e)
         {
-            LOGF_WARNING("POST /api/agents/:id/thresholds failed: %s", e.what());
-            res.status = 400;
-            set_json(res, json{
-                              {"error", e.what()}
-            });
+            respond_to_exception(req, res, e);
         }
     });
 
@@ -2216,11 +2219,7 @@ void ApiServer::setup_routes()
         }
         catch (const std::exception& e)
         {
-            LOGF_WARNING("POST /api/agents/:id/collector_config failed: %s", e.what());
-            res.status = 400;
-            set_json(res, json{
-                              {"error", e.what()}
-            });
+            respond_to_exception(req, res, e);
         }
     });
 
@@ -2246,10 +2245,7 @@ void ApiServer::setup_routes()
         }
         catch (const std::exception& e)
         {
-            res.status = 400;
-            set_json(res, json{
-                              {"error", e.what()}
-            });
+            respond_to_exception(req, res, e);
         }
     });
 
@@ -2366,10 +2362,7 @@ void ApiServer::setup_routes()
         }
         catch (const std::exception& e)
         {
-            res.status = 400;
-            set_json(res, json{
-                              {"error", e.what()}
-            });
+            respond_to_exception(req, res, e);
         }
     });
 
@@ -2429,7 +2422,7 @@ void ApiServer::setup_routes()
                         require_valid(check_timestamp("start_ms", rec.start_ms));
                         require_valid(check_timestamp("end_ms", rec.end_ms));
                         if (rec.end_ms <= rec.start_ms)
-                            throw std::runtime_error("end_ms must be after start_ms");
+                            throw validation::ValidationError("end_ms must be after start_ms");
                         auto window_id = store_.create_maintenance_window(rec);
                         set_json(res, json{
                                           {"window_id", window_id}
@@ -2437,10 +2430,7 @@ void ApiServer::setup_routes()
                     }
                     catch (const std::exception& e)
                     {
-                        res.status = 400;
-                        set_json(res, json{
-                                          {"error", e.what()}
-                        });
+                        respond_to_exception(req, res, e);
                     }
                 });
 
@@ -2480,10 +2470,7 @@ void ApiServer::setup_routes()
         }
         catch (const std::exception& e)
         {
-            res.status = 400;
-            set_json(res, json{
-                              {"error", e.what()}
-            });
+            respond_to_exception(req, res, e);
         }
     });
 
@@ -2516,10 +2503,7 @@ void ApiServer::setup_routes()
         }
         catch (const std::exception& e)
         {
-            res.status = 400;
-            set_json(res, json{
-                              {"error", e.what()}
-            });
+            respond_to_exception(req, res, e);
         }
     });
 
@@ -2552,10 +2536,7 @@ void ApiServer::setup_routes()
         }
         catch (const std::exception& e)
         {
-            res.status = 400;
-            set_json(res, json{
-                              {"error", e.what()}
-            });
+            respond_to_exception(req, res, e);
         }
     });
 
@@ -2616,21 +2597,21 @@ void ApiServer::setup_routes()
             {
                 const auto v = body.at("offline_after_seconds").get<int>();
                 if (v < 10 || v > 86400)
-                    throw std::runtime_error("offline_after_seconds must be between 10 and 86400");
+                    throw validation::ValidationError("offline_after_seconds must be between 10 and 86400");
                 store_.set_setting("offline_after_seconds", std::to_string(v));
             }
             if (body.contains("escalation_timeout_seconds"))
             {
                 const auto v = body.at("escalation_timeout_seconds").get<int>();
                 if (v < 60 || v > 604800)
-                    throw std::runtime_error("escalation_timeout_seconds must be between 60 and 604800");
+                    throw validation::ValidationError("escalation_timeout_seconds must be between 60 and 604800");
                 store_.set_setting("escalation_timeout_seconds", std::to_string(v));
             }
             if (body.contains("metrics_retention_days"))
             {
                 const auto v = body.at("metrics_retention_days").get<int>();
                 if (v < 1 || v > 365)
-                    throw std::runtime_error("metrics_retention_days must be between 1 and 365");
+                    throw validation::ValidationError("metrics_retention_days must be between 1 and 365");
                 store_.set_setting("metrics_retention_days", std::to_string(v));
             }
             if (body.contains("reports_enabled"))
@@ -2639,21 +2620,21 @@ void ApiServer::setup_routes()
             {
                 const auto v = body.at("reports_schedule").get<std::string>();
                 if (v != "daily" && v != "weekly")
-                    throw std::runtime_error("reports_schedule must be 'daily' or 'weekly'");
+                    throw validation::ValidationError("reports_schedule must be 'daily' or 'weekly'");
                 store_.set_setting("reports.schedule", v);
             }
             if (body.contains("reports_hour"))
             {
                 const auto v = body.at("reports_hour").get<int>();
                 if (v < 0 || v > 23)
-                    throw std::runtime_error("reports_hour must be between 0 and 23");
+                    throw validation::ValidationError("reports_hour must be between 0 and 23");
                 store_.set_setting("reports.hour", std::to_string(v));
             }
             if (body.contains("reports_day_of_week"))
             {
                 const auto v = body.at("reports_day_of_week").get<int>();
                 if (v < 0 || v > 6)
-                    throw std::runtime_error("reports_day_of_week must be between 0 and 6");
+                    throw validation::ValidationError("reports_day_of_week must be between 0 and 6");
                 store_.set_setting("reports.day_of_week", std::to_string(v));
             }
             if (body.contains("reports_webhook_url"))
@@ -2664,10 +2645,7 @@ void ApiServer::setup_routes()
         }
         catch (const std::exception& e)
         {
-            res.status = 400;
-            set_json(res, json{
-                              {"error", e.what()}
-            });
+            respond_to_exception(req, res, e);
         }
     });
 
@@ -2730,10 +2708,7 @@ void ApiServer::setup_routes()
         }
         catch (const std::exception& e)
         {
-            res.status = 400;
-            set_json(res, json{
-                              {"error", e.what()}
-            });
+            respond_to_exception(req, res, e);
         }
     });
 
@@ -2772,10 +2747,7 @@ void ApiServer::setup_routes()
         }
         catch (const std::exception& e)
         {
-            res.status = 400;
-            set_json(res, json{
-                              {"error", e.what()}
-            });
+            respond_to_exception(req, res, e);
         }
     });
 
@@ -2815,10 +2787,7 @@ void ApiServer::setup_routes()
         }
         catch (const std::exception& e)
         {
-            res.status = 400;
-            set_json(res, json{
-                              {"error", e.what()}
-            });
+            respond_to_exception(req, res, e);
         }
     });
 
@@ -2873,10 +2842,7 @@ void ApiServer::setup_routes()
         }
         catch (const std::exception& e)
         {
-            res.status = 400;
-            set_json(res, json{
-                              {"error", e.what()}
-            });
+            respond_to_exception(req, res, e);
         }
     });
 
@@ -2935,7 +2901,7 @@ void ApiServer::setup_routes()
             rec.created_by = session->username;
             rec.created_at = now_ms();
             if (rec.until_ms <= rec.created_at)
-                throw std::runtime_error("until_ms must be in the future");
+                throw validation::ValidationError("until_ms must be in the future");
             const auto silence_id = store_.create_silence(rec);
             LOGF_INFO("Created silence silence_id=%lld agent_id=%s indicator=%s by=%s",
                       static_cast<long long>(silence_id), rec.agent_id.c_str(), rec.indicator.c_str(),
@@ -2946,10 +2912,7 @@ void ApiServer::setup_routes()
         }
         catch (const std::exception& e)
         {
-            res.status = 400;
-            set_json(res, json{
-                              {"error", e.what()}
-            });
+            respond_to_exception(req, res, e);
         }
     });
 
@@ -2989,10 +2952,7 @@ void ApiServer::setup_routes()
         }
         catch (const std::exception& e)
         {
-            res.status = 400;
-            set_json(res, json{
-                              {"error", e.what()}
-            });
+            respond_to_exception(req, res, e);
         }
     });
 
@@ -3018,10 +2978,7 @@ void ApiServer::setup_routes()
         }
         catch (const std::exception& e)
         {
-            res.status = 400;
-            set_json(res, json{
-                              {"error", e.what()}
-            });
+            respond_to_exception(req, res, e);
         }
     });
 
@@ -3038,6 +2995,29 @@ void ApiServer::setup_routes()
             {"agent_ids",      v.agent_ids     },
             {"created_at",     v.created_at    },
         };
+    };
+
+    // 404 when the view names an agent or group that does not exist. Answers on
+    // res and returns false in that case.
+    auto view_references_exist = [this, first_missing_group](httplib::Response& res, const ViewRecord& view,
+                                                             bool check_agents, bool check_group) {
+        if (check_agents)
+        {
+            for (const auto& agent_id : view.agent_ids)
+            {
+                if (!store_.get_agent(agent_id))
+                {
+                    send_error(res, 404, "agent " + agent_id + " not found");
+                    return false;
+                }
+            }
+        }
+        if (check_group && view.group_id > 0 && first_missing_group({view.group_id}))
+        {
+            send_error(res, 404, "group " + std::to_string(view.group_id) + " not found");
+            return false;
+        }
+        return true;
     };
 
     // Size limits for a view's name and agent list (400 when exceeded).
@@ -3077,7 +3057,8 @@ void ApiServer::setup_routes()
     });
 
     // POST /api/views — create a view (operator+)
-    http_->Post("/api/views", [this, view_to_json, validate_view](const httplib::Request& req, httplib::Response& res) {
+    http_->Post("/api/views", [this, view_to_json, validate_view, view_references_exist](const httplib::Request& req,
+                                                                                         httplib::Response& res) {
         try
         {
             auto session = require_role(req, res, "operator");
@@ -3093,10 +3074,14 @@ void ApiServer::setup_routes()
             {
                 const auto groups = store_.get_user_groups(session->user_id);
                 if (std::find(groups.begin(), groups.end(), rec.group_id) == groups.end())
-                    throw std::runtime_error("view group is outside the user's groups");
+                    throw validation::ValidationError("view group is outside the user's groups");
             }
-            if (body.contains("agent_ids") && body["agent_ids"].is_array())
+            if (body.contains("agent_ids"))
+            {
+                if (!body["agent_ids"].is_array())
+                    throw validation::ValidationError("agent_ids must be an array of agent ids");
                 rec.agent_ids = body["agent_ids"].get<std::vector<std::string>>();
+            }
             validate_view(rec);
             // SEC-11: a view may only reference agents its creator can see.
             if (!is_global_role(session->role))
@@ -3104,9 +3089,11 @@ void ApiServer::setup_routes()
                 for (const auto& agent_id : rec.agent_ids)
                 {
                     if (!can_access_agent(*session, agent_id))
-                        throw std::runtime_error("view references an agent outside your access");
+                        throw validation::ValidationError("view references an agent outside your access");
                 }
             }
+            if (!view_references_exist(res, rec, true, true))
+                return;
             rec.created_at = now_ms();
             const auto id = store_.create_view(rec);
             rec.view_id = id;
@@ -3116,11 +3103,7 @@ void ApiServer::setup_routes()
         }
         catch (const std::exception& e)
         {
-            LOGF_WARNING("POST /api/views failed: %s", e.what());
-            res.status = 400;
-            set_json(res, json{
-                              {"error", e.what()}
-            });
+            respond_to_exception(req, res, e);
         }
     });
 
@@ -3155,76 +3138,77 @@ void ApiServer::setup_routes()
         }
         catch (const std::exception& e)
         {
-            res.status = 400;
-            set_json(res, json{
-                              {"error", e.what()}
-            });
+            respond_to_exception(req, res, e);
         }
     });
 
     // PUT /api/views/:id — update (owner or admin)
-    http_->Put("/api/views/:id",
-               [this, view_to_json, validate_view](const httplib::Request& req, httplib::Response& res) {
-                   try
-                   {
-                       auto session = require_role(req, res, "operator");
-                       if (!session)
-                           return;
-                       const auto parsed_id = path_id(req, res);
-                       if (!parsed_id)
-                           return;
-                       const auto id = *parsed_id;
-                       auto existing = store_.get_view(id);
-                       if (!existing)
-                       {
-                           res.status = 404;
-                           set_json(res, json{
-                                             {"error", "not found"}
-                           });
-                           return;
-                       }
-                       if (existing->owner_user_id != session->user_id && !is_global_role(session->role))
-                       {
-                           res.status = 403;
-                           set_json(res, json{
-                                             {"error", "forbidden"}
-                           });
-                           return;
-                       }
-                       auto body = json::parse(req.body);
-                       existing->name = body.value("name", existing->name);
-                       existing->is_public = body.value("is_public", existing->is_public);
-                       existing->group_id = body.value("group_id", existing->group_id);
-                       if (!is_global_role(session->role))
-                       {
-                           const auto groups = store_.get_user_groups(session->user_id);
-                           if (std::find(groups.begin(), groups.end(), existing->group_id) == groups.end())
-                               throw std::runtime_error("view group is outside the user's groups");
-                       }
-                       if (body.contains("agent_ids") && body["agent_ids"].is_array())
-                           existing->agent_ids = body["agent_ids"].get<std::vector<std::string>>();
-                       validate_view(*existing);
-                       // SEC-11: a view may only reference agents its editor can see.
-                       if (!is_global_role(session->role))
-                       {
-                           for (const auto& agent_id : existing->agent_ids)
-                           {
-                               if (!can_access_agent(*session, agent_id))
-                                   throw std::runtime_error("view references an agent outside your access");
-                           }
-                       }
-                       store_.update_view(*existing);
-                       set_json(res, view_to_json(*existing));
-                   }
-                   catch (const std::exception& e)
-                   {
-                       LOGF_WARNING("PUT /api/views/:id failed: %s", e.what());
-                       res.status = 400;
-                       set_json(res, json{
-                                         {"error", e.what()}
-                       });
-                   }
-               });
+    http_->Put("/api/views/:id", [this, view_to_json, validate_view, view_references_exist](const httplib::Request& req,
+                                                                                            httplib::Response& res) {
+        try
+        {
+            auto session = require_role(req, res, "operator");
+            if (!session)
+                return;
+            const auto parsed_id = path_id(req, res);
+            if (!parsed_id)
+                return;
+            const auto id = *parsed_id;
+            auto existing = store_.get_view(id);
+            if (!existing)
+            {
+                res.status = 404;
+                set_json(res, json{
+                                  {"error", "not found"}
+                });
+                return;
+            }
+            if (existing->owner_user_id != session->user_id && !is_global_role(session->role))
+            {
+                res.status = 403;
+                set_json(res, json{
+                                  {"error", "forbidden"}
+                });
+                return;
+            }
+            auto body = json::parse(req.body);
+            existing->name = body.value("name", existing->name);
+            existing->is_public = body.value("is_public", existing->is_public);
+            existing->group_id = body.value("group_id", existing->group_id);
+            if (!is_global_role(session->role))
+            {
+                const auto groups = store_.get_user_groups(session->user_id);
+                if (std::find(groups.begin(), groups.end(), existing->group_id) == groups.end())
+                    throw validation::ValidationError("view group is outside the user's groups");
+            }
+            if (body.contains("agent_ids"))
+            {
+                if (!body["agent_ids"].is_array())
+                    throw validation::ValidationError("agent_ids must be an array of agent ids");
+                existing->agent_ids = body["agent_ids"].get<std::vector<std::string>>();
+            }
+            validate_view(*existing);
+            // SEC-11: a view may only reference agents its editor can see.
+            if (!is_global_role(session->role))
+            {
+                for (const auto& agent_id : existing->agent_ids)
+                {
+                    if (!can_access_agent(*session, agent_id))
+                        throw validation::ValidationError("view references an agent outside your access");
+                }
+            }
+            // Only references the request changed are checked, so a view
+            // that still holds an old stale id can be renamed.
+            if (!view_references_exist(res, *existing, body.contains("agent_ids"), body.contains("group_id")))
+                return;
+            store_.update_view(*existing);
+            set_json(res, view_to_json(*existing));
+        }
+        catch (const std::exception& e)
+        {
+            respond_to_exception(req, res, e);
+        }
+    });
 
     // DELETE /api/views/:id — owner or admin
     http_->Delete("/api/views/:id", [this](const httplib::Request& req, httplib::Response& res) {
@@ -3261,10 +3245,7 @@ void ApiServer::setup_routes()
         }
         catch (const std::exception& e)
         {
-            res.status = 400;
-            set_json(res, json{
-                              {"error", e.what()}
-            });
+            respond_to_exception(req, res, e);
         }
     });
 
@@ -3337,9 +3318,9 @@ void ApiServer::setup_routes()
             require_valid(validation::check_text("url", rec.url, validation::limits::url_bytes, true));
             require_valid(validation::check_text("notes", rec.notes, validation::limits::note_bytes));
             if (rec.url.rfind("https://", 0) != 0 && rec.url.rfind("http://", 0) != 0)
-                throw std::runtime_error("url must start with https:// or http://");
+                throw validation::ValidationError("url must start with https:// or http://");
             if (rec.status != "yellow" && rec.status != "amber" && rec.status != "red")
-                throw std::runtime_error("status must be yellow, amber, or red");
+                throw validation::ValidationError("status must be yellow, amber, or red");
             const auto id = store_.create_runbook(rec);
             rec.runbook_id = id;
             res.status = 201;
@@ -3347,10 +3328,7 @@ void ApiServer::setup_routes()
         }
         catch (const std::exception& e)
         {
-            res.status = 400;
-            set_json(res, json{
-                              {"error", e.what()}
-            });
+            respond_to_exception(req, res, e);
         }
     });
 
@@ -3387,10 +3365,7 @@ void ApiServer::setup_routes()
         }
         catch (const std::exception& e)
         {
-            res.status = 400;
-            set_json(res, json{
-                              {"error", e.what()}
-            });
+            respond_to_exception(req, res, e);
         }
     });
 }

@@ -11,16 +11,19 @@
 #include "common/protocol.hpp"
 #include "test_support/net_helpers.hpp"
 #include "test_support/server_fixture.hpp"
+#include "test_support/temp_dir.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 #include <nlohmann/json.hpp>
 
 #include <chrono>
+#include <filesystem>
 #include <memory>
 #include <string>
 #include <vector>
 
 #include <httplib.h>
+#include <sqlite3.h>
 #include <zmq.hpp>
 
 using json = nlohmann::json;
@@ -35,8 +38,8 @@ namespace
 // An ApiServer on an in-memory store, started on a free port.
 struct ApiFixture
 {
-    ApiFixture()
-        : store(make_store("sqlite", ":memory:"))
+    explicit ApiFixture(const std::string& db = ":memory:")
+        : store(make_store("sqlite", db))
         , api(*store, zap, "127.0.0.1", port)
         , client("http://127.0.0.1:" + std::to_string(port))
     {
@@ -774,6 +777,176 @@ SCENARIO("Deleting an agent through the API leaves nothing for a re-enrolled age
                 REQUIRE_FALSE(fx.store->is_silenced("again", "cpu", now_ms()));
                 REQUIRE(fx.store->active_maintenance_windows(now_ms()).empty());
                 REQUIRE_FALSE(fx.store->get_runbook("again", "cpu", "red").has_value());
+            }
+        }
+    }
+}
+
+// ── Review follow-ups ─────────────────────────────────────────────────────────
+
+SCENARIO("Views may only reference agents and groups that exist")
+{
+    GIVEN("an admin, one real agent and one real group")
+    {
+        ApiFixture fx;
+        fx.store->upsert_agent(approved_agent("a1"));
+        REQUIRE(login_as_default_admin(fx.client));
+        const auto group = json::parse(fx.post("/api/groups",
+                                               json{
+                                                   {"name", "G"}
+        })
+                                           ->body)["group_id"]
+                               .get<int64_t>();
+        const auto created = fx.post("/api/views", json{
+                                                       {"name",      "ok"  },
+                                                       {"agent_ids", {"a1"}},
+                                                       {"group_id",  group }
+        });
+        REQUIRE(created->status == 201);
+        const auto view_id = json::parse(created->body)["view_id"].get<int64_t>();
+        const auto path = "/api/views/" + std::to_string(view_id);
+
+        THEN("creating a view with an unknown agent or group is 404")
+        {
+            REQUIRE(fx.post("/api/views",
+                            json{
+                                {"name",      "v"      },
+                                {"agent_ids", {"ghost"}}
+            })
+                        ->status == 404);
+            REQUIRE(fx.post("/api/views",
+                            json{
+                                {"name",     "v"  },
+                                {"group_id", 98765}
+            })
+                        ->status == 404);
+        }
+
+        THEN("updating a view to an unknown agent or group is 404 and leaves it unchanged")
+        {
+            REQUIRE(fx.put(path,
+                           json{
+                               {"agent_ids", {"ghost"}}
+            })
+                        ->status == 404);
+            REQUIRE(fx.put(path,
+                           json{
+                               {"group_id", 98765}
+            })
+                        ->status == 404);
+            REQUIRE(fx.store->get_view(view_id)->agent_ids == std::vector<std::string>{"a1"});
+        }
+
+        THEN("agent_ids that is not an array is 400 on create and update")
+        {
+            REQUIRE(fx.post("/api/views",
+                            json{
+                                {"name",      "v" },
+                                {"agent_ids", "a1"}
+            })
+                        ->status == 400);
+            REQUIRE(fx.put(path,
+                           json{
+                               {"agent_ids", "a1"}
+            })
+                        ->status == 400);
+        }
+
+        THEN("renaming a view that holds an old stale agent id still works")
+        {
+            ViewRecord stale;
+            stale.name = "stale";
+            stale.owner_user_id = 1;
+            stale.created_at = 1;
+            stale.agent_ids = {"long-gone"};
+            const auto stale_id = fx.store->create_view(stale);
+            REQUIRE(fx.put("/api/views/" + std::to_string(stale_id),
+                           json{
+                               {"name", "renamed"}
+            })
+                        ->status == 200);
+        }
+    }
+}
+
+SCENARIO("Bulk acknowledge and approve reject malformed bodies")
+{
+    GIVEN("an admin, a pending agent and an alert")
+    {
+        ApiFixture fx;
+        auto pending = approved_agent("p1");
+        pending.approved = false;
+        fx.store->upsert_agent(pending);
+        fx.store->upsert_agent(approved_agent("a1"));
+        const auto alert = add_alert(*fx.store, "a1", 100);
+        REQUIRE(login_as_default_admin(fx.client));
+
+        THEN("a non-string note on bulk-ack is 400 and nothing is acknowledged")
+        {
+            REQUIRE(fx.post("/api/alerts/bulk-ack",
+                            json{
+                                {"alert_ids", {alert}},
+                                {"note",      123    }
+            })
+                        ->status == 400);
+            REQUIRE(fx.store->get_alert(alert)->acknowledged_at == 0);
+        }
+
+        THEN("an approve body that is not a JSON object is 400 and the agent stays pending")
+        {
+            for (const char* body : {"[]", "null", "\"x\"", "7"})
+            {
+                INFO("body: " << body);
+                REQUIRE(fx.client.Post("/api/agents/p1/approve", body, "application/json")->status == 400);
+            }
+            REQUIRE_FALSE(fx.store->get_agent("p1")->approved);
+        }
+    }
+}
+
+SCENARIO("A storage fault is a generic 500, not a 400 carrying the database error")
+{
+    GIVEN("an API on a file database whose runbooks table is dropped behind its back")
+    {
+        const auto dir = thewatcher::test::process_temp_dir().path() / "api-validation";
+        std::filesystem::create_directories(dir);
+        const auto db = (dir / "fault.db").string();
+        std::filesystem::remove(db);
+        ApiFixture fx(db);
+        REQUIRE(login_as_default_admin(fx.client));
+        {
+            sqlite3* raw = nullptr;
+            REQUIRE(sqlite3_open(db.c_str(), &raw) == SQLITE_OK);
+            REQUIRE(sqlite3_exec(raw, "DROP TABLE runbooks;", nullptr, nullptr, nullptr) == SQLITE_OK);
+            sqlite3_close(raw);
+        }
+
+        WHEN("a valid runbook is created")
+        {
+            auto res = fx.post("/api/runbooks", json{
+                                                    {"status", "red"                        },
+                                                    {"url",    "https://wiki.example.com/rb"}
+            });
+
+            THEN("the answer is 500 with the generic message and no SQL text")
+            {
+                REQUIRE(res->status == 500);
+                REQUIRE(json::parse(res->body) == json{
+                                                      {"error", "internal error"}
+                });
+            }
+        }
+
+        WHEN("an invalid runbook is created")
+        {
+            auto res = fx.post("/api/runbooks", json{
+                                                    {"status", "purple"                     },
+                                                    {"url",    "https://wiki.example.com/rb"}
+            });
+
+            THEN("it is still a 400 validation error")
+            {
+                REQUIRE(res->status == 400);
             }
         }
     }

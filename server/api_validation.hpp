@@ -8,12 +8,21 @@
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <system_error>
 
 namespace thewatcher::server::validation
 {
+
+// Thrown for input the client got wrong (answered 400 with its message), as
+// opposed to a storage or runtime fault (answered 500 with a generic message).
+class ValidationError : public std::runtime_error
+{
+public:
+    using std::runtime_error::runtime_error;
+};
 
 // Maximum sizes, in bytes for text. Every handler uses these so the same kind
 // of value is limited the same way on every endpoint.

@@ -48,10 +48,10 @@ Every failure uses one shape: `{"error": "<message>"}` with one of:
 | 401 | No valid session, or wrong credentials. |
 | 403 | Signed in but not allowed (role, group scope, cross-origin request). |
 | 404 | The id in the path, or the agent or group id named in the body, does not exist. |
-| 409 | The request conflicts with existing data (duplicate user or group name, public key already bound to another agent). |
+| 409 | The request conflicts with existing data (duplicate user or group name, public key already bound to another agent). A duplicate username that two requests create at the same moment is also 409: the database constraint decides, not a prior lookup. Group creation is idempotent in the store, so two simultaneous requests for one new group name both succeed with the same `group_id`. |
 | 415 | `Content-Type` is not JSON. |
 | 429 | Login throttled. |
-| 500 | Server fault. The message is always `internal error`; the cause is in the server log. |
+| 500 | Server fault, such as a database error. The message is always `internal error`; the cause is in the server log. Input the client got wrong is never a 500, and a database failure is never reported as a 400. |
 
 Validation failures are always `400` (the API does not use `422`). A group user
 asking for an agent that does not exist gets `403`, the same as for an agent in
@@ -123,10 +123,10 @@ under Roles. `404` is returned when the agent does not exist.
 | --- | --- | --- | --- |
 | `GET /api/pending-enrollments` | operator and global | none | Array of agent records awaiting approval. |
 | `GET /api/agents` | viewer | none | Array of approved agents the caller can see, each with `group_ids`. |
-| `POST /api/agents/:id/approve` | operator and global | optional `{group_ids}` (defaults to the Admins group) | `{ok}`. `404` unknown agent or group, `409` public key already bound to another approved agent. The body is validated before the agent is approved. |
+| `POST /api/agents/:id/approve` | operator and global | optional JSON object `{group_ids}` (defaults to the Admins group) | `{ok}`. `400` if the body is not a JSON object, `404` unknown agent or group, `409` public key already bound to another approved agent. The body is validated before the agent is approved. |
 | `POST /api/agents/:id/reject` | operator and global | none | `{ok}`; removes the key from ZAP. `404`. |
 | `POST /api/agents/:id/groups` | operator and global | `{group_ids}` | `{ok}`. `404` unknown agent or group. |
-| `DELETE /api/agents/:id` | operator, agent access | none | `{ok}`. Removes the agent, its metrics, alerts and group links, and in one transaction its silences, maintenance windows, agent runbooks and its id in views, so a re-enrolled agent starts clean. |
+| `DELETE /api/agents/:id` | operator, agent access | none | `{ok}`. Removes the agent, its metrics, alerts and group links, and in one transaction its silences, maintenance windows, agent runbooks and its id in views, so a re-enrolled agent starts clean. A view whose stored config cannot be decoded and mentions the agent makes the delete fail with `500` (nothing is deleted) rather than keeping the id. |
 | `POST /api/agents/:id/command` | operator, agent access | `{command_type, args?}` (`args` is a byte array, at most 4096) | `{ok, command_id}`. `400` unknown `command_type`. |
 | `POST /api/agents/:id/set_interval` | operator, agent access | `{interval_seconds}` | `{ok}`; saved and sent to the agent. |
 | `POST /api/agents/:id/set_process_limit` | operator, agent access | `{limit}` | `{ok}`; saved and sent to the agent. |
@@ -158,7 +158,7 @@ under Roles. `404` is returned when the agent does not exist.
 | `GET /api/alerts` | viewer | `?include_archived=1`, `?limit=`, `?offset=` | Array of alerts the caller can see: `{alert_id, agent_id, indicator, old_status, new_status, message, created_at, acknowledged_by, acknowledged_at, deleted_at, note, escalated_at, runbook_url, runbook_markdown}`. |
 | `GET /api/alerts/unacknowledged` | viewer | `?limit=`, `?offset=` | Same shape, active and unacknowledged only. |
 | `POST /api/alerts/:id/ack` | operator | optional `{note}` | `{ok}`. `404` unknown or archived alert, `403` alert's agent is outside the caller's groups. |
-| `POST /api/alerts/bulk-ack` | operator | `{alert_ids, note?}` | `{ok, count}`. Ids that do not exist, are archived or are outside the caller's groups are skipped and not counted. `400` for a non-integer id or over 1000 ids. |
+| `POST /api/alerts/bulk-ack` | operator | `{alert_ids, note?}` | `{ok, count}`. Ids that do not exist, are archived or are outside the caller's groups are skipped and not counted. `400` for a non-integer id, over 1000 ids or a `note` that is not a string. |
 | `POST /api/alerts/bulk-archive` | operator | `{alert_ids}` | `{ok, count}`, with the same rules. |
 | `DELETE /api/alerts/:id` | operator | none | `{ok}`; archives (soft-deletes) the alert. `404`, `403` as for ack. |
 
@@ -185,8 +185,8 @@ belong to.
 | --- | --- | --- | --- |
 | `GET /api/views` | viewer | none | Array of `{view_id, name, owner_user_id, owner_username, is_public, group_id, agent_ids, created_at}`. |
 | `GET /api/views/:id` | viewer | none | One view. `403` outside the caller's groups, `404`. |
-| `POST /api/views` | operator | `{name, is_public?, group_id?, agent_ids?}` | `201` with the view. `400` over a limit. |
-| `PUT /api/views/:id` | operator; owner or global role | any of `name`, `is_public`, `group_id`, `agent_ids` | The updated view. `403`, `404`. |
+| `POST /api/views` | operator | `{name, is_public?, group_id?, agent_ids?}` | `201` with the view. `400` over a limit or `agent_ids` that is not an array, `404` an agent in `agent_ids` or the `group_id` does not exist. |
+| `PUT /api/views/:id` | operator; owner or global role | any of `name`, `is_public`, `group_id`, `agent_ids` | The updated view. `400` as for create, `403`, `404` the view, or an agent or group the request names does not exist. Only references in the request are checked, so a view holding an old stale id can still be renamed. |
 | `DELETE /api/views/:id` | operator; owner or global role | none | `{ok}`. `403`, `404`. |
 
 ## Runbooks

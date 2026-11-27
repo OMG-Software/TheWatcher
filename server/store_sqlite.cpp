@@ -5,6 +5,7 @@
 #endif
 
 #include "common/SingleLog.hpp"
+#include "view_config.hpp"
 
 #include <nlohmann/json.hpp>
 
@@ -12,6 +13,7 @@
 #include <cctype>
 #include <stdexcept>
 #include <string>
+#include <utility>
 
 #include <sodium.h>
 
@@ -46,7 +48,13 @@ namespace
     void check(int rc, sqlite3* db, const char* ctx)
     {
         if (rc != SQLITE_OK && rc != SQLITE_ROW && rc != SQLITE_DONE)
-            throw std::runtime_error(std::string(ctx) + ": " + sqlite3_errmsg(db));
+        {
+            const auto message = std::string(ctx) + ": " + sqlite3_errmsg(db);
+            const auto extended = sqlite3_extended_errcode(db);
+            if (extended == SQLITE_CONSTRAINT_UNIQUE || extended == SQLITE_CONSTRAINT_PRIMARYKEY)
+                throw UniqueViolation(message);
+            throw std::runtime_error(message);
+        }
     }
 
     std::string text_col(sqlite3_stmt* s, int col)
@@ -649,11 +657,6 @@ void SqliteStore::reject_agent(const std::string& agent_id)
     check(sqlite3_step(st.s), db_, "step reject_agent");
 }
 
-namespace
-{
-    ViewRecord row_to_view(sqlite3_stmt* s); // defined with the view queries below
-} // namespace
-
 void SqliteStore::delete_agent(const std::string& agent_id)
 {
     // Rolls back unless commit() ran, so a failure part-way leaves the agent
@@ -692,28 +695,29 @@ void SqliteStore::delete_agent(const std::string& agent_id)
         check(sqlite3_step(st.s), db_, "step delete_agent");
     }
 
-    // Views keep their agent ids inside config_json: drop the deleted id.
-    std::vector<ViewRecord> affected;
+    // Views keep their agent ids inside config_json: drop the deleted id and
+    // rewrite the row. A config that cannot be decoded and mentions the id
+    // throws, which rolls the whole delete back (see remove_agent_from_view_config).
+    std::vector<std::pair<int64_t, std::string>> rewritten;
     {
         Stmt st;
-        check(sqlite3_prepare_v2(db_,
-                                 "SELECT v.view_id,v.name,v.owner_user_id,'',v.is_public,v.group_id,v.created_at,"
-                                 "v.config_json FROM views v;",
-                                 -1, &st.s, nullptr),
-              db_, "prepare delete_agent views");
+        check(sqlite3_prepare_v2(db_, "SELECT view_id,config_json FROM views;", -1, &st.s, nullptr), db_,
+              "prepare delete_agent views");
         while (sqlite3_step(st.s) == SQLITE_ROW)
         {
-            auto view = row_to_view(st.s);
-            const auto it = std::find(view.agent_ids.begin(), view.agent_ids.end(), agent_id);
-            if (it == view.agent_ids.end())
-                continue;
-            view.agent_ids.erase(std::remove(view.agent_ids.begin(), view.agent_ids.end(), agent_id),
-                                 view.agent_ids.end());
-            affected.push_back(std::move(view));
+            if (auto updated = remove_agent_from_view_config(text_col(st.s, 1), agent_id))
+                rewritten.emplace_back(sqlite3_column_int64(st.s, 0), std::move(*updated));
         }
     }
-    for (const auto& view : affected)
-        update_view(view);
+    for (const auto& [view_id, config_json] : rewritten)
+    {
+        Stmt st;
+        check(sqlite3_prepare_v2(db_, "UPDATE views SET config_json=? WHERE view_id=?;", -1, &st.s, nullptr), db_,
+              "prepare delete_agent view update");
+        sqlite3_bind_text(st.s, 1, config_json.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(st.s, 2, view_id);
+        check(sqlite3_step(st.s), db_, "step delete_agent view update");
+    }
 
     tx.commit();
 }

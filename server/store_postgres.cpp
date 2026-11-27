@@ -3,12 +3,15 @@
 #include "store_postgres.hpp"
 
 #include "common/SingleLog.hpp"
+#include "view_config.hpp"
 
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
 #include <stdexcept>
 #include <string>
+#include <string_view>
+#include <utility>
 
 #include <sodium.h>
 
@@ -48,7 +51,12 @@ namespace
             // Do NOT call PQclear here — the caller wraps res in a Res RAII
             // guard whose destructor will free it during stack unwinding.
             // Calling PQclear here would cause a double-free.
-            throw std::runtime_error(std::string(ctx) + ": " + PQresultErrorMessage(res));
+            const auto message = std::string(ctx) + ": " + PQresultErrorMessage(res);
+            // SQLSTATE 23505 is unique_violation.
+            const char* sqlstate = PQresultErrorField(res, PG_DIAG_SQLSTATE);
+            if (sqlstate != nullptr && std::string_view(sqlstate) == "23505")
+                throw UniqueViolation(message);
+            throw std::runtime_error(message);
         }
     }
 
@@ -708,11 +716,6 @@ void PostgresStore::reject_agent(const std::string& agent_id)
     check_res(res.r, "reject_agent");
 }
 
-namespace
-{
-    ViewRecord pg_row_to_view(PGresult* r, int row); // defined with the view queries below
-} // namespace
-
 void PostgresStore::delete_agent(const std::string& agent_id)
 {
     // Rolls back unless commit() ran, so a failure part-way leaves the agent
@@ -752,25 +755,26 @@ void PostgresStore::delete_agent(const std::string& agent_id)
         check_res(res.r, "delete_agent");
     }
 
-    // Views keep their agent ids inside config_json: drop the deleted id.
-    std::vector<ViewRecord> affected;
+    // Views keep their agent ids inside config_json: drop the deleted id and
+    // rewrite the row. A config that cannot be decoded and mentions the id
+    // throws, which rolls the whole delete back (see remove_agent_from_view_config).
+    std::vector<std::pair<std::string, std::string>> rewritten;
     {
-        Res res(PQexec(conn_,
-                       "SELECT v.view_id,v.name,v.owner_user_id,'',v.is_public,v.group_id,v.created_at,v.config_json "
-                       "FROM views v;"));
+        Res res(PQexec(conn_, "SELECT view_id,config_json FROM views;"));
         check_res(res.r, "delete_agent views");
         for (int i = 0; i < PQntuples(res.r); ++i)
         {
-            auto view = pg_row_to_view(res.r, i);
-            if (std::find(view.agent_ids.begin(), view.agent_ids.end(), agent_id) == view.agent_ids.end())
-                continue;
-            view.agent_ids.erase(std::remove(view.agent_ids.begin(), view.agent_ids.end(), agent_id),
-                                 view.agent_ids.end());
-            affected.push_back(std::move(view));
+            if (auto updated = remove_agent_from_view_config(col(res.r, i, 1), agent_id))
+                rewritten.emplace_back(col(res.r, i, 0), std::move(*updated));
         }
     }
-    for (const auto& view : affected)
-        update_view(view);
+    for (const auto& [view_id, config_json] : rewritten)
+    {
+        const char* view_params[] = {config_json.c_str(), view_id.c_str()};
+        Res res(PQexecParams(conn_, "UPDATE views SET config_json=$1 WHERE view_id=$2::bigint;", 2, nullptr,
+                             view_params, nullptr, nullptr, 0));
+        check_res(res.r, "delete_agent view update");
+    }
 
     tx.commit();
 }

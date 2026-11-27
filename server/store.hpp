@@ -6,11 +6,21 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
 namespace thewatcher::server
 {
+
+// Thrown when a write violates a UNIQUE or PRIMARY KEY constraint (for example
+// a second user with the same name), so the API can answer 409 instead of
+// treating it as a server fault.
+class UniqueViolation : public std::runtime_error
+{
+public:
+    using std::runtime_error::runtime_error;
+};
 
 struct AgentRecord
 {

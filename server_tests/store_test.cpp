@@ -6,6 +6,8 @@
 #include <algorithm>
 #include <filesystem>
 
+#include <sqlite3.h>
+
 using namespace thewatcher;
 using namespace thewatcher::server;
 
@@ -3222,6 +3224,110 @@ SCENARIO("query_alerts filters, joins group access and paginates in the store")
             REQUIRE(store.get_alert(a3).has_value());
             REQUIRE(store.get_alert(a3)->deleted_at == 350);
             REQUIRE_FALSE(store.get_alert(99999).has_value());
+        }
+    }
+}
+
+// ── Review follow-ups ─────────────────────────────────────────────────────────
+
+SCENARIO("A duplicate username raises UniqueViolation")
+{
+    GIVEN("a store with a user")
+    {
+        SqliteStore store(":memory:");
+        store.create_user("alice", "hash", "group_viewer");
+
+        THEN("creating the same name again throws the typed uniqueness error")
+        {
+            REQUIRE_THROWS_AS(store.create_user("alice", "hash", "group_viewer"), UniqueViolation);
+        }
+
+        THEN("create_group is idempotent by name and returns the existing id")
+        {
+            const auto first = store.create_group("ops");
+            REQUIRE(store.create_group("ops") == first);
+        }
+    }
+}
+
+SCENARIO("Deleting an agent never leaves its id in a view with an undecodable config")
+{
+    GIVEN("a file store with a view whose stored config is corrupt and mentions the agent")
+    {
+        const auto path = unique_store_path("corrupt-view.db").string();
+        SqliteStore store(path);
+        store.upsert_agent(make_agent("gone"));
+        ViewRecord view;
+        view.name = "v";
+        view.owner_user_id = 1;
+        view.created_at = 1;
+        view.agent_ids = {"gone"};
+        const auto view_id = store.create_view(view);
+        {
+            sqlite3* raw = nullptr;
+            REQUIRE(sqlite3_open(path.c_str(), &raw) == SQLITE_OK);
+            const auto sql =
+                "UPDATE views SET config_json='{\"agent_ids\":[\"gone\"' WHERE view_id=" + std::to_string(view_id) +
+                ";";
+            REQUIRE(sqlite3_exec(raw, sql.c_str(), nullptr, nullptr, nullptr) == SQLITE_OK);
+            sqlite3_close(raw);
+        }
+
+        WHEN("the agent is deleted")
+        {
+            THEN("the delete fails and rolls back, so the agent still exists")
+            {
+                REQUIRE_THROWS(store.delete_agent("gone"));
+                REQUIRE(store.get_agent("gone").has_value());
+            }
+        }
+    }
+
+    GIVEN("a corrupt view that does not mention the agent")
+    {
+        const auto path = unique_store_path("corrupt-view-other.db").string();
+        SqliteStore store(path);
+        store.upsert_agent(make_agent("gone"));
+        ViewRecord view;
+        view.name = "v";
+        view.owner_user_id = 1;
+        view.created_at = 1;
+        const auto view_id = store.create_view(view);
+        {
+            sqlite3* raw = nullptr;
+            REQUIRE(sqlite3_open(path.c_str(), &raw) == SQLITE_OK);
+            const auto sql = "UPDATE views SET config_json='not json' WHERE view_id=" + std::to_string(view_id) + ";";
+            REQUIRE(sqlite3_exec(raw, sql.c_str(), nullptr, nullptr, nullptr) == SQLITE_OK);
+            sqlite3_close(raw);
+        }
+
+        THEN("the agent is deleted normally")
+        {
+            store.delete_agent("gone");
+            REQUIRE_FALSE(store.get_agent("gone").has_value());
+        }
+    }
+
+    GIVEN("a view whose config keeps other keys next to agent_ids")
+    {
+        SqliteStore store(":memory:");
+        store.upsert_agent(make_agent("gone"));
+        ViewRecord view;
+        view.name = "v";
+        view.owner_user_id = 1;
+        view.group_id = 0;
+        view.created_at = 1;
+        view.agent_ids = {"gone", "stays"};
+        const auto view_id = store.create_view(view);
+
+        WHEN("the agent is deleted")
+        {
+            store.delete_agent("gone");
+
+            THEN("only that id is removed")
+            {
+                REQUIRE(store.get_view(view_id)->agent_ids == std::vector<std::string>{"stays"});
+            }
         }
     }
 }

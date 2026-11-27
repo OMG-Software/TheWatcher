@@ -79,6 +79,17 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - `GET /api/settings` no longer fails with a 500 when a stored numeric setting
   is corrupt, and `/api/uptime` no longer divides by zero for an agent with a
   stored interval of 0 (#67).
+- Error statuses now separate the client's mistakes from server faults:
+  validation errors stay 400, a database failure in a mutation handler is a
+  logged generic 500 instead of a 400 carrying the SQL error, and a duplicate
+  username that loses a race is 409 (the store raises a typed
+  `UniqueViolation`) (#67).
+- Views reject an `agent_ids` that is not an array and answer 404 for an
+  agent or group that does not exist, `bulk-ack` rejects a non-string `note`,
+  and approve rejects a body that is not a JSON object (#67, #69).
+- Deleting an agent no longer silently skips a view whose stored config is
+  malformed: a config that mentions the agent fails the delete and rolls it
+  back (#146).
 - Server config values are validated at load with errors that name the key
   and line (`API_PORT: not a number (line 3)`): port range, offline interval
   range, `DB_TYPE`, a Postgres DSN, and a complete, matching CURVE keypair.
