@@ -1121,6 +1121,22 @@ std::optional<StatusHistoryRow> PostgresStore::latest_status_for_indicator(const
                             col(res.r, 0, 4),       col(res.r, 0, 5), col_int64(res.r, 0, 6)};
 }
 
+std::vector<StatusHistoryRow> PostgresStore::latest_status_per_indicator(const std::string& agent_id)
+{
+    const char* params[] = {agent_id.c_str()};
+    Res res(PQexecParams(conn_,
+                         "SELECT id,agent_id,indicator,old_status,new_status,message,created_at FROM status_history "
+                         "WHERE agent_id=$1 AND id IN (SELECT MAX(id) FROM status_history WHERE agent_id=$1 "
+                         "GROUP BY indicator);",
+                         1, nullptr, params, nullptr, nullptr, 0));
+    check_res(res.r, "latest_status_per_indicator");
+    std::vector<StatusHistoryRow> out;
+    for (int i = 0; i < PQntuples(res.r); ++i)
+        out.push_back({col_int64(res.r, i, 0), col(res.r, i, 1), col(res.r, i, 2), col(res.r, i, 3), col(res.r, i, 4),
+                       col(res.r, i, 5), col_int64(res.r, i, 6)});
+    return out;
+}
+
 std::vector<StatusHistoryRow> PostgresStore::list_status_history(const std::string& agent_id, int limit)
 {
     const auto p_lim = s(limit);

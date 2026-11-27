@@ -259,6 +259,39 @@ SCENARIO("GET /api/agents carries the status engine's latest status per indicato
     }
 }
 
+SCENARIO("indicator_status keeps a stable indicator whose only row is old (issue #114)")
+{
+    GIVEN("an agent with one old disk:/ transition to green and 250 newer cpu transitions")
+    {
+        ApiFixture fx;
+        fx.store->upsert_agent(agent("a1", "", true));
+        using thewatcher::server::StatusHistoryRow;
+        fx.store->insert_status_history(StatusHistoryRow{0, "a1", "disk:/", "grey", "green", "disk ok", 1});
+        for (int i = 0; i < 250; ++i)
+        {
+            const bool high = i % 2 == 0;
+            fx.store->insert_status_history(StatusHistoryRow{0, "a1", "cpu", high ? "green" : "yellow",
+                                                             high ? "yellow" : "green", "cpu flaps", 1000 + i});
+        }
+        REQUIRE(login_as_default_admin(fx.client));
+
+        WHEN("the agent list is requested")
+        {
+            auto res = fx.client.Get("/api/agents");
+
+            THEN("disk:/ is still green and cpu has its newest status")
+            {
+                REQUIRE(res);
+                REQUIRE(res->status == 200);
+                const auto agents = nlohmann::json::parse(res->body);
+                REQUIRE(agents.size() == 1);
+                REQUIRE(agents[0]["indicator_status"]["disk:/"] == "green");
+                REQUIRE(agents[0]["indicator_status"]["cpu"] == "green"); // i=249 is odd: yellow -> green
+            }
+        }
+    }
+}
+
 SCENARIO("Oversize settings values are rejected, not truncated (issue #147)")
 {
     GIVEN("a logged-in global admin")

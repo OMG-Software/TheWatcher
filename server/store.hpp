@@ -227,6 +227,8 @@ public:
     virtual std::optional<StatusHistoryRow> latest_status_for_indicator(const std::string& agent_id,
                                                                         const std::string& indicator) = 0;
     virtual std::vector<StatusHistoryRow> list_status_history(const std::string& agent_id, int limit = 100) = 0;
+    // The newest status row of every indicator the agent has (one row each).
+    virtual std::vector<StatusHistoryRow> latest_status_per_indicator(const std::string& agent_id) = 0;
     virtual std::optional<PendingStatusRecord> get_pending_status(const std::string& agent_id,
                                                                   const std::string& indicator) = 0;
     virtual void set_pending_status(const std::string& agent_id, const std::string& indicator,

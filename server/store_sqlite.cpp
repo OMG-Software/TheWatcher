@@ -1065,6 +1065,23 @@ std::optional<StatusHistoryRow> SqliteStore::latest_status_for_indicator(const s
     return std::nullopt;
 }
 
+std::vector<StatusHistoryRow> SqliteStore::latest_status_per_indicator(const std::string& agent_id)
+{
+    Stmt st;
+    check(sqlite3_prepare_v2(db_,
+                             "SELECT id,agent_id,indicator,old_status,new_status,message,created_at FROM "
+                             "status_history WHERE agent_id=? AND id IN (SELECT MAX(id) FROM status_history "
+                             "WHERE agent_id=? GROUP BY indicator);",
+                             -1, &st.s, nullptr),
+          db_, "prepare latest_status_per_indicator");
+    sqlite3_bind_text(st.s, 1, agent_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st.s, 2, agent_id.c_str(), -1, SQLITE_TRANSIENT);
+    std::vector<StatusHistoryRow> out;
+    while (sqlite3_step(st.s) == SQLITE_ROW)
+        out.push_back(row_to_status(st.s));
+    return out;
+}
+
 std::vector<StatusHistoryRow> SqliteStore::list_status_history(const std::string& agent_id, int limit)
 {
     Stmt st;

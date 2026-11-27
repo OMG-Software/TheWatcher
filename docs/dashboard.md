@@ -373,7 +373,7 @@ The dashboard consumes:
 | `POST /api/login` | Create a session for a local SQLite user. |
 | `POST /api/logout` | Delete the current session. |
 | `GET /api/session` | Return the current authenticated session. |
-| `GET /api/agents` | Approved agent identity, connection, maintenance, settings, groups, timestamps, and `indicator_status` (the status engine's latest status per indicator, from its newest 200 history rows). |
+| `GET /api/agents` | Approved agent identity, connection, maintenance, settings, groups, timestamps, and `indicator_status` (the status engine's latest status per indicator, the newest row per indicator however long ago it changed). |
 | `GET /api/pending-enrollments` | Pending enrollment records for global operators and admins. |
 | `GET /api/metrics` | Latest metrics snapshot per agent. |
 | `GET /api/groups` | List groups. |

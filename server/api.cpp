@@ -1486,11 +1486,11 @@ void ApiServer::setup_routes()
                 item["group_ids"] = store_.get_agent_groups(a.agent_id);
                 // The status engine's verdict per indicator (issue #114), so the
                 // dashboard shows what alerting acted on instead of re-deriving it.
-                // Built from the newest 200 history rows; an indicator whose last
-                // change is older than that window is not listed.
+                // status_history holds transitions, so the newest row of each
+                // indicator is its current status however long ago it changed.
                 json indicator_status = json::object();
-                for (const auto& h : store_.list_status_history(a.agent_id, 200))
-                    indicator_status.emplace(h.indicator, h.new_status); // newest first: first row wins
+                for (const auto& h : store_.latest_status_per_indicator(a.agent_id))
+                    indicator_status[h.indicator] = h.new_status;
                 item["indicator_status"] = std::move(indicator_status);
                 arr.push_back(item);
             }

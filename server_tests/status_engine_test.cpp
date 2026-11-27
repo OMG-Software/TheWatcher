@@ -868,6 +868,59 @@ SCENARIO("classify_percent threshold boundaries: exact values produce the correc
     }
 }
 
+SCENARIO("Network Mbps thresholds and per-agent CPU thresholds decide the status (dashboard no longer classifies)")
+{
+    GIVEN("an approved agent with a custom CPU warning threshold of 50 percent")
+    {
+        SqliteStore store(":memory:");
+        insert_approved_agent(store, "agent-thresholds");
+        auto agent = store.get_agent("agent-thresholds");
+        REQUIRE(agent.has_value());
+        agent->collector_config.cpu.warning_percent = 50.0;
+        store.set_agent_collector_config(agent->agent_id, agent->collector_config);
+        StatusEngine engine(store);
+
+        auto baseline = metrics_with_cpu(10.0);
+        insert_metrics(store, "agent-thresholds", 1000, baseline);
+        engine.evaluate_metrics("agent-thresholds", baseline, 1000);
+
+        WHEN("CPU is 55 percent, below the default warning but above the custom one")
+        {
+            auto sample = metrics_with_cpu(55.0);
+            insert_metrics(store, "agent-thresholds", 2000, sample);
+            engine.evaluate_metrics("agent-thresholds", sample, 2000);
+
+            THEN("cpu is yellow")
+            {
+                auto s = store.latest_status_for_indicator("agent-thresholds", "cpu");
+                REQUIRE(s.has_value());
+                REQUIRE(s->new_status == "yellow");
+            }
+        }
+
+        WHEN("an interface carries exactly 100, 200 and 300 Mbps in turn")
+        {
+            const auto network_status = [&](int64_t at, int64_t bytes_per_sec) {
+                auto sample = metrics_with_cpu(10.0);
+                sample.networks[0].interface_name = "eth0";
+                sample.networks[0].bytes_recv_per_sec = bytes_per_sec;
+                sample.networks[0].bytes_sent_per_sec = 0;
+                insert_metrics(store, "agent-thresholds", at, sample);
+                engine.evaluate_metrics("agent-thresholds", sample, at);
+                return store.latest_status_for_indicator("agent-thresholds", "network:eth0")->new_status;
+            };
+
+            THEN("the status is green below 100, yellow at 100, amber at 200 and red at 300")
+            {
+                REQUIRE(network_status(2000, 12'000'000) == "green");
+                REQUIRE(network_status(3000, 12'500'000) == "yellow");
+                REQUIRE(network_status(4000, 25'000'000) == "amber");
+                REQUIRE(network_status(5000, 37'500'000) == "red");
+            }
+        }
+    }
+}
+
 // ── Direct green → red jump ───────────────────────────────────────────────────
 
 SCENARIO("CPU jumps directly from green to red without intermediate states when readings=1")
