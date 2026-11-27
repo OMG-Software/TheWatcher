@@ -78,6 +78,23 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   unprivileged writers, and root-reserved blocks count as used (#158).
 - Encoding a frame with an empty payload no longer passes a null pointer to
   libcbor (undefined behaviour reported by UBSan on every heartbeat) (#162).
+- The CPU collector reports a real usage value on its first `update()` and
+  after a collector restart. The constructor takes a baseline and the first
+  update waits until it is at least 100 ms old. Calls closer than 100 ms to
+  the previous sample report the previous result instead of a few-tick
+  delta (#97).
+- Memory collector swap figures can no longer underflow. Windows reads the
+  real page files (`EnumPageFilesW`) instead of the commit limit (#94).
+  FreeBSD sums `vm.swap_info` instead of `vm.swap_reserved` (#159). A host
+  with no swap reports 0/0/0, and every subtraction is clamped (the Linux
+  `used_bytes` too).
+- CPU usage is collected on FreeBSD (`kern.cp_time`, `kern.cp_times`),
+  OpenBSD (`KERN_CPTIME`, `KERN_CPTIME2`) and NetBSD (`kern.cp_time`), with
+  load averages from `getloadavg`. Memory is collected on OpenBSD
+  (`VM_UVMEXP`) and NetBSD (`VM_UVMEXP2`). The OpenBSD and NetBSD code has
+  not been compiled yet. Disk and process collectors are still open (part
+  of #93).
+- Added behavioural tests for the CPU and memory collectors (part of #137).
 - The Linux CI build (GCC 11, `-O3 -Werror`) compiles again:
   `protocol_security_test` builds its CBOR payloads in a buffer sized up
   front instead of appending with `vector::insert`, which tripped a GCC 11
