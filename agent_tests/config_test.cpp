@@ -717,3 +717,66 @@ SCENARIO("The saved config holding the CURVE secret key is restricted to its own
         fs::remove(path);
     }
 }
+
+SCENARIO("Agent config LOG_* keys control the log level and rotation (issue #99)")
+{
+    GIVEN("a config with no LOG_* keys")
+    {
+        auto path = thewatcher::test::process_temp_dir().path() / "thewatcher_test_agent_log_default.conf";
+        {
+            std::ofstream f(path);
+            f << "COLLECTION_INTERVAL=30\n";
+        }
+
+        THEN("logging defaults to INFO with 10 MiB files and 5 backups")
+        {
+            const auto cfg = AgentConfig::load_or_create(path);
+            REQUIRE(cfg.log.level == thewatcher::logging::LogLevel::L_INFO);
+            REQUIRE(cfg.log.max_size_mib == 10);
+            REQUIRE(cfg.log.max_files == 5);
+        }
+        fs::remove(path);
+    }
+
+    GIVEN("a config that sets all LOG_* keys")
+    {
+        auto path = thewatcher::test::process_temp_dir().path() / "thewatcher_test_agent_log_set.conf";
+        {
+            std::ofstream f(path);
+            f << "LOG_LEVEL=warning\nLOG_MAX_SIZE_MB=0\nLOG_MAX_FILES=1\n";
+        }
+
+        WHEN("the config is loaded, saved and loaded again")
+        {
+            auto cfg = AgentConfig::load_or_create(path);
+            cfg.save(path);
+            const auto reloaded = AgentConfig::load_or_create(path);
+
+            THEN("the values are read and survive the round trip")
+            {
+                REQUIRE(cfg.log.level == thewatcher::logging::LogLevel::L_WARNING);
+                REQUIRE(cfg.log.max_size_mib == 0);
+                REQUIRE(cfg.log.max_files == 1);
+                REQUIRE(reloaded.log.level == thewatcher::logging::LogLevel::L_WARNING);
+                REQUIRE(reloaded.log.max_size_mib == 0);
+                REQUIRE(reloaded.log.max_files == 1);
+            }
+        }
+        fs::remove(path);
+    }
+
+    GIVEN("a config with an invalid LOG_MAX_FILES")
+    {
+        auto path = thewatcher::test::process_temp_dir().path() / "thewatcher_test_agent_log_bad.conf";
+        {
+            std::ofstream f(path);
+            f << "LOG_MAX_FILES=lots\n";
+        }
+
+        THEN("loading fails with a clear error")
+        {
+            REQUIRE_THROWS_AS(AgentConfig::load_or_create(path), std::invalid_argument);
+        }
+        fs::remove(path);
+    }
+}
