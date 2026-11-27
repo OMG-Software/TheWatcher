@@ -52,27 +52,44 @@ void require_status(const httplib::Result& res, int status)
     REQUIRE(res->status == status);
 }
 
-// Creates a group operator inside the "Admins" group (the group the approve
-// flow assigns agents to) and leaves the admin session logged in.
+// The id of the built-in "Admins" group, read through the admin session.
+int64_t admins_group_id(ServerFixture& fx)
+{
+    auto res = fx.client.Get("/api/groups");
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    for (const auto& g : json::parse(res->body))
+    {
+        if (g.value("name", "") == "Admins")
+            return g.value("group_id", int64_t{0});
+    }
+    FAIL("no Admins group");
+    return 0;
+}
+
+// Enrolls `agent_id` and approves it into the "Admins" group; approval must
+// name its groups, and the group operator below belongs to this one.
+bool enroll_and_approve_into_admins(ServerFixture& fx, const std::string& agent_id)
+{
+    return fx.enroll_and_approve(agent_id, "collector-test-host",
+                                 json{
+                                     {"group_ids", json::array({admins_group_id(fx)})}
+    }
+                                     .dump());
+}
+
+// Creates a group operator inside the "Admins" group and leaves the admin
+// session logged in.
 void create_admins_group_operator(ServerFixture& fx, const std::string& username)
 {
-    std::optional<int64_t> admins_group_id;
-    {
-        auto res = fx.client.Get("/api/groups");
-        REQUIRE(res);
-        REQUIRE(res->status == 200);
-        for (const auto& g : json::parse(res->body))
-            if (g.value("name", "") == "Admins")
-                admins_group_id = g.value("group_id", int64_t{0});
-    }
-    REQUIRE(admins_group_id.has_value());
+    const auto admins_group_id_value = admins_group_id(fx);
 
     auto created = fx.client.Post("/api/users",
                                   json{
-                                      {"username",  username                       },
-                                      {"password",  "operatorpw!"                  },
-                                      {"role",      "group_operator"               },
-                                      {"group_ids", json::array({*admins_group_id})}
+                                      {"username",  username                            },
+                                      {"password",  "operatorpw!"                       },
+                                      {"role",      "group_operator"                    },
+                                      {"group_ids", json::array({admins_group_id_value})}
     }
                                       .dump(),
                                   "application/json");
@@ -132,7 +149,7 @@ SCENARIO("Non-admin operators cannot configure log monitor paths")
     {
         ServerFixture fx;
         fx.start_and_login();
-        REQUIRE(fx.enroll_and_approve("cfg-sec-agent-2", "collector-test-host"));
+        REQUIRE(enroll_and_approve_into_admins(fx, "cfg-sec-agent-2"));
         create_admins_group_operator(fx, "log_op");
 
         // Switch the HTTP session to the group operator.
@@ -166,7 +183,7 @@ SCENARIO("Operators keep admin-set log monitors intact")
     {
         ServerFixture fx;
         fx.start_and_login();
-        REQUIRE(fx.enroll_and_approve("cfg-sec-agent-3", "collector-test-host"));
+        REQUIRE(enroll_and_approve_into_admins(fx, "cfg-sec-agent-3"));
         require_status(post_collector_config(fx.client, "cfg-sec-agent-3", json::array({valid_log_entry()})), 200);
         create_admins_group_operator(fx, "log_op3");
 

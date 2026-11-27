@@ -90,6 +90,7 @@ private:
 
     std::queue<PendingCommand> cmd_queue_;
     std::mutex cmd_mutex_;
+    std::mutex config_mutex_; // serialises Configure saves (revision check + write)
 
     // Login failure tracker for rate limiting (M-1): (client_ip, username) -> (fail_count, window_start_ms)
     std::unordered_map<std::string, std::pair<int, int64_t>> login_failures_;

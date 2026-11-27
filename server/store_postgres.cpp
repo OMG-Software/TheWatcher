@@ -147,6 +147,54 @@ namespace
         return v ? "true" : "false";
     }
 
+    // RAII transaction: rolls back on destruction unless commit() was called.
+    class Transaction
+    {
+    public:
+        explicit Transaction(PGconn* conn)
+            : conn_(conn)
+        {
+            Res begin(PQexec(conn_, "BEGIN"));
+            check_res(begin.r, "begin");
+        }
+        ~Transaction()
+        {
+            if (!committed_)
+                Res rollback(PQexec(conn_, "ROLLBACK"));
+        }
+        Transaction(const Transaction&) = delete;
+        Transaction& operator=(const Transaction&) = delete;
+
+        void commit()
+        {
+            Res done(PQexec(conn_, "COMMIT"));
+            check_res(done.r, "commit");
+            committed_ = true;
+        }
+
+    private:
+        PGconn* conn_;
+        bool committed_ = false;
+    };
+
+    // Replaces an agent's group rows. The caller owns the transaction.
+    void write_agent_groups(PGconn* conn, const std::string& agent_id, const std::vector<int64_t>& group_ids)
+    {
+        const char* del_params[] = {agent_id.c_str()};
+        Res del(PQexecParams(conn, "DELETE FROM agent_groups WHERE agent_id=$1;", 1, nullptr, del_params, nullptr,
+                             nullptr, 0));
+        check_res(del.r, "set_agent_groups delete");
+        for (auto gid : group_ids)
+        {
+            const auto p_gid = s(gid);
+            const char* params[] = {agent_id.c_str(), p_gid.c_str()};
+            Res ins(PQexecParams(conn,
+                                 "INSERT INTO agent_groups(agent_id,group_id) VALUES($1,$2) ON CONFLICT DO NOTHING;", 2,
+                                 nullptr, params, nullptr, nullptr, 0));
+            check_res(ins.r, "set_agent_groups insert");
+        }
+    }
+
     // Strip the password value from a libpq connection string so it is safe
     // to include in log output.
     std::string redact_dsn(const std::string& dsn)
@@ -707,6 +755,41 @@ void PostgresStore::reject_agent(const std::string& agent_id)
     check_res(res.r, "reject_agent");
 }
 
+bool PostgresStore::approve_pending_agent(const std::string& agent_id, const std::vector<int64_t>& group_ids)
+{
+    Transaction tx(conn_);
+    const char* params[] = {agent_id.c_str()};
+    Res res(PQexecParams(
+        conn_,
+        "UPDATE agents SET approved=TRUE,rejected=FALSE WHERE agent_id=$1 AND approved=FALSE AND rejected=FALSE;", 1,
+        nullptr, params, nullptr, nullptr, 0));
+    check_res(res.r, "approve_pending_agent");
+    if (std::string(PQcmdTuples(res.r)) == "0")
+        return false; // unknown, approved or rejected: the guard rolls back
+    write_agent_groups(conn_, agent_id, group_ids);
+    tx.commit();
+    return true;
+}
+
+void PostgresStore::save_agent_config(const AgentRecord& rec, const std::optional<std::vector<int64_t>>& group_ids)
+{
+    Transaction tx(conn_);
+    const auto cfg_json = nlohmann::json(rec.collector_config).dump();
+    const auto p_interval = s(rec.collection_interval);
+    const auto p_heartbeat = s(rec.heartbeat_interval);
+    const auto p_limit = s(rec.process_limit);
+    const char* params[] = {p_interval.c_str(), p_heartbeat.c_str(),          p_limit.c_str(),
+                            cfg_json.c_str(),   rec.runbook_markdown.c_str(), rec.agent_id.c_str()};
+    Res res(PQexecParams(conn_,
+                         "UPDATE agents SET collection_interval=$1,heartbeat_interval=$2,process_limit=$3,"
+                         "collector_config_json=$4,runbook_markdown=$5 WHERE agent_id=$6;",
+                         6, nullptr, params, nullptr, nullptr, 0));
+    check_res(res.r, "save_agent_config");
+    if (group_ids)
+        write_agent_groups(conn_, rec.agent_id, *group_ids);
+    tx.commit();
+}
+
 void PostgresStore::delete_agent(const std::string& agent_id)
 {
     const char* params[] = {agent_id.c_str()};
@@ -829,18 +912,9 @@ std::vector<int64_t> PostgresStore::get_agent_groups(const std::string& agent_id
 
 void PostgresStore::set_agent_groups(const std::string& agent_id, const std::vector<int64_t>& group_ids)
 {
-    const char* del_params[] = {agent_id.c_str()};
-    Res del(PQexecParams(conn_, "DELETE FROM agent_groups WHERE agent_id=$1;", 1, nullptr, del_params, nullptr, nullptr,
-                         0));
-    check_res(del.r, "set_agent_groups delete");
-    for (auto gid : group_ids)
-    {
-        const auto p_gid = s(gid);
-        const char* params[] = {agent_id.c_str(), p_gid.c_str()};
-        Res ins(PQexecParams(conn_, "INSERT INTO agent_groups(agent_id,group_id) VALUES($1,$2) ON CONFLICT DO NOTHING;",
-                             2, nullptr, params, nullptr, nullptr, 0));
-        check_res(ins.r, "set_agent_groups insert");
-    }
+    Transaction tx(conn_);
+    write_agent_groups(conn_, agent_id, group_ids);
+    tx.commit();
 }
 
 // ── Users ─────────────────────────────────────────────────────────────────────

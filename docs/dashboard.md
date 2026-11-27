@@ -221,14 +221,19 @@ changes which users can see its alerts.
 The Agents view starts with Pending Enrollments for global operators and global
 admins, then shows Agent Management below it.
 
-Pending enrollment rows show unapproved agents awaiting approval. The Approve
-button currently always sends the first group in the group list (or no group
-when there are none); there is no group picker, so use Configure afterwards to
-change groups. Reject marks the enrollment rejected. Approve/Reject buttons
-disappear once an enrollment is decided.
+Pending enrollment rows show unapproved agents awaiting approval. Each row has
+a Group picker; it starts at "No group (global users only)" and the operator has
+to pick a group on purpose, because the approval names its groups explicitly. Reject
+marks the enrollment rejected. Approve/Reject buttons disappear once an
+enrollment is decided.
 
 Agent Management handles approved agents:
 
+- the Configure modal's Access section lists one checkbox per group, so an agent
+  in several groups keeps every membership when saved; group users see them
+  read-only. Saving sends the `config_revision` the modal opened with; if
+  someone else saved the agent in the meantime the server answers 409 and the
+  modal shows the message (close and reopen it to load their changes);
 - approved agents show command buttons, then Configure, then Delete;
 - approved agent identity shows the hostname, primary non-loopback IP address,
   and agent id;
@@ -292,15 +297,18 @@ The Views page lists the custom views the API returns for the current user,
 with name, owner, agent count, Public/Private flag, group and creation date.
 Open applies the view as a filter on the Monitoring page (the URL hash becomes
 `#view-<id>`, so it can be bookmarked). Operators can create views (name,
-agents, Public flag, group). Edit and Delete are shown only to operators who
-own the view, or to global operators and admins.
+agents, Public flag, group). Edit and Delete are shown to global operators and
+admins, to the view's owner, and to group admins and operators for views of their
+own groups.
 
 The Views page supports group assignment when a view is created or edited.
 Global account types can see all views and all group choices ("No group" is
-only offered to them). Group account types only receive their assigned groups
-from the API and only see views assigned to those groups; public views from
-other groups are not returned. Agents inside a view are still filtered by the
-same agent visibility rules.
+only offered to them). Group account types see the views of their groups, and
+public or own views that have no group; public views of another group are not
+shown. The agent list of a view only contains the agents the user can access.
+A `#view-<id>` bookmark to a view that no longer exists, or that the user cannot
+open, is dropped with a notice instead of filtering the page to nothing. The
+full policy is in [authorization.md](authorization.md).
 
 ### Silences
 

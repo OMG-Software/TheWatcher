@@ -773,6 +773,86 @@ namespace
         return user_group_set(store, session.user_id).contains(group_id);
     }
 
+    // Visibility of a view, evaluated here and nowhere else (not in SQL):
+    //  - global roles see every view;
+    //  - a grouped view (group_id > 0) is visible to the members of that group;
+    //  - an ungrouped view (group_id 0, which includes views that predate group
+    //    scoping) is visible to its owner, and to every signed-in user when it
+    //    is public.
+    // is_public has no effect on a grouped view: group membership decides.
+    bool view_visible_to_session(Store& store, const SessionRecord& session, const ViewRecord& view)
+    {
+        if (is_global_role(session.role))
+            return true;
+        if (view.group_id > 0)
+            return user_group_set(store, session.user_id).contains(view.group_id);
+        return view.is_public || view.owner_user_id == session.user_id;
+    }
+
+    // Who may edit or delete a view. The caller already holds an operator
+    // role, so a non-global session here is a group admin or group operator:
+    // they manage views of their own groups whoever wrote them, and views they
+    // own. Public ungrouped views stay with their owner and global operators.
+    bool can_modify_view(Store& store, const SessionRecord& session, const ViewRecord& view)
+    {
+        if (is_global_role(session.role))
+            return true;
+        if (!view_visible_to_session(store, session, view))
+            return false;
+        return view.owner_user_id == session.user_id || view.group_id > 0;
+    }
+
+    // Reads a JSON array of group ids; anything else is the caller's mistake.
+    std::vector<int64_t> parse_group_ids(const json& value)
+    {
+        if (!value.is_array())
+            throw std::invalid_argument("group_ids must be an array of group ids");
+        std::vector<int64_t> ids;
+        for (const auto& item : value)
+        {
+            if (!item.is_number_integer())
+                throw std::invalid_argument("group_ids must be an array of group ids");
+            ids.push_back(item.get<int64_t>());
+        }
+        return ids;
+    }
+
+    // Throws std::invalid_argument naming the first id that is not a group.
+    void require_existing_groups(Store& store, const std::vector<int64_t>& group_ids)
+    {
+        std::unordered_set<int64_t> known;
+        for (const auto& group : store.list_groups())
+            known.insert(group.group_id);
+        for (const auto group_id : group_ids)
+        {
+            if (!known.contains(group_id))
+                throw std::invalid_argument("unknown group id " + std::to_string(group_id));
+        }
+    }
+
+    // A version of everything the Configure modal saves, so a save made from
+    // a stale snapshot can be refused (issue #112). It is a hash of the saved
+    // fields rather than a stored counter: liveness updates (last_seen,
+    // connected) must not count as a conflicting edit.
+    std::string agent_config_revision(const AgentRecord& rec, std::vector<int64_t> group_ids)
+    {
+        std::sort(group_ids.begin(), group_ids.end());
+        const json fields = {
+            {"collection_interval", rec.collection_interval},
+            {"heartbeat_interval",  rec.heartbeat_interval },
+            {"process_limit",       rec.process_limit      },
+            {"collector_config",    rec.collector_config   },
+            {"runbook_markdown",    rec.runbook_markdown   },
+            {"group_ids",           group_ids              },
+        };
+        const auto text = fields.dump(-1, ' ', false, json::error_handler_t::replace);
+        std::array<unsigned char, crypto_hash_sha256_BYTES> digest{};
+        crypto_hash_sha256(digest.data(), reinterpret_cast<const unsigned char*>(text.data()), text.size());
+        std::array<char, crypto_hash_sha256_BYTES * 2 + 1> hex{};
+        sodium_bin2hex(hex.data(), hex.size(), digest.data(), digest.size());
+        return hex.data();
+    }
+
     // Serialises body as the response. Issue #147: invalid UTF-8 already in
     // the database (for example a note cut by an older version) is replaced
     // with U+FFFD instead of throwing and failing the whole list for everyone.
@@ -1449,8 +1529,11 @@ void ApiServer::setup_routes()
         });
     });
 
+    // Pending agents belong to no group yet, so any global role may read them
+    // (a global viewer included) and group roles may not. Deciding on them
+    // (approve/reject) stays with global operators.
     http_->Get("/api/pending-enrollments", [this](const httplib::Request& req, httplib::Response& res) {
-        auto session = require_role(req, res, "operator");
+        auto session = require_role(req, res, "viewer");
         if (!session)
             return;
         if (!is_global_role(session->role))
@@ -1483,7 +1566,9 @@ void ApiServer::setup_routes()
                 if (!can_access_agent(*session, a.agent_id))
                     continue;
                 auto item = agent_to_json(a);
-                item["group_ids"] = store_.get_agent_groups(a.agent_id);
+                const auto group_ids = store_.get_agent_groups(a.agent_id);
+                item["group_ids"] = group_ids;
+                item["config_revision"] = agent_config_revision(a, group_ids);
                 arr.push_back(item);
             }
             set_json(res, arr);
@@ -1517,11 +1602,45 @@ void ApiServer::setup_routes()
         try
         {
             auto id = req.path_params.at("id");
+            if (!is_json_content_type(req))
+            {
+                res.status = 415;
+                set_json(res, json{
+                                  {"error", "Content-Type must be application/json"}
+                });
+                return;
+            }
+            const auto pending = store_.get_agent(id);
+            if (!pending)
+            {
+                res.status = 404;
+                set_json(res, json{
+                                  {"error", "agent not found"}
+                });
+                return;
+            }
+
+            // Validate everything before changing anything (issue #63). The
+            // body must name the groups explicitly: [] means "no group",
+            // visible to global roles only. There is no default group.
+            const auto body = json::parse(req.body);
+            if (!body.is_object() || !body.contains("group_ids"))
+                throw std::invalid_argument("group_ids is required (use [] for no group)");
+            const auto group_ids = parse_group_ids(body.at("group_ids"));
+            require_existing_groups(store_, group_ids);
+            if (pending->approved || pending->rejected)
+            {
+                res.status = 409;
+                set_json(res, json{
+                                  {"error", "agent is not pending"}
+                });
+                return;
+            }
             // A CURVE key may be bound to one approved agent only: approving a
             // second record with the same key would rebind it in ZAP and cut
             // the original agent off. Enrollment already refuses duplicates;
             // this also covers records stored before that check existed.
-            if (auto pending = store_.get_agent(id); pending && !pending->curve_public_key_z85.empty())
+            if (!pending->curve_public_key_z85.empty())
             {
                 for (const auto& other : store_.list_approved_agents())
                 {
@@ -1537,53 +1656,47 @@ void ApiServer::setup_routes()
                     }
                 }
             }
-            LOGF_INFO("Approving agent id=%s", id.c_str());
-            store_.approve_agent(id);
-            std::vector<int64_t> group_ids;
-            if (!req.body.empty())
+
+            LOGF_INFO("Approving agent id=%s group_count=%zu", id.c_str(), group_ids.size());
+            // Approval and group membership are one store transaction; false
+            // means another request approved or rejected the agent first.
+            if (!store_.approve_pending_agent(id, group_ids))
             {
-                auto body = json::parse(req.body);
-                if (body.contains("group_ids"))
-                    group_ids = body["group_ids"].get<std::vector<int64_t>>();
+                res.status = 409;
+                set_json(res, json{
+                                  {"error", "agent is not pending"}
+                });
+                return;
             }
-            if (group_ids.empty())
-            {
-                auto groups = store_.list_groups();
-                for (const auto& group : groups)
-                {
-                    if (group.name == "Admins")
-                    {
-                        group_ids.push_back(group.group_id);
-                        break;
-                    }
-                }
-            }
-            store_.set_agent_groups(id, group_ids);
-            auto rec = store_.get_agent(id);
-            if (rec)
-            {
-                // SEC-04: bind the key to the agent it belongs to so ZAP can
-                // report the authenticated identity for the data plane.
-                zap_.add_key(rec->curve_public_key_z85, rec->agent_id);
-                LOGF_DEBUG("Approved agent key added to ZAP id=%s", id.c_str());
-            }
-            res.set_content(
-                json{
-                    {"ok", true}
-            }
-                    .dump(),
-                "application/json");
+            // SEC-04: bind the key to the agent it belongs to so ZAP can
+            // report the authenticated identity for the data plane.
+            zap_.add_key(pending->curve_public_key_z85, pending->agent_id);
+            LOGF_DEBUG("Approved agent key added to ZAP id=%s", id.c_str());
+            set_json(res, json{
+                              {"ok", true}
+            });
+        }
+        catch (const json::exception& e)
+        {
+            res.status = 400;
+            set_json(res, json{
+                              {"error", std::string("invalid request body: ") + e.what()}
+            });
+        }
+        catch (const std::invalid_argument& e)
+        {
+            res.status = 400;
+            set_json(res, json{
+                              {"error", e.what()}
+            });
         }
         catch (const std::exception& e)
         {
             LOGF_WARNING("POST /api/agents/:id/approve failed: %s", e.what());
             res.status = 500;
-            res.set_content(
-                json{
-                    {"error", e.what()}
-            }
-                    .dump(),
-                "application/json");
+            set_json(res, json{
+                              {"error", e.what()}
+            });
         }
     });
 
@@ -1647,8 +1760,17 @@ void ApiServer::setup_routes()
         try
         {
             auto id = req.path_params.at("id");
+            if (!store_.get_agent(id))
+            {
+                res.status = 404;
+                set_json(res, json{
+                                  {"error", "agent not found"}
+                });
+                return;
+            }
             auto body = json::parse(req.body);
-            auto group_ids = body.at("group_ids").get<std::vector<int64_t>>();
+            auto group_ids = parse_group_ids(body.at("group_ids"));
+            require_existing_groups(store_, group_ids);
             store_.set_agent_groups(id, group_ids);
             LOGF_INFO("Updated agent groups id=%s group_count=%zu", id.c_str(), group_ids.size());
             set_json(res, json{
@@ -1986,6 +2108,9 @@ void ApiServer::setup_routes()
             if (!session)
                 return;
 
+            // Held from the revision check to the write, so two saves that
+            // carry the same revision cannot both pass the check (issue #112).
+            std::lock_guard<std::mutex> config_lock(config_mutex_);
             auto rec = store_.get_agent(id);
             if (!rec)
             {
@@ -2027,6 +2152,49 @@ void ApiServer::setup_routes()
                 return;
             }
 
+            // Issue #62: group changes are explicit and validated. Only global
+            // roles change an agent's groups; a group user may resubmit the
+            // current list (the modal always sends it) but not alter it.
+            std::optional<std::vector<int64_t>> new_groups;
+            const auto current_groups = store_.get_agent_groups(id);
+            if (body.contains("group_ids"))
+            {
+                auto requested = parse_group_ids(body.at("group_ids"));
+                require_existing_groups(store_, requested);
+                if (is_global_role(session->role))
+                    new_groups = requested;
+                else
+                {
+                    auto sorted_requested = requested;
+                    auto sorted_current = current_groups;
+                    std::sort(sorted_requested.begin(), sorted_requested.end());
+                    sorted_requested.erase(std::unique(sorted_requested.begin(), sorted_requested.end()),
+                                           sorted_requested.end());
+                    std::sort(sorted_current.begin(), sorted_current.end());
+                    if (sorted_requested != sorted_current)
+                    {
+                        res.status = 403;
+                        set_json(res, json{
+                                          {"error", "only global users can change an agent's groups"}
+                        });
+                        return;
+                    }
+                }
+            }
+
+            // Issue #112: refuse a save made from a stale snapshot. A request
+            // without config_revision is applied unconditionally.
+            if (body.contains("config_revision") &&
+                body.at("config_revision").get<std::string>() != agent_config_revision(*rec, current_groups))
+            {
+                res.status = 409;
+                set_json(res, json{
+                                  {"error", "this agent's configuration was changed by someone else; reload it and "
+                                            "apply your edits again"}
+                });
+                return;
+            }
+
             rec->collection_interval = interval;
             rec->heartbeat_interval = heartbeat_interval;
             rec->process_limit = process_limit;
@@ -2041,14 +2209,8 @@ void ApiServer::setup_routes()
                     throw std::runtime_error("runbook_markdown must be 65536 bytes or fewer");
                 rec->runbook_markdown = std::move(markdown);
             }
-            store_.upsert_agent(*rec);
-            store_.set_agent_collector_config(id, config);
-            if (body.contains("group_ids"))
-            {
-                auto group_ids = body.at("group_ids").get<std::vector<int64_t>>();
-                if (is_global_role(session->role))
-                    store_.set_agent_groups(id, group_ids);
-            }
+            // One transaction for the config and the groups.
+            store_.save_agent_config(*rec, new_groups);
             LOGF_INFO("Updated collector config id=%s interval=%d heartbeat_interval=%d process_limit=%d "
                       "disk_configs=%zu network_configs=%zu "
                       "process_watches=%zu",
@@ -2232,7 +2394,8 @@ void ApiServer::setup_routes()
         json arr = json::array();
         for (const auto& w : windows)
         {
-            if (is_global_role(session->role) || (w.agent_id != "*" && can_access_agent(*session, w.agent_id)))
+            // A "*" window covers every agent, so group users see it too (read-only).
+            if (is_global_role(session->role) || w.agent_id == "*" || can_access_agent(*session, w.agent_id))
                 arr.push_back(maintenance_window_to_json(w));
         }
         set_json(res, arr);
@@ -2703,9 +2866,9 @@ void ApiServer::setup_routes()
         }
     });
 
-    // GET /api/silences — list active and future silence rules (operator+)
+    // GET /api/silences — list active and future silence rules (viewer+)
     http_->Get("/api/silences", [this](const httplib::Request& req, httplib::Response& res) {
-        auto session = require_role(req, res, "operator");
+        auto session = require_role(req, res, "viewer");
         if (!session)
             return;
         auto silences = store_.list_silences();
@@ -2859,19 +3022,52 @@ void ApiServer::setup_routes()
         };
     };
 
-    // GET /api/views — list views accessible to current user (own + public)
-    http_->Get("/api/views", [this, view_to_json](const httplib::Request& req, httplib::Response& res) {
+    // A view as the session may see it: group-scoped users only get the agent
+    // ids they can access themselves (issue #163), so a view never reveals an
+    // agent of another group.
+    auto view_for_session = [this, view_to_json](const SessionRecord& session, const ViewRecord& v) -> json {
+        auto out = view_to_json(v);
+        if (!is_global_role(session.role))
+        {
+            json visible_ids = json::array();
+            for (const auto& agent_id : v.agent_ids)
+            {
+                if (can_access_agent(session, agent_id))
+                    visible_ids.push_back(agent_id);
+            }
+            out["agent_ids"] = std::move(visible_ids);
+        }
+        return out;
+    };
+
+    // Checks the group a view is being given. Global operators may use group 0
+    // (no group) or any existing group; group users only their own groups.
+    auto require_assignable_view_group = [this](const SessionRecord& session, int64_t group_id) {
+        if (is_global_role(session.role))
+        {
+            if (group_id < 0)
+                throw std::invalid_argument("group_id must not be negative");
+            if (group_id > 0)
+                require_existing_groups(store_, {group_id});
+            return;
+        }
+        const auto groups = store_.get_user_groups(session.user_id);
+        if (std::find(groups.begin(), groups.end(), group_id) == groups.end())
+            throw std::invalid_argument("view group is outside the user's groups");
+    };
+
+    // GET /api/views — the views this session may see (see view_visible_to_session)
+    http_->Get("/api/views", [this, view_for_session](const httplib::Request& req, httplib::Response& res) {
         try
         {
             auto session = require_role(req, res, "viewer");
             if (!session)
                 return;
-            auto rows = store_.list_views(is_global_role(session->role) ? 0 : session->user_id);
             json arr = json::array();
-            for (const auto& v : rows)
+            for (const auto& v : store_.list_views(0))
             {
-                if (group_visible_to_session(store_, *session, v.group_id))
-                    arr.push_back(view_to_json(v));
+                if (view_visible_to_session(store_, *session, v))
+                    arr.push_back(view_for_session(*session, v));
             }
             set_json(res, arr);
         }
@@ -2886,7 +3082,8 @@ void ApiServer::setup_routes()
     });
 
     // POST /api/views — create a view (operator+)
-    http_->Post("/api/views", [this, view_to_json](const httplib::Request& req, httplib::Response& res) {
+    http_->Post("/api/views", [this, view_for_session, require_assignable_view_group](const httplib::Request& req,
+                                                                                      httplib::Response& res) {
         try
         {
             auto session = require_role(req, res, "operator");
@@ -2900,12 +3097,7 @@ void ApiServer::setup_routes()
             rec.owner_user_id = session->user_id;
             rec.is_public = body.value("is_public", false);
             rec.group_id = body.value("group_id", static_cast<int64_t>(0));
-            if (!is_global_role(session->role))
-            {
-                const auto groups = store_.get_user_groups(session->user_id);
-                if (std::find(groups.begin(), groups.end(), rec.group_id) == groups.end())
-                    throw std::runtime_error("view group is outside the user's groups");
-            }
+            require_assignable_view_group(*session, rec.group_id);
             if (body.contains("agent_ids") && body["agent_ids"].is_array())
                 rec.agent_ids = body["agent_ids"].get<std::vector<std::string>>();
             // SEC-11: a view may only reference agents its creator can see.
@@ -2922,7 +3114,7 @@ void ApiServer::setup_routes()
             rec.view_id = id;
             rec.owner_username = session->username;
             res.status = 201;
-            set_json(res, view_to_json(rec));
+            set_json(res, view_for_session(*session, rec));
         }
         catch (const std::exception& e)
         {
@@ -2935,7 +3127,7 @@ void ApiServer::setup_routes()
     });
 
     // GET /api/views/:id
-    http_->Get("/api/views/:id", [this, view_to_json](const httplib::Request& req, httplib::Response& res) {
+    http_->Get("/api/views/:id", [this, view_for_session](const httplib::Request& req, httplib::Response& res) {
         try
         {
             auto session = require_role(req, res, "viewer");
@@ -2951,7 +3143,7 @@ void ApiServer::setup_routes()
                 });
                 return;
             }
-            if (!group_visible_to_session(store_, *session, v->group_id))
+            if (!view_visible_to_session(store_, *session, *v))
             {
                 res.status = 403;
                 set_json(res, json{
@@ -2959,7 +3151,7 @@ void ApiServer::setup_routes()
                 });
                 return;
             }
-            set_json(res, view_to_json(*v));
+            set_json(res, view_for_session(*session, *v));
         }
         catch (const std::exception& e)
         {
@@ -2970,8 +3162,9 @@ void ApiServer::setup_routes()
         }
     });
 
-    // PUT /api/views/:id — update (owner or admin)
-    http_->Put("/api/views/:id", [this, view_to_json](const httplib::Request& req, httplib::Response& res) {
+    // PUT /api/views/:id — update (see can_modify_view)
+    http_->Put("/api/views/:id", [this, view_for_session, require_assignable_view_group](const httplib::Request& req,
+                                                                                         httplib::Response& res) {
         try
         {
             auto session = require_role(req, res, "operator");
@@ -2987,7 +3180,7 @@ void ApiServer::setup_routes()
                 });
                 return;
             }
-            if (existing->owner_user_id != session->user_id && !is_global_role(session->role))
+            if (!can_modify_view(store_, *session, *existing))
             {
                 res.status = 403;
                 set_json(res, json{
@@ -3000,26 +3193,37 @@ void ApiServer::setup_routes()
             if (existing->name.empty())
                 throw std::runtime_error("name is required");
             existing->is_public = body.value("is_public", existing->is_public);
-            existing->group_id = body.value("group_id", existing->group_id);
-            if (!is_global_role(session->role))
-            {
-                const auto groups = store_.get_user_groups(session->user_id);
-                if (std::find(groups.begin(), groups.end(), existing->group_id) == groups.end())
-                    throw std::runtime_error("view group is outside the user's groups");
-            }
+            // Only a changed group is checked, so a group user can keep editing
+            // a legacy ungrouped view they own without being able to create one.
+            const auto new_group = body.value("group_id", existing->group_id);
+            if (new_group != existing->group_id)
+                require_assignable_view_group(*session, new_group);
+            existing->group_id = new_group;
             if (body.contains("agent_ids") && body["agent_ids"].is_array())
-                existing->agent_ids = body["agent_ids"].get<std::vector<std::string>>();
-            // SEC-11: a view may only reference agents its editor can see.
-            if (!is_global_role(session->role))
             {
-                for (const auto& agent_id : existing->agent_ids)
+                auto requested = body["agent_ids"].get<std::vector<std::string>>();
+                // SEC-11: a view may only reference agents its editor can see.
+                if (!is_global_role(session->role))
                 {
-                    if (!can_access_agent(*session, agent_id))
-                        throw std::runtime_error("view references an agent outside your access");
+                    for (const auto& agent_id : requested)
+                    {
+                        if (!can_access_agent(*session, agent_id))
+                            throw std::runtime_error("view references an agent outside your access");
+                    }
+                    // The editor was never shown the agents they cannot access
+                    // (issue #163), so their list cannot mean "remove these":
+                    // keep them.
+                    for (const auto& agent_id : existing->agent_ids)
+                    {
+                        if (!can_access_agent(*session, agent_id) &&
+                            std::find(requested.begin(), requested.end(), agent_id) == requested.end())
+                            requested.push_back(agent_id);
+                    }
                 }
+                existing->agent_ids = std::move(requested);
             }
             store_.update_view(*existing);
-            set_json(res, view_to_json(*existing));
+            set_json(res, view_for_session(*session, *existing));
         }
         catch (const std::exception& e)
         {
@@ -3031,7 +3235,7 @@ void ApiServer::setup_routes()
         }
     });
 
-    // DELETE /api/views/:id — owner or admin
+    // DELETE /api/views/:id — see can_modify_view
     http_->Delete("/api/views/:id", [this](const httplib::Request& req, httplib::Response& res) {
         try
         {
@@ -3048,7 +3252,7 @@ void ApiServer::setup_routes()
                 });
                 return;
             }
-            if (existing->owner_user_id != session->user_id && !is_global_role(session->role))
+            if (!can_modify_view(store_, *session, *existing))
             {
                 res.status = 403;
                 set_json(res, json{

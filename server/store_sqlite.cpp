@@ -180,6 +180,64 @@ namespace
             throw std::runtime_error("Unable to hash default admin password");
         return hash;
     }
+
+    // RAII transaction: rolls back on destruction unless commit() was called.
+    class Transaction
+    {
+    public:
+        explicit Transaction(sqlite3* db)
+            : db_(db)
+        {
+            char* err = nullptr;
+            const int rc = sqlite3_exec(db_, "BEGIN IMMEDIATE;", nullptr, nullptr, &err);
+            std::string msg = err ? err : "";
+            sqlite3_free(err);
+            if (rc != SQLITE_OK)
+                throw std::runtime_error("sqlite begin: " + msg);
+        }
+        ~Transaction()
+        {
+            if (!committed_)
+                sqlite3_exec(db_, "ROLLBACK;", nullptr, nullptr, nullptr);
+        }
+        Transaction(const Transaction&) = delete;
+        Transaction& operator=(const Transaction&) = delete;
+
+        void commit()
+        {
+            char* err = nullptr;
+            const int rc = sqlite3_exec(db_, "COMMIT;", nullptr, nullptr, &err);
+            std::string msg = err ? err : "";
+            sqlite3_free(err);
+            if (rc != SQLITE_OK)
+                throw std::runtime_error("sqlite commit: " + msg);
+            committed_ = true;
+        }
+
+    private:
+        sqlite3* db_;
+        bool committed_ = false;
+    };
+
+    // Replaces an agent's group rows. The caller owns the transaction.
+    void write_agent_groups(sqlite3* db, const std::string& agent_id, const std::vector<int64_t>& group_ids)
+    {
+        Stmt del;
+        check(sqlite3_prepare_v2(db, "DELETE FROM agent_groups WHERE agent_id=?;", -1, &del.s, nullptr), db,
+              "prepare delete agent groups");
+        sqlite3_bind_text(del.s, 1, agent_id.c_str(), -1, SQLITE_TRANSIENT);
+        check(sqlite3_step(del.s), db, "step delete agent groups");
+        for (auto group_id : group_ids)
+        {
+            Stmt ins;
+            check(sqlite3_prepare_v2(db, "INSERT OR IGNORE INTO agent_groups(agent_id,group_id) VALUES(?,?);", -1,
+                                     &ins.s, nullptr),
+                  db, "prepare insert agent group");
+            sqlite3_bind_text(ins.s, 1, agent_id.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_int64(ins.s, 2, group_id);
+            check(sqlite3_step(ins.s), db, "step insert agent group");
+        }
+    }
 } // namespace
 
 SqliteStore::SqliteStore(const std::string& path)
@@ -648,6 +706,45 @@ void SqliteStore::reject_agent(const std::string& agent_id)
     check(sqlite3_step(st.s), db_, "step reject_agent");
 }
 
+bool SqliteStore::approve_pending_agent(const std::string& agent_id, const std::vector<int64_t>& group_ids)
+{
+    Transaction tx(db_);
+    Stmt st;
+    check(sqlite3_prepare_v2(db_,
+                             "UPDATE agents SET approved=1,rejected=0 WHERE agent_id=? AND approved=0 AND rejected=0;",
+                             -1, &st.s, nullptr),
+          db_, "prepare approve_pending_agent");
+    sqlite3_bind_text(st.s, 1, agent_id.c_str(), -1, SQLITE_TRANSIENT);
+    check(sqlite3_step(st.s), db_, "step approve_pending_agent");
+    if (sqlite3_changes(db_) == 0)
+        return false; // unknown, approved or rejected: the guard rolls back
+    write_agent_groups(db_, agent_id, group_ids);
+    tx.commit();
+    return true;
+}
+
+void SqliteStore::save_agent_config(const AgentRecord& rec, const std::optional<std::vector<int64_t>>& group_ids)
+{
+    Transaction tx(db_);
+    const auto collector_config_json = nlohmann::json(rec.collector_config).dump();
+    Stmt st;
+    check(sqlite3_prepare_v2(db_,
+                             "UPDATE agents SET collection_interval=?,heartbeat_interval=?,process_limit=?,"
+                             "collector_config_json=?,runbook_markdown=? WHERE agent_id=?;",
+                             -1, &st.s, nullptr),
+          db_, "prepare save_agent_config");
+    sqlite3_bind_int(st.s, 1, rec.collection_interval);
+    sqlite3_bind_int(st.s, 2, rec.heartbeat_interval);
+    sqlite3_bind_int(st.s, 3, rec.process_limit);
+    sqlite3_bind_text(st.s, 4, collector_config_json.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st.s, 5, rec.runbook_markdown.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st.s, 6, rec.agent_id.c_str(), -1, SQLITE_TRANSIENT);
+    check(sqlite3_step(st.s), db_, "step save_agent_config");
+    if (group_ids)
+        write_agent_groups(db_, rec.agent_id, *group_ids);
+    tx.commit();
+}
+
 void SqliteStore::delete_agent(const std::string& agent_id)
 {
     Stmt st;
@@ -777,31 +874,9 @@ std::vector<int64_t> SqliteStore::get_agent_groups(const std::string& agent_id)
 
 void SqliteStore::set_agent_groups(const std::string& agent_id, const std::vector<int64_t>& group_ids)
 {
-    exec("BEGIN IMMEDIATE;");
-    try
-    {
-        Stmt del;
-        check(sqlite3_prepare_v2(db_, "DELETE FROM agent_groups WHERE agent_id=?;", -1, &del.s, nullptr), db_,
-              "prepare delete agent groups");
-        sqlite3_bind_text(del.s, 1, agent_id.c_str(), -1, SQLITE_TRANSIENT);
-        check(sqlite3_step(del.s), db_, "step delete agent groups");
-        for (auto group_id : group_ids)
-        {
-            Stmt ins;
-            check(sqlite3_prepare_v2(db_, "INSERT OR IGNORE INTO agent_groups(agent_id,group_id) VALUES(?,?);", -1,
-                                     &ins.s, nullptr),
-                  db_, "prepare insert agent group");
-            sqlite3_bind_text(ins.s, 1, agent_id.c_str(), -1, SQLITE_TRANSIENT);
-            sqlite3_bind_int64(ins.s, 2, group_id);
-            check(sqlite3_step(ins.s), db_, "step insert agent group");
-        }
-        exec("COMMIT;");
-    }
-    catch (...)
-    {
-        exec("ROLLBACK;");
-        throw;
-    }
+    Transaction tx(db_);
+    write_agent_groups(db_, agent_id, group_ids);
+    tx.commit();
 }
 
 std::optional<UserRecord> SqliteStore::get_user_by_username(const std::string& username)

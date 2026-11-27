@@ -13,5 +13,12 @@ export function useActiveView() {
     }
   }, [activeViewId]);
 
+  // Following a #view-N link while the dashboard is already open changes only the hash.
+  React.useEffect(() => {
+    const onHashChange = () => setActiveViewId(parseViewHash(window.location.hash));
+    window.addEventListener('hashchange', onHashChange);
+    return () => window.removeEventListener('hashchange', onHashChange);
+  }, []);
+
   return { activeViewId, setActiveViewId };
 }

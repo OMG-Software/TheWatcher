@@ -22,6 +22,8 @@ public:
     std::vector<AgentRecord> list_pending_agents() override;
     void approve_agent(const std::string& agent_id) override;
     void reject_agent(const std::string& agent_id) override;
+    bool approve_pending_agent(const std::string& agent_id, const std::vector<int64_t>& group_ids) override;
+    void save_agent_config(const AgentRecord& rec, const std::optional<std::vector<int64_t>>& group_ids) override;
     void delete_agent(const std::string& agent_id) override;
     void mark_agents_offline_before(int64_t cutoff_ms) override;
     void set_agent_maintenance(const std::string& agent_id, bool maintenance, const std::string& reason,

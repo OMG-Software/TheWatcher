@@ -61,7 +61,12 @@ export function ViewsPage({
     setEditAgentIds([...v.agent_ids]);
   };
 
-  const canEdit = (v: ViewRecord) => operator && (v.owner_username === session.username || isGlobal(session.role));
+  // Mirrors the server rule: global operators edit any view; group users edit
+  // views they own and views of a group they belong to (the groups list is
+  // already limited to their own groups).
+  const canEdit = (v: ViewRecord) =>
+    operator &&
+    (isGlobal(session.role) || v.owner_username === session.username || (v.group_id > 0 && groups.some((group) => group.group_id === v.group_id)));
 
   return (
     <main className="table-wrap">

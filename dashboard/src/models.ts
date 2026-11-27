@@ -22,6 +22,8 @@ export interface AgentRecord {
   description: string;
   runbook_markdown: string;
   group_ids?: number[];
+  /** Version of the Configure-modal fields; sent back on save so a stale save is refused with 409. */
+  config_revision?: string;
   thresholds?: AgentThresholds;
   collector_config?: CollectorConfig;
 }
@@ -131,6 +133,8 @@ export interface AgentCollectorConfigUpdate {
   collector_config: CollectorConfig;
   group_ids?: number[];
   runbook_markdown?: string;
+  /** The agent's config_revision when the modal opened. */
+  config_revision?: string;
 }
 
 export interface GroupRecord {
@@ -321,6 +325,7 @@ export interface DashboardAgent {
   uptime: string;
   group: string;
   groupIds: number[];
+  configRevision?: string;
   status: HealthColor;
   alertColor: HealthColor;
   components: ComponentHealth[];

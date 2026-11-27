@@ -2992,3 +2992,136 @@ SCENARIO("get_runbook never returns another agent's runbook")
         }
     }
 }
+
+// ── Approval and configuration saves are single transactions (#63, #62, #112) ─
+
+SCENARIO("A pending agent is approved together with its groups, or not at all")
+{
+    GIVEN("a store with a pending agent and two groups")
+    {
+        SqliteStore store(":memory:");
+        const auto prod = store.create_group("Prod");
+        const auto dev = store.create_group("Dev");
+        AgentRecord rec;
+        rec.agent_id = "pending-agent";
+        rec.first_seen = 1;
+        store.upsert_agent(rec);
+
+        WHEN("it is approved into Dev")
+        {
+            const auto approved = store.approve_pending_agent("pending-agent", {dev});
+
+            THEN("it is approved and belongs to Dev only")
+            {
+                REQUIRE(approved);
+                REQUIRE(store.get_agent("pending-agent")->approved);
+                REQUIRE(store.get_agent_groups("pending-agent") == std::vector<int64_t>{dev});
+            }
+        }
+
+        WHEN("it is approved with a group that does not exist")
+        {
+            THEN("the call throws and the agent is still pending with no groups")
+            {
+                REQUIRE_THROWS(store.approve_pending_agent("pending-agent", {dev, 9999}));
+                REQUIRE_FALSE(store.get_agent("pending-agent")->approved);
+                REQUIRE(store.get_agent_groups("pending-agent").empty());
+            }
+        }
+
+        WHEN("it is approved twice")
+        {
+            REQUIRE(store.approve_pending_agent("pending-agent", {dev}));
+
+            THEN("the second approval reports false and leaves the groups alone")
+            {
+                REQUIRE_FALSE(store.approve_pending_agent("pending-agent", {prod}));
+                REQUIRE(store.get_agent_groups("pending-agent") == std::vector<int64_t>{dev});
+            }
+        }
+
+        WHEN("it was rejected first")
+        {
+            store.reject_agent("pending-agent");
+
+            THEN("approval reports false and the agent stays rejected")
+            {
+                REQUIRE_FALSE(store.approve_pending_agent("pending-agent", {dev}));
+                REQUIRE(store.get_agent("pending-agent")->rejected);
+                REQUIRE_FALSE(store.get_agent("pending-agent")->approved);
+            }
+        }
+
+        THEN("an unknown agent reports false")
+        {
+            REQUIRE_FALSE(store.approve_pending_agent("nobody", {dev}));
+        }
+    }
+}
+
+SCENARIO("An agent configuration save writes the config and groups in one transaction")
+{
+    GIVEN("an approved agent in two groups")
+    {
+        SqliteStore store(":memory:");
+        const auto a = store.create_group("A");
+        const auto b = store.create_group("B");
+        AgentRecord rec;
+        rec.agent_id = "agent-1";
+        rec.approved = true;
+        rec.connected = true;
+        rec.last_seen = 1234;
+        rec.collection_interval = 30;
+        store.upsert_agent(rec);
+        store.set_agent_groups("agent-1", {a, b});
+
+        auto edited = *store.get_agent("agent-1");
+        edited.collection_interval = 60;
+        edited.heartbeat_interval = 7;
+        edited.process_limit = 9;
+        edited.runbook_markdown = "restart the service";
+        edited.collector_config.cpu_readings = 4;
+        // A stale copy of fields the modal does not own must not be written back.
+        edited.last_seen = 1;
+        edited.connected = false;
+
+        WHEN("it is saved without a group list")
+        {
+            store.save_agent_config(edited, std::nullopt);
+
+            THEN("the edited fields are stored and the groups and liveness fields are untouched")
+            {
+                const auto got = *store.get_agent("agent-1");
+                REQUIRE(got.collection_interval == 60);
+                REQUIRE(got.heartbeat_interval == 7);
+                REQUIRE(got.process_limit == 9);
+                REQUIRE(got.runbook_markdown == "restart the service");
+                REQUIRE(got.collector_config.cpu_readings == 4);
+                REQUIRE(got.last_seen == 1234);
+                REQUIRE(got.connected);
+                REQUIRE(store.get_agent_groups("agent-1") == std::vector<int64_t>{a, b});
+            }
+        }
+
+        WHEN("it is saved with a new group list")
+        {
+            store.save_agent_config(edited, std::vector<int64_t>{b});
+
+            THEN("both the config and the groups change")
+            {
+                REQUIRE(store.get_agent("agent-1")->collection_interval == 60);
+                REQUIRE(store.get_agent_groups("agent-1") == std::vector<int64_t>{b});
+            }
+        }
+
+        WHEN("it is saved with a group that does not exist")
+        {
+            THEN("nothing changes")
+            {
+                REQUIRE_THROWS(store.save_agent_config(edited, std::vector<int64_t>{a, 9999}));
+                REQUIRE(store.get_agent("agent-1")->collection_interval == 30);
+                REQUIRE(store.get_agent_groups("agent-1") == std::vector<int64_t>{a, b});
+            }
+        }
+    }
+}

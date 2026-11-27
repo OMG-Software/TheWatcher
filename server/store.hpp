@@ -187,6 +187,16 @@ public:
     virtual std::vector<AgentRecord> list_pending_agents() = 0;
     virtual void approve_agent(const std::string& agent_id) = 0;
     virtual void reject_agent(const std::string& agent_id) = 0;
+    // Approves a pending agent and sets its groups in one transaction. Returns
+    // false, changing nothing, when the agent is unknown or no longer pending
+    // (already approved or rejected). Throws, changing nothing, when a group
+    // does not exist.
+    virtual bool approve_pending_agent(const std::string& agent_id, const std::vector<int64_t>& group_ids) = 0;
+    // Writes the fields the Configure modal edits (intervals, process limit,
+    // collector config, runbook) and, when `group_ids` is given, replaces the
+    // agent's groups, all in one transaction. Liveness fields (last_seen,
+    // connected, ...) are not touched.
+    virtual void save_agent_config(const AgentRecord& rec, const std::optional<std::vector<int64_t>>& group_ids) = 0;
     virtual void delete_agent(const std::string& agent_id) = 0;
     virtual void mark_agents_offline_before(int64_t cutoff_ms) = 0;
     virtual void set_agent_maintenance(const std::string& agent_id, bool maintenance, const std::string& reason,
