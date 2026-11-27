@@ -1253,8 +1253,20 @@ int64_t PostgresStore::insert_alert(const AlertRecord& alert)
 
 bool PostgresStore::insert_heartbeat_alert_if_absent(const AlertRecord& alert)
 {
-    // One statement, so the existence check and the insert cannot interleave
-    // with another writer (or another server node on the same database).
+    // READ COMMITTED lets two server nodes both see "no live alert" and both
+    // insert. A transaction-scoped advisory lock keyed on the agent serialises
+    // them: the second node waits, then its INSERT's fresh snapshot sees the
+    // first node's committed row. No unique index, so this also works on a
+    // database that already holds duplicates. (SQLite has a single writer, so
+    // its single statement is enough.)
+    postgres::Transaction tx(conn_);
+    {
+        const std::string lock_key = "thewatcher:heartbeat:" + alert.agent_id;
+        const char* lock_params[] = {lock_key.c_str()};
+        Res lock(PQexecParams(conn_, "SELECT pg_advisory_xact_lock(hashtext($1));", 1, nullptr, lock_params, nullptr,
+                              nullptr, 0));
+        check_res(lock.r, "insert_heartbeat_alert_if_absent lock");
+    }
     const auto p_cat = s(alert.created_at);
     const auto p_aat = s(alert.acknowledged_at);
     const auto p_dat = s(alert.deleted_at);
@@ -1280,7 +1292,9 @@ bool PostgresStore::insert_heartbeat_alert_if_absent(const AlertRecord& alert)
     )",
                          11, nullptr, params, nullptr, nullptr, 0));
     check_res(res.r, "insert_heartbeat_alert_if_absent");
-    return std::string(PQcmdTuples(res.r)) != "0";
+    const bool inserted = std::string(PQcmdTuples(res.r)) != "0";
+    tx.commit();
+    return inserted;
 }
 
 namespace

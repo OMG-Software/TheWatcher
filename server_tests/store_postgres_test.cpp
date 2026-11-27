@@ -843,4 +843,72 @@ SCENARIO("[postgres] Eight threads can use one synchronized store at the same ti
     }
 }
 
+SCENARIO("[postgres] Two server nodes racing to raise a dead-agent alert create exactly one")
+{
+    if (!postgres_is_available())
+        SKIP("PostgreSQL not available");
+    GIVEN("two connections to one database and several offline agents")
+    {
+        PostgresStore node_a(test_dsn());
+        PostgresStore node_b(test_dsn());
+        std::vector<std::string> ids;
+        for (int i = 0; i < 20; ++i)
+        {
+            ids.push_back("pg-race-" + std::to_string(i));
+            cleanup_pg(node_a, ids.back());
+            node_a.upsert_agent(make_agent(ids.back()));
+        }
+
+        WHEN("both nodes insert the heartbeat alert for every agent at the same time")
+        {
+            std::atomic<bool> go{false};
+            std::atomic<int> errors{0};
+            std::atomic<int> inserted{0};
+            auto race = [&](PostgresStore& node) {
+                while (!go.load())
+                    std::this_thread::yield();
+                for (const auto& id : ids)
+                {
+                    try
+                    {
+                        AlertRecord alert;
+                        alert.agent_id = id;
+                        alert.indicator = "Heartbeat";
+                        alert.old_status = "green";
+                        alert.new_status = "red";
+                        alert.created_at = 2000;
+                        if (node.insert_heartbeat_alert_if_absent(alert))
+                            ++inserted;
+                    }
+                    catch (...)
+                    {
+                        ++errors;
+                    }
+                }
+            };
+            std::thread a(race, std::ref(node_a));
+            std::thread b(race, std::ref(node_b));
+            go = true;
+            a.join();
+            b.join();
+
+            THEN("each agent has exactly one live heartbeat alert")
+            {
+                CHECK(errors == 0);
+                CHECK(inserted == static_cast<int>(ids.size()));
+                for (const auto& id : ids)
+                {
+                    int live = 0;
+                    for (const auto& alert : node_a.list_alerts(false))
+                        if (alert.agent_id == id && alert.indicator == "Heartbeat")
+                            ++live;
+                    CHECK(live == 1);
+                }
+            }
+        }
+        for (const auto& id : ids)
+            cleanup_pg(node_a, id);
+    }
+}
+
 #endif // HAVE_LIBPQ
