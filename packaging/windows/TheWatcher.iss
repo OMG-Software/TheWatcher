@@ -29,17 +29,9 @@ Source: "..\..\dashboard\dist\*"; DestDir: "{app}\dashboard"; Flags: ignoreversi
 ; which let any local user read both CURVE secrets and edit configs consumed
 ; by SYSTEM services. SecureConfigDir (see [Code]) resets the ACL to SYSTEM
 ; and Administrators only and aborts the install if that fails. It runs here,
-; during the file-copy phase, so it always completes before the [Run] entries
-; that install the services. SIDs are used so it works on any Windows language.
+; during the file-copy phase, so it always completes before the services are
+; registered (CurStepChanged, ssPostInstall). SIDs are used so it works on any Windows language.
 Name: "{commonappdata}\TheWatcher"; AfterInstall: SecureConfigDir
-
-[Run]
-; Upgrades: a service registered by an older installer still points at
-; server.json and CreateService does not update an existing registration, so
-; remove the old registration first. This fails harmlessly on a fresh install.
-Filename: "{app}\server\TheWatcherServer.exe"; Parameters: "--uninstall-service"; Flags: runhidden waituntilterminated
-Filename: "{app}\server\TheWatcherServer.exe"; Parameters: "--install-service --config ""{commonappdata}\TheWatcher\TheWatcherServer.conf"""; Flags: runhidden waituntilterminated
-Filename: "{app}\agent\TheWatcherAgent.exe"; Parameters: "--install-service --config ""{commonappdata}\TheWatcher\TheWatcherAgent.conf"""; Flags: runhidden waituntilterminated
 
 [UninstallRun]
 Filename: "{app}\agent\TheWatcherAgent.exe"; Parameters: "--uninstall-service"; Flags: runhidden waituntilterminated
@@ -124,6 +116,75 @@ begin
       Result := True;
       Exit;
     end;
+  end;
+end;
+
+// True when the service is registered. sc query exits 1060
+// (ERROR_SERVICE_DOES_NOT_EXIST) for a missing service.
+function ServiceExists(const Name: String): Boolean;
+var
+  ResultCode: Integer;
+begin
+  Result := Exec(ExpandConstant('{sys}\sc.exe'), 'query ' + Name, '', SW_HIDE,
+                 ewWaitUntilTerminated, ResultCode) and (ResultCode = 0);
+end;
+
+// (Re)registers a service so its command line points at ConfPath. Service
+// registration lives here instead of [Run] because [Run] cannot check exit
+// codes. Any failure aborts the install with a message.
+// - An existing registration (an upgrade, possibly still pointing at the old
+//   server.json) is removed first. A missing service is not an error: the
+//   uninstall is skipped. After removing it we wait up to 30 seconds for the
+//   service to disappear, since a service with open handles (for example
+//   services.msc) is only marked for deletion.
+// - Registration is retried 5 times, 2 seconds apart, because it fails while
+//   the old service is still marked for deletion (ERROR_SERVICE_MARKED_FOR_
+//   DELETE, 1072; the binary reports that as a non-zero exit code, not 1072).
+procedure RegisterService(const Name, Exe, ConfPath: String);
+var
+  ResultCode, I: Integer;
+  Registered: Boolean;
+begin
+  if ServiceExists(Name) then
+  begin
+    if not Exec(Exe, '--uninstall-service', '', SW_HIDE, ewWaitUntilTerminated, ResultCode)
+       or (ResultCode <> 0) then
+      RaiseException('Could not remove the existing ' + Name + ' service (exit code ' + IntToStr(ResultCode) + ').');
+    for I := 1 to 30 do
+    begin
+      if not ServiceExists(Name) then
+        Break;
+      Sleep(1000);
+    end;
+    if ServiceExists(Name) then
+      RaiseException('The old ' + Name + ' service is still marked for deletion. Close services.msc and run the installer again.');
+  end;
+
+  Registered := False;
+  for I := 1 to 5 do
+  begin
+    if Exec(Exe, '--install-service --config "' + ConfPath + '"', '', SW_HIDE, ewWaitUntilTerminated, ResultCode)
+       and (ResultCode = 0) then
+    begin
+      Registered := True;
+      Break;
+    end;
+    Sleep(2000);
+  end;
+  if not Registered then
+    RaiseException('Could not register the ' + Name + ' service (exit code ' + IntToStr(ResultCode) + ').');
+end;
+
+// Runs after all files are installed and the server config has been migrated,
+// so the service never starts on a missing TheWatcherServer.conf.
+procedure CurStepChanged(CurStep: TSetupStep);
+begin
+  if CurStep = ssPostInstall then
+  begin
+    RegisterService('TheWatcherServer', ExpandConstant('{app}\server\TheWatcherServer.exe'),
+                    ExpandConstant('{commonappdata}\TheWatcher\TheWatcherServer.conf'));
+    RegisterService('TheWatcherAgent', ExpandConstant('{app}\agent\TheWatcherAgent.exe'),
+                    ExpandConstant('{commonappdata}\TheWatcher\TheWatcherAgent.conf'));
   end;
 end;
 

@@ -276,8 +276,14 @@ current installer therefore:
    exist (an existing `.conf` is never overwritten, and `server.json` is kept
    as a backup), so the server keeps its CURVE identity and agents keep
    working;
-2. removes the old service registration and registers it again so the service
-   command line points at `TheWatcherServer.conf`.
+2. removes the old service registration (skipped when the service is not
+   installed), waits up to 30 seconds for it to disappear, and registers it
+   again so the service command line points at `TheWatcherServer.conf`,
+   retrying 5 times if the old service is still marked for deletion. This is
+   done in the installer's script rather than `[Run]` so exit codes are
+   checked: any failure aborts the install with a message (close
+   `services.msc` and run the installer again if it reports the old service is
+   still marked for deletion).
 
 If `server.json` has no such line (for example JSON you wrote by hand, even if
 it mentions `SERVER_SECRET_KEY`), it is not converted and is left untouched. Copy the settings into `TheWatcherServer.conf`
