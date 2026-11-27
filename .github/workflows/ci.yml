@@ -32,7 +32,8 @@ jobs:
       - name: Install clang-format 22.1.5
         # --only-binary: install the published wheel only, never run a
         # source distribution's setup script.
-        run: python3 -m pip install --user --only-binary :all: clang-format==22.1.5
+        run: |
+          python3 -m pip install --user --only-binary :all: clang-format==22.1.5
 
       - name: Check formatting
         run: |
