@@ -5,6 +5,7 @@
 #include "common/crypto.hpp"
 #include "common/metrics.hpp"
 #include "common/zmq_limits.hpp"
+#include "peer_address.hpp"
 #include "report_generator.hpp"
 #include "status_engine.hpp"
 
@@ -25,6 +26,20 @@ namespace
         return std::chrono::duration_cast<std::chrono::milliseconds>(
                    std::chrono::system_clock::now().time_since_epoch())
             .count();
+    }
+
+    // The "Peer-Address" property libzmq attaches to a received message, or an
+    // empty string when the transport sets none.
+    std::string peer_address_of(zmq::message_t& msg)
+    {
+        try
+        {
+            return msg.gets("Peer-Address");
+        }
+        catch (const zmq::error_t&)
+        {
+            return {};
+        }
     }
 
     // SEC-05: attacker-controlled strings may carry CR/LF or ANSI control
@@ -436,6 +451,10 @@ void Server::handle_router_frame(zmq::socket_t& router)
     const bool was_offline = !rec->connected;
     rec->connected = true;
     rec->last_seen = now_ms();
+    // Issue #65: remember where the agent connects from. Only a valid IP is
+    // kept; an unreadable address leaves the last known one in place.
+    if (const auto peer_ip = parse_peer_ip(peer_address_of(identity_msg)); !peer_ip.empty())
+        rec->ip_address = peer_ip;
     store_->upsert_agent(*rec);
     if (was_offline)
     {
@@ -786,14 +805,10 @@ void Server::handle_enrollment(zmq::socket_t& enroll)
         constexpr int64_t rate_entry_ttl_ms = 60'000;
         const auto enroll_now = now_ms();
 
-        std::string peer_address = "unknown";
-        try
-        {
-            peer_address = msg.gets("Peer-Address");
-        }
-        catch (const zmq::error_t&)
-        {
-        }
+        const auto raw_peer_address = peer_address_of(msg);
+        const std::string peer_address = raw_peer_address.empty() ? "unknown" : raw_peer_address;
+        // Untrusted text until parsed: only a valid IP literal is stored.
+        const auto peer_ip = parse_peer_ip(raw_peer_address);
 
         for (auto it = enrollment_last_request_ms_.begin(); it != enrollment_last_request_ms_.end();)
             it = (enroll_now - it->second > rate_entry_ttl_ms) ? enrollment_last_request_ms_.erase(it) : std::next(it);
@@ -849,6 +864,8 @@ void Server::handle_enrollment(zmq::socket_t& enroll)
                 }
                 existing->hostname = req.hostname;
                 existing->platform = req.platform;
+                if (!peer_ip.empty())
+                    existing->ip_address = peer_ip;
                 store_->upsert_agent(*existing);
             }
         }
@@ -889,6 +906,7 @@ void Server::handle_enrollment(zmq::socket_t& enroll)
             rec.curve_public_key_z85 = req.curve_public_key_z85;
             rec.approved = false;
             rec.rejected = false;
+            rec.ip_address = peer_ip;
             rec.first_seen = now_ms();
             rec.last_seen = rec.first_seen;
             store_->upsert_agent(rec);

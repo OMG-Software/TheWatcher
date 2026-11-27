@@ -355,8 +355,7 @@ void PostgresStore::init_schema()
                           "ALTER TABLE agents ADD COLUMN heartbeat_interval INTEGER NOT NULL DEFAULT 5;");
     add_column_if_missing("agents", "runbook_markdown",
                           "ALTER TABLE agents ADD COLUMN runbook_markdown TEXT NOT NULL DEFAULT '';");
-    add_column_if_missing("agents", "ip_address",
-                          "ALTER TABLE agents ADD COLUMN ip_address TEXT NOT NULL DEFAULT '';");
+    add_column_if_missing("agents", "ip_address", "ALTER TABLE agents ADD COLUMN ip_address TEXT NOT NULL DEFAULT '';");
     exec(R"(
         CREATE TABLE IF NOT EXISTS metrics (
             id           BIGSERIAL PRIMARY KEY,
@@ -994,8 +993,8 @@ namespace
     {
         const auto p = s(user_id);
         const char* params[] = {p.c_str()};
-        const auto sql = std::string("SELECT 1 FROM users WHERE user_id=$1 AND built_in=FALSE AND ") +
-                         WOULD_REMOVE_LAST_ADMIN + ";";
+        const auto sql =
+            std::string("SELECT 1 FROM users WHERE user_id=$1 AND built_in=FALSE AND ") + WOULD_REMOVE_LAST_ADMIN + ";";
         Res res(PQexecParams(conn, sql.c_str(), 1, nullptr, params, nullptr, nullptr, 0));
         check_res(res.r, "is_last_global_admin");
         return PQntuples(res.r) > 0;

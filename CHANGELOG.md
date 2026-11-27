@@ -9,6 +9,10 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Security
 
+- The last enabled global admin can no longer be disabled, deleted or demoted;
+  the API answers 409. The check is part of the store write (one statement on
+  SQLite, an advisory-locked transaction on PostgreSQL), so concurrent requests
+  cannot both pass it (#64).
 - The agent no longer trusts the server key in an enrollment reply: it must
   be 40 Z85 characters decoding to a 32-byte key, and the config writer
   refuses any value containing CR or LF. Before, a crafted key could inject
@@ -174,6 +178,18 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+- Users can be edited: `PUT /api/users/:id` changes a user's role and/or groups,
+  and the Users page has an Edit dialog. Group admins can now edit, disable,
+  enable and delete the users of their own groups (group-scoped users only; a
+  change to a user who is also in another group is limited to the admin's own
+  groups). The Password button now follows the server rule (global admin or the
+  user) (#64).
+- The agent IP address (the peer address the server saw, not necessarily the
+  agent's own behind a NAT or proxy) is stored on the agent record, with a
+  migration for SQLite and PostgreSQL, refreshed on every data-plane frame and
+  at enrollment, returned as `ip_address` by `/api/agents` and
+  `/api/pending-enrollments`, and shown on the Monitoring, Agents and Pending
+  pages (#65).
 - Dashboard: ESLint (flat config, `typescript-eslint`, `react-hooks`) with
   `npm run lint`, and a `dashboard` CI job running
   `npm ci --ignore-scripts` (no package install scripts), lint, build, tests

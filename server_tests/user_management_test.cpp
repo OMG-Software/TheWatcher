@@ -96,7 +96,12 @@ struct ApiFixture
 
 int64_t create_group(httplib::Client& admin, const std::string& name)
 {
-    auto res = admin.Post("/api/groups", json{{"name", name}}.dump(), "application/json");
+    auto res = admin.Post("/api/groups",
+                          json{
+                              {"name", name}
+    }
+                              .dump(),
+                          "application/json");
     REQUIRE(res);
     REQUIRE(res->status == 200);
     return json::parse(res->body).at("group_id").get<int64_t>();
@@ -105,9 +110,15 @@ int64_t create_group(httplib::Client& admin, const std::string& name)
 int64_t create_user(httplib::Client& admin, const std::string& name, const std::string& role,
                     const std::vector<int64_t>& groups)
 {
-    auto res = admin.Post(
-        "/api/users", json{{"username", name}, {"password", "pw-" + name}, {"role", role}, {"group_ids", groups}}.dump(),
-        "application/json");
+    auto res = admin.Post("/api/users",
+                          json{
+                              {"username",  name        },
+                              {"password",  "pw-" + name},
+                              {"role",      role        },
+                              {"group_ids", groups      }
+    }
+                              .dump(),
+                          "application/json");
     REQUIRE(res);
     REQUIRE(res->status == 200);
     return json::parse(res->body).at("user_id").get<int64_t>();
@@ -161,7 +172,8 @@ SCENARIO("A user's role and groups can be edited in one step")
 
         WHEN("role and groups are updated together")
         {
-            const auto changed = store->update_user_access(id, std::string("group_operator"), std::vector<int64_t>{group_b});
+            const auto changed =
+                store->update_user_access(id, std::string("group_operator"), std::vector<int64_t>{group_b});
 
             THEN("both change and one row is reported")
             {
@@ -197,7 +209,8 @@ SCENARIO("A user's role and groups can be edited in one step")
         {
             THEN("the whole update is rolled back")
             {
-                REQUIRE_THROWS(store->update_user_access(id, std::string("group_operator"), std::vector<int64_t>{999999}));
+                REQUIRE_THROWS(
+                    store->update_user_access(id, std::string("group_operator"), std::vector<int64_t>{999999}));
                 REQUIRE(find_user(*store, "alice")->role == "group_viewer");
                 REQUIRE(groups_of(*store, id) == std::vector<int64_t>{group_a});
             }
@@ -414,7 +427,11 @@ SCENARIO("A global admin edits a user's role and groups")
 
         WHEN("the admin changes the role and groups")
         {
-            const auto status = put_user(fx.client, user, {{"role", "group_operator"}, {"group_ids", ids({group_b})}});
+            const auto status = put_user(fx.client, user,
+                                         {
+                                             {"role",      "group_operator"},
+                                             {"group_ids", ids({group_b})  }
+            });
 
             THEN("the user list shows the new values")
             {
@@ -435,7 +452,10 @@ SCENARIO("A global admin edits a user's role and groups")
         {
             THEN("it is accepted")
             {
-                REQUIRE(put_user(fx.client, user, {{"role", "global_viewer"}}) == 200);
+                REQUIRE(put_user(fx.client, user,
+                                 {
+                                     {"role", "global_viewer"}
+                }) == 200);
                 REQUIRE(find_user(*fx.store, "carol")->role == "global_viewer");
             }
         }
@@ -444,7 +464,10 @@ SCENARIO("A global admin edits a user's role and groups")
         {
             THEN("it is stored in its normalised form")
             {
-                REQUIRE(put_user(fx.client, user, {{"role", "operator"}}) == 200);
+                REQUIRE(put_user(fx.client, user,
+                                 {
+                                     {"role", "operator"}
+                }) == 200);
                 REQUIRE(find_user(*fx.store, "carol")->role == "global_operator");
             }
         }
@@ -454,9 +477,18 @@ SCENARIO("A global admin edits a user's role and groups")
             THEN("each case is a 400 and nothing changes")
             {
                 REQUIRE(put_user(fx.client, user, json::object()) == 400);
-                REQUIRE(put_user(fx.client, user, {{"role", "emperor"}}) == 400);
-                REQUIRE(put_user(fx.client, user, {{"group_ids", ids({999999})}}) == 400);
-                REQUIRE(put_user(fx.client, user, {{"group_ids", "A"}}) == 400);
+                REQUIRE(put_user(fx.client, user,
+                                 {
+                                     {"role", "emperor"}
+                }) == 400);
+                REQUIRE(put_user(fx.client, user,
+                                 {
+                                     {"group_ids", ids({999999})}
+                }) == 400);
+                REQUIRE(put_user(fx.client, user,
+                                 {
+                                     {"group_ids", "A"}
+                }) == 400);
                 REQUIRE(find_user(*fx.store, "carol")->role == "group_viewer");
                 REQUIRE(groups_of(*fx.store, user) == std::vector<int64_t>{group_a});
             }
@@ -466,7 +498,10 @@ SCENARIO("A global admin edits a user's role and groups")
         {
             THEN("the request is a 404")
             {
-                REQUIRE(put_user(fx.client, 424242, {{"role", "group_viewer"}}) == 404);
+                REQUIRE(put_user(fx.client, 424242,
+                                 {
+                                     {"role", "group_viewer"}
+                }) == 404);
             }
         }
 
@@ -476,7 +511,10 @@ SCENARIO("A global admin edits a user's role and groups")
 
             THEN("the request is a 409 and the role is kept")
             {
-                REQUIRE(put_user(fx.client, built_in, {{"role", "group_viewer"}}) == 409);
+                REQUIRE(put_user(fx.client, built_in,
+                                 {
+                                     {"role", "group_viewer"}
+                }) == 409);
                 REQUIRE(find_user(*fx.store, "thewatcher")->role == "global_admin");
             }
         }
@@ -495,7 +533,10 @@ SCENARIO("A role change applies to the user's live session")
 
         WHEN("the admin demotes the user")
         {
-            REQUIRE(put_user(fx.client, user, {{"role", "group_viewer"}}) == 200);
+            REQUIRE(put_user(fx.client, user,
+                             {
+                                 {"role", "group_viewer"}
+            }) == 200);
 
             THEN("the next request on the same session sees the new role")
             {
@@ -534,13 +575,19 @@ SCENARIO("A group admin manages only the users of their own groups")
         {
             THEN("a group-scoped role is accepted")
             {
-                REQUIRE(put_user(*boss, in_a, {{"role", "group_operator"}}) == 200);
+                REQUIRE(put_user(*boss, in_a,
+                                 {
+                                     {"role", "group_operator"}
+                }) == 200);
                 REQUIRE(find_user(*fx.store, "in-a")->role == "group_operator");
             }
 
             THEN("a global role is refused")
             {
-                REQUIRE(put_user(*boss, in_a, {{"role", "global_admin"}}) == 403);
+                REQUIRE(put_user(*boss, in_a,
+                                 {
+                                     {"role", "global_admin"}
+                }) == 403);
                 REQUIRE(find_user(*fx.store, "in-a")->role == "group_viewer");
             }
         }
@@ -549,8 +596,14 @@ SCENARIO("A group admin manages only the users of their own groups")
         {
             THEN("the request is refused")
             {
-                REQUIRE(put_user(*boss, in_b, {{"role", "group_operator"}}) == 403);
-                REQUIRE(put_user(*boss, in_b, {{"group_ids", ids({group_a})}}) == 403);
+                REQUIRE(put_user(*boss, in_b,
+                                 {
+                                     {"role", "group_operator"}
+                }) == 403);
+                REQUIRE(put_user(*boss, in_b,
+                                 {
+                                     {"group_ids", ids({group_a})}
+                }) == 403);
                 REQUIRE(groups_of(*fx.store, in_b) == std::vector<int64_t>{group_b});
             }
         }
@@ -559,8 +612,14 @@ SCENARIO("A group admin manages only the users of their own groups")
         {
             THEN("the request is refused even though the user is in their group")
             {
-                REQUIRE(put_user(*boss, global, {{"group_ids", ids({})}}) == 403);
-                REQUIRE(put_user(*boss, global, {{"role", "group_viewer"}}) == 403);
+                REQUIRE(put_user(*boss, global,
+                                 {
+                                     {"group_ids", ids({})}
+                }) == 403);
+                REQUIRE(put_user(*boss, global,
+                                 {
+                                     {"role", "group_viewer"}
+                }) == 403);
                 REQUIRE(find_user(*fx.store, "global-op")->role == "global_operator");
             }
         }
@@ -569,14 +628,20 @@ SCENARIO("A group admin manages only the users of their own groups")
         {
             THEN("the request is refused")
             {
-                REQUIRE(put_user(*boss, in_a, {{"group_ids", ids({group_a, group_b})}}) == 403);
+                REQUIRE(put_user(*boss, in_a,
+                                 {
+                                     {"group_ids", ids({group_a, group_b})}
+                }) == 403);
                 REQUIRE(groups_of(*fx.store, in_a) == std::vector<int64_t>{group_a});
             }
         }
 
         WHEN("they remove a user from their group while the user is also in another")
         {
-            REQUIRE(put_user(*boss, in_both, {{"group_ids", ids({})}}) == 200);
+            REQUIRE(put_user(*boss, in_both,
+                             {
+                                 {"group_ids", ids({})}
+            }) == 200);
 
             THEN("only their own group is touched")
             {
@@ -588,7 +653,10 @@ SCENARIO("A group admin manages only the users of their own groups")
         {
             THEN("the request is refused because it would reach beyond their groups")
             {
-                REQUIRE(put_user(*boss, in_both, {{"role", "group_operator"}}) == 403);
+                REQUIRE(put_user(*boss, in_both,
+                                 {
+                                     {"role", "group_operator"}
+                }) == 403);
             }
         }
 
@@ -626,7 +694,10 @@ SCENARIO("A group admin manages only the users of their own groups")
 
             THEN("every request is refused")
             {
-                REQUIRE(put_user(*viewer, in_a, {{"role", "group_operator"}}) == 403);
+                REQUIRE(put_user(*viewer, in_a,
+                                 {
+                                     {"role", "group_operator"}
+                }) == 403);
                 REQUIRE(put_action(*viewer, in_a, "disable") == 403);
                 REQUIRE(delete_user(*viewer, in_a) == 403);
             }
@@ -651,7 +722,10 @@ SCENARIO("The last global admin is protected through the API")
             {
                 REQUIRE(delete_user(fx.client, self) == 409);
                 REQUIRE(put_action(fx.client, self, "disable") == 409);
-                REQUIRE(put_user(fx.client, self, {{"role", "global_viewer"}}) == 409);
+                REQUIRE(put_user(fx.client, self,
+                                 {
+                                     {"role", "global_viewer"}
+                }) == 409);
                 const auto after = find_user(*fx.store, "thewatcher");
                 REQUIRE(after);
                 REQUIRE_FALSE(after->disabled);
@@ -665,7 +739,10 @@ SCENARIO("The last global admin is protected through the API")
 
             THEN("the first can leave, and the survivor is then protected")
             {
-                REQUIRE(put_user(fx.client, self, {{"role", "global_viewer"}}) == 200);
+                REQUIRE(put_user(fx.client, self,
+                                 {
+                                     {"role", "global_viewer"}
+                }) == 200);
                 auto survivor = fx.sign_in("second", "pw-second");
                 REQUIRE(delete_user(*survivor, second) == 409);
             }

@@ -488,6 +488,23 @@ describe('GIVEN toDashboardAgents with metric components', () => {
     expect(dashAgent.ipAddress).toBe('192.0.2.10');
   });
 
+  it('WHEN an agent has no metrics but the server saw its address THEN the dashboard row shows that address', () => {
+    const [pending] = toDashboardAgents([{ ...baseAgent(), approved: false, ip_address: '198.51.100.7' }], []);
+    expect(pending.ipAddress).toBe('198.51.100.7');
+  });
+
+  it('WHEN the agent reports an interface IP and the server saw another THEN the reported interface IP wins', () => {
+    const snapshot = baseSnapshot('comp-agent');
+    snapshot.metrics.networks[0].ip_address = '192.0.2.10';
+    const [dashAgent] = toDashboardAgents([{ ...baseAgent(), ip_address: '203.0.113.1' }], [snapshot]);
+    expect(dashAgent.ipAddress).toBe('192.0.2.10');
+  });
+
+  it('WHEN neither source has an address THEN the row has an empty address', () => {
+    const [dashAgent] = toDashboardAgents([baseAgent()], []);
+    expect(dashAgent.ipAddress).toBe('');
+  });
+
   it('WHEN a network interface has packet errors THEN network component is red', () => {
     const snapshot = baseSnapshot('comp-agent');
     snapshot.metrics.networks[0].errors_in = 5;

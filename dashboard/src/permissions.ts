@@ -22,3 +22,39 @@ export function canManageUsers(role: UserRole): boolean {
 export function canManageGroups(role: UserRole): boolean {
   return role === 'global_admin';
 }
+
+/** The part of a user record the account rules look at. */
+export interface ManagedUser {
+  built_in: boolean;
+  group_ids: number[];
+  role: UserRole;
+  user_id: number;
+}
+
+const sharesGroup = (a: number[], b: number[]) => a.some((id) => b.includes(id));
+
+/**
+ * May the session change this user's membership of its own groups? A global
+ * admin may for anyone but the built-in user; a group admin only for
+ * group-scoped users who share one of their groups.
+ */
+export function canEditMembership(role: UserRole, ownGroupIds: number[], target: ManagedUser): boolean {
+  if (target.built_in) return false;
+  if (role === 'global_admin') return true;
+  return role === 'group_admin' && !isGlobal(target.role) && sharesGroup(ownGroupIds, target.group_ids);
+}
+
+/**
+ * May the session act on the whole account (role, disable, enable, delete)?
+ * Those reach every group the user is in, so a group admin needs all of them
+ * to be their own.
+ */
+export function canManageAccount(role: UserRole, ownGroupIds: number[], target: ManagedUser): boolean {
+  if (!canEditMembership(role, ownGroupIds, target)) return false;
+  return role === 'global_admin' || target.group_ids.every((id) => ownGroupIds.includes(id));
+}
+
+/** Only a global admin or the user themselves may change a password (the server's rule). */
+export function canChangePassword(role: UserRole, isSelf: boolean): boolean {
+  return role === 'global_admin' || isSelf;
+}

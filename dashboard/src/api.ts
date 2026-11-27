@@ -302,6 +302,15 @@ export async function deleteUser(userId: number): Promise<void> {
   await mutateJson<{ ok: boolean }>(`/api/users/${userId}`, { method: 'DELETE' });
 }
 
+/** Changes a user's role and/or group membership; omitted fields stay as they are. */
+export async function updateUserAccess(userId: number, changes: { role?: UserRecord['role']; group_ids?: number[] }): Promise<void> {
+  await mutateJson<{ ok: boolean }>(`/api/users/${userId}`, {
+    body: JSON.stringify(changes),
+    headers: { 'Content-Type': 'application/json' },
+    method: 'PUT',
+  });
+}
+
 export async function changeUserPassword(userId: number, password: string): Promise<void> {
   await mutateJson<{ ok: boolean }>(`/api/users/${userId}/password`, {
     body: JSON.stringify({ password }),

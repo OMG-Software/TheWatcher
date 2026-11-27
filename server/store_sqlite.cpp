@@ -331,8 +331,7 @@ void SqliteStore::init_schema()
                           "ALTER TABLE agents ADD COLUMN heartbeat_interval INTEGER NOT NULL DEFAULT 5;");
     add_column_if_missing("agents", "runbook_markdown",
                           "ALTER TABLE agents ADD COLUMN runbook_markdown TEXT NOT NULL DEFAULT '';");
-    add_column_if_missing("agents", "ip_address",
-                          "ALTER TABLE agents ADD COLUMN ip_address TEXT NOT NULL DEFAULT '';");
+    add_column_if_missing("agents", "ip_address", "ALTER TABLE agents ADD COLUMN ip_address TEXT NOT NULL DEFAULT '';");
     // Schema break in 0.3.0: metrics column changed from JSON TEXT to CBOR BLOB.
     // Existing 0.2.x dev databases drop and recreate the metrics table on first start.
     if (column_exists("metrics", "metrics_json") && !column_exists("metrics", "metrics_cbor"))
@@ -864,8 +863,8 @@ namespace
         for (auto group_id : group_ids)
         {
             Stmt ins;
-            check(sqlite3_prepare_v2(db, "INSERT OR IGNORE INTO user_groups(user_id,group_id) VALUES(?,?);", -1,
-                                     &ins.s, nullptr),
+            check(sqlite3_prepare_v2(db, "INSERT OR IGNORE INTO user_groups(user_id,group_id) VALUES(?,?);", -1, &ins.s,
+                                     nullptr),
                   db, "prepare insert user group");
             sqlite3_bind_int64(ins.s, 1, user_id);
             sqlite3_bind_int64(ins.s, 2, group_id);
@@ -886,8 +885,8 @@ namespace
     // global admin. Used to tell a refused change from an unknown id.
     bool is_last_global_admin(sqlite3* db, int64_t user_id)
     {
-        const auto sql = std::string("SELECT 1 FROM users WHERE user_id=? AND built_in=0 AND ") +
-                         WOULD_REMOVE_LAST_ADMIN + ";";
+        const auto sql =
+            std::string("SELECT 1 FROM users WHERE user_id=? AND built_in=0 AND ") + WOULD_REMOVE_LAST_ADMIN + ";";
         Stmt st;
         check(sqlite3_prepare_v2(db, sql.c_str(), -1, &st.s, nullptr), db, "prepare is_last_global_admin");
         sqlite3_bind_int64(st.s, 1, user_id);
@@ -948,8 +947,8 @@ void SqliteStore::enable_user(int64_t user_id)
 
 int SqliteStore::delete_user(int64_t user_id)
 {
-    const auto sql = std::string("DELETE FROM users WHERE user_id=? AND built_in=0 AND NOT ") +
-                     WOULD_REMOVE_LAST_ADMIN + ";";
+    const auto sql =
+        std::string("DELETE FROM users WHERE user_id=? AND built_in=0 AND NOT ") + WOULD_REMOVE_LAST_ADMIN + ";";
     Stmt st;
     check(sqlite3_prepare_v2(db_, sql.c_str(), -1, &st.s, nullptr), db_, "prepare delete_user");
     sqlite3_bind_int64(st.s, 1, user_id);

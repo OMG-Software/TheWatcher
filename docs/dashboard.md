@@ -56,6 +56,9 @@ Roles decide which controls are shown (the server enforces every permission):
 | `canOperate` | admins and operators, global or group |
 | `canManageUsers` | `global_admin`, `group_admin` |
 | `canManageGroups` | `global_admin` |
+| `canEditMembership(role, ownGroupIds, user)` | global admin for any user but the built-in one; group admin for group-scoped users who share one of their groups |
+| `canManageAccount(role, ownGroupIds, user)` | same as `canEditMembership`, but a group admin needs every group of the user to be their own |
+| `canChangePassword(role, isSelf)` | global admin, or the user themselves (the server's rule) |
 
 ## Linting
 
@@ -189,6 +192,12 @@ ungrouped options; the API only returns their assigned group data.
 The group filter can show all groups, a single group, or only ungrouped agents
 for global account types.
 
+The line under each server name is its IP address. An address the agent reported
+from a non-loopback interface wins; otherwise it is the address the server saw the
+agent connect from (`ip_address` in the API), which behind a NAT or proxy is that
+device's address. The Agents and Pending views show it the same way, and "IP unknown"
+appears until the agent has connected once.
+
 Columns:
 
 ```text
@@ -275,6 +284,15 @@ type. Group admins can create users only inside their own groups and cannot
 assign global account types. Global and group operators have read-only user
 access.
 
+Edit opens a dialog with the account type and the group memberships and saves only what
+changed (`PUT /api/users/:id`). Group admins see Edit, Disable, Enable and Delete only
+for group-scoped users in their groups: Disable, Enable, Delete and the account type
+need every group of the user to be the admin's own, while the group checkboxes edit only
+the admin's own groups and leave the user's other memberships alone. The Password
+button is shown to global admins and to the user themselves, as the server enforces.
+A change that would remove or demote the last enabled global admin is refused with 409
+and shown in the dialog.
+
 Account types:
 
 | Type | Scope |
@@ -334,13 +352,15 @@ The dashboard consumes:
 | `POST /api/login` | Create a session for a local SQLite user. |
 | `POST /api/logout` | Delete the current session. |
 | `GET /api/session` | Return the current authenticated session. |
-| `GET /api/agents` | Approved agent identity, connection, maintenance, settings, groups, and timestamps. |
-| `GET /api/pending-enrollments` | Pending enrollment records for global operators and admins. |
+| `GET /api/agents` | Approved agent identity, connection, maintenance, settings, groups, timestamps, and the `ip_address` the server saw. |
+| `GET /api/pending-enrollments` | Pending enrollment records (with `ip_address`) for global operators and admins. |
 | `GET /api/metrics` | Latest metrics snapshot per agent. |
 | `GET /api/groups` | List groups. |
 | `POST /api/groups` | Create a group. |
 | `GET /api/users` | List users and group memberships. |
 | `POST /api/users` | Create a user with hashed password, role, and group memberships. |
+| `PUT /api/users/:id` | Change a user's role and/or group memberships. |
+| `PUT /api/users/:id/disable`, `PUT /api/users/:id/enable`, `DELETE /api/users/:id` | Disable, re-enable or delete a user. |
 | `GET /api/alerts` | List active, non-deleted alerts. |
 | `GET /api/alerts/unacknowledged` | List active unacknowledged alerts. |
 | `POST /api/alerts/:id/ack` | Acknowledge an alert. |

@@ -2688,8 +2688,9 @@ void ApiServer::setup_routes()
             if (normalize_role(session->role) != "global_admin")
             {
                 const auto own = store_.get_user_groups(session->user_id);
-                const bool allowed = may_edit_membership(store_, *session, *target) &&
-                                     (!role || (!is_global_role(*role) && may_manage_account(store_, *session, *target)));
+                const bool allowed =
+                    may_edit_membership(store_, *session, *target) &&
+                    (!role || (!is_global_role(*role) && may_manage_account(store_, *session, *target)));
                 if (!allowed)
                 {
                     res.status = 403;
@@ -2753,7 +2754,8 @@ void ApiServer::setup_routes()
         }
     });
 
-    // PUT /api/users/:id/disable — disable a user account (global admin, or a group admin for users wholly in their groups; not built-in)
+    // PUT /api/users/:id/disable — disable a user account (global admin, or a group admin for users wholly in their
+    // groups; not built-in)
     http_->Put("/api/users/:id/disable", [this](const httplib::Request& req, httplib::Response& res) {
         auto session = require_role(req, res, "viewer");
         if (!session)

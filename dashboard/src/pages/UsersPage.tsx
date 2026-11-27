@@ -1,12 +1,15 @@
 import React from 'react';
-import { Pause, Play, Plus, SlidersHorizontal, Trash2, X } from 'lucide-react';
-import { changeUserPassword, createGroup, createUser, deleteUser, disableUser, enableUser } from '../api';
+import { Pause, Pencil, Play, Plus, SlidersHorizontal, Trash2, X } from 'lucide-react';
+import { changeUserPassword, createGroup, createUser, deleteUser, disableUser, enableUser, updateUserAccess } from '../api';
 import { ActionError } from '../components/ActionError';
 import { ActionButton } from '../components/ActionButton';
 import { ActionFailureContext, type RunAction } from '../hooks/useRunAction';
 import type { GroupRecord, SessionInfo, UserRecord } from '../models';
-import { canManageGroups, canManageUsers, isGlobal } from '../permissions';
+import { canChangePassword, canEditMembership, canManageAccount, canManageGroups, canManageUsers, isGlobal } from '../permissions';
 import { accountTypeLabel } from '../uiLogic';
+
+const GROUP_ROLES: UserRecord['role'][] = ['group_admin', 'group_operator', 'group_viewer'];
+const ALL_ROLES: UserRecord['role'][] = ['global_admin', 'global_operator', 'global_viewer', ...GROUP_ROLES];
 
 export function UsersPage({
   busyAction,
@@ -28,6 +31,9 @@ export function UsersPage({
   const [groupId, setGroupId] = React.useState<number>(groups[0]?.group_id ?? 0);
   const [pwUserId, setPwUserId] = React.useState<number | null>(null);
   const [pwValue, setPwValue] = React.useState('');
+  const [editUserId, setEditUserId] = React.useState<number | null>(null);
+  const [editRole, setEditRole] = React.useState<UserRecord['role']>('group_viewer');
+  const [editGroupIds, setEditGroupIds] = React.useState<number[]>([]);
   const { clear } = React.useContext(ActionFailureContext);
   const pwKey = `user:${pwUserId}:pw`;
   const pwBusy = busyAction === pwKey;
@@ -39,8 +45,24 @@ export function UsersPage({
   };
 
   const admin = canManageUsers(session.role);
-  const globalAdmin = session.role === 'global_admin';
   const globalAccount = isGlobal(session.role);
+  // The groups the signed-in account administers: every group the server lists for it.
+  const ownGroupIds = groups.map((group) => group.group_id);
+  const editUser = users.find((user) => user.user_id === editUserId) ?? null;
+  const editKey = `user:${editUserId}:edit`;
+  const editBusy = busyAction === editKey;
+  // The edit dialog cannot be dismissed while saving; dismissing drops its old failure.
+  const closeEdit = () => {
+    if (editBusy) return;
+    clear(editKey);
+    setEditUserId(null);
+  };
+  const openEdit = (user: UserRecord) => {
+    setEditUserId(user.user_id);
+    setEditRole(user.role);
+    // Only the groups this account can see are editable; the rest stay as they are.
+    setEditGroupIds(user.group_ids.filter((id) => globalAccount || ownGroupIds.includes(id)));
+  };
   const currentUser = users.find((u) => u.username === session.username);
 
   React.useEffect(() => {
@@ -89,7 +111,68 @@ export function UsersPage({
           </div>
         </div>
       ) : null}
+      {editUser ? (() => {
+        const roleEditable = canManageAccount(session.role, ownGroupIds, editUser);
+        const visibleGroupIds = globalAccount ? groups.map((group) => group.group_id) : ownGroupIds;
+        const initialGroupIds = editUser.group_ids.filter((id) => globalAccount || ownGroupIds.includes(id));
+        const sameIds = (a: number[], b: number[]) => a.length === b.length && a.every((id) => b.includes(id));
+        const roleChanged = roleEditable && editRole !== editUser.role;
+        const groupsChanged = !sameIds(editGroupIds, initialGroupIds);
+        return (
+          <div className="modal-backdrop" onClick={closeEdit}>
+            <div className="modal-panel" role="dialog" aria-label={`Edit ${editUser.username}`} onClick={(e) => e.stopPropagation()}>
+              <div className="modal-header">
+                <h2>Edit {editUser.username}</h2>
+                <button className="icon-button" disabled={editBusy} onClick={closeEdit} aria-label="Close"><X size={14} /></button>
+              </div>
+              <label>
+                Account type
+                <select value={editRole} disabled={!roleEditable} onChange={(e) => setEditRole(e.target.value as UserRecord['role'])}>
+                  {(globalAccount ? ALL_ROLES : GROUP_ROLES).map((role) => (
+                    <option key={role} value={role}>{accountTypeLabel(role)}</option>
+                  ))}
+                  {!(globalAccount ? ALL_ROLES : GROUP_ROLES).includes(editUser.role) ? <option value={editUser.role}>{accountTypeLabel(editUser.role)}</option> : null}
+                </select>
+              </label>
+              <fieldset>
+                <legend>Groups</legend>
+                {visibleGroupIds.map((id) => (
+                  <label key={id} className="checkbox-label">
+                    <input
+                      type="checkbox"
+                      checked={editGroupIds.includes(id)}
+                      onChange={(e) => setEditGroupIds(e.target.checked ? [...editGroupIds, id] : editGroupIds.filter((g) => g !== id))}
+                    />
+                    {groups.find((group) => group.group_id === id)?.name ?? id}
+                  </label>
+                ))}
+              </fieldset>
+              <ActionError actionKey={editKey} />
+              <div className="button-row modal-actions">
+                <button className="text-button secondary" disabled={editBusy} onClick={closeEdit}>Cancel</button>
+                <button
+                  className="text-button"
+                  disabled={editBusy || (!roleChanged && !groupsChanged)}
+                  onClick={() => {
+                    const id = editUser.user_id;
+                    // Send only what changed, so a group admin never re-sends a role it may not set.
+                    const changes: { role?: UserRecord['role']; group_ids?: number[] } = {};
+                    if (roleChanged) changes.role = editRole;
+                    if (groupsChanged) changes.group_ids = editGroupIds;
+                    void runAction(editKey, () => updateUserAccess(id, changes), { inline: true }).then((saved) => {
+                      if (saved) setEditUserId(null);
+                    });
+                  }}
+                >
+                  Save
+                </button>
+              </div>
+            </div>
+          </div>
+        );
+      })() : null}
       <div className="management-header"><h1>Users & Groups</h1></div>
+
       <ActionError actionKey="group:create" />
       <ActionError actionKey="user:create" />
       <div className="management-grid">
@@ -141,7 +224,10 @@ export function UsersPage({
         <table className="management-table">
           <thead><tr><th>User</th><th>Type</th><th>Groups</th><th>State</th><th>Actions</th></tr></thead>
           <tbody>{users.map((user) => {
-            const canChangePw = admin || currentUser?.user_id === user.user_id;
+            const canChangePw = canChangePassword(session.role, currentUser?.user_id === user.user_id);
+            const canEdit = canEditMembership(session.role, ownGroupIds, user);
+            const canManage = canManageAccount(session.role, ownGroupIds, user);
+
             return (
               <tr key={user.user_id} className={user.disabled ? 'row-archived' : ''}>
                 <td>{user.username}</td>
@@ -158,8 +244,17 @@ export function UsersPage({
                         onClick={() => { setPwUserId(user.user_id); setPwValue(''); }}
                       />
                     ) : null}
-                    {globalAdmin && !user.built_in ? (
+                    {canEdit ? (
+                      <ActionButton
+                        busy={editBusy && editUserId === user.user_id}
+                        icon={<Pencil size={14} />}
+                        label="Edit"
+                        onClick={() => openEdit(user)}
+                      />
+                    ) : null}
+                    {canManage ? (
                       user.disabled ? (
+
                         <ActionButton
                           busy={busyAction === `user:${user.user_id}:enable`}
                           icon={<Play size={14} />}
@@ -175,7 +270,7 @@ export function UsersPage({
                         />
                       )
                     ) : null}
-                    {globalAdmin && !user.built_in ? (
+                    {canManage ? (
                       <ActionButton
                         busy={busyAction === `user:${user.user_id}:delete`}
                         danger
