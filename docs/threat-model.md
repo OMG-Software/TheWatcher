@@ -63,13 +63,16 @@ working document for audit, design review, and regression testing.
   optional pre-shared enrollment token, strict field validation, and an
   immutable first-seen public key for pending records. First approval still
   relies on administrator judgment.
-- The authenticated identity is the pair agent_id and CURVE key (ZAP user id
-  `<agent_id>:<z85 key>`). libzmq fixes it once, at the handshake, so the
-  server also compares the session key with the agent's current record on
-  every frame. A live session opened with a key that was later deleted or
-  replaced (for example the old key after a compromise, once the agent is
-  deleted and approved again with a new key) is dropped without refreshing
-  `last_seen` or the agent's command route. The session stays open at the
+- The authenticated identity is agent_id, CURVE key and key-approval
+  generation (ZAP user id `<agent_id>:<generation>:<z85 key>`). libzmq fixes
+  it once, at the handshake, so the server also compares the session key with
+  the agent's current record, and the generation with ZAP's current one, on
+  every frame. ZAP gives every fresh approval of a key a new generation, so
+  deleting an agent and approving the same key again does not revive a
+  session opened before the deletion. A live session opened with a key that
+  was later deleted or replaced (for example the old key after a compromise,
+  once the agent is deleted and approved again with a new key) is dropped
+  without refreshing `last_seen` or the agent's command route. The session stays open at the
   transport level until the peer or the heartbeat timeout closes it; its
   frames just no longer count.
 - **Key rotation flow.** An approved agent that enrolls again with a
@@ -222,4 +225,9 @@ when webhooks are enabled.
   victim by connecting first.
 - A deleted or rotated agent's old session is not closed by the server
   (libzmq offers no way to close one peer from a ROUTER); its frames are
-  dropped until the peer disconnects or the heartbeat timeout ends it.
+  dropped until the peer disconnects or the heartbeat timeout ends it. This
+  also holds when the same key is approved again after the deletion.
+- Without CURVE (explicitly insecure mode) nothing vouches for the `agent_id`
+  in a frame, so the server drops frames whose `agent_id` does not match the
+  enrollment format before any lookup; the id can never reach storage or JSON
+  with invalid UTF-8 or control characters.

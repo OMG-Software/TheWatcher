@@ -1,5 +1,7 @@
 #pragma once
 
+#include <charconv>
+#include <cstdint>
 #include <optional>
 #include <shared_mutex>
 #include <stop_token>
@@ -20,24 +22,40 @@ namespace thewatcher::server
 struct SessionIdentity
 {
     std::string agent_id;
+    std::uint64_t generation = 0;
     std::string key_z85;
 };
 
-// "<agent_id>:<z85 key>". agent_id never contains ':' (enrollment limits it
-// to letters, digits and "._-"), so the first ':' splits the two.
-inline std::string make_session_identity(const std::string& agent_id, const std::string& key_z85)
+// "<agent_id>:<generation>:<z85 key>". agent_id (letters, digits and "._-")
+// and generation (decimal digits) never contain ':', but the Z85 alphabet
+// does, so the key goes last and takes everything after the second ':'.
+inline std::string make_session_identity(const std::string& agent_id, std::uint64_t generation,
+                                         const std::string& key_z85)
 {
-    return agent_id + ":" + key_z85;
+    return agent_id + ":" + std::to_string(generation) + ":" + key_z85;
 }
 
 // Splits a user_id made by make_session_identity(). nullopt when it has no
-// agent_id or no key (for example the empty user_id of an unbound key).
+// agent_id, generation or key (for example the empty user_id of an unbound
+// key) or the generation is not a plain decimal number.
 inline std::optional<SessionIdentity> parse_session_identity(const std::string& user_id)
 {
-    const auto separator = user_id.find(':');
-    if (separator == std::string::npos || separator == 0 || separator + 1 == user_id.size())
+    const auto first = user_id.find(':');
+    if (first == std::string::npos || first == 0)
         return std::nullopt;
-    return SessionIdentity{user_id.substr(0, separator), user_id.substr(separator + 1)};
+    const auto second = user_id.find(':', first + 1);
+    if (second == std::string::npos || second == first + 1 || second + 1 == user_id.size())
+        return std::nullopt;
+
+    SessionIdentity identity;
+    identity.agent_id = user_id.substr(0, first);
+    const char* const digits_begin = user_id.data() + first + 1;
+    const char* const digits_end = user_id.data() + second;
+    const auto parsed = std::from_chars(digits_begin, digits_end, identity.generation);
+    if (parsed.ec != std::errc{} || parsed.ptr != digits_end)
+        return std::nullopt;
+    identity.key_z85 = user_id.substr(second + 1);
+    return identity;
 }
 
 // Runs the ZAP (ZeroMQ Authentication Protocol) handler on a background thread.
@@ -62,6 +80,13 @@ public:
     // unknown or was added without an identity.
     std::optional<std::string> user_id_for_key(const std::string& z85_key) const;
 
+    // The approval generation of an approved key: it changes whenever the key
+    // is approved afresh (added after being removed, or for another agent_id)
+    // and stays the same when the same binding is added again. nullopt when
+    // the key is not approved. Sessions opened under an older generation are
+    // stale (#183).
+    std::optional<std::uint64_t> generation_for_key(const std::string& z85_key) const;
+
 private:
     // Thread body: binds inproc://zeromq.zap.01 and answers each ZAP request
     // until stopped. Accepts a CURVE peer only if its key is approved, and
@@ -71,7 +96,13 @@ private:
 
     zmq::context_t& ctx_;
     mutable std::shared_mutex keys_mutex_;
-    std::unordered_map<std::string, std::string> approved_keys_; // z85 key -> agent_id
+    struct Binding
+    {
+        std::string agent_id;
+        std::uint64_t generation = 0;
+    };
+    std::unordered_map<std::string, Binding> approved_keys_; // z85 key -> binding
+    std::uint64_t next_generation_ = 1;                      // guarded by keys_mutex_
     std::jthread thread_;
 };
 

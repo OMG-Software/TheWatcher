@@ -31,6 +31,7 @@ SCENARIO("ZAP keys are bound to the agent_id they authenticate")
             {
                 REQUIRE(zap.has_key(key));
                 REQUIRE(zap.user_id_for_key(key) == std::optional<std::string>{"agent-alpha"});
+                REQUIRE(zap.generation_for_key(key).has_value());
             }
 
             AND_WHEN("the same key is re-added under a different agent_id")
@@ -40,6 +41,32 @@ SCENARIO("ZAP keys are bound to the agent_id they authenticate")
                 THEN("the latest binding wins")
                 {
                     REQUIRE(zap.user_id_for_key(key) == std::optional<std::string>{"agent-beta"});
+                }
+            }
+
+            AND_WHEN("the same key is re-added under the same agent_id")
+            {
+                const auto before = zap.generation_for_key(key);
+                zap.add_key(key, "agent-alpha");
+
+                THEN("the generation is unchanged, so a live session stays valid")
+                {
+                    REQUIRE(before.has_value());
+                    REQUIRE(zap.generation_for_key(key) == before);
+                }
+            }
+
+            AND_WHEN("the key is removed and approved again for the same agent_id")
+            {
+                const auto before = zap.generation_for_key(key);
+                zap.remove_key(key);
+                zap.add_key(key, "agent-alpha");
+
+                THEN("the key gets a new generation, so sessions from before the removal no longer match")
+                {
+                    REQUIRE(before.has_value());
+                    REQUIRE(zap.generation_for_key(key).has_value());
+                    REQUIRE(zap.generation_for_key(key) != before);
                 }
             }
 
@@ -77,32 +104,50 @@ SCENARIO("ZAP keys are bound to the agent_id they authenticate")
     }
 }
 
-SCENARIO("A session identity names the agent and the key it authenticated with")
+SCENARIO("A session identity names the agent, key generation and key")
 {
-    GIVEN("an agent_id and a key")
+    GIVEN("an agent_id, a generation and a key")
     {
         const std::string key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
 
         WHEN("an identity is made and parsed back")
         {
-            const auto parsed = parse_session_identity(make_session_identity("agent-alpha", key));
+            const auto parsed = parse_session_identity(make_session_identity("agent-alpha", 7, key));
 
-            THEN("both parts round-trip")
+            THEN("all three parts round-trip")
             {
                 REQUIRE(parsed.has_value());
                 REQUIRE(parsed->agent_id == "agent-alpha");
+                REQUIRE(parsed->generation == 7);
                 REQUIRE(parsed->key_z85 == key);
             }
         }
 
-        WHEN("a user_id has no agent_id, no key or no separator")
+        WHEN("the Z85 key contains colons, which are part of the Z85 alphabet")
+        {
+            const std::string colon_key = ":::AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA:::::";
+            const auto parsed = parse_session_identity(make_session_identity("agent-alpha", 12, colon_key));
+
+            THEN("the agent_id, generation and the whole key still round-trip")
+            {
+                REQUIRE(parsed.has_value());
+                REQUIRE(parsed->agent_id == "agent-alpha");
+                REQUIRE(parsed->generation == 12);
+                REQUIRE(parsed->key_z85 == colon_key);
+            }
+        }
+
+        WHEN("a user_id has no agent_id, no generation, no key or a non-numeric generation")
         {
             THEN("it does not parse")
             {
                 REQUIRE_FALSE(parse_session_identity("").has_value());
                 REQUIRE_FALSE(parse_session_identity("agent-alpha").has_value());
-                REQUIRE_FALSE(parse_session_identity(":" + key).has_value());
-                REQUIRE_FALSE(parse_session_identity("agent-alpha:").has_value());
+                REQUIRE_FALSE(parse_session_identity("agent-alpha:" + key).has_value());
+                REQUIRE_FALSE(parse_session_identity(":1:" + key).has_value());
+                REQUIRE_FALSE(parse_session_identity("agent-alpha:1:").has_value());
+                REQUIRE_FALSE(parse_session_identity("agent-alpha:x:" + key).has_value());
+                REQUIRE_FALSE(parse_session_identity("agent-alpha::" + key).has_value());
             }
         }
     }
@@ -152,8 +197,10 @@ SCENARIO("ZAP authenticates a real CURVE connection and stamps the session ident
             {
                 REQUIRE(router.recv(identity, zmq::recv_flags::none).has_value());
                 REQUIRE(router.recv(payload, zmq::recv_flags::none).has_value());
+                const auto generation = zap.generation_for_key(agent_keys.public_key_z85);
+                REQUIRE(generation.has_value());
                 REQUIRE(std::string(identity.gets("User-Id")) ==
-                        make_session_identity("agent-alpha", agent_keys.public_key_z85));
+                        make_session_identity("agent-alpha", *generation, agent_keys.public_key_z85));
             }
         }
 

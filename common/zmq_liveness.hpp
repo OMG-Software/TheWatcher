@@ -15,6 +15,8 @@ namespace thewatcher::proto
 // thread does not trigger them.
 inline constexpr int kHeartbeatIvlMs = 10'000;
 inline constexpr int kHeartbeatTimeoutMs = 30'000;
+// libzmq takes the TTL in milliseconds too (ZMQ_HEARTBEAT_TTL), rounds it
+// down to deciseconds for the wire (max 6553599 ms) and reads it back in ms.
 inline constexpr int kHeartbeatTtlMs = 30'000;
 
 // TCP keepalive is the second line of defence for peers that do not speak ZMTP

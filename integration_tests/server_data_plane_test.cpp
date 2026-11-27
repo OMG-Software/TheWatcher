@@ -384,6 +384,58 @@ SCENARIO("A deleted agent's old session is not accepted after re-approval with a
     }
 }
 
+SCENARIO("A deleted agent's old session stays dead when the same key is approved again (issue #183)")
+{
+    GIVEN("an approved agent with a live session on key K")
+    {
+        crypto::init();
+        DataPlaneFixture fx;
+        fx.start_and_login();
+        const auto key = crypto::generate_curve_keypair();
+        fx.enroll_and_approve_with("dp-revived", key);
+        AgentPeer old_session(fx.config, key);
+        old_session.send_cpu("dp-revived", 10.0);
+        REQUIRE(eventually(
+            [&] {
+                return fx.metric_rows("dp-revived") == 1;
+            },
+            5s));
+
+        WHEN("the agent is deleted and the same agent_id is approved again with the same key K")
+        {
+            auto deleted = fx.client.Delete("/api/agents/dp-revived");
+            REQUIRE(deleted);
+            REQUIRE(deleted->status == 200);
+            // Per-agent_id enrollment rate limit is 10 s.
+            std::this_thread::sleep_for(11s);
+            fx.enroll_and_approve_with("dp-revived", key);
+            const auto rows_before = fx.metric_rows("dp-revived");
+
+            AND_WHEN("the session opened before the deletion sends metrics")
+            {
+                old_session.send_cpu("dp-revived", 99.0);
+
+                THEN("they are dropped")
+                {
+                    std::this_thread::sleep_for(500ms);
+                    REQUIRE(fx.metric_rows("dp-revived") == rows_before);
+                }
+
+                AND_THEN("a new session with the same key is accepted")
+                {
+                    AgentPeer new_session(fx.config, key);
+                    new_session.send_cpu("dp-revived", 20.0);
+                    REQUIRE(eventually(
+                        [&] {
+                            return fx.metric_rows("dp-revived") == rows_before + 1;
+                        },
+                        5s));
+                }
+            }
+        }
+    }
+}
+
 SCENARIO("A reconnecting agent replaces its dead connection (issue #143)")
 {
     GIVEN("an agent whose old connection is still open on the server under the same routing id")

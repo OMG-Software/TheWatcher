@@ -13,6 +13,12 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   revives the old key's live session. ZAP now reports `<agent_id>:<key>` as
   the session identity and the server compares the key with the agent's
   record on every frame (#144).
+- A deleted agent that is approved again with the same key no longer revives
+  the old session: ZAP now reports `<agent_id>:<generation>:<key>`, where the
+  generation changes with every fresh approval of a key, and the server checks
+  it on every frame. The key goes last, so a Z85 key containing `:` parses
+  correctly. Frames whose `agent_id` does not have the enrollment format are
+  dropped, also when CURVE is disabled (#183).
 - The server sanitises every agent-supplied string (log-match indicator,
   severity and path, hostnames, mount points, interface and process names)
   before logging it, through one function, so an agent can no longer forge

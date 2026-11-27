@@ -25,7 +25,13 @@ ZapHandler::ZapHandler(zmq::context_t& ctx)
 void ZapHandler::add_key(const std::string& z85_key, const std::string& agent_id)
 {
     std::unique_lock lock(keys_mutex_);
-    approved_keys_[z85_key] = agent_id;
+    auto it = approved_keys_.find(z85_key);
+    if (it != approved_keys_.end() && it->second.agent_id == agent_id)
+        return; // same binding again (for example a second approve): live sessions stay valid
+    // A fresh approval gets a fresh generation, so a session opened before the
+    // key was removed (agent deleted, then approved again with the same key)
+    // does not come back to life (#183).
+    approved_keys_[z85_key] = Binding{agent_id, next_generation_++};
     LOGF_DEBUG("ZAP key added approved_key_count=%zu bound_agent_id=%s", approved_keys_.size(), agent_id.c_str());
 }
 
@@ -50,9 +56,18 @@ std::optional<std::string> ZapHandler::user_id_for_key(const std::string& z85_ke
     auto it = approved_keys_.find(z85_key);
     if (it == approved_keys_.end())
         return std::nullopt;
-    if (it->second.empty())
+    if (it->second.agent_id.empty())
         return std::nullopt;
-    return it->second;
+    return it->second.agent_id;
+}
+
+std::optional<std::uint64_t> ZapHandler::generation_for_key(const std::string& z85_key) const
+{
+    std::shared_lock lock(keys_mutex_);
+    auto it = approved_keys_.find(z85_key);
+    if (it == approved_keys_.end())
+        return std::nullopt;
+    return it->second.generation;
 }
 
 // Binds inproc://zeromq.zap.01 and answers ZAP requests until stopped. Allows a
@@ -114,8 +129,8 @@ void ZapHandler::run(std::stop_token st)
                 allow = it != approved_keys_.end();
                 // Issue #144: the identity names the key too, so the server
                 // can tell a session of a replaced key from the current one.
-                if (allow && !it->second.empty())
-                    user_id = make_session_identity(it->second, z85);
+                if (allow && !it->second.agent_id.empty())
+                    user_id = make_session_identity(it->second.agent_id, it->second.generation, z85);
                 LOGF_TRACE("ZAP CURVE lookup approved=%d bound=%d", allow ? 1 : 0, user_id.empty() ? 0 : 1);
             }
             else if (mechanism == "NULL")

@@ -1,5 +1,6 @@
 #include "server.hpp"
 
+#include "agent_id.hpp"
 #include "common/SingleLog.hpp"
 #include "common/commands.hpp"
 #include "common/crypto.hpp"
@@ -398,6 +399,15 @@ void Server::handle_router_frame(zmq::socket_t& router)
     }
 
     const std::string& agent_id = frame.agent_id;
+    // The id is a database key and a routing identity: with CURVE the ZAP
+    // identity must equal it, without CURVE nothing else vouches for it, so
+    // it must have the enrollment format before it reaches storage (#183).
+    if (!is_valid_agent_id(agent_id))
+    {
+        LOGF_WARNING("Dropping frame with invalid agent_id format identity_size=%zu length=%zu type=%s",
+                     identity_msg.size(), agent_id.size(), frame_type_name(frame.type));
+        return;
+    }
     // Peer-supplied: every log line below uses this sanitised copy (#157).
     const std::string log_id = sanitize_log_text(agent_id);
     LOGF_TRACE("Received frame identity_size=%zu agent_id=%s type=%s raw_type=%u payload_size=%zu frame_timestamp=%lld",
@@ -408,7 +418,8 @@ void Server::handle_router_frame(zmq::socket_t& router)
     // authoritative. frame.agent_id is attacker-controlled payload; a peer
     // whose key belongs to a different agent must not be able to poison
     // another agent's metrics, alerts or config.
-    std::string session_key; // the CURVE key this session authenticated with (#144)
+    std::string session_key;              // the CURVE key this session authenticated with (#144)
+    std::uint64_t session_generation = 0; // the approval generation of that key (#183)
     if (!config_.server_public_key.empty())
     {
         std::string authenticated_id;
@@ -431,6 +442,7 @@ void Server::handle_router_frame(zmq::socket_t& router)
             return;
         }
         session_key = session->key_z85;
+        session_generation = session->generation;
     }
 
     // SEC-09: approval is enforced per frame, not only at handshake time.
@@ -449,10 +461,14 @@ void Server::handle_router_frame(zmq::socket_t& router)
     // opened with a key that was since deleted or replaced still carries the
     // agent_id. Accept it only while its key is the record's current key. The
     // route is left alone: it belongs to the agent's current session.
-    if (!config_.server_public_key.empty() && session_key != rec->curve_public_key_z85)
+    // Issue #183: a deleted agent approved again with the same key has the same
+    // (agent_id, key), so the generation must match too: ZAP gives every fresh
+    // approval a new one.
+    if (!config_.server_public_key.empty() &&
+        (session_key != rec->curve_public_key_z85 || zap_->generation_for_key(session_key) != session_generation))
     {
-        LOGF_WARNING("Dropping frame from a session whose key is no longer agent_id=%s's key type=%s", log_id.c_str(),
-                     frame_type_name(frame.type));
+        LOGF_WARNING("Dropping frame from a session whose key approval is no longer current agent_id=%s type=%s",
+                     log_id.c_str(), frame_type_name(frame.type));
         return;
     }
 
@@ -746,13 +762,10 @@ void Server::handle_enrollment(zmq::socket_t& enroll)
         // and bounds before touching storage, the rate-limit maps or the
         // log. agent_id doubles as a routing identity and DB key, so its
         // charset is deliberately strict.
-        static constexpr std::size_t max_agent_id_len = 64;
         static constexpr std::size_t max_hostname_len = 255;
         static constexpr std::size_t max_platform_len = 64;
         static constexpr std::size_t max_enroll_token_len = 256;
-        if (req.agent_id.empty() || req.agent_id.size() > max_agent_id_len ||
-            req.agent_id.find_first_not_of("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-") !=
-                std::string::npos)
+        if (!is_valid_agent_id(req.agent_id))
         {
             LOGF_WARNING("Enrollment rejected: invalid agent_id format length=%zu", req.agent_id.size());
             send_error("invalid agent_id");

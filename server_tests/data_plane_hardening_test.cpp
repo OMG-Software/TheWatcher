@@ -5,6 +5,7 @@
 #include "common/protocol.hpp"
 #include "common/text_safety.hpp"
 #include "common/zmq_liveness.hpp"
+#include "server/agent_id.hpp"
 #include "server/ingest_sanitize.hpp"
 
 #include <catch2/catch_test_macros.hpp>
@@ -135,6 +136,32 @@ SCENARIO("Data-plane sockets enable heartbeats and TCP keepalive")
                     REQUIRE(socket->get(zmq::sockopt::tcp_keepalive_idle) == proto::kTcpKeepaliveIdleSeconds);
                 }
             }
+        }
+    }
+}
+
+SCENARIO("Agent ids are checked against the enrollment format wherever they are used")
+{
+    GIVEN("agent ids that enrollment accepts")
+    {
+        THEN("they are valid")
+        {
+            REQUIRE(is_valid_agent_id("agent-alpha"));
+            REQUIRE(is_valid_agent_id("web_01.example-corp"));
+            REQUIRE(is_valid_agent_id(std::string(64, 'a')));
+        }
+    }
+
+    GIVEN("agent ids that carry invalid UTF-8, a separator or control characters, or have a bad length")
+    {
+        THEN("they are not valid")
+        {
+            REQUIRE_FALSE(is_valid_agent_id(""));
+            REQUIRE_FALSE(is_valid_agent_id(std::string(65, 'a')));
+            REQUIRE_FALSE(is_valid_agent_id("agent\xE9"));
+            REQUIRE_FALSE(is_valid_agent_id("agent:alpha"));
+            REQUIRE_FALSE(is_valid_agent_id("agent\nalpha"));
+            REQUIRE_FALSE(is_valid_agent_id(std::string("agent\0alpha", 11)));
         }
     }
 }
