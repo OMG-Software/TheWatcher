@@ -172,6 +172,11 @@ int main(int argc, char* argv[])
             service_args.push_back("--config");
             service_args.push_back(config_path);
         }
+        if (!cli_log_level.empty())
+        {
+            service_args.push_back("--log-level");
+            service_args.push_back(cli_log_level);
+        }
         if (!override_server.empty())
         {
             service_args.push_back("--server");

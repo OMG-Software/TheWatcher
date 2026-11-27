@@ -405,7 +405,9 @@ void Server::handle_router_frame(zmq::socket_t& router)
     while (router.get(zmq::sockopt::rcvmore))
     {
         zmq::message_t extra;
-        if (!router.recv(extra, zmq::recv_flags::none))
+        if (!thewatcher::zmqutil::retry_on_eintr([&] {
+                return router.recv(extra, zmq::recv_flags::none);
+            }))
             break;
     }
 

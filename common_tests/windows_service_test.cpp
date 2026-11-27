@@ -184,3 +184,21 @@ SCENARIO("The windows_service stubs refuse to act on non-Windows platforms")
     }
 }
 #endif
+
+SCENARIO("A service command line carries forwarded options such as --log-level")
+{
+    GIVEN("the arguments an installer builds when --log-level is given")
+    {
+        const std::vector<std::string> args{"agent.exe", "--service", "--service-name", "Svc", "--log-level", "debug"};
+
+        WHEN("the command line is built")
+        {
+            const auto line = build_service_command_line(args);
+
+            THEN("the option and its value are separate quoted arguments")
+            {
+                REQUIRE(line == R"("agent.exe" "--service" "--service-name" "Svc" "--log-level" "debug")");
+            }
+        }
+    }
+}

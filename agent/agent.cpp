@@ -145,7 +145,8 @@ void Agent::start()
 {
     LOG_FUNCTION_TRACE
     {
-        enrollment_stop_.store(false);
+        // enrollment_stop_ is not reset here: a stop() that arrived before
+        // start() (for example a service Stop during startup) must stay in effect.
         LOGF_INFO("Starting enrollment with %s", config_.enrollment_address.c_str());
         enroll(config_, ctx_, enrollment_stop_);
         if (enrollment_stop_.load())
@@ -236,8 +237,12 @@ void Agent::io_loop(std::stop_token st)
                     LOGF_WARNING("Sending undecodable queued frame encoded_size=%zu error=%s", payload.size(),
                                  e.what());
                 }
-                dealer_.send(zmq::message_t{}, zmq::send_flags::sndmore);
-                dealer_.send(zmq::message_t(payload.data(), payload.size()), zmq::send_flags::none);
+                thewatcher::zmqutil::retry_on_eintr([&] {
+                    return dealer_.send(zmq::message_t{}, zmq::send_flags::sndmore);
+                });
+                thewatcher::zmqutil::retry_on_eintr([&] {
+                    return dealer_.send(zmq::message_t(payload.data(), payload.size()), zmq::send_flags::none);
+                });
             }
         }
 
@@ -455,8 +460,12 @@ void Agent::handle_command(const CommandMessage& cmd)
                 .count();
         f.payload = proto::pack(ack_msg);
         auto encoded = proto::encode_frame(f);
-        dealer_.send(zmq::message_t{}, zmq::send_flags::sndmore);
-        dealer_.send(zmq::message_t(encoded.data(), encoded.size()), zmq::send_flags::none);
+        thewatcher::zmqutil::retry_on_eintr([&] {
+            return dealer_.send(zmq::message_t{}, zmq::send_flags::sndmore);
+        });
+        thewatcher::zmqutil::retry_on_eintr([&] {
+            return dealer_.send(zmq::message_t(encoded.data(), encoded.size()), zmq::send_flags::none);
+        });
         LOGF_DEBUG("Sent immediate ACK command_id=%s ok=%d message=%s", cmd.command_id.c_str(), ok ? 1 : 0,
                    msg.c_str());
     };

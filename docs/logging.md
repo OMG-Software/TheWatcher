@@ -58,6 +58,10 @@ so on up to `LOG_MAX_FILES`; the oldest file is deleted. Entries are never
 split across files. Defaults are 10 MiB and 5 backups, so the log uses at most
 about 60 MiB per binary. Set `LOG_MAX_SIZE_MB=0` to turn rotation off, and
 `LOG_MAX_FILES=0` to keep no backups (the file is emptied at the limit).
+If a rotation fails (for example the directory does not allow renaming the
+file), the live log is never truncated: the logger keeps appending, writes a
+`Log rotation failed` warning, and retries after another full size limit has
+been written.
 Example:
 
 ```text

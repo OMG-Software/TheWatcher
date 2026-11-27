@@ -101,7 +101,13 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   with an embedded `"` no longer swallows the following arguments (#161).
 - The Windows service helpers close their `SC_HANDLE`s through an RAII
   wrapper (part of #100), and the test server runner uses `std::jthread`.
-- Log files are no longer truncated on every start (#99).
+- Log files are no longer truncated on every start (#99). A failed
+  rotation (a rename or remove error) no longer truncates the live log: the
+  logger keeps appending and writes a warning (#99).
+- A service Stop that arrives before the agent starts is no longer cleared by
+  `Agent::start()`; the agent's stop state is sticky. `--install-service` now
+  forwards `--log-level` to the service command line for both binaries, and
+  agent ZeroMQ sends, like receives, retry on `EINTR` (#84, #99).
 - The CPU collector reports a real usage value on its first `update()` and
   after a collector restart. The constructor takes a baseline and the first
   update waits until it is at least 100 ms old. Calls closer than 100 ms to

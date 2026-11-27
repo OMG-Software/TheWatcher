@@ -294,3 +294,40 @@ SCENARIO("Default log settings keep TRACE lines out of the file")
         std::filesystem::remove(path, ec);
     }
 }
+
+SCENARIO("SingleLog keeps the live log when a rotation cannot move it aside")
+{
+    GIVEN("a log limited to 600 bytes whose first backup name is a non-empty directory")
+    {
+        const auto path = thewatcher::test::process_temp_dir().path() / "thewatcher-singlelog-rotatefail-test.log";
+        std::error_code ec;
+        use_log_file(path);
+        const auto blocker = std::filesystem::path(path.string() + ".1");
+        std::filesystem::remove_all(blocker, ec);
+        std::filesystem::create_directories(blocker / "inner");
+        auto& logger = thewatcher::logging::SingleLog::GetInstance();
+        logger.SetLogRotation(600, 1);
+
+        WHEN("enough is written to trigger rotation, which fails")
+        {
+            const std::string filler(80, 'z');
+            for (int i = 0; i < 20; ++i)
+                LOG_NOTICE("rotatefail probe " + std::to_string(i) + " " + filler);
+
+            THEN("no entry is lost and logging continues")
+            {
+                REQUIRE(eventually(
+                    [&] {
+                        return file_contains(path, "rotatefail probe 19");
+                    },
+                    2s, 20ms));
+                REQUIRE(file_contains(path, "rotatefail probe 0 "));
+                REQUIRE(file_contains(path, "rotatefail probe 10 "));
+            }
+        }
+
+        logger.SetLogRotation(0, 0);
+        std::filesystem::remove_all(blocker, ec);
+        std::filesystem::remove(path, ec);
+    }
+}

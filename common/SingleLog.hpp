@@ -489,26 +489,58 @@ namespace logging
         {
             m_fileOut.close();
             std::error_code ec;
+            std::string failure;
             if (m_maxBackups == 0)
             {
                 std::filesystem::remove(m_filePath, ec);
+                if (ec)
+                {
+                    failure = "remove " + m_filePath + ": " + ec.message();
+                }
             }
             else
             {
                 const auto backup = [this](unsigned index) {
                     return m_filePath + "." + std::to_string(index);
                 };
+                // remove() reports a missing file as success (false), so an error
+                // here is a real failure. Stop at the first one: the live file
+                // has not been touched yet.
                 std::filesystem::remove(backup(m_maxBackups), ec);
-                for (unsigned i = m_maxBackups - 1; i >= 1; --i)
+                for (unsigned i = m_maxBackups - 1; failure.empty() && ec.value() == 0 && i >= 1; --i)
                 {
-                    if (std::filesystem::exists(backup(i), ec))
+                    if (std::filesystem::exists(backup(i), ec) && !ec)
                     {
                         std::filesystem::rename(backup(i), backup(i + 1), ec);
                     }
                 }
-                std::filesystem::rename(m_filePath, backup(1), ec);
+                if (!ec)
+                {
+                    std::filesystem::rename(m_filePath, backup(1), ec);
+                }
+                if (ec)
+                {
+                    failure = "rename " + m_filePath + ": " + ec.message();
+                }
             }
-            OpenFileLocked(true);
+            if (failure.empty())
+            {
+                m_rotationRetryBytes = 0;
+                OpenFileLocked(true);
+                return;
+            }
+            // The live file was not moved aside, so never truncate it. Keep
+            // appending, note the failure in the log, and try again only once
+            // another full limit has been written.
+            OpenFileLocked(false);
+            m_rotationRetryBytes = m_fileBytes + m_maxFileBytes;
+            if (m_fileOut.is_open())
+            {
+                const std::string line = MakeLogLine("WARNING", "SingleLog", "Log rotation failed: " + failure);
+                m_fileOut << line;
+                m_fileOut.flush();
+                m_fileBytes += OnDiskSize(line);
+            }
         }
 
         void ConsoleLog(const std::string& s, bool flush)
@@ -582,7 +614,7 @@ namespace logging
                 if (m_fileOut.is_open())
                 {
                     if (m_maxFileBytes > 0 && m_fileBytes > 0 &&
-                        m_fileBytes + OnDiskSize(entry.message) > m_maxFileBytes)
+                        m_fileBytes + OnDiskSize(entry.message) > m_maxFileBytes && m_fileBytes >= m_rotationRetryBytes)
                     {
                         RotateLocked();
                     }
@@ -612,6 +644,7 @@ namespace logging
         std::string m_filePath{};
         std::uintmax_t m_fileBytes{0};
         std::uintmax_t m_maxFileBytes{0};
+        std::uintmax_t m_rotationRetryBytes{0}; // after a failed rotation, retry at this size
         unsigned m_maxBackups{0};
         std::array<char, LoggerInternalBufferSize> m_writeBuffer{};
 
