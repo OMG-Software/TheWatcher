@@ -101,6 +101,10 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   range, `DB_TYPE`, a Postgres DSN, and a complete, matching CURVE keypair.
   Unknown keys log a warning. The Windows default path no longer reads an
   uninitialised buffer if the shell call fails (#58).
+- Dashboard: `tsc` no longer writes `.js`/`.d.ts` files into `dashboard/src`
+  (`noEmit`), the 21 committed compiled twins are removed, and vitest runs
+  only `*.test.ts(x)`. Before, Vite served the stale twins and every test ran
+  twice (8 files / 172 tests became 4 / 86) (#103).
 - Agent enrollment recovers after a reply timeout: each attempt uses a new
   REQ socket, so a late server is reached without restarting the agent (#86).
 - A malformed enrollment reply is logged and retried instead of terminating
@@ -179,8 +183,26 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   history. `*.cmd`/`*.bat` are checked out with CRLF (#128).
 - Version bumped to 0.9.0 in `meson.build`, `dashboard/package.json` and
   the Windows installer.
+- Dashboard: `main.tsx` is split into `App.tsx`, `pages/`, `components/`,
+  `hooks/` and `permissions.ts` (role helpers, now unit tested); inline
+  styles moved into `styles.css`. No behaviour change (#117).
+- Dashboard: removed the unused API helpers `deleteAlert` (identical to
+  `archiveAlert`), `setAgentGroups`, `setAgentRunbook`, `setAgentInterval`,
+  `setAgentProcessLimit`, `setAgentThresholds` and `fetchUptimeReport`, and
+  the unused imports in `main.tsx` (#116).
+- `docs/dashboard.md` now describes the UI as it behaves, including the
+  Silences, Maintenance and Settings pages, the fixed maintenance reason and
+  the first-group approval, and that the server does not serve the bundle
+  (#135).
 
 ### Added
+
+- Dashboard: ESLint (flat config, `typescript-eslint`, `react-hooks`) with
+  `npm run lint`, and a `dashboard` CI job running
+  `npm ci --ignore-scripts` (no package install scripts), lint, build, tests
+  and `npm audit --omit=dev` (#120).
+- Dashboard: the footer shows the dashboard version from `package.json`
+  (#127).
 
 - `docs/api.md`: a reference for every REST route (role, request and response
   shapes, error codes, limits, paging). The README index now lists it, the
