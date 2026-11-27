@@ -9,6 +9,14 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Security
 
+- The agent no longer trusts the server key in an enrollment reply: it must
+  be 40 Z85 characters decoding to a 32-byte key, and the config writer
+  refuses any value containing CR or LF. Before, a crafted key could inject
+  `SERVER_ADDRESS` or `ALLOW_INSECURE` lines into the saved config (#148).
+- The agent config is now written atomically through an owner-only temporary
+  file and renamed over the old one; write errors are reported. On Windows the
+  file gets a protected DACL (SYSTEM, Administrators, owner) instead of the
+  parent directory's inherited rights (#149).
 - Fixed a server crash (NULL dereference) and heap over-read when a metrics
   or collector-config payload has a CBOR `null`/`true`/`false`/`undefined`
   or a half/single-precision float where a double is expected. All float
@@ -51,6 +59,13 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   (`noEmit`), the 21 committed compiled twins are removed, and vitest runs
   only `*.test.ts(x)`. Before, Vite served the stale twins and every test ran
   twice (8 files / 172 tests became 4 / 86) (#103).
+- Agent enrollment recovers after a reply timeout: each attempt uses a new
+  REQ socket, so a late server is reached without restarting the agent (#86).
+- A malformed enrollment reply is logged and retried instead of terminating
+  the agent (#160).
+- IPv6 server addresses such as `[2001:db8::1]:5555` are parsed correctly in
+  the agent config; an unbracketed IPv6 address is rejected with a clear
+  error (#98).
 - Alert notes longer than 4,096 bytes are cut on a UTF-8 character
   boundary. Oversize `runbook_markdown` (collector config) and
   `reports_webhook_url` (settings) are rejected with 400 instead of being
@@ -67,6 +82,23 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   unprivileged writers, and root-reserved blocks count as used (#158).
 - Encoding a frame with an empty payload no longer passes a null pointer to
   libcbor (undefined behaviour reported by UBSan on every heartbeat) (#162).
+- The CPU collector reports a real usage value on its first `update()` and
+  after a collector restart. The constructor takes a baseline and the first
+  update waits until it is at least 100 ms old. Calls closer than 100 ms to
+  the previous sample report the previous result instead of a few-tick
+  delta (#97).
+- Memory collector swap figures can no longer underflow. Windows reads the
+  real page files (`EnumPageFilesW`) instead of the commit limit (#94).
+  FreeBSD sums `vm.swap_info` instead of `vm.swap_reserved` (#159). A host
+  with no swap reports 0/0/0, and every subtraction is clamped (the Linux
+  `used_bytes` too).
+- CPU usage is collected on FreeBSD (`kern.cp_time`, `kern.cp_times`),
+  OpenBSD (`KERN_CPTIME`, `KERN_CPTIME2`) and NetBSD (`kern.cp_time`), with
+  load averages from `getloadavg`. Memory is collected on OpenBSD
+  (`VM_UVMEXP`) and NetBSD (`VM_UVMEXP2`). The OpenBSD and NetBSD code has
+  not been compiled yet. Disk and process collectors are still open (part
+  of #93).
+- Added behavioural tests for the CPU and memory collectors (part of #137).
 - The Linux CI build (GCC 11, `-O3 -Werror`) compiles again:
   `protocol_security_test` builds its CBOR payloads in a buffer sized up
   front instead of appending with `vector::insert`, which tripped a GCC 11
@@ -95,6 +127,9 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Changed
 
+- The server config save now uses the shared `common::write_private_file_atomic`
+  helper (atomic, owner-only write) that the agent config also uses; the
+  duplicated code in `server/config.cpp` is removed. No behaviour change (#149).
 - The whole C++ tree is formatted with the root `.clang-format`, and CI
   fails any PR whose C++ is not (`clang-format` 22.1.5, pinned). The
   formatting commit is listed in `.git-blame-ignore-revs`. A new include
