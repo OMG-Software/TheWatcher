@@ -43,8 +43,8 @@ Options:
 | `API_HOST` | `0.0.0.0` | HTTP REST API bind host. |
 | `API_PORT` | `8080` | HTTP REST API port consumed by the dashboard. |
 | `DB_PATH` | `thewatcher.db` | SQLite database path when `DB_TYPE` is `sqlite`. Relative paths resolve beside the active server config file so server restarts from different working directories keep using the same database. |
-| `DB_TYPE` | `sqlite` | Storage backend. `sqlite` is implemented. `postgres` is reserved in config but not implemented by the current build. |
-| `POSTGRES_DSN` | empty | Reserved for future PostgreSQL support. |
+| `DB_TYPE` | `sqlite` | Storage backend: `sqlite` or `postgres`. `postgres` needs a server binary built with PostgreSQL support (see [Build Environment](build-environment.md)); a binary built without it stops at startup with `Unsupported db_type: postgres`. Any other value stops the server the same way. |
+| `POSTGRES_DSN` | empty | libpq connection string used when `DB_TYPE` is `postgres`, for example `host=db.example.com port=5432 dbname=thewatcher user=thewatcher password=... sslmode=require`. It holds a password, so it is protected like `SERVER_SECRET_KEY`. Ignored when `DB_TYPE` is `sqlite`. |
 | `OFFLINE_AFTER_SECONDS` | `60` | Approved connected agents are marked disconnected when `last_seen` is older than this number of seconds. Set `0` or a negative value to disable automatic offline marking. |
 | `SERVER_PUBLIC_KEY` | generated | Server CURVE public key. Approved enrollment responses include this key and its fingerprint so agents can learn and pin it. |
 | `SERVER_SECRET_KEY` | generated | Server CURVE secret key. Keep this private. |

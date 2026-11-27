@@ -34,7 +34,7 @@ Source: "..\..\dashboard\dist\*"; DestDir: "{app}\dashboard"; Flags: ignoreversi
 Name: "{commonappdata}\TheWatcher"; AfterInstall: SecureConfigDir
 
 [Run]
-Filename: "{app}\server\TheWatcherServer.exe"; Parameters: "--install-service --config ""{commonappdata}\TheWatcher\server.json"""; Flags: runhidden waituntilterminated
+Filename: "{app}\server\TheWatcherServer.exe"; Parameters: "--install-service --config ""{commonappdata}\TheWatcher\TheWatcherServer.conf"""; Flags: runhidden waituntilterminated
 Filename: "{app}\agent\TheWatcherAgent.exe"; Parameters: "--install-service --config ""{commonappdata}\TheWatcher\TheWatcherAgent.conf"""; Flags: runhidden waituntilterminated
 
 [UninstallRun]

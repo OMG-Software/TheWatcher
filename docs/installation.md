@@ -14,6 +14,11 @@ ready. Build tool setup is covered in [Build Environment](build-environment.md).
   - `5556/tcp` enrollment;
   - `8080/tcp` REST API.
 - SQLite support from the built binary. No external SQLite service is required.
+- Optional: a PostgreSQL server (14 or later) if you set `DB_TYPE=postgres`.
+  The server binary must have been built with PostgreSQL support; see
+  [Build Environment](build-environment.md). See [Configuration](configuration.md)
+  for the settings and [High-Availability Topology](ha-topology.md) for a
+  two-node setup.
 - The generated server CURVE public key is returned to agents in approved
   enrollment responses and then pinned by the agent.
 
@@ -228,13 +233,13 @@ New-Item -ItemType Directory -Force C:\ProgramData\TheWatcher
 Recommended files:
 
 ```text
-C:\ProgramData\TheWatcher\server.json
+C:\ProgramData\TheWatcher\TheWatcherServer.conf
 C:\ProgramData\TheWatcher\TheWatcherServer.log
 C:\ProgramData\TheWatcher\TheWatcherAgent.conf
 C:\ProgramData\TheWatcher\TheWatcherAgent.log
 ```
 
-The server creates `server.json` on first run if it does not exist. The agent
+The server creates `TheWatcherServer.conf` on first run if it does not exist. The agent
 creates `TheWatcherAgent.conf` on first run if it does not exist.
 
 The config directory holds the server and agent CURVE secret keys. On POSIX
@@ -260,7 +265,7 @@ Foreground mode is the simplest local setup. No service registration is needed.
 Create the server config and print its public key:
 
 ```powershell
-.\builddir-release\server\TheWatcherServer.exe --config C:\ProgramData\TheWatcher\server.json
+.\builddir-release\server\TheWatcherServer.exe --config C:\ProgramData\TheWatcher\TheWatcherServer.conf
 ```
 
 Stop it with `Ctrl+C` if you only wanted to create the config. Normal agents
@@ -286,7 +291,7 @@ Open the dashboard and approve the pending agent.
 Install the server service:
 
 ```powershell
-.\builddir-release\server\TheWatcherServer.exe --install-service --config C:\ProgramData\TheWatcher\server.json
+.\builddir-release\server\TheWatcherServer.exe --install-service --config C:\ProgramData\TheWatcher\TheWatcherServer.conf
 ```
 
 Install the agent service:
@@ -363,7 +368,7 @@ explanatory error outside Windows.
 Typical config paths:
 
 ```text
-/etc/thewatcher/server.json
+/etc/thewatcher/TheWatcherServer.conf
 ~/.config/thewatcher/TheWatcherAgent.conf
 ```
 

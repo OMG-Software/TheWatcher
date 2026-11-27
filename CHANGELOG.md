@@ -63,9 +63,24 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   unprivileged writers, and root-reserved blocks count as used (#158).
 - Encoding a frame with an empty payload no longer passes a null pointer to
   libcbor (undefined behaviour reported by UBSan on every heartbeat) (#162).
+- The Windows installer registers the server service with
+  `TheWatcherServer.conf`, the file the server actually reads, instead of a
+  non-existent `server.json`; the docs name the same file and
+  `OFFLINE_AFTER_SECONDS` key (#131).
 
 ### Changed
 
+- Documentation: PostgreSQL is documented as an implemented backend selected
+  with `DB_TYPE=postgres` / `POSTGRES_DSN` (build-time support required), the
+  HA guide uses the real `TheWatcherServer.conf` KEY=VALUE format with its
+  failover and single-writer caveats, and architecture, configuration, README
+  and tracker match (#130).
+- Documentation: the new-collector checklists point at the real files
+  (`common/metrics.hpp` for the struct and CBOR, `server/api_json.hpp` for the
+  JSON mapping), and the nonexistent `dashboard_tests/` directory and
+  temperature collector references are gone (#133).
+- Agent and server metric log lines no longer print a `temperatures=` count
+  (#133).
 - The whole C++ tree is formatted with the root `.clang-format`, and CI
   fails any PR whose C++ is not (`clang-format` 22.1.5, pinned). The
   formatting commit is listed in `.git-blame-ignore-revs`. A new include

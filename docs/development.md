@@ -7,12 +7,11 @@ work required to extend TheWatcher end to end.
 
 ```text
 agent/              Agent runtime, config, enrollment, collectors.
-agent/collectors/   CPU, memory, disk, temperature, process, network collectors.
+agent/collectors/   CPU, memory, disk, process, network and log collectors.
 agent_tests/        Agent config and collector contract tests.
 common/             Shared protocol, commands, metrics, crypto, logging, service helpers.
 common_tests/       Tests for shared helpers.
 dashboard/          React + TypeScript + Vite dashboard.
-dashboard_tests/    Dashboard test helpers or future browser tests.
 docs/               Operator and developer documentation.
 integration_tests/  End-to-end server-agent lifecycle tests.
 plans/              dev-task-planner task plans.
@@ -81,15 +80,22 @@ npm.cmd test
 Use this checklist when adding a metric family such as GPU, filesystem inode
 usage, services, packages, or custom application health.
 
-1. Define the metric shape in `common/metrics.hpp`.
+1. Define the metric shape in `common/metrics.hpp` and `server/api_json.hpp`.
 
-   Add a struct with stable field names and a
-   `NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE` mapping. Add the struct to
-   `SystemMetrics`.
+   In `common/metrics.hpp`, add a struct with stable field names, add it to
+   `SystemMetrics`, and add `to_cbor` / `from_cbor` specialisations for the
+   struct. Agents send metrics to the server as CBOR (the `cbor` helpers live
+   in `common/protocol.hpp`), and `SystemMetrics` is encoded as a fixed-length
+   positional array, so a new field changes the wire format: update the array
+   size in both `to_cbor` and `from_cbor` and keep the protocol version in
+   mind. The REST API serialises the same structs as JSON; add the
+   `NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT` mapping for the new
+   struct, and the new `SystemMetrics` field, in `server/api_json.hpp`.
 
 2. Add wire/API compatibility tests.
 
-   Update or add tests that serialize and inspect `SystemMetrics`. If the new
+   Update or add tests that round-trip `SystemMetrics` through CBOR
+   (`common_tests/protocol_test.cpp`) and check its JSON form. If the new
    metric affects integration behavior, extend
    `integration_tests/server_agent_integration_test.cpp`.
 
