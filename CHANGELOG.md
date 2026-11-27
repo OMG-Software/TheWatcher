@@ -63,6 +63,29 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   unprivileged writers, and root-reserved blocks count as used (#158).
 - Encoding a frame with an empty payload no longer passes a null pointer to
   libcbor (undefined behaviour reported by UBSan on every heartbeat) (#162).
+- Disk collector (Linux): LVM/device-mapper volumes now report I/O rates
+  (`/dev/mapper/<name>` is mapped to its `dm-N` node, and symlinks such as
+  `/dev/disk/by-uuid/...` are resolved); loop, snap (squashfs), pseudo and
+  bind-mounted duplicates are no longer reported; octal escapes such as
+  `\040` in mount paths are decoded so those disks are no longer dropped
+  (#96).
+- Disk collector (BSD): every real mount is reported through `getmntinfo`
+  instead of only `/` (FreeBSD, OpenBSD, NetBSD; not yet compiled on
+  OpenBSD or NetBSD) (#93, part of).
+- Process collector: a watch longer than 15 characters now matches on Linux
+  through the executable basename (`/proc/<pid>/exe`, falling back to
+  `argv[0]`); matching is case-insensitive on Windows; a matched process is
+  reported under the watch name (#95).
+- Process CPU is now percent of one core on every OS (Windows was divided by
+  the core count, and Linux/BSD values were clamped to 100); a process using
+  two cores reports about 200 (#95).
+- Windows process collection opens processes with
+  `PROCESS_QUERY_LIMITED_INFORMATION` only, so other users' processes are
+  readable without admin (#95). The Toolhelp snapshot, process handles and
+  the Linux `/proc` `DIR*` are now RAII-owned (#100, part of).
+- Process collector (BSD): FreeBSD owner comes from the uid, not the login
+  name; OpenBSD (`struct kinfo_proc`, `p_*`) and NetBSD (`kinfo_proc2`) now
+  have their own readers instead of the FreeBSD layout (#93).
 
 ### Changed
 

@@ -53,3 +53,11 @@ disk_collector_test = executable(
   dependencies: [collectors_dep, common_dep, catch2_dep, platform_deps],
 )
 test('disk_collector', disk_collector_test)
+
+process_collector_test = executable(
+  'process_collector_test',
+  ['process_collector_test.cpp'],
+  include_directories: root_inc,
+  dependencies: [collectors_dep, common_dep, catch2_dep, platform_deps],
+)
+test('process_collector', process_collector_test)
