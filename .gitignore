@@ -22,6 +22,12 @@ dashboard/dist/
 dashboard/node_modules/
 dashboard/*.tsbuildinfo
 
+# Compiled twins of the TypeScript sources: tsc must never emit into src.
+dashboard/src/**/*.js
+dashboard/src/**/*.d.ts
+!dashboard/src/vite-env.d.ts
+!dashboard/src/**/globals.d.ts
+
 # plans/ is tracked on purpose: task plans are kept as project history
 # (see docs/01-progress-tracker.md).
 

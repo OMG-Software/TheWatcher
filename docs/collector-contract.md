@@ -111,7 +111,7 @@ are outside the normal top-N sample.
 7. Update `integration_tests/server_agent_integration_test.cpp` if the metric
    must be proven through the server API.
 8. Update `dashboard/src/models.ts`, `dashboard/src/status.ts`, and
-   `dashboard/src/main.tsx` if the metric is displayed.
+   the matching file under `dashboard/src/pages/` or `dashboard/src/components/` if the metric is displayed.
 9. Update docs and changelog.
 
 More end-to-end extension guidance is in [Development](development.md).

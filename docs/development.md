@@ -128,8 +128,8 @@ usage, services, packages, or custom application health.
 6. Update dashboard models and status mapping.
 
    Update `dashboard/src/models.ts` for the API shape, `dashboard/src/status.ts`
-   for health classification, and `dashboard/src/main.tsx` if the UI needs new
-   controls or columns. Collector thresholds should be absolute values in the
+   for health classification, and the matching file under `dashboard/src/pages/`
+   or `dashboard/src/components/` if the UI needs new controls or columns. Collector thresholds should be absolute values in the
    same units the collector reports: percentages for CPU, memory, and disks;
    combined megabits per second for network interfaces; exact executable counts
    for process watches.
@@ -173,7 +173,8 @@ usage, services, packages, or custom application health.
 1. Add the persistent or computed field in the server model.
 2. Serialize it in `agent_to_json()` or metric JSON.
 3. Update `dashboard/src/models.ts`.
-4. Update `dashboard/src/status.ts` or `dashboard/src/main.tsx` if displayed.
+4. Update `dashboard/src/status.ts` or the matching file under
+   `dashboard/src/pages/` or `dashboard/src/components/` if displayed.
 5. Run dashboard build/tests and relevant server tests.
 
 ## Third-Party Dependencies

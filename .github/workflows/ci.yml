@@ -40,6 +40,40 @@ jobs:
           git ls-files '*.cpp' '*.hpp' '*.h' ':!:subprojects/**' \
             | xargs ~/.local/bin/clang-format --dry-run --Werror
 
+  # ── Dashboard ──────────────────────────────────────────────────────────────
+  dashboard:
+    name: dashboard (lint, build, test)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: dashboard
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: dashboard/package-lock.json
+
+      - name: Install dependencies
+        # --ignore-scripts: never run a package's install lifecycle scripts.
+        # esbuild and rollup ship their native binaries as optional
+        # dependencies, so the toolchain works without them.
+        run: npm ci --ignore-scripts
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Build
+        run: npm run build
+
+      - name: Test
+        run: npm test
+
+      - name: Audit production dependencies
+        run: npm audit --omit=dev
+
   # ── Linux ──────────────────────────────────────────────────────────────────
   linux:
     name: Linux (ubuntu-22.04, gcc)
