@@ -46,8 +46,8 @@ namespace dsn_detail
         std::string out = "'";
         for (const char c : value)
         {
-            if (c == '\'' || c == '\')
-                out.push_back('\');
+            if (c == '\'' || c == '\\')
+                out.push_back('\\');
             out.push_back(c);
         }
         out.push_back('\'');
