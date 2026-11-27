@@ -39,7 +39,11 @@ working document for audit, design review, and regression testing.
   reply contradicting a configured server key is rejected, and connecting
   without CURVE requires the explicit `--insecure` / `ALLOW_INSECURE=1`
   opt-in. An optional pre-shared `ENROLLMENT_TOKEN` on the server makes the
-  enrollment endpoint unforgeable by arbitrary hosts.
+  enrollment endpoint unforgeable by arbitrary hosts. The reply is also
+  untrusted text that is saved to the agent config: the server key must be
+  exactly 40 Z85 characters decoding to a 32-byte key before it is used or
+  stored, and a malformed or unreadable reply is dropped and retried on a new
+  socket instead of stopping the agent.
 - Agent data plane to server: ZeroMQ ROUTER with CURVE when the server has a
   public key configured. ZAP admits only approved agent public keys and
   reports the agent_id each key is bound to; every frame's claimed
@@ -99,6 +103,13 @@ working document for audit, design review, and regression testing.
   existing config is group/world readable. On Windows the installer grants
   only SYSTEM and Administrators on the config directory; the same is
   recommended for manually installed services.
+- The agent config holds the CURVE secret key. It is written through an
+  owner-only temporary file in the same directory that is flushed and renamed
+  over the target (mode 0600 on POSIX; a protected DACL for SYSTEM,
+  Administrators and the owner on Windows), every write error is reported, and
+  a value containing CR or LF is refused so that no field, including the
+  server key learned during enrollment, can inject extra config lines such as
+  `SERVER_ADDRESS` or `ALLOW_INSECURE`.
 
 ### Denial Of Service
 

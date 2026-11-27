@@ -53,3 +53,19 @@ disk_collector_test = executable(
   dependencies: [collectors_dep, common_dep, catch2_dep, platform_deps],
 )
 test('disk_collector', disk_collector_test)
+
+cpu_collector_test = executable(
+  'cpu_collector_test',
+  ['cpu_collector_test.cpp'],
+  include_directories: root_inc,
+  dependencies: [collectors_dep, common_dep, catch2_dep, platform_deps],
+)
+test('cpu_collector', cpu_collector_test)
+
+memory_collector_test = executable(
+  'memory_collector_test',
+  ['memory_collector_test.cpp'],
+  include_directories: root_inc,
+  dependencies: [collectors_dep, common_dep, catch2_dep, platform_deps],
+)
+test('memory_collector', memory_collector_test)
