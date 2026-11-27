@@ -254,8 +254,10 @@ void Server::run(StartupSignal* startup)
                     alert.new_status = "red";
                     alert.message = "Agent has gone offline (no heartbeat received)";
                     alert.created_at = ts;
-                    store_->insert_alert(alert);
-                    LOGF_INFO("Created dead-agent alert for agent_id=%s", agent_id.c_str());
+                    // Atomic check-and-insert: no duplicate Heartbeat alert even
+                    // if another node raced us between the scan and here (#79).
+                    if (store_->insert_heartbeat_alert_if_absent(alert))
+                        LOGF_INFO("Created dead-agent alert for agent_id=%s", agent_id.c_str());
                 }
             }
 
@@ -434,9 +436,9 @@ void Server::handle_router_frame(zmq::socket_t& router)
 
     // Update last_seen timestamp for every inbound frame.
     const bool was_offline = !rec->connected;
-    rec->connected = true;
-    rec->last_seen = now_ms();
-    store_->upsert_agent(*rec);
+    // Narrow update: only last_seen and connected change, so a concurrent
+    // operator save of any other column is never reverted (#51).
+    store_->touch_agent(agent_id, now_ms(), true);
     if (was_offline)
     {
         store_->archive_heartbeat_alerts_for_agent(agent_id, now_ms());
@@ -535,26 +537,23 @@ void Server::handle_router_frame(zmq::socket_t& router)
                         auto command_agent = store_->get_agent(agent_id);
                         if (command_agent)
                         {
+                            // Narrow updates only: rewriting the whole row from this
+                            // snapshot would revert concurrent operator saves.
+                            const auto ack_time = now_ms();
                             if (command->second.type == CommandType::DISCONNECT)
-                                command_agent->connected = false;
-                            else if (command->second.type == CommandType::PAUSE)
+                                store_->touch_agent(agent_id, ack_time, false);
+                            else
                             {
-                                command_agent->maintenance = true;
-                                command_agent->maintenance_reason = "command";
-                                command_agent->maintenance_until = 0;
+                                store_->touch_agent(agent_id, ack_time, command_agent->connected);
+                                if (command->second.type == CommandType::PAUSE)
+                                    store_->set_agent_maintenance(agent_id, true, "command", 0);
+                                else
+                                    store_->set_agent_maintenance(agent_id, false, "", 0);
                             }
-                            else if (command->second.type == CommandType::RESUME)
-                            {
-                                command_agent->maintenance = false;
-                                command_agent->maintenance_reason = "";
-                                command_agent->maintenance_until = 0;
-                            }
-                            command_agent->last_seen = now_ms();
-                            store_->upsert_agent(*command_agent);
                             if (command->second.type == CommandType::PAUSE)
                             {
                                 StatusEngine status_engine(*store_);
-                                status_engine.enter_maintenance(agent_id, "command", 0, command_agent->last_seen);
+                                status_engine.enter_maintenance(agent_id, "command", 0, ack_time);
                             }
                             else if (command->second.type == CommandType::RESUME)
                             {

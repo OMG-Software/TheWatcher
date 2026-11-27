@@ -63,6 +63,34 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   unprivileged writers, and root-reserved blocks count as used (#158).
 - Encoding a frame with an empty payload no longer passes a null pointer to
   libcbor (undefined behaviour reported by UBSan on every heartbeat) (#162).
+- The store is now safe to share between threads. `make_store` returns the
+  backend wrapped in `SynchronizedStore`, which holds one mutex for every
+  call, so HTTP workers, the data-plane thread and the status engine no
+  longer interleave statements or transactions on the single SQLite or
+  PostgreSQL connection (#73).
+- Group assignments on PostgreSQL (`set_agent_groups`, `set_user_groups`) are
+  transactional: a failed insert, such as an unknown group id, no longer
+  leaves the agent or user with no groups. The configure-modal save
+  (`POST /api/agents/:id/collector_config`) is one transaction through the
+  new `save_agent_configuration`, so a failure saves nothing (#72).
+- SQLite reads no longer report a database error as "no rows": a locked or
+  failing database makes `get_session`, `is_silenced`,
+  `get_offline_unalerted_agent_ids` and the list calls throw instead of
+  returning an empty result (an active silence could be ignored). The
+  connection now waits up to 5 seconds for a competing lock (#78).
+- Bulk acknowledge and bulk delete of alerts run in one transaction on both
+  backends, and the dead-agent alert is created with an atomic
+  insert-if-absent, so two server nodes cannot create duplicates (#79).
+- A heartbeat or an API setting no longer rewrites the whole agent row from a
+  stale snapshot, which silently reverted a collector config, heartbeat
+  interval, runbook or maintenance change saved at the same moment. The data
+  plane and API now use narrow setters (`touch_agent`,
+  `set_agent_collection_interval`, `set_agent_heartbeat_interval`,
+  `set_agent_process_limit`); `upsert_agent` is for enrollment (#51).
+- The store owns its database handles with RAII (`sqlite::Connection`,
+  `postgres::Connection`), so a constructor that throws no longer leaks the
+  connection; prepared statements are movable and transactions use a guard
+  that rolls back without masking the original error (part of #100).
 
 ### Changed
 

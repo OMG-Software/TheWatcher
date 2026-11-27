@@ -1,11 +1,16 @@
 #ifdef HAVE_LIBPQ
 
 #include "../server/store_postgres.hpp"
+#include "../server/store_synchronized.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <cstdlib>
+#include <memory>
+#include <thread>
+#include <vector>
 
 using namespace thewatcher;
 using namespace thewatcher::server;
@@ -641,6 +646,200 @@ SCENARIO("[postgres] Silence rules can be created, listed, deleted, and matched"
                 CHECK_FALSE(store.is_silenced("pg-silence-agent", "cpu", 5000));
             }
         }
+    }
+}
+
+// ── Atomicity and concurrency (#72, #73, #79, #51) ───────────────────────────
+
+namespace
+{
+// Removes the agent and the groups a test created so reruns start clean.
+void cleanup_pg(PostgresStore& store, const std::string& agent_id)
+{
+    try
+    {
+        store.delete_agent(agent_id);
+    }
+    catch (...)
+    {
+    }
+}
+} // namespace
+
+SCENARIO("[postgres] A failed group assignment leaves the previous memberships intact")
+{
+    if (!postgres_is_available())
+        SKIP("PostgreSQL not available");
+    GIVEN("an agent in group A")
+    {
+        PostgresStore store(test_dsn());
+        const std::string id = "pg-atomic-groups";
+        cleanup_pg(store, id);
+        store.upsert_agent(make_agent(id));
+        const auto group_a = store.create_group("pg-atomic-A");
+        store.set_agent_groups(id, {group_a});
+
+        WHEN("an assignment names a group that does not exist")
+        {
+            THEN("it throws and the agent is still in A")
+            {
+                REQUIRE_THROWS(store.set_agent_groups(id, {group_a, 999999999}));
+                REQUIRE(store.get_agent_groups(id) == std::vector<int64_t>{group_a});
+            }
+        }
+
+        WHEN("the configure-modal save names a group that does not exist")
+        {
+            AgentConfigUpdate update;
+            update.collection_interval = 77;
+            update.heartbeat_interval = 9;
+            update.process_limit = 3;
+            update.collector_config = default_collector_config();
+            update.group_ids = std::vector<int64_t>{999999999};
+
+            THEN("it throws and no part is stored")
+            {
+                REQUIRE_THROWS(store.save_agent_configuration(id, update));
+                const auto rec = store.get_agent(id);
+                CHECK(rec->collection_interval == 30);
+                CHECK(rec->heartbeat_interval == 5);
+                CHECK(store.get_agent_groups(id) == std::vector<int64_t>{group_a});
+            }
+        }
+        cleanup_pg(store, id);
+    }
+}
+
+SCENARIO("[postgres] A heartbeat touch does not revert saved settings")
+{
+    if (!postgres_is_available())
+        SKIP("PostgreSQL not available");
+    GIVEN("an agent with a saved heartbeat interval and runbook")
+    {
+        PostgresStore store(test_dsn());
+        const std::string id = "pg-touch";
+        cleanup_pg(store, id);
+        store.upsert_agent(make_agent(id));
+        store.set_agent_heartbeat_interval(id, 17);
+        store.set_agent_runbook(id, "# rb");
+
+        WHEN("a heartbeat touches the agent")
+        {
+            store.touch_agent(id, 9999, true);
+
+            THEN("only last_seen and connected change")
+            {
+                const auto rec = store.get_agent(id);
+                CHECK(rec->last_seen == 9999);
+                CHECK(rec->connected);
+                CHECK(rec->heartbeat_interval == 17);
+                CHECK(rec->runbook_markdown == "# rb");
+            }
+        }
+        cleanup_pg(store, id);
+    }
+}
+
+SCENARIO("[postgres] A dead-agent heartbeat alert is created once and bulk alert changes are atomic")
+{
+    if (!postgres_is_available())
+        SKIP("PostgreSQL not available");
+    GIVEN("an agent with no alerts")
+    {
+        PostgresStore store(test_dsn());
+        const std::string id = "pg-heartbeat-alert";
+        cleanup_pg(store, id);
+        store.upsert_agent(make_agent(id));
+        AlertRecord alert;
+        alert.agent_id = id;
+        alert.indicator = "Heartbeat";
+        alert.old_status = "green";
+        alert.new_status = "red";
+        alert.created_at = 2000;
+
+        WHEN("the heartbeat alert is inserted twice")
+        {
+            const bool first = store.insert_heartbeat_alert_if_absent(alert);
+            const bool second = store.insert_heartbeat_alert_if_absent(alert);
+
+            THEN("only the first creates a row")
+            {
+                CHECK(first);
+                CHECK_FALSE(second);
+            }
+        }
+
+        WHEN("alerts are acknowledged in bulk")
+        {
+            std::vector<int64_t> ids;
+            for (int i = 0; i < 3; ++i)
+            {
+                alert.indicator = "cpu";
+                ids.push_back(store.insert_alert(alert));
+            }
+            store.bulk_acknowledge_alerts(ids, "bob", 5000);
+
+            THEN("all are acknowledged")
+            {
+                for (const auto& a : store.list_alerts(false))
+                    if (a.agent_id == id)
+                        CHECK(a.acknowledged_at == 5000);
+            }
+        }
+        cleanup_pg(store, id);
+    }
+}
+
+SCENARIO("[postgres] Eight threads can use one synchronized store at the same time")
+{
+    if (!postgres_is_available())
+        SKIP("PostgreSQL not available");
+    GIVEN("a shared store with an agent and two groups")
+    {
+        SynchronizedStore store(std::make_unique<PostgresStore>(test_dsn()));
+        const std::string id = "pg-concurrent";
+        store.delete_agent(id);
+        store.upsert_agent(make_agent(id));
+        const auto group_a = store.create_group("pg-conc-A");
+        const auto group_b = store.create_group("pg-conc-B");
+        std::atomic<int> errors{0};
+
+        WHEN("threads mix transactional and plain calls")
+        {
+            std::vector<std::thread> threads;
+            for (int t = 0; t < 8; ++t)
+            {
+                threads.emplace_back([&, t] {
+                    for (int i = 0; i < 25; ++i)
+                    {
+                        try
+                        {
+                            if ((t + i) % 3 == 0)
+                                store.set_agent_groups(id, (i % 2) ? std::vector<int64_t>{group_a}
+                                                                   : std::vector<int64_t>{group_a, group_b});
+                            else if ((t + i) % 3 == 1)
+                                store.touch_agent(id, i, true);
+                            else
+                                (void)store.get_agent(id);
+                        }
+                        catch (...)
+                        {
+                            ++errors;
+                        }
+                    }
+                });
+            }
+            for (auto& th : threads)
+                th.join();
+
+            THEN("no call fails and the final state is consistent")
+            {
+                REQUIRE(errors == 0);
+                const auto groups = store.get_agent_groups(id);
+                REQUIRE((groups == std::vector<int64_t>{group_a} || groups == std::vector<int64_t>{group_a, group_b}));
+            }
+        }
+        store.delete_agent(id);
     }
 }
 
