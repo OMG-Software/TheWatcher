@@ -77,6 +77,7 @@ agent_runtime_test = executable(
   dependencies: [agent_dep, catch2_dep, cbor_dep, cppzmq_dep, sodium_dep, platform_deps],
 )
 test('agent_runtime', agent_runtime_test, is_parallel: false, timeout: 180)
+
 cpu_collector_test = executable(
   'cpu_collector_test',
   ['cpu_collector_test.cpp'],
