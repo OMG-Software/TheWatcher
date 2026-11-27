@@ -97,14 +97,14 @@ describe('GIVEN the real polling refresh behind runAction', () => {
     expect(result.current.run.failure).toBeNull();
   });
 
-  it('WHEN the action refresh is overtaken by a newer refresh that succeeds THEN it is not reported as a failure', async () => {
+  it('WHEN a manual refresh is queued behind the action refresh THEN the action reports its own refresh result and the data ends fresh', async () => {
     let calls = 0;
-    const slowFailure = deferred<string>();
+    const actionRefresh = deferred<string>();
     const fetcher = vi.fn(() => {
       calls++;
       if (calls === 1) return Promise.resolve('first');
-      if (calls === 2) return slowFailure.promise; // the action's refresh
-      return Promise.resolve('newer'); // a manual refresh that overtakes it
+      if (calls === 2) return actionRefresh.promise; // the action's refresh
+      return Promise.resolve('newer'); // the manual refresh, queued behind it
     });
     const { result } = setup(fetcher);
     await act(async () => undefined);
@@ -114,19 +114,38 @@ describe('GIVEN the real polling refresh behind runAction', () => {
       running = result.current.run.runAction('x', async () => undefined);
     });
     await act(async () => undefined);
-    await act(async () => {
-      await result.current.polling.refresh();
+    let manual!: Promise<string | null>;
+    act(() => {
+      manual = result.current.polling.refresh();
     });
     await act(async () => {
-      slowFailure.promise.catch(() => undefined);
-      await Promise.resolve();
-    });
-    await act(async () => {
-      slowFailure.reject(new Error('late failure'));
+      actionRefresh.resolve('after-action');
       await running;
+      await manual;
     });
 
+    expect(fetcher).toHaveBeenCalledTimes(3);
     expect(result.current.run.failure).toBeNull();
     expect(result.current.polling.data).toBe('newer');
+  });
+});
+
+describe('GIVEN an action whose refresh is still running', () => {
+  it('WHEN the mutation has finished THEN the action stays busy until the refresh settles, then reports success', async () => {
+    const refreshing = deferred<string | null>();
+    const { result } = renderHook(() => useRunAction(() => refreshing.promise));
+
+    let running!: Promise<boolean>;
+    act(() => {
+      running = result.current.runAction('silence:create', async () => undefined);
+    });
+    await act(async () => undefined);
+
+    expect(result.current.busyAction).toBe('silence:create');
+    await act(async () => {
+      refreshing.resolve(null);
+      expect(await running).toBe(true);
+    });
+    expect(result.current.busyAction).toBeNull();
   });
 });
