@@ -1442,3 +1442,5 @@ td {
 .view-agent-select { min-width: 14rem; }
 .view-name-input { min-width: 12rem; }
 .view-create { margin-top: 1rem; }
+
+.app-footer { padding: 1rem; text-align: center; color: var(--muted); font-size: 0.75rem; }

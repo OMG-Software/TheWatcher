@@ -4,6 +4,7 @@ import { canManageAgent } from './agentActions';
 import { logout } from './api';
 import { AgentConfigModal } from './components/AgentConfigModal';
 import { AgentIdentity } from './components/AgentIdentity';
+import { AppFooter } from './components/AppFooter';
 import { NavTab } from './components/NavTab';
 import { SummaryCard } from './components/SummaryCard';
 import { useActiveView } from './hooks/useActiveView';
@@ -183,6 +184,7 @@ export function App() {
       ) : null}
       {view === 'users' ? <UsersPage busyAction={busyAction} groups={groups} runAction={runAction} session={session} users={users} /> : null}
       {view === 'settings' ? <SettingsPage runAction={runAction} /> : null}
+      <AppFooter />
     </>
   );
 }
