@@ -81,6 +81,11 @@ working document for audit, design review, and regression testing.
   acting username where the current API contract supports it.
 - Logs record security-relevant actions such as login failures, agent approval,
   command queueing, and webhook rejection.
+- Authentication and authorization events (login success, failure and
+  lockout, logout, every 403, user create/disable/enable/delete, password
+  changes and session revocation) are written as `AUDIT` lines at NOTICE with
+  the acting user, client address and target. Client-supplied values are
+  sanitised so they cannot forge log lines. See `docs/logging.md`.
 
 ### Information Disclosure
 
@@ -99,6 +104,21 @@ working document for audit, design review, and regression testing.
 
 - Login failures are rate-limited per username (fixed window that resets on
   expiry) and throttled per source IP across all usernames.
+- The client address used for throttling is taken from forwarding headers
+  only when the TCP peer matches `TRUSTED_PROXIES` (addresses or CIDR ranges).
+  Headers are parsed strictly; a malformed value goes to its own
+  `unknown-client` bucket rather than the proxy's address, so a hostile client
+  cannot throttle every user behind the proxy.
+- The limit check and the failure count are one atomic step, so a burst of
+  concurrent guesses cannot exceed the per-account limits while the password
+  hash runs.
+- Unknown and disabled usernames are verified against a dummy Argon2 hash, so
+  response time does not reveal which usernames exist.
+- Sessions are revoked when a user's password changes (all of the user's
+  sessions, except the caller's own on a self-service change), when a user is
+  disabled or deleted (re-enabling does not restore old sessions). Expired
+  sessions are purged at most every five minutes from login and session
+  validation.
 - Every ZMQ socket caps inbound message size (`ZMQ_MAXMSGSIZE`: 64 KiB
   enrollment, 4 MiB data plane) and bounds the connection handshake
   (`ZMQ_HANDSHAKE_IVL`); enrollment replies use a send timeout so a stalled
@@ -157,6 +177,14 @@ when webhooks are enabled.
 - An attacker who can reach the login endpoint can repeatedly lock a single
   username out for 15 minutes at a time; per-source-IP throttling slows this
   but cannot prevent it from a distributed position.
+- Behind a trusted proxy, `X-Real-IP` is believed as sent. A proxy that does
+  not overwrite it lets clients choose their throttling bucket, so configure
+  the proxy to set it (or strip it and rely on `X-Forwarded-For`).
+- A self-service password change keeps the caller's current session; a stolen
+  session can therefore still change the password. The change endpoint does not
+  yet ask for the current password, and session tokens are stored unhashed in
+  the database. Audit lines share the server log file and are not tamper
+  proof.
 - The built-in first-run `thewatcher` account has a documented default password.
   It must be changed or disabled immediately after bootstrap.
 - Hostname webhook SSRF cannot be completely prevented without DNS resolution

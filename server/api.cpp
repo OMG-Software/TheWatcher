@@ -13,6 +13,7 @@
 #include <charconv>
 #include <chrono>
 #include <cmath>
+#include <cstring>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -47,6 +48,16 @@ ApiServer::ApiServer(Store& store, ZapHandler& zap, const std::string& host, int
 {
     LOG_FUNCTION_TRACE
     LOGF_DEBUG("Constructing API server host=%s port=%d", host_.c_str(), port_);
+    // Same Argon2 parameters as hash_password, so verifying against it costs
+    // what a real verification costs (issue #154).
+    if (sodium_init() < 0)
+        throw std::runtime_error("libsodium initialisation failed");
+    std::array<char, crypto_pwhash_STRBYTES> dummy{};
+    constexpr std::string_view dummy_password = "thewatcher-timing-equaliser";
+    if (crypto_pwhash_str(dummy.data(), dummy_password.data(), dummy_password.size(),
+                          crypto_pwhash_OPSLIMIT_INTERACTIVE, crypto_pwhash_MEMLIMIT_INTERACTIVE) != 0)
+        throw std::runtime_error("password hashing failed");
+    dummy_password_hash_ = dummy.data();
     setup_routes();
 }
 
@@ -89,14 +100,11 @@ void ApiServer::stop()
     }
 }
 
-void ApiServer::set_trusted_proxies(std::vector<std::string> proxies)
-{
-    std::lock_guard<std::mutex> lk(login_mutex_);
-    trusted_proxies_ = std::move(proxies);
-}
-
 namespace
 {
+
+    // Bucket for requests whose forwarded client address is malformed.
+    constexpr std::string_view unknown_client = "unknown-client";
 
     // Strips leading and trailing spaces and tabs. The view aliases the input.
     std::string_view trim_ws(std::string_view v)
@@ -108,55 +116,208 @@ namespace
         return v;
     }
 
-    // Plausible IPv4/IPv6 literal: bounded length, digits / hex / '.' / ':' only.
-    bool plausible_ip_literal(std::string_view v)
+    // Replaces control characters and quotes so a value is safe inside a
+    // quoted log field, and bounds its length.
+    std::string sanitize_audit_text(std::string_view text)
     {
-        if (v.empty() || v.size() > 45)
+        constexpr std::size_t max_len = 128;
+        std::string out;
+        for (const char c : text.substr(0, max_len))
+        {
+            const auto u = static_cast<unsigned char>(c);
+            out += (u < 0x20 || u == 0x7f || c == '"' || c == '\\') ? '?' : c;
+        }
+        if (text.size() > max_len)
+            out += "...";
+        return out;
+    }
+
+    using IpBytes = std::array<unsigned char, 16>;
+
+    // Strictly parses an IPv4 or IPv6 literal (no zone, no port) into 16
+    // bytes; IPv4 becomes an IPv4-mapped IPv6 address so both compare alike.
+    std::optional<IpBytes> parse_ip(std::string_view text)
+    {
+        if (text.empty() || text.size() > 45)
+            return std::nullopt;
+        const std::string s(text);
+        IpBytes out{};
+        in6_addr v6{};
+        in_addr v4{};
+        if (inet_pton(AF_INET6, s.c_str(), &v6) == 1)
+            std::memcpy(out.data(), &v6, out.size());
+        else if (inet_pton(AF_INET, s.c_str(), &v4) == 1)
+        {
+            out[10] = out[11] = 0xff;
+            std::memcpy(out.data() + 12, &v4, 4);
+        }
+        else
+            return std::nullopt;
+        return out;
+    }
+
+    // Canonical text form, so "::1" and "0:0::1" share one throttle bucket.
+    std::string format_ip(const IpBytes& ip)
+    {
+        const bool mapped_v4 = std::all_of(ip.begin(), ip.begin() + 10,
+                                           [](unsigned char b) {
+                                               return b == 0;
+                                           }) &&
+                               ip[10] == 0xff && ip[11] == 0xff;
+        std::array<char, 46> buf{};
+        if (mapped_v4)
+        {
+            in_addr a{};
+            std::memcpy(&a, ip.data() + 12, 4);
+            inet_ntop(AF_INET, &a, buf.data(), static_cast<socklen_t>(buf.size()));
+        }
+        else
+        {
+            in6_addr a{};
+            std::memcpy(&a, ip.data(), ip.size());
+            inet_ntop(AF_INET6, &a, buf.data(), static_cast<socklen_t>(buf.size()));
+        }
+        return buf.data();
+    }
+
+    // Parses "addr" or "addr/prefix". The prefix of an IPv4 range counts IPv4
+    // bits. Returns nullopt for anything malformed.
+    std::optional<ProxyRange> parse_proxy_range(std::string_view entry)
+    {
+        entry = trim_ws(entry);
+        const auto slash = entry.find('/');
+        const auto addr = entry.substr(0, slash);
+        const auto ip = parse_ip(addr);
+        if (!ip)
+            return std::nullopt;
+        const bool is_v4 = addr.find(':') == std::string_view::npos;
+        int bits = is_v4 ? 32 : 128;
+        if (slash != std::string_view::npos)
+        {
+            const auto digits = entry.substr(slash + 1);
+            int parsed = -1;
+            const auto [end, ec] = std::from_chars(digits.data(), digits.data() + digits.size(), parsed);
+            if (digits.empty() || ec != std::errc{} || end != digits.data() + digits.size() || parsed < 0 ||
+                parsed > bits)
+                return std::nullopt;
+            bits = parsed;
+        }
+        return ProxyRange{*ip, is_v4 ? bits + 96 : bits};
+    }
+
+    bool in_range(const IpBytes& ip, const ProxyRange& range)
+    {
+        const int full = range.prefix_bits / 8;
+        if (!std::equal(ip.begin(), ip.begin() + full, range.bytes.begin()))
             return false;
-        return std::all_of(v.begin(), v.end(), [](char c) {
-            return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F') || c == '.' || c == ':';
-        });
+        const int rem = range.prefix_bits % 8;
+        if (rem == 0)
+            return true;
+        const auto mask = static_cast<unsigned char>(0xFF << (8 - rem));
+        return (ip[full] & mask) == (range.bytes[full] & mask);
     }
 
 } // namespace
 
-// Returns the address used for login throttling. The TCP peer is used unless it
-// is a trusted proxy; then the first untrusted X-Forwarded-For entry (or X-Real-IP
-// when the former is absent) is used. Falls back to the peer if it is not a plausible IP.
+void ApiServer::set_trusted_proxies(std::vector<std::string> proxies)
+{
+    std::vector<ProxyRange> ranges;
+    for (const auto& entry : proxies)
+    {
+        if (const auto range = parse_proxy_range(entry))
+            ranges.push_back(*range);
+        else
+            LOGF_WARNING("Ignoring invalid TRUSTED_PROXIES entry \"%s\"", sanitize_audit_text(entry).c_str());
+    }
+    std::lock_guard<std::mutex> lk(login_mutex_);
+    trusted_proxies_ = std::move(ranges);
+}
+
+// Returns the address used for login throttling. The TCP peer is used unless
+// it is a trusted proxy. For a trusted proxy the single X-Real-IP value wins
+// (the proxy must set or overwrite it); otherwise every X-Forwarded-For line
+// is joined and walked right to left, skipping trusted proxies, and the first
+// untrusted entry is the client. A header that is present but not a valid IP
+// yields unknown_client, a bucket of its own: falling back to the peer would
+// let one malformed request throttle every user behind the proxy.
 std::string ApiServer::client_ip(const httplib::Request& req)
 {
     const std::string remote = req.remote_addr;
-    std::vector<std::string> proxies;
+    std::vector<ProxyRange> proxies;
     {
         std::lock_guard<std::mutex> lk(login_mutex_);
         proxies = trusted_proxies_;
     }
-    const auto is_trusted = [&proxies](std::string_view addr) {
-        return std::find(proxies.begin(), proxies.end(), addr) != proxies.end();
+    const auto is_trusted = [&proxies](const IpBytes& ip) {
+        return std::any_of(proxies.begin(), proxies.end(), [&ip](const ProxyRange& r) {
+            return in_range(ip, r);
+        });
     };
-    if (!is_trusted(remote))
+    const auto peer = parse_ip(remote);
+    if (!peer || !is_trusted(*peer))
         return remote;
 
-    std::string candidate;
-    const std::string xff = req.get_header_value("X-Forwarded-For");
-    // Walk right to left: the rightmost entries were appended by our own
-    // proxies; the first untrusted one is the real client. Anything further
-    // left is client-supplied and spoofable.
+    if (const auto real_ip_lines = req.get_header_value_count("X-Real-IP"); real_ip_lines > 0)
+    {
+        const auto ip = real_ip_lines == 1 ? parse_ip(trim_ws(req.get_header_value("X-Real-IP"))) : std::nullopt;
+        return ip ? format_ip(*ip) : std::string(unknown_client);
+    }
+
+    std::string xff;
+    for (std::size_t i = 0; i < req.get_header_value_count("X-Forwarded-For"); ++i)
+    {
+        if (!xff.empty())
+            xff += ',';
+        xff += req.get_header_value("X-Forwarded-For", "", i);
+    }
+
     std::string_view rest = xff;
     while (!rest.empty())
     {
         const auto comma = rest.rfind(',');
         const auto entry = trim_ws(comma == std::string_view::npos ? rest : rest.substr(comma + 1));
         rest = comma == std::string_view::npos ? std::string_view{} : rest.substr(0, comma);
-        if (entry.empty() || is_trusted(entry))
+        if (entry.empty())
             continue;
-        candidate = std::string(entry);
-        break;
+        const auto ip = parse_ip(entry);
+        if (!ip)
+            return std::string(unknown_client);
+        if (!is_trusted(*ip))
+            return format_ip(*ip);
     }
-    if (candidate.empty() && trim_ws(xff).empty())
-        candidate = std::string(trim_ws(req.get_header_value("X-Real-IP")));
+    // No forwarding information (or only trusted hops): the proxy itself.
+    return remote;
+}
 
-    return plausible_ip_literal(candidate) ? candidate : remote;
+// Writes one key=value AUDIT line at NOTICE. user/source/target are
+// sanitised, so a hostile username cannot forge or split log lines.
+void ApiServer::audit(const char* event, const char* outcome, const std::string& user, const std::string& source,
+                      const std::string& target) const
+{
+    std::string line = std::string("AUDIT event=") + event + " outcome=" + outcome + " user=\"" +
+                       sanitize_audit_text(user) + "\" source=" + sanitize_audit_text(source);
+    if (!target.empty())
+        line += " target=\"" + sanitize_audit_text(target) + "\"";
+    LOG_NOTICE(line);
+}
+
+// Purges expired sessions at most once every five minutes. Called from login
+// and session validation; could move to the server maintenance tick later.
+void ApiServer::purge_expired_sessions_if_due(int64_t now_ms)
+{
+    constexpr int64_t purge_interval_ms = 5LL * 60LL * 1000LL;
+    auto last = last_session_purge_ms_.load();
+    if (now_ms - last < purge_interval_ms || !last_session_purge_ms_.compare_exchange_strong(last, now_ms))
+        return;
+    try
+    {
+        if (const auto removed = store_.delete_expired_sessions(now_ms); removed > 0)
+            LOGF_DEBUG("Purged %d expired session(s)", removed);
+    }
+    catch (const std::exception& e)
+    {
+        LOGF_WARNING("Expired session purge failed: %s", e.what());
+    }
 }
 
 void ApiServer::drain_commands(std::vector<PendingCommand>& out)
@@ -788,7 +949,9 @@ std::optional<SessionRecord> ApiServer::current_session(const httplib::Request& 
     auto token = cookie_value(req, "tw_session");
     if (token.empty())
         return std::nullopt;
-    return store_.get_session(token, now_ms());
+    const auto now = now_ms();
+    purge_expired_sessions_if_due(now);
+    return store_.get_session(token, now);
 }
 
 std::optional<SessionRecord> ApiServer::require_role(const httplib::Request& req, httplib::Response& res,
@@ -898,8 +1061,24 @@ void ApiServer::setup_routes()
         res.status = 204;
         apply_browser_origin_headers(req, res);
     });
-    http_->set_post_routing_handler([](const httplib::Request& req, httplib::Response& res) {
+    http_->set_post_routing_handler([this](const httplib::Request& req, httplib::Response& res) {
         apply_browser_origin_headers(req, res);
+        // Issue #70: every 403 is an authorization failure. Handling it here
+        // covers all routes without touching each handler.
+        if (res.status == 403)
+        {
+            std::string user = "-";
+            try
+            {
+                if (const auto session = current_session(req))
+                    user = session->username;
+            }
+            catch (const std::exception&)
+            {
+                // The audit line still records the denial with an unknown user.
+            }
+            audit("permission_denied", "denied", user, client_ip(req), req.method + " " + req.path);
+        }
     });
 
     http_->Post("/api/login", [this](const httplib::Request& req, httplib::Response& res) {
@@ -938,12 +1117,19 @@ void ApiServer::setup_routes()
             // The client IP honours X-Forwarded-For / X-Real-IP only from
             // trusted proxies (see client_ip). Expired entries are pruned so
             // all maps stay bounded.
+            //
+            // Issue #154: the limit check and the failure count happen in ONE
+            // critical section. Each admitted attempt is counted up front (a
+            // reservation) and the counters are released again on success, so
+            // concurrent requests cannot all slip past the check while the
+            // slow password hash runs.
             constexpr int max_failures = 5;
             constexpr int max_ip_failures = 10;
             constexpr int max_account_failures = 50;
             const auto now = now_ms();
             const std::string remote = client_ip(req);
             const std::string pair_key = remote + "|" + username;
+            purge_expired_sessions_if_due(now);
             {
                 std::lock_guard<std::mutex> lk(login_mutex_);
 
@@ -962,61 +1148,58 @@ void ApiServer::setup_routes()
                 prune(login_account_failures_, login_lockout_ms_);
                 prune(login_ip_failures_, login_ip_window_ms_);
 
-                const auto pair_it = login_failures_.find(pair_key);
-                if (pair_it != login_failures_.end() && pair_it->second.first >= max_failures)
+                const auto count_of = [](const auto& map, const std::string& key) {
+                    const auto it = map.find(key);
+                    return it == map.end() ? 0 : it->second.first;
+                };
+
+                const char* limit_message = nullptr;
+                const char* retry_after = "900";
+                if (count_of(login_failures_, pair_key) >= max_failures)
+                    limit_message = "too many failed login attempts; try again later";
+                else if (count_of(login_ip_failures_, remote) >= max_ip_failures)
                 {
-                    LOGF_WARNING("Login locked out for repeated failures from %s", remote.c_str());
+                    // SEC-12: throttle by source IP across all usernames so a
+                    // single host cannot spray many accounts (or lock them out).
+                    limit_message = "too many login attempts from this address; try again later";
+                    retry_after = "60";
+                }
+                else if (count_of(login_account_failures_, username) >= max_account_failures)
+                    limit_message = "too many failed login attempts; try again later";
+
+                if (limit_message != nullptr)
+                {
+                    audit("login", "locked_out", username, remote);
                     res.status = 429;
-                    res.set_header("Retry-After", "900");
+                    res.set_header("Retry-After", retry_after);
                     set_json(res, json{
-                                      {"error", "too many failed login attempts; try again later"}
+                                      {"error", limit_message}
                     });
                     return;
                 }
 
-                // SEC-12: throttle by source IP across all usernames so a
-                // single host cannot spray many accounts (or lock them out).
-                const auto ip_it = login_ip_failures_.find(remote);
-                if (ip_it != login_ip_failures_.end() && ip_it->second.first >= max_ip_failures)
-                {
-                    LOGF_WARNING("Login throttled for source address %s", remote.c_str());
-                    res.status = 429;
-                    res.set_header("Retry-After", "60");
-                    set_json(res, json{
-                                      {"error", "too many login attempts from this address; try again later"}
-                    });
-                    return;
-                }
-
-                const auto acct_it = login_account_failures_.find(username);
-                if (acct_it != login_account_failures_.end() && acct_it->second.first >= max_account_failures)
-                {
-                    LOGF_WARNING("Account-wide login limit reached (last source %s)", remote.c_str());
-                    res.status = 429;
-                    res.set_header("Retry-After", "900");
-                    set_json(res, json{
-                                      {"error", "too many failed login attempts; try again later"}
-                    });
-                    return;
-                }
+                // Reserve this attempt; released below if the login succeeds.
+                const auto reserve = [now](auto& map, const std::string& key) {
+                    auto& [count, window_start] = map[key];
+                    if (count == 0)
+                        window_start = now;
+                    ++count;
+                };
+                reserve(login_failures_, pair_key);
+                reserve(login_account_failures_, username);
+                reserve(login_ip_failures_, remote);
             }
 
+            // Issue #154: unknown and disabled users are verified against a
+            // dummy hash so every failure path pays for one Argon2 run and
+            // response time does not reveal which usernames exist.
             auto user = store_.get_user_by_username(username);
-            if (!user || user->disabled ||
-                crypto_pwhash_str_verify(user->password_hash.c_str(), password.c_str(), password.size()) != 0)
+            const bool usable = user && !user->disabled;
+            const char* hash = usable ? user->password_hash.c_str() : dummy_password_hash_.c_str();
+            const bool verified = crypto_pwhash_str_verify(hash, password.c_str(), password.size()) == 0;
+            if (!usable || !verified)
             {
-                {
-                    std::lock_guard<std::mutex> lk(login_mutex_);
-                    const auto record_failure = [now](auto& map, const std::string& key) {
-                        auto& [count, window_start] = map[key];
-                        if (count == 0)
-                            window_start = now;
-                        ++count;
-                    };
-                    record_failure(login_failures_, pair_key);
-                    record_failure(login_account_failures_, username);
-                    record_failure(login_ip_failures_, remote);
-                }
+                audit("login", "failure", username, remote);
                 res.status = 401;
                 set_json(res, json{
                                   {"error", "invalid credentials"}
@@ -1025,9 +1208,17 @@ void ApiServer::setup_routes()
             }
 
             {
+                // Success: give back the reservation, so only failures count.
                 std::lock_guard<std::mutex> lk(login_mutex_);
                 login_failures_.erase(pair_key);
+                const auto release = [](auto& map, const std::string& key) {
+                    if (const auto it = map.find(key); it != map.end() && --it->second.first <= 0)
+                        map.erase(it);
+                };
+                release(login_account_failures_, username);
+                release(login_ip_failures_, remote);
             }
+            audit("login", "success", user->username, remote);
 
             SessionRecord session;
             session.token = random_token();
@@ -1065,7 +1256,11 @@ void ApiServer::setup_routes()
 
         auto token = cookie_value(req, "tw_session");
         if (!token.empty())
+        {
+            if (const auto session = store_.get_session(token, now_ms()))
+                audit("logout", "success", session->username, client_ip(req));
             store_.delete_session(token);
+        }
         res.set_header("Set-Cookie", "tw_session=; Path=/; HttpOnly; SameSite=Strict; Secure; Max-Age=0");
         set_json(res, json{
                           {"ok", true}
@@ -1221,6 +1416,7 @@ void ApiServer::setup_routes()
             store_.set_user_groups(user_id, group_ids);
             LOGF_INFO("Created user username=%s role=%s group_count=%zu", username.c_str(), role.c_str(),
                       group_ids.size());
+            audit("user_create", "success", session->username, client_ip(req), username);
             set_json(res, json{
                               {"user_id", user_id}
             });
@@ -2564,6 +2760,10 @@ void ApiServer::setup_routes()
                 return;
             }
             LOGF_INFO("Disabled user user_id=%lld", static_cast<long long>(user_id));
+            // Issue #145: end the user's logins now; re-enabling must not
+            // bring old sessions back.
+            store_.delete_sessions_for_user(user_id);
+            audit("user_disable", "success", session->username, client_ip(req), "user_id=" + std::to_string(user_id));
             set_json(res, json{
                               {"ok", true}
             });
@@ -2595,6 +2795,7 @@ void ApiServer::setup_routes()
             const auto user_id = std::stoll(req.path_params.at("id"));
             store_.enable_user(user_id);
             LOGF_INFO("Enabled user user_id=%lld", static_cast<long long>(user_id));
+            audit("user_enable", "success", session->username, client_ip(req), "user_id=" + std::to_string(user_id));
             set_json(res, json{
                               {"ok", true}
             });
@@ -2635,6 +2836,8 @@ void ApiServer::setup_routes()
                 return;
             }
             LOGF_INFO("Deleted user user_id=%lld", static_cast<long long>(user_id));
+            store_.delete_sessions_for_user(user_id);
+            audit("user_delete", "success", session->username, client_ip(req), "user_id=" + std::to_string(user_id));
             set_json(res, json{
                               {"ok", true}
             });
@@ -2690,6 +2893,15 @@ void ApiServer::setup_routes()
             store_.update_user_password(user_id, hash_password(password));
             LOGF_INFO("Changed password for user_id=%lld by=%s", static_cast<long long>(user_id),
                       session->username.c_str());
+            // Issue #145: a new password invalidates existing logins. On a
+            // self-service change the current session is kept (so the user
+            // is not logged out of the page that made the change); an admin
+            // reset of another account revokes all of that account's sessions.
+            const auto kept_token = user_id == session->user_id ? cookie_value(req, "tw_session") : std::string{};
+            const auto revoked = store_.delete_sessions_for_user(user_id, kept_token);
+            audit("password_change", "success", session->username, client_ip(req), target_user->username);
+            if (revoked > 0)
+                audit("session_revoke", "success", session->username, client_ip(req), target_user->username);
             set_json(res, json{
                               {"ok", true}
             });

@@ -9,6 +9,23 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Security
 
+- Login throttling no longer lets a client-supplied or malformed
+  `X-Forwarded-For` / `X-Real-IP` choose or poison the throttle bucket.
+  `TRUSTED_PROXIES` now accepts CIDR ranges, `X-Real-IP` is preferred, all
+  `X-Forwarded-For` lines are read, and a malformed forwarded address gets
+  its own bucket instead of the proxy's address (#153).
+- Unknown and disabled usernames are verified against a dummy Argon2 hash so
+  login timing no longer reveals which usernames exist, and the login rate
+  limit check and failure count are one atomic step, so concurrent guesses
+  cannot exceed the limits (#154).
+- Sessions are revoked when a password changes (the caller's own session is
+  kept on a self-service change), and when a user is disabled or deleted;
+  expired sessions are purged periodically. New store methods
+  `delete_sessions_for_user` and `delete_expired_sessions` (SQLite and
+  PostgreSQL) (#145).
+- Authentication and authorization events are audit logged as `AUDIT` lines
+  at NOTICE: login success/failure/lockout, logout, every 403, user
+  create/disable/enable/delete, password change and session revocation (#70).
 - Fixed a server crash (NULL dereference) and heap over-read when a metrics
   or collector-config payload has a CBOR `null`/`true`/`false`/`undefined`
   or a half/single-precision float where a double is expected. All float

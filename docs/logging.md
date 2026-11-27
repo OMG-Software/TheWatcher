@@ -127,3 +127,27 @@ directory.
 The `--help`, `--genkey`, `--install-service`, and `--uninstall-service`
 commands keep concise console output for scripting and operator feedback.
 Runtime diagnostics go through `SingleLog`.
+
+## Audit Log
+
+Authentication and authorization events are written to the server log at
+`NOTICE` level as single `key=value` lines starting with `AUDIT`, so they are
+flushed immediately and can be filtered with one search:
+
+```text
+AUDIT event=login outcome=failure user="alice" source=203.0.113.7
+AUDIT event=permission_denied outcome=denied user="bob" source=203.0.113.9 target="PUT /api/users/1/disable"
+```
+
+Events: `login` (`success`, `failure`, `locked_out`), `logout`,
+`permission_denied` (every HTTP 403), `user_create`, `user_disable`,
+`user_enable`, `user_delete`, `password_change` and `session_revoke`. Fields
+are the acting `user`, the client `source` address (as resolved for login
+throttling, see `TRUSTED_PROXIES`) and, where relevant, the `target`.
+Usernames and other client-supplied values have control characters, quotes
+and backslashes replaced with `?` and are truncated, so they cannot forge
+lines. Passwords and session tokens are never logged.
+
+The audit trail shares the server log file (and its rotation and retention)
+rather than a separate file or database table. Ship the log to a remote
+collector if you need tamper resistance.

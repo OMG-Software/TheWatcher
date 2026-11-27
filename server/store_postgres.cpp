@@ -996,6 +996,28 @@ void PostgresStore::delete_session(const std::string& token)
     check_res(res.r, "delete_session");
 }
 
+// Revokes all of a user's sessions except keep_token (empty keeps none).
+int PostgresStore::delete_sessions_for_user(int64_t user_id, const std::string& keep_token)
+{
+    const auto p_uid = s(user_id);
+    const char* params[] = {p_uid.c_str(), keep_token.c_str()};
+    Res res(PQexecParams(conn_, "DELETE FROM sessions WHERE user_id=$1 AND token<>$2;", 2, nullptr, params, nullptr,
+                         nullptr, 0));
+    check_res(res.r, "delete_sessions_for_user");
+    const char* affected = PQcmdTuples(res.r);
+    return affected != nullptr ? std::atoi(affected) : 0;
+}
+
+int PostgresStore::delete_expired_sessions(int64_t now_ms)
+{
+    const auto p_now = s(now_ms);
+    const char* params[] = {p_now.c_str()};
+    Res res(PQexecParams(conn_, "DELETE FROM sessions WHERE expires_at<=$1;", 1, nullptr, params, nullptr, nullptr, 0));
+    check_res(res.r, "delete_expired_sessions");
+    const char* affected = PQcmdTuples(res.r);
+    return affected != nullptr ? std::atoi(affected) : 0;
+}
+
 // ── Metrics ───────────────────────────────────────────────────────────────────
 
 void PostgresStore::insert_metrics(const MetricsRow& row)

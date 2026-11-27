@@ -216,6 +216,11 @@ public:
     // expired at now_ms, or belongs to a disabled user.
     virtual std::optional<SessionRecord> get_session(const std::string& token, int64_t now_ms) = 0;
     virtual void delete_session(const std::string& token) = 0;
+    // Revokes every session of user_id except the one whose token is
+    // keep_token (empty keeps none). Returns the number of rows removed.
+    virtual int delete_sessions_for_user(int64_t user_id, const std::string& keep_token = "") = 0;
+    // Removes sessions that expired at or before now_ms. Returns the number removed.
+    virtual int delete_expired_sessions(int64_t now_ms) = 0;
 
     virtual void insert_metrics(const MetricsRow& row) = 0;
     virtual std::vector<MetricsRow> get_metrics(const std::string& agent_id, int limit = 100) = 0;

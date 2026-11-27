@@ -54,6 +54,8 @@ public:
     // otherwise nullopt. Throws on SQL error.
     std::optional<SessionRecord> get_session(const std::string& token, int64_t now_ms) override;
     void delete_session(const std::string& token) override;
+    int delete_sessions_for_user(int64_t user_id, const std::string& keep_token = "") override;
+    int delete_expired_sessions(int64_t now_ms) override;
 
     void insert_metrics(const MetricsRow& row) override;
     std::vector<MetricsRow> get_metrics(const std::string& agent_id, int limit) override;

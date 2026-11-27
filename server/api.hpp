@@ -4,6 +4,8 @@
 #include "store.hpp"
 #include "zap_handler.hpp"
 
+#include <array>
+#include <atomic>
 #include <functional>
 #include <mutex>
 #include <optional>
@@ -28,6 +30,14 @@ struct PendingCommand
 {
     std::string agent_id;
     CommandMessage cmd;
+};
+
+// A trusted-proxy network: address bytes (IPv4 as IPv4-mapped IPv6) and the
+// number of leading bits that must match.
+struct ProxyRange
+{
+    std::array<unsigned char, 16> bytes{};
+    int prefix_bits = 128;
 };
 
 // REST API server (runs on its own thread via httplib).
@@ -57,10 +67,11 @@ public:
 
     void stop();
 
-    // Addresses (exact remote_addr strings, e.g. "127.0.0.1" or "::1") of
+    // Addresses or CIDR ranges (e.g. "127.0.0.1", "::1", "10.0.0.0/8") of
     // reverse proxies whose X-Forwarded-For / X-Real-IP headers are trusted
     // for login throttling. Empty (the default) means the headers are
-    // ignored and the TCP peer address is always used.
+    // ignored and the TCP peer address is always used. Invalid entries are
+    // skipped with a warning.
     void set_trusted_proxies(std::vector<std::string> proxies);
 
     // Drain pending commands into caller's vector (called from ZMQ thread).
@@ -79,6 +90,12 @@ private:
     // X-Real-IP only when the TCP peer is a trusted proxy. Falls back to the
     // peer address when the header value is not a plausible IP literal.
     std::string client_ip(const httplib::Request& req);
+    // Writes an AUDIT line (NOTICE) for an authentication or authorization
+    // event. user/target are sanitised; detail must not contain secrets.
+    void audit(const char* event, const char* outcome, const std::string& user, const std::string& source,
+               const std::string& target = "") const;
+    // Deletes expired sessions at most once per purge interval.
+    void purge_expired_sessions_if_due(int64_t now_ms);
 
     Store& store_;
     ZapHandler& zap_;
@@ -96,12 +113,16 @@ private:
     // Account-wide failure tracker keyed by username alone (high threshold):
     // username -> (fail_count, window_start_ms)
     std::unordered_map<std::string, std::pair<int, int64_t>> login_account_failures_;
-    std::vector<std::string> trusted_proxies_; // guarded by login_mutex_
+    std::vector<ProxyRange> trusted_proxies_; // guarded by login_mutex_
     // SEC-12: per-source-IP failure throttle: ip -> (fail_count, window_start_ms)
     std::unordered_map<std::string, std::pair<int, int64_t>> login_ip_failures_;
     int64_t login_lockout_ms_;
     int64_t login_ip_window_ms_;
     std::mutex login_mutex_;
+    // Argon2 hash of a throwaway password; verified when a login names an
+    // unknown or disabled user so those paths cost the same as a real one.
+    std::string dummy_password_hash_;
+    std::atomic<int64_t> last_session_purge_ms_{0};
 };
 
 } // namespace thewatcher::server

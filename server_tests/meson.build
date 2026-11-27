@@ -78,7 +78,8 @@ login_rate_limit_test = executable(
   include_directories: root_inc,
   dependencies: [server_dep, common_dep, catch2_dep, http_dep, cppzmq_dep, sqlite_dep, platform_deps],
 )
-test('login_rate_limit', login_rate_limit_test, is_parallel: false)
+# Argon2 verifications and real window expiries need more than the 30s default.
+test('login_rate_limit', login_rate_limit_test, timeout: 120, is_parallel: false)
 
 api_server_test = executable(
   'api_server_test',
@@ -118,3 +119,11 @@ if libpq_dep.found()
     env: ['THEWATCHER_POSTGRES_TEST_DSN=host=localhost dbname=thewatcher_test user=thewatcher_test password=thewatcher_test'],
   )
 endif
+
+auth_sessions_test = executable(
+  'auth_sessions_test',
+  ['auth_sessions_test.cpp'],
+  include_directories: root_inc,
+  dependencies: [server_dep, common_dep, catch2_dep, http_dep, cppzmq_dep, sqlite_dep, sodium_dep, platform_deps],
+)
+test('auth_sessions', auth_sessions_test, is_parallel: false)

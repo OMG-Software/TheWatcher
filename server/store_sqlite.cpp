@@ -966,6 +966,27 @@ void SqliteStore::delete_session(const std::string& token)
     check(sqlite3_step(st.s), db_, "step delete_session");
 }
 
+int SqliteStore::delete_sessions_for_user(int64_t user_id, const std::string& keep_token)
+{
+    Stmt st;
+    check(sqlite3_prepare_v2(db_, "DELETE FROM sessions WHERE user_id=? AND token<>?;", -1, &st.s, nullptr), db_,
+          "prepare delete_sessions_for_user");
+    sqlite3_bind_int64(st.s, 1, user_id);
+    sqlite3_bind_text(st.s, 2, keep_token.c_str(), -1, SQLITE_TRANSIENT);
+    check(sqlite3_step(st.s), db_, "step delete_sessions_for_user");
+    return sqlite3_changes(db_);
+}
+
+int SqliteStore::delete_expired_sessions(int64_t now_ms)
+{
+    Stmt st;
+    check(sqlite3_prepare_v2(db_, "DELETE FROM sessions WHERE expires_at<=?;", -1, &st.s, nullptr), db_,
+          "prepare delete_expired_sessions");
+    sqlite3_bind_int64(st.s, 1, now_ms);
+    check(sqlite3_step(st.s), db_, "step delete_expired_sessions");
+    return sqlite3_changes(db_);
+}
+
 void SqliteStore::insert_metrics(const MetricsRow& row)
 {
     Stmt st;

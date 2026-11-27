@@ -10,10 +10,13 @@
 #include "../server/store.hpp"
 #include "../server/zap_handler.hpp"
 #include "test_support/net_helpers.hpp"
+#include "test_support/server_fixture.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <memory>
 #include <string>
@@ -268,6 +271,230 @@ SCENARIO("A username is limited account-wide across many client addresses")
                 {
                     REQUIRE(attempt_login_via_proxy(fx.client, "192.0.2.200", "thewatcher", "look_at_me") == 200);
                 }
+            }
+        }
+    }
+}
+
+SCENARIO("A trusted proxy that forwards a malformed address cannot lock out other clients")
+{
+    GIVEN("an API server that trusts 127.0.0.1 as a reverse proxy")
+    {
+        ApiFixture fx(60'000, {"127.0.0.1"});
+
+        WHEN("an attacker sends garbage in X-Forwarded-For until their own bucket is throttled")
+        {
+            for (int i = 0; i < 10; ++i)
+                REQUIRE(attempt_login_via_proxy(fx.client, "zzz", "spray-user-" + std::to_string(i),
+                                                "wrong-password") == 401);
+
+            THEN("the malformed requests themselves are throttled")
+            {
+                REQUIRE(attempt_login_via_proxy(fx.client, "zzz", "thewatcher", "look_at_me") == 429);
+            }
+
+            THEN("a legitimate client behind the same proxy can still log in")
+            {
+                REQUIRE(attempt_login_via_proxy(fx.client, "203.0.113.30", "thewatcher", "look_at_me") == 200);
+            }
+
+            THEN("requests the proxy forwards without any client header are not throttled")
+            {
+                REQUIRE(attempt_login(fx.client, "thewatcher", "look_at_me") == 200);
+            }
+        }
+    }
+}
+
+SCENARIO("X-Real-IP set by a trusted proxy takes precedence over X-Forwarded-For")
+{
+    GIVEN("an API server that trusts 127.0.0.1 as a reverse proxy")
+    {
+        ApiFixture fx(60'000, {"127.0.0.1"});
+
+        WHEN("five failures carry the same X-Real-IP but a different client-supplied X-Forwarded-For each time")
+        {
+            for (int i = 0; i < 5; ++i)
+                REQUIRE(attempt_login(fx.client, "thewatcher", "wrong-password",
+                                      {
+                                          {"X-Real-IP",       "203.0.113.40"                       },
+                                          {"X-Forwarded-For", "198.51.100." + std::to_string(i + 1)}
+                }) == 401);
+
+            THEN("the real client is locked out despite the rotating X-Forwarded-For")
+            {
+                REQUIRE(attempt_login(fx.client, "thewatcher", "wrong-password",
+                                      {
+                                          {"X-Real-IP",       "203.0.113.40" },
+                                          {"X-Forwarded-For", "198.51.100.77"}
+                }) == 429);
+            }
+        }
+    }
+}
+
+SCENARIO("Every X-Forwarded-For header line is considered, the proxy's line last")
+{
+    GIVEN("an API server that trusts 127.0.0.1 as a reverse proxy")
+    {
+        ApiFixture fx(60'000, {"127.0.0.1"});
+
+        WHEN("the client sends its own X-Forwarded-For line and the proxy adds a second one")
+        {
+            // HAProxy's `option forwardfor` adds a separate header line.
+            for (int i = 0; i < 5; ++i)
+                REQUIRE(attempt_login(fx.client, "thewatcher", "wrong-password",
+                                      {
+                                          {"X-Forwarded-For", "198.51.100." + std::to_string(i + 1)},
+                                          {"X-Forwarded-For", "203.0.113.50"                       }
+                }) == 401);
+
+            THEN("the address on the proxy's line is the one that is locked out")
+            {
+                REQUIRE(attempt_login(fx.client, "thewatcher", "wrong-password",
+                                      {
+                                          {"X-Forwarded-For", "198.51.100.99"},
+                                          {"X-Forwarded-For", "203.0.113.50" }
+                }) ==
+                        429);
+            }
+        }
+    }
+}
+
+SCENARIO("Trusted proxies may be given as CIDR ranges")
+{
+    GIVEN("an API server that trusts the 127.0.0.0/8 range")
+    {
+        ApiFixture fx(60'000, {"127.0.0.0/8"});
+
+        WHEN("five failures arrive via the proxy for one forwarded client")
+        {
+            for (int i = 0; i < 5; ++i)
+                REQUIRE(attempt_login_via_proxy(fx.client, "203.0.113.60", "thewatcher", "wrong-password") == 401);
+
+            THEN("that forwarded client is locked out, so the range was honoured")
+            {
+                REQUIRE(attempt_login_via_proxy(fx.client, "203.0.113.60", "thewatcher", "wrong-password") == 429);
+                REQUIRE(attempt_login_via_proxy(fx.client, "203.0.113.61", "thewatcher", "look_at_me") == 200);
+            }
+        }
+    }
+
+    GIVEN("an API server whose trusted entries are invalid or do not contain the peer")
+    {
+        ApiFixture fx(60'000, {"10.0.0.0/8", "not-an-address", "10.0.0.0/99"});
+
+        WHEN("ten failures each claim a different forwarded client")
+        {
+            for (int i = 0; i < 10; ++i)
+                REQUIRE(attempt_login_via_proxy(fx.client, "198.51.100." + std::to_string(i + 1),
+                                                "spray-user-" + std::to_string(i), "wrong-password") == 401);
+
+            THEN("the headers are ignored and the real peer is throttled")
+            {
+                REQUIRE(attempt_login_via_proxy(fx.client, "198.51.100.200", "thewatcher", "look_at_me") == 429);
+            }
+        }
+    }
+}
+
+SCENARIO("Unknown and disabled usernames cost as much as a wrong password")
+{
+    GIVEN("an API server with the default admin and a disabled user")
+    {
+        ApiFixture fx(60'000, {"127.0.0.1"});
+        REQUIRE(thewatcher::test::login_as_default_admin(fx.client));
+        auto created =
+            fx.client.Post("/api/users",
+                           json{
+                               {"username", "sleeper"      },
+                               {"password", "sleeper-pass" },
+                               {"role",     "global_viewer"}
+        }
+                               .dump(),
+                           "application/json");
+        REQUIRE(created);
+        REQUIRE(created->status == 200);
+        const auto user_id = json::parse(created->body).at("user_id").get<int64_t>();
+        auto disabled = fx.client.Put("/api/users/" + std::to_string(user_id) + "/disable", "", "application/json");
+        REQUIRE(disabled);
+        REQUIRE(disabled->status == 200);
+        httplib::Client anon("http://127.0.0.1:" + std::to_string(fx.port));
+        anon.set_read_timeout(10, 0);
+
+        // Median login time of three failures, each from its own forwarded
+        // address so the throttle stays out of the measurement.
+        const auto median_ms = [&](const std::string& user, const std::string& pass, const std::string& prefix) {
+            std::vector<double> samples;
+            for (int i = 0; i < 3; ++i)
+            {
+                const auto start = std::chrono::steady_clock::now();
+                REQUIRE(attempt_login(anon, user, pass,
+                                      {
+                                          {"X-Forwarded-For", prefix + std::to_string(i + 1)}
+                }) == 401);
+                samples.push_back(
+                    std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
+            }
+            std::sort(samples.begin(), samples.end());
+            return samples[1];
+        };
+
+        WHEN("a login is attempted for an existing user with the wrong password")
+        {
+            const auto known = median_ms("thewatcher", "wrong-password", "198.51.100.");
+
+            THEN("an unknown username takes a comparable time")
+            {
+                REQUIRE(median_ms("no-such-user", "wrong-password", "198.51.101.") > known * 0.5);
+            }
+
+            THEN("a disabled username takes a comparable time")
+            {
+                REQUIRE(median_ms("sleeper", "sleeper-pass", "198.51.102.") > known * 0.5);
+            }
+        }
+    }
+}
+
+SCENARIO("Concurrent login attempts cannot exceed the failure limit")
+{
+    GIVEN("an API server and many simultaneous bad logins for one account from one address")
+    {
+        ApiFixture fx(60'000);
+        constexpr int attempts = 16;
+        std::atomic<int> unauthorized{0};
+        std::atomic<int> throttled{0};
+
+        WHEN("they are all in flight at once")
+        {
+            std::vector<std::thread> threads;
+            for (int i = 0; i < attempts; ++i)
+            {
+                threads.emplace_back([&] {
+                    httplib::Client client("http://127.0.0.1:" + std::to_string(fx.port));
+                    client.set_read_timeout(30, 0);
+                    auto res = client.Post("/api/login",
+                                           json{
+                                               {"username", "thewatcher"    },
+                                               {"password", "wrong-password"}
+                    }
+                                               .dump(),
+                                           "application/json");
+                    if (res && res->status == 401)
+                        ++unauthorized;
+                    else if (res && res->status == 429)
+                        ++throttled;
+                });
+            }
+            for (auto& t : threads)
+                t.join();
+
+            THEN("no more than the per-account limit of five verifications are admitted")
+            {
+                REQUIRE(unauthorized.load() == 5);
+                REQUIRE(throttled.load() == attempts - 5);
             }
         }
     }
