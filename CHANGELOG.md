@@ -85,7 +85,10 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   services (aborting if one cannot be stopped), copies a KEY=VALUE
   `server.json` that has a `SERVER_SECRET_KEY` line to
   `TheWatcherServer.conf` without overwriting an existing one, and
-  re-registers the service, so agents keep the same server identity. Config
+  re-registers the service, so agents keep the same server identity. A
+  `server.json` that cannot be converted, with no `TheWatcherServer.conf`
+  beside it, makes the installer refuse to run before it stops or changes
+  anything, so the server never starts without its keypair. Config
   preparation and migration run in `PrepareToInstall` and abort the install on
   failure; service registration checks exit codes, retries while the old
   service is marked for deletion, and on failure shows the manual commands and

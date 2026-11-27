@@ -215,6 +215,32 @@ end;
 // - A server.json that does not look like a KEY=VALUE config (for example one
 //   hand-written as JSON) is not converted; see the upgrade notes in
 //   docs/installation.md.
+// Pre-flight check, run before anything is stopped or changed. Returns an
+// error message when a legacy server.json exists, there is no
+// TheWatcherServer.conf yet, and server.json cannot be converted. Carrying on
+// would register the server without its config: on its next start it would
+// generate a new CURVE keypair and every enrolled agent would have to be
+// re-enrolled. Returns '' when the upgrade can proceed.
+function CheckLegacyServerConfig(): String;
+var
+  Dir, OldConf, NewConf: String;
+begin
+  Result := '';
+  Dir := ExpandConstant('{commonappdata}\TheWatcher');
+  OldConf := AddBackslash(Dir) + 'server.json';
+  NewConf := AddBackslash(Dir) + 'TheWatcherServer.conf';
+  if FileExists(NewConf) or not FileExists(OldConf) then
+    Exit;
+  try
+    if not HasServerSecretKey(OldConf) then
+      Result := OldConf + ' is not a KEY=VALUE server config, so it cannot be migrated automatically. ' +
+                'Copy its settings, including SERVER_PUBLIC_KEY and SERVER_SECRET_KEY, into ' + NewConf +
+                ' and run the installer again. Nothing has been changed.';
+  except
+    Result := GetExceptionMessage() + ' Nothing has been changed.';
+  end;
+end;
+
 procedure MigrateServerConfig(const Dir: String);
 var
   OldConf, NewConf: String;
@@ -223,11 +249,10 @@ begin
   NewConf := AddBackslash(Dir) + 'TheWatcherServer.conf';
   if FileExists(NewConf) or not FileExists(OldConf) then
     Exit;
+  // CheckLegacyServerConfig already refused a server.json that cannot be
+  // converted; check again in case the file changed since.
   if not HasServerSecretKey(OldConf) then
-  begin
-    Log('server.json is not a KEY=VALUE server config; not migrated');
-    Exit;
-  end;
+    RaiseException(OldConf + ' is not a KEY=VALUE server config; it was not migrated');
   if not FileCopy(OldConf, NewConf, True) then
     RaiseException('Could not copy ' + OldConf + ' to ' + NewConf);
 end;
@@ -273,14 +298,18 @@ end;
 // Steps that must not fail silently run here, before any file is touched:
 // Inno Setup catches exceptions raised from [Dirs] AfterInstall and from
 // CurStepChanged and carries on, but a non-empty result from PrepareToInstall
-// aborts the install cleanly. Order: stop the services, create and lock down
-// the config directory, migrate the legacy server config. Migration must
-// complete before the service is registered, otherwise the server could start
-// on a missing TheWatcherServer.conf and generate a new CURVE keypair, which
-// breaks every enrolled agent.
+// aborts the install cleanly. Order: check that a legacy server config can be
+// migrated (before anything is stopped, so a refusal leaves the running
+// install untouched), stop the services, create and lock down the config
+// directory, migrate the legacy server config. Migration must complete before
+// the service is registered, otherwise the server could start on a missing
+// TheWatcherServer.conf and generate a new CURVE keypair, which breaks every
+// enrolled agent.
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 begin
-  Result := StopServiceIfPresent('TheWatcherAgent');
+  Result := CheckLegacyServerConfig();
+  if Result = '' then
+    Result := StopServiceIfPresent('TheWatcherAgent');
   if Result = '' then
     Result := StopServiceIfPresent('TheWatcherServer');
   if Result = '' then
