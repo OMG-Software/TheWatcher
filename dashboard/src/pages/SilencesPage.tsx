@@ -1,6 +1,7 @@
 import React from 'react';
 import { Plus, Trash2 } from 'lucide-react';
 import { createSilence, deleteSilence } from '../api';
+import { ActionError } from '../components/ActionError';
 import { ActionButton } from '../components/ActionButton';
 import type { RunAction } from '../hooks/useRunAction';
 import type { DashboardAgent, SilenceRecord } from '../models';
@@ -9,6 +10,7 @@ export function SilencesPage({
   agents,
   busyAction,
   global,
+  loadFailed = false,
   operator,
   runAction,
   silences,
@@ -16,6 +18,7 @@ export function SilencesPage({
   agents: DashboardAgent[];
   busyAction: string | null;
   global: boolean;
+  loadFailed?: boolean;
   operator: boolean;
   runAction: RunAction;
   silences: SilenceRecord[];
@@ -38,8 +41,9 @@ export function SilencesPage({
           onSubmit={(event) => {
             event.preventDefault();
             const untilMs = Date.now() + hours * 3_600_000;
-            void runAction('silence:create', () => createSilence(agentId, indicator, reason, untilMs)).then(() => {
-              setReason('');
+            void runAction('silence:create', () => createSilence(agentId, indicator, reason, untilMs), { inline: true }).then((saved) => {
+              // Keep what the user typed when the save failed.
+              if (saved) setReason('');
             });
           }}
         >
@@ -74,6 +78,7 @@ export function SilencesPage({
               <input placeholder="Planned maintenance…" value={reason} onChange={(e) => setReason(e.target.value)} />
             </label>
           </div>
+          <ActionError actionKey="silence:create" />
           <div className="button-row">
             <button className="text-button" disabled={busyAction !== null} type="submit">
               <Plus size={14} /> Add Silence Rule
@@ -94,7 +99,7 @@ export function SilencesPage({
             </tr>
           </thead>
           <tbody>
-            {silences.length === 0 ? (
+            {silences.length === 0 && !loadFailed ? (
               <tr><td colSpan={operator ? 6 : 5} className="uptime">No active silence rules.</td></tr>
             ) : null}
             {silences.map((s) => {

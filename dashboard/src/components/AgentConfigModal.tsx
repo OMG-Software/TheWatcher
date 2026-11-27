@@ -2,6 +2,7 @@ import React from 'react';
 import { Plus, Trash2, X } from 'lucide-react';
 import { setAgentCollectorConfig } from '../api';
 import { buildCollectorDraft } from '../collectorDraft';
+import { ActionError } from './ActionError';
 import { ActionButton } from './ActionButton';
 import { AgentIdentity } from './AgentIdentity';
 import { AnomalyInputs, NetworkThresholdInputs, NumberField, ThresholdInputs, ThresholdRow } from './ThresholdInputs';
@@ -87,7 +88,7 @@ export function AgentConfigModal({
         className="config-modal"
         onSubmit={(event) => {
           event.preventDefault();
-          void runAction(`${agent.id}:collector_config`, () => setAgentCollectorConfig(agent.id, draft)).then((saved) => {
+          void runAction(`${agent.id}:collector_config`, () => setAgentCollectorConfig(agent.id, draft), { inline: true }).then((saved) => {
             if (saved) onClose();
           });
         }}
@@ -279,6 +280,7 @@ export function AgentConfigModal({
           </section>
         </div>
 
+        <ActionError actionKey={`${agent.id}:collector_config`} />
         <div className="modal-actions">
           <button className="text-button" type="button" onClick={onClose}>Cancel</button>
           <button className="text-button" type="submit" disabled={!operator || busy}>{busy ? '...' : 'Save'}</button>

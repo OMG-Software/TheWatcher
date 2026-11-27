@@ -36,7 +36,7 @@ describe('GIVEN a polling hook', () => {
   it('WHEN mounted THEN it loads at once and again every interval', async () => {
     const fetcher = vi.fn().mockResolvedValue('data');
 
-    const { result } = renderHook(() => usePolling(fetcher, 1000));
+    const { result } = renderHook(() => usePolling(fetcher, { intervalMs: 1000 }));
     await advance(0);
     expect(result.current.data).toBe('data');
     expect(result.current.loading).toBe(false);
@@ -49,7 +49,7 @@ describe('GIVEN a polling hook', () => {
     const slow = deferred<string>();
     const fetcher = vi.fn().mockReturnValueOnce(slow.promise).mockResolvedValue('next');
 
-    renderHook(() => usePolling(fetcher, 1000));
+    renderHook(() => usePolling(fetcher, { intervalMs: 1000 }));
     await advance(3500);
     expect(fetcher).toHaveBeenCalledTimes(1);
 
@@ -61,7 +61,7 @@ describe('GIVEN a polling hook', () => {
 
   it('WHEN the tab is hidden THEN polling pauses, and it refreshes at once when the tab is visible again', async () => {
     const fetcher = vi.fn().mockResolvedValue('data');
-    renderHook(() => usePolling(fetcher, 1000));
+    renderHook(() => usePolling(fetcher, { intervalMs: 1000 }));
     await advance(0);
     expect(fetcher).toHaveBeenCalledTimes(1);
 
@@ -78,7 +78,7 @@ describe('GIVEN a polling hook', () => {
     const older = deferred<string>();
     const newer = deferred<string>();
     const fetcher = vi.fn().mockReturnValueOnce(older.promise).mockReturnValueOnce(newer.promise);
-    const { result } = renderHook(() => usePolling(fetcher, 1000));
+    const { result } = renderHook(() => usePolling(fetcher, { intervalMs: 1000 }));
 
     let refreshing!: Promise<void>;
     act(() => {
@@ -102,7 +102,7 @@ describe('GIVEN a polling hook', () => {
       .mockResolvedValueOnce('good')
       .mockRejectedValueOnce(new Error('boom'))
       .mockResolvedValue('recovered');
-    const { result } = renderHook(() => usePolling(fetcher, 1000));
+    const { result } = renderHook(() => usePolling(fetcher, { intervalMs: 1000 }));
     await advance(0);
 
     await advance(1000);
@@ -121,6 +121,15 @@ describe('GIVEN a polling hook', () => {
     await advance(0);
 
     expect(result.current).toMatchObject({ data: null, error: 'server down', loading: false });
+  });
+
+  it('WHEN disabled THEN it neither loads nor polls', async () => {
+    const fetcher = vi.fn().mockResolvedValue('x');
+
+    renderHook(() => usePolling(fetcher, { intervalMs: 1000, enabled: false }));
+    await advance(10_000);
+
+    expect(fetcher).not.toHaveBeenCalled();
   });
 
   it('WHEN no interval is given THEN it loads once and never polls', async () => {

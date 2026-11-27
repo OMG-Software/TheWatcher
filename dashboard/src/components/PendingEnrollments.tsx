@@ -5,7 +5,7 @@ import { AgentIdentity } from './AgentIdentity';
 import type { RunAction } from '../hooks/useRunAction';
 import type { DashboardAgent, GroupRecord } from '../models';
 
-export function PendingEnrollments({ agents, busyAction, groups, runAction }: { agents: DashboardAgent[]; busyAction: string | null; groups: GroupRecord[]; runAction: RunAction }) {
+export function PendingEnrollments({ agents, busyAction, groups, loadFailed = false, runAction }: { agents: DashboardAgent[]; busyAction: string | null; groups: GroupRecord[]; loadFailed?: boolean; runAction: RunAction }) {
   const defaultGroup = groups[0]?.group_id;
   return (
     <section className="embedded-management">
@@ -24,7 +24,7 @@ export function PendingEnrollments({ agents, busyAction, groups, runAction }: { 
               </div></td>
             </tr>
           ))}
-          {agents.length === 0 ? <tr><td colSpan={4} className="uptime">No pending enrollments.</td></tr> : null}
+          {agents.length === 0 && !loadFailed ? <tr><td colSpan={4} className="uptime">No pending enrollments.</td></tr> : null}
           </tbody>
         </table>
       </div>
