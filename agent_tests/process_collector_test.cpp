@@ -6,6 +6,13 @@
 #include <utility>
 #include <vector>
 
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#endif
+
 using namespace thewatcher;
 using namespace thewatcher::agent;
 
@@ -269,3 +276,83 @@ SCENARIO("Reported processes are the top N plus every watched match (issue #95, 
         }
     }
 }
+
+#ifdef _WIN32
+
+namespace
+{
+
+// Starts a child process that idles for a few seconds and kills it on scope exit.
+class ChildProcess
+{
+public:
+    ChildProcess()
+    {
+        char command[] = "ping.exe -n 8 127.0.0.1";
+        STARTUPINFOA startup{};
+        startup.cb = sizeof(startup);
+        startup.dwFlags = STARTF_USESHOWWINDOW;
+        startup.wShowWindow = SW_HIDE;
+        started_ = ::CreateProcessA(nullptr, command, nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, nullptr,
+                                    &startup, &info_) != 0;
+    }
+    ~ChildProcess()
+    {
+        if (started_)
+        {
+            ::TerminateProcess(info_.hProcess, 0);
+            ::CloseHandle(info_.hThread);
+            ::CloseHandle(info_.hProcess);
+        }
+    }
+    ChildProcess(const ChildProcess&) = delete;
+    ChildProcess& operator=(const ChildProcess&) = delete;
+
+    bool started() const
+    {
+        return started_;
+    }
+    uint32_t pid() const
+    {
+        return info_.dwProcessId;
+    }
+
+private:
+    PROCESS_INFORMATION info_{};
+    bool started_ = false;
+};
+
+} // namespace
+
+SCENARIO("On Windows, memory of another process is reported with the access the collector requests (issue #95)")
+{
+    GIVEN("a separate child process, whose handle has no special rights unlike the test's own pseudo-handle")
+    {
+        ChildProcess child;
+        REQUIRE(child.started());
+
+        WHEN("the collector lists all processes")
+        {
+            ProcessCollector collector(100000);
+            SystemMetrics metrics;
+            collector.update(metrics);
+
+            THEN("the child is reported with non-zero RSS and VMS")
+            {
+                bool found = false;
+                for (const auto& p : metrics.top_processes)
+                {
+                    if (p.pid == child.pid())
+                    {
+                        found = true;
+                        REQUIRE(p.memory_rss_bytes > 0);
+                        REQUIRE(p.memory_vms_bytes > 0);
+                    }
+                }
+                REQUIRE(found);
+            }
+        }
+    }
+}
+
+#endif

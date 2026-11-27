@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -27,6 +28,7 @@ struct MountEntry
     std::string device;
     std::string mount_point;
     std::string filesystem;
+    std::string canonical_device; // device after resolving symlinks; set by filter_mounts
 };
 
 // Decodes the octal escapes (\040 for a space, \011 tab, \012 newline, \134
@@ -47,7 +49,13 @@ bool is_pseudo_filesystem(std::string_view filesystem);
 // and keeps only the first mount of each device so bind mounts and btrfs
 // subvolumes are not reported twice. With require_block_device only /dev/*
 // devices are kept (Linux); BSD passes false so ZFS datasets survive.
-std::vector<MountEntry> filter_mounts(const std::vector<MountEntry>& entries, bool require_block_device);
+// resolve maps a device path to its canonical node (realpath); it is applied
+// once per mount and its result is used for the loop check, the de-duplication
+// and MountEntry::canonical_device, while `device` keeps the original string.
+// A null resolver means the device is already canonical.
+using DeviceResolver = std::function<std::string(const std::string&)>;
+std::vector<MountEntry> filter_mounts(const std::vector<MountEntry>& entries, bool require_block_device,
+                                      const DeviceResolver& resolve = {});
 
 // Name under which a mounted device appears in /proc/diskstats. dm_names maps
 // a device-mapper name (the /dev/mapper/<name> alias) to its dm-N node, as

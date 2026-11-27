@@ -323,3 +323,70 @@ SCENARIO("A mount's device maps to its /proc/diskstats name (issue #96)")
         }
     }
 }
+
+SCENARIO("Mounts are filtered and de-duplicated on their resolved device (issue #96)")
+{
+    // Stands in for realpath(): udev aliases resolve to the kernel node.
+    const auto resolve = [](const std::string& device) -> std::string {
+        static const std::unordered_map<std::string, std::string> links{
+            {"/dev/disk/by-uuid/aaaa",    "/dev/dm-0" },
+            {"/dev/mapper/vg-root",       "/dev/dm-0" },
+            {"/dev/disk/by-id/snap-core", "/dev/loop7"},
+            {"/dev/disk/by-label/data",   "/dev/sdb1" },
+        };
+        const auto it = links.find(device);
+        return it != links.end() ? it->second : device;
+    };
+
+    GIVEN("one volume mounted twice through two different alias names")
+    {
+        const auto entries = parse_mount_table("/dev/mapper/vg-root / ext4 rw 0 0\n"
+                                               "/dev/disk/by-uuid/aaaa /srv/again ext4 rw 0 0\n"
+                                               "/dev/dm-0 /srv/third ext4 rw 0 0\n");
+
+        WHEN("the mounts are filtered with a resolver")
+        {
+            const auto kept = filter_mounts(entries, true, resolve);
+
+            THEN("only the first mount remains and it keeps the device string from the mount table")
+            {
+                REQUIRE(kept.size() == 1);
+                REQUIRE(kept[0].mount_point == "/");
+                REQUIRE(kept[0].device == "/dev/mapper/vg-root");
+                REQUIRE(kept[0].canonical_device == "/dev/dm-0");
+            }
+        }
+    }
+
+    GIVEN("a by-id alias that resolves to a loop device and a by-label alias that resolves to a disk")
+    {
+        const auto entries = parse_mount_table("/dev/disk/by-id/snap-core /snap/core/1 ext4 ro 0 0\n"
+                                               "/dev/disk/by-label/data /data ext4 rw 0 0\n");
+
+        WHEN("the mounts are filtered with a resolver")
+        {
+            const auto kept = filter_mounts(entries, true, resolve);
+
+            THEN("the loop-backed mount is excluded and the disk is kept")
+            {
+                REQUIRE(kept.size() == 1);
+                REQUIRE(kept[0].mount_point == "/data");
+                REQUIRE(kept[0].canonical_device == "/dev/sdb1");
+            }
+        }
+    }
+
+    GIVEN("no resolver")
+    {
+        WHEN("a device is filtered")
+        {
+            const auto kept = filter_mounts(parse_mount_table("/dev/sda1 / ext4 rw 0 0\n"), true);
+
+            THEN("its canonical device is the device itself")
+            {
+                REQUIRE(kept.size() == 1);
+                REQUIRE(kept[0].canonical_device == "/dev/sda1");
+            }
+        }
+    }
+}

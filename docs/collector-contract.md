@@ -87,7 +87,10 @@ are outside the normal top-N sample.
 Reported mounts exclude pseudo filesystems (proc, sysfs, tmpfs, devtmpfs,
 overlay, ...), `squashfs` (snap packages are always 100% used), loop
 devices, and repeat mounts of a device already reported (bind mounts, btrfs
-subvolumes; the first mount in the mount table wins).
+subvolumes; the first mount in the mount table wins). Loop filtering and
+de-duplication use the device after resolving symlinks (so
+`/dev/disk/by-id/...` aliases are handled); `device` in the metric stays the
+string from the mount table.
 
 - Linux reads `/proc/self/mounts` and decodes octal escapes (`\040` is a
   space). I/O rates come from `/proc/diskstats`; the mount's device is

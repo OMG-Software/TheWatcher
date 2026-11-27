@@ -83,7 +83,7 @@ std::vector<MountEntry> parse_mount_table(std::string_view text)
         std::string filesystem;
         if (!(row >> device >> mount_point >> filesystem))
             continue;
-        entries.push_back({unescape_mount_field(device), unescape_mount_field(mount_point), filesystem});
+        entries.push_back({unescape_mount_field(device), unescape_mount_field(mount_point), filesystem, {}});
     }
     return entries;
 }
@@ -99,7 +99,8 @@ bool is_pseudo_filesystem(std::string_view filesystem)
     return std::find(std::begin(pseudo), std::end(pseudo), filesystem) != std::end(pseudo);
 }
 
-std::vector<MountEntry> filter_mounts(const std::vector<MountEntry>& entries, bool require_block_device)
+std::vector<MountEntry> filter_mounts(const std::vector<MountEntry>& entries, bool require_block_device,
+                                      const DeviceResolver& resolve)
 {
     std::vector<MountEntry> kept;
     for (const auto& entry : entries)
@@ -108,14 +109,18 @@ std::vector<MountEntry> filter_mounts(const std::vector<MountEntry>& entries, bo
             continue;
         if (require_block_device && entry.device.rfind("/dev/", 0) != 0)
             continue;
-        if (entry.device.rfind("/dev/loop", 0) == 0)
+        // Resolve once: aliases such as /dev/disk/by-id/... may point at a loop device or
+        // at a device already reported.
+        MountEntry resolved = entry;
+        resolved.canonical_device = resolve ? resolve(entry.device) : entry.device;
+        if (resolved.canonical_device.rfind("/dev/loop", 0) == 0)
             continue;
         // Bind mounts and btrfs subvolumes repeat the device: report it once.
         const bool seen = std::any_of(kept.begin(), kept.end(), [&](const MountEntry& k) {
-            return k.device == entry.device;
+            return k.canonical_device == resolved.canonical_device;
         });
         if (!seen)
-            kept.push_back(entry);
+            kept.push_back(std::move(resolved));
     }
     return kept;
 }
@@ -154,7 +159,14 @@ namespace
                 dm_names[dm_name] = node;
         }
 
-        for (const auto& entry : filter_mounts(parse_mount_table(text), true))
+        // Follow symlinks (/dev/disk/by-uuid/..., /dev/mapper/...) to the real node, once:
+        // the result drives loop filtering, de-duplication and the diskstats lookup.
+        const DeviceResolver resolve = [](const std::string& device) {
+            std::error_code resolve_ec;
+            const auto real = std::filesystem::canonical(device, resolve_ec);
+            return resolve_ec ? device : real.string();
+        };
+        for (const auto& entry : filter_mounts(parse_mount_table(text), true, resolve))
         {
             auto space = std::filesystem::space(entry.mount_point, ec);
             if (ec)
@@ -167,9 +179,7 @@ namespace
             apply_space_info(disk, space);
             disks.push_back(std::move(disk));
 
-            // Follow symlinks (/dev/disk/by-uuid/..., /dev/mapper/...) to the real node.
-            const auto real = std::filesystem::canonical(entry.device, ec);
-            io_names.push_back(diskstats_name_for_device(ec ? entry.device : real.string(), dm_names));
+            io_names.push_back(diskstats_name_for_device(entry.canonical_device, dm_names));
         }
         return disks;
     }
@@ -246,7 +256,7 @@ namespace
         std::vector<MountEntry> entries;
         for (int i = 0; i < count; ++i)
         {
-            entries.push_back({table[i].f_mntfromname, table[i].f_mntonname, table[i].f_fstypename});
+            entries.push_back({table[i].f_mntfromname, table[i].f_mntonname, table[i].f_fstypename, {}});
         }
 
         for (const auto& entry : filter_mounts(entries, false))

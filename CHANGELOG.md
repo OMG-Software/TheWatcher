@@ -69,6 +69,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   bind-mounted duplicates are no longer reported; octal escapes such as
   `\040` in mount paths are decoded so those disks are no longer dropped
   (#96).
+- Disk collector (Linux): loop-device filtering, de-duplication and the
+  `/proc/diskstats` lookup now all use the device resolved once through
+  symlinks, so a `/dev/disk/by-id/...` alias of a loop device is excluded and
+  two aliases of one volume are reported once; the reported `device` stays the
+  string from the mount table (#96).
 - Disk collector (BSD): every real mount is reported through `getmntinfo`
   instead of only `/` (FreeBSD, OpenBSD, NetBSD; not yet compiled on
   OpenBSD or NetBSD) (#93, part of).
