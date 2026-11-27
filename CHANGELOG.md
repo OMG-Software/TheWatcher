@@ -85,9 +85,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   services (aborting if one cannot be stopped), copies a KEY=VALUE
   `server.json` that has a `SERVER_SECRET_KEY` line to
   `TheWatcherServer.conf` without overwriting an existing one, and
-  re-registers the service, checking exit codes and retrying while the old
-  service is marked for deletion, so agents keep the same server identity
-  (#131).
+  re-registers the service, so agents keep the same server identity. Config
+  preparation and migration run in `PrepareToInstall` and abort the install on
+  failure; service registration checks exit codes, retries while the old
+  service is marked for deletion, and on failure shows the manual commands and
+  makes setup exit with code 10 (#131).
 - The CPU collector reports a real usage value on its first `update()` and
   after a collector restart. The constructor takes a baseline and the first
   update waits until it is at least 100 ms old. Calls closer than 100 ms to

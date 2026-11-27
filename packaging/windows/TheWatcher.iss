@@ -28,10 +28,9 @@ Source: "..\..\dashboard\dist\*"; DestDir: "{app}\dashboard"; Flags: ignoreversi
 ; AGENT_SECRET_KEY. Do NOT grant Users modify here — previous installers did,
 ; which let any local user read both CURVE secrets and edit configs consumed
 ; by SYSTEM services. SecureConfigDir (see [Code]) resets the ACL to SYSTEM
-; and Administrators only and aborts the install if that fails. It runs here,
-; during the file-copy phase, so it always completes before the services are
-; registered (CurStepChanged, ssPostInstall). SIDs are used so it works on any Windows language.
-Name: "{commonappdata}\TheWatcher"; AfterInstall: SecureConfigDir
+; and Administrators only. It runs from PrepareToInstall, before any file is
+; touched, so a failure aborts the install cleanly. SIDs are used so it works on any Windows language.
+Name: "{commonappdata}\TheWatcher"
 
 [UninstallRun]
 Filename: "{app}\agent\TheWatcherAgent.exe"; Parameters: "--uninstall-service"; Flags: runhidden waituntilterminated
@@ -41,6 +40,10 @@ Filename: "{app}\server\TheWatcherServer.exe"; Parameters: "--uninstall-service"
 Name: "{group}\TheWatcher Dashboard"; Filename: "{app}\dashboard\index.html"; Check: DashboardExists
 
 [Code]
+var
+  RegistrationError: String;
+  RegistrationFailureText: String;
+
 // Upgrades: stop the running services before any file is replaced, so the
 // executables are not locked and the service registration can be deleted and
 // recreated immediately afterwards.
@@ -79,13 +82,6 @@ begin
     Sleep(1000);
   end;
   Result := 'The ' + Name + ' service did not stop. Stop it manually and run the installer again.';
-end;
-
-function PrepareToInstall(var NeedsRestart: Boolean): String;
-begin
-  Result := StopServiceIfPresent('TheWatcherAgent');
-  if Result = '' then
-    Result := StopServiceIfPresent('TheWatcherServer');
 end;
 
 // True when FileName has a non-comment KEY=VALUE line whose trimmed key is
@@ -175,19 +171,6 @@ begin
     RaiseException('Could not register the ' + Name + ' service (exit code ' + IntToStr(ResultCode) + ').');
 end;
 
-// Runs after all files are installed and the server config has been migrated,
-// so the service never starts on a missing TheWatcherServer.conf.
-procedure CurStepChanged(CurStep: TSetupStep);
-begin
-  if CurStep = ssPostInstall then
-  begin
-    RegisterService('TheWatcherServer', ExpandConstant('{app}\server\TheWatcherServer.exe'),
-                    ExpandConstant('{commonappdata}\TheWatcher\TheWatcherServer.conf'));
-    RegisterService('TheWatcherAgent', ExpandConstant('{app}\agent\TheWatcherAgent.exe'),
-                    ExpandConstant('{commonappdata}\TheWatcher\TheWatcherAgent.conf'));
-  end;
-end;
-
 function DashboardExists(): Boolean;
 begin
   Result := FileExists(ExpandConstant('{app}\dashboard\index.html'));
@@ -265,6 +248,8 @@ var
   Raw: AnsiString;
 begin
   Dir := ExpandConstant('{commonappdata}\TheWatcher');
+  if not ForceDirectories(Dir) then
+    RaiseException('Could not create ' + Dir);
   RunIcacls('"' + Dir + '" /inheritance:r /remove:g *S-1-5-32-545 *S-1-5-11 *S-1-1-0 ' +
             '/grant:r *S-1-5-32-544:(OI)(CI)F *S-1-5-18:(OI)(CI)F');
   if DirHasEntries(Dir) then
@@ -283,4 +268,81 @@ begin
 
   // After the ACL reset so the copied file inherits the restricted ACL.
   MigrateServerConfig(Dir);
+end;
+
+// Steps that must not fail silently run here, before any file is touched:
+// Inno Setup catches exceptions raised from [Dirs] AfterInstall and from
+// CurStepChanged and carries on, but a non-empty result from PrepareToInstall
+// aborts the install cleanly. Order: stop the services, create and lock down
+// the config directory, migrate the legacy server config. Migration must
+// complete before the service is registered, otherwise the server could start
+// on a missing TheWatcherServer.conf and generate a new CURVE keypair, which
+// breaks every enrolled agent.
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+begin
+  Result := StopServiceIfPresent('TheWatcherAgent');
+  if Result = '' then
+    Result := StopServiceIfPresent('TheWatcherServer');
+  if Result = '' then
+  begin
+    try
+      SecureConfigDir();
+    except
+      Result := 'Could not prepare the configuration directory: ' + GetExceptionMessage();
+    end;
+  end;
+end;
+
+// Registration needs the installed executables, so it runs after the files are
+// copied (ssPostInstall) and cannot abort the install. Failures are recorded,
+// shown (SuppressibleMsgBox, so silent installs log them), reflected in the
+// finished page and returned as the setup exit code.
+procedure RegisterAll();
+var
+  Msg: String;
+begin
+  try
+    RegisterService('TheWatcherServer', ExpandConstant('{app}\server\TheWatcherServer.exe'),
+                    ExpandConstant('{commonappdata}\TheWatcher\TheWatcherServer.conf'));
+  except
+    RegistrationError := GetExceptionMessage();
+  end;
+  try
+    RegisterService('TheWatcherAgent', ExpandConstant('{app}\agent\TheWatcherAgent.exe'),
+                    ExpandConstant('{commonappdata}\TheWatcher\TheWatcherAgent.conf'));
+  except
+    if RegistrationError <> '' then
+      RegistrationError := RegistrationError + #13#10;
+    RegistrationError := RegistrationError + GetExceptionMessage();
+  end;
+  if RegistrationError <> '' then
+  begin
+    Msg := 'The files were installed but service registration failed:' + #13#10 + RegistrationError + #13#10#13#10 +
+           'Fix the problem, then run as Administrator:' + #13#10 +
+           ExpandConstant('"{app}\server\TheWatcherServer.exe" --install-service --config "{commonappdata}\TheWatcher\TheWatcherServer.conf"') + #13#10 +
+           ExpandConstant('"{app}\agent\TheWatcherAgent.exe" --install-service --config "{commonappdata}\TheWatcher\TheWatcherAgent.conf"');
+    RegistrationFailureText := Msg;
+    SuppressibleMsgBox(Msg, mbError, MB_OK, IDOK);
+  end;
+end;
+
+procedure CurStepChanged(CurStep: TSetupStep);
+begin
+  if CurStep = ssPostInstall then
+    RegisterAll();
+end;
+
+procedure CurPageChanged(CurPageID: Integer);
+begin
+  if (CurPageID = wpFinished) and (RegistrationError <> '') then
+    WizardForm.FinishedLabel.Caption := RegistrationFailureText;
+end;
+
+// Non-zero when service registration failed, so silent installs report it.
+function GetCustomSetupExitCode(): Integer;
+begin
+  if RegistrationError <> '' then
+    Result := 10
+  else
+    Result := 0;
 end;

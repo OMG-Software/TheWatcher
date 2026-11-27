@@ -265,25 +265,36 @@ Older Windows installers registered the server service with
 `KEY=VALUE` file at that path, the same format as `TheWatcherServer.conf`. The
 current installer therefore:
 
-0. stops the TheWatcher agent and server services before replacing any
-   files, waiting up to 30 seconds for each to stop. A service that is not
-   installed is skipped; if an installed service cannot be stopped the
-   installer aborts with a message, so stop it manually and run the installer
-   again;
+Steps 0 to 1 run in `PrepareToInstall`, before any file is touched. Inno Setup
+carries on after an error raised later in the install, but a failure here
+aborts the install cleanly with a message, so the server can never be
+registered against a missing `TheWatcherServer.conf` (which would generate a new
+CURVE keypair and break every enrolled agent):
+
+0. stops the TheWatcher agent and server services, waiting up to 30 seconds
+   for each. A service that is not installed is skipped; if an installed
+   service cannot be stopped the installer aborts, so stop it manually and run
+   the installer again. It then creates the config directory and restricts it
+   to SYSTEM and Administrators;
 1. copies `server.json` to `TheWatcherServer.conf` when the old file exists,
    has a non-comment `SERVER_SECRET_KEY=<value>` line (spaces around `=` are
    fine, as in the server parser), and `TheWatcherServer.conf` does not
    exist (an existing `.conf` is never overwritten, and `server.json` is kept
    as a backup), so the server keeps its CURVE identity and agents keep
-   working;
-2. removes the old service registration (skipped when the service is not
-   installed), waits up to 30 seconds for it to disappear, and registers it
-   again so the service command line points at `TheWatcherServer.conf`,
-   retrying 5 times if the old service is still marked for deletion. This is
-   done in the installer's script rather than `[Run]` so exit codes are
-   checked: any failure aborts the install with a message (close
-   `services.msc` and run the installer again if it reports the old service is
-   still marked for deletion).
+   working. An unreadable `server.json` aborts the install;
+2. after the files are copied, removes the old service registration (skipped
+   when the service is not installed), waits up to 30 seconds for it to
+   disappear, and registers it again so the service command line points at
+   `TheWatcherServer.conf`, retrying 5 times if the old service is still marked
+   for deletion. Exit codes are checked in the installer script, because
+   `[Run]` entries cannot check them. Registration cannot abort an install that
+   has already copied its files, so a failure here is reported instead: the
+   installer shows an error with the exact
+   `--install-service --config <path>` commands to run as Administrator, the
+   finished page repeats them, and the setup process exits with code 10 (so
+   silent installs can detect it; `/LOG` records the message). Close
+   `services.msc` and run the installer again if the old service is still marked
+   for deletion.
 
 If `server.json` has no such line (for example JSON you wrote by hand, even if
 it mentions `SERVER_SECRET_KEY`), it is not converted and is left untouched. Copy the settings into `TheWatcherServer.conf`
