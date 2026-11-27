@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <filesystem>
+#include <fstream>
 
 #include <sqlite3.h>
 
@@ -3327,6 +3328,61 @@ SCENARIO("Deleting an agent never leaves its id in a view with an undecodable co
             THEN("only that id is removed")
             {
                 REQUIRE(store.get_view(view_id)->agent_ids == std::vector<std::string>{"stays"});
+            }
+        }
+    }
+}
+
+SCENARIO("A read error while scanning views rolls the agent delete back")
+{
+    GIVEN("a file store whose views relation fails when it is read")
+    {
+        const auto path = unique_store_path("failing-views.db").string();
+        {
+            SqliteStore store(path);
+            store.upsert_agent(make_agent("gone"));
+            SilenceRecord silence;
+            silence.agent_id = "gone";
+            silence.indicator = "*";
+            silence.until_ms = 9'000'000'000'000;
+            silence.created_at = 1;
+            store.create_silence(silence);
+        }
+
+        // Replace the views table by a SQL view whose config_json raises
+        // "integer overflow" (SQLITE_ERROR) when a row is stepped. Unlike a
+        // corrupt page, this error does not make SQLite roll the transaction
+        // back by itself, so only the store's own error handling can.
+        sqlite3* raw = nullptr;
+        REQUIRE(sqlite3_open(path.c_str(), &raw) == SQLITE_OK);
+        REQUIRE(
+            sqlite3_exec(raw,
+                         "DROP TABLE views;"
+                         "CREATE VIEW views AS SELECT 1 AS view_id, 'v' AS name, 1 AS owner_user_id, 0 AS is_public,"
+                         " 0 AS group_id, abs(-9223372036854775807-1) AS config_json, 1 AS created_at;",
+                         nullptr, nullptr, nullptr) == SQLITE_OK);
+        sqlite3_close(raw);
+
+        SqliteStore store(path);
+
+        WHEN("the agent is deleted")
+        {
+            THEN("the delete fails instead of committing with the id left in the views")
+            {
+                REQUIRE_THROWS(store.delete_agent("gone"));
+            }
+
+            AND_THEN("nothing was deleted: the agent and its silence are still there")
+            {
+                try
+                {
+                    store.delete_agent("gone");
+                }
+                catch (const std::exception&)
+                {
+                }
+                REQUIRE(store.get_agent("gone").has_value());
+                REQUIRE(store.list_silences().size() == 1);
             }
         }
     }

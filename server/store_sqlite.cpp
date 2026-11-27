@@ -57,6 +57,20 @@ namespace
         }
     }
 
+    // Advances a SELECT. Returns true for a row and false at SQLITE_DONE; any
+    // other result (SQLITE_ERROR, SQLITE_BUSY, ...) throws, so a failed scan can
+    // never be read as "no more rows" and let a caller commit partial work.
+    bool next_row(sqlite3_stmt* stmt, sqlite3* db, const char* ctx)
+    {
+        const int rc = sqlite3_step(stmt);
+        if (rc == SQLITE_ROW)
+            return true;
+        if (rc == SQLITE_DONE)
+            return false;
+        check(rc == SQLITE_OK ? SQLITE_ERROR : rc, db, ctx);
+        return false;
+    }
+
     std::string text_col(sqlite3_stmt* s, int col)
     {
         const auto* value = sqlite3_column_text(s, col);
@@ -703,7 +717,7 @@ void SqliteStore::delete_agent(const std::string& agent_id)
         Stmt st;
         check(sqlite3_prepare_v2(db_, "SELECT view_id,config_json FROM views;", -1, &st.s, nullptr), db_,
               "prepare delete_agent views");
-        while (sqlite3_step(st.s) == SQLITE_ROW)
+        while (next_row(st.s, db_, "step delete_agent views"))
         {
             if (auto updated = remove_agent_from_view_config(text_col(st.s, 1), agent_id))
                 rewritten.emplace_back(sqlite3_column_int64(st.s, 0), std::move(*updated));
@@ -1294,7 +1308,7 @@ std::vector<AlertRecord> SqliteStore::query_alerts(const AlertQuery& query)
         sqlite3_bind_int64(st.s, bind++, query.offset);
     }
     std::vector<AlertRecord> out;
-    while (sqlite3_step(st.s) == SQLITE_ROW)
+    while (next_row(st.s, db_, "step query_alerts"))
         out.push_back(row_to_alert(st.s));
     return out;
 }
@@ -1305,7 +1319,7 @@ std::optional<AlertRecord> SqliteStore::get_alert(int64_t alert_id)
     Stmt st;
     check(sqlite3_prepare_v2(db_, sql.c_str(), -1, &st.s, nullptr), db_, "prepare get_alert");
     sqlite3_bind_int64(st.s, 1, alert_id);
-    if (sqlite3_step(st.s) == SQLITE_ROW)
+    if (next_row(st.s, db_, "step get_alert"))
         return row_to_alert(st.s);
     return std::nullopt;
 }

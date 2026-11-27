@@ -90,6 +90,12 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Deleting an agent no longer silently skips a view whose stored config is
   malformed: a config that mentions the agent fails the delete and rolls it
   back (#146).
+- The SQLite store checks the result of the view scan, alert query and
+  single-alert lookup: an error is raised instead of being read as "no more
+  rows", so a failed scan during agent delete rolls the delete back (#146).
+- On Windows the default server config path is no longer guessed from the
+  `ProgramData` environment variable or a fixed `C:\ProgramData` when the
+  shell call fails; the server stops and asks for `--config` (#58).
 - Server config values are validated at load with errors that name the key
   and line (`API_PORT: not a number (line 3)`): port range, offline interval
   range, `DB_TYPE`, a Postgres DSN, and a complete, matching CURVE keypair.

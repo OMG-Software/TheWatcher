@@ -15,6 +15,10 @@ Linux: /etc/thewatcher/TheWatcherServer.conf
 FreeBSD/OpenBSD/NetBSD/DragonFly: /usr/local/etc/thewatcher/TheWatcherServer.conf
 ```
 
+On Windows the common application data folder comes from the system; if it
+cannot be determined the server stops with an error asking for `--config`
+instead of guessing a folder that other users might be able to write to.
+
 On the BSDs an existing `/etc/thewatcher/TheWatcherServer.conf` is still used
 when no file exists under `/usr/local/etc/thewatcher/`, so upgrades keep their
 settings.

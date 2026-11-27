@@ -104,7 +104,16 @@ int main(int argc, char* argv[])
         return 0;
     }
 
-    fs::path cfg_path = config_path.empty() ? ServerConfig::default_path() : fs::path(config_path);
+    fs::path cfg_path;
+    try
+    {
+        cfg_path = config_path.empty() ? ServerConfig::default_path() : fs::path(config_path);
+    }
+    catch (const std::exception& e)
+    {
+        std::cerr << "Cannot choose a config path: " << e.what() << "\n";
+        return 1;
+    }
     auto log_path = log_path_for_config(cfg_path, "TheWatcherServer.log");
     auto& logger = thewatcher::logging::SingleLog::GetInstance();
     logger.SetConsoleLogLevel(thewatcher::logging::LogLevel::L_INFO);

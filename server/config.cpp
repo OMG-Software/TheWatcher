@@ -267,14 +267,11 @@ fs::path ServerConfig::default_path()
     LOG_FUNCTION_TRACE
 #ifdef _WIN32
     char buf[MAX_PATH] = {};
-    // Fall back to %ProgramData% (then its usual location) if the shell call fails.
+    // Fail closed: guessing a folder (an environment variable or a fixed
+    // C:\ProgramData) could point somewhere other users can write, and this
+    // file holds the CURVE secret key. The caller can pass --config instead.
     if (FAILED(SHGetFolderPathA(nullptr, CSIDL_COMMON_APPDATA, nullptr, 0, buf)) || buf[0] == '\0')
-    {
-        char program_data[MAX_PATH] = {};
-        const DWORD length = GetEnvironmentVariableA("ProgramData", program_data, MAX_PATH);
-        const fs::path base = (length > 0 && length < MAX_PATH) ? fs::path(program_data) : fs::path("C:\\ProgramData");
-        return base / "TheWatcher" / "TheWatcherServer.conf";
-    }
+        throw std::runtime_error("Cannot determine the common application data folder; pass --config <path>");
     return fs::path(buf) / "TheWatcher" / "TheWatcherServer.conf";
 #elif defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__) || defined(__DragonFly__)
     // BSD convention is /usr/local/etc for add-on software. An existing config

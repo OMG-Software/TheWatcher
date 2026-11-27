@@ -38,6 +38,8 @@ struct ServerConfig
     // loads after a downgrade. Never written by save().
     std::vector<std::string> unknown_keys;
 
+    // Throws std::runtime_error on Windows when the common application data
+    // folder cannot be determined (it never guesses a location).
     static std::filesystem::path default_path();
     // Loads the KEY=VALUE config at path, or creates it with a new CURVE keypair
     // when missing. A relative sqlite DB_PATH resolves against the config
