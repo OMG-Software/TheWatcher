@@ -48,6 +48,8 @@ public:
     // SEC-14: built-in users are never deleted. Returns the affected row
     // count, so 0 means an unknown id or a built-in user. Throws on SQL error.
     int delete_user(int64_t user_id) override;
+    int update_user_access(int64_t user_id, const std::optional<std::string>& role,
+                           const std::optional<std::vector<int64_t>>& group_ids) override;
     void update_user_password(int64_t user_id, const std::string& password_hash) override;
     void create_session(const SessionRecord& session) override;
     // Returns the session only while it is unexpired and its user is enabled;

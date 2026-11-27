@@ -206,6 +206,7 @@ namespace
         a.description = col(r, row, 27);
         a.heartbeat_interval = col_int(r, row, 28);
         a.runbook_markdown = col(r, row, 29);
+        a.ip_address = col(r, row, 30);
         return a;
     }
 
@@ -328,7 +329,8 @@ void PostgresStore::init_schema()
             collector_config_json       TEXT NOT NULL DEFAULT '',
             description                 TEXT NOT NULL DEFAULT '',
             heartbeat_interval          INTEGER NOT NULL DEFAULT 5,
-            runbook_markdown            TEXT NOT NULL DEFAULT ''
+            runbook_markdown            TEXT NOT NULL DEFAULT '',
+            ip_address                  TEXT NOT NULL DEFAULT ''
         );
     )");
     add_column_if_missing("agents", "rejected",
@@ -353,6 +355,8 @@ void PostgresStore::init_schema()
                           "ALTER TABLE agents ADD COLUMN heartbeat_interval INTEGER NOT NULL DEFAULT 5;");
     add_column_if_missing("agents", "runbook_markdown",
                           "ALTER TABLE agents ADD COLUMN runbook_markdown TEXT NOT NULL DEFAULT '';");
+    add_column_if_missing("agents", "ip_address",
+                          "ALTER TABLE agents ADD COLUMN ip_address TEXT NOT NULL DEFAULT '';");
     exec(R"(
         CREATE TABLE IF NOT EXISTS metrics (
             id           BIGSERIAL PRIMARY KEY,
@@ -604,6 +608,7 @@ void PostgresStore::upsert_agent(const AgentRecord& rec)
         rec.description.c_str(),
         p_hi.c_str(),
         rec.runbook_markdown.c_str(),
+        rec.ip_address.c_str(),
     };
     Res res(PQexecParams(conn_, R"(
         INSERT INTO agents(agent_id,hostname,platform,curve_public_key_z85,approved,rejected,connected,
@@ -612,9 +617,9 @@ void PostgresStore::upsert_agent(const AgentRecord& rec)
             memory_warning_pct_of_avg,memory_degraded_pct_of_avg,memory_critical_pct_of_avg,
             disk_warning_pct_of_avg,disk_degraded_pct_of_avg,disk_critical_pct_of_avg,
             network_warning_pct_of_avg,network_degraded_pct_of_avg,network_critical_pct_of_avg,
-            collector_config_json,description,heartbeat_interval,runbook_markdown)
+            collector_config_json,description,heartbeat_interval,runbook_markdown,ip_address)
         VALUES($1,$2,$3,$4,$5::boolean,$6::boolean,$7::boolean,$8::boolean,$9,$10,$11,$12,$13,$14,
-               $15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30)
+               $15,$16,$17,$18,$19,$20,$21,$22,$23,$24,$25,$26,$27,$28,$29,$30,$31)
         ON CONFLICT(agent_id) DO UPDATE SET
             hostname=EXCLUDED.hostname,
             platform=EXCLUDED.platform,
@@ -628,9 +633,10 @@ void PostgresStore::upsert_agent(const AgentRecord& rec)
             collector_config_json=EXCLUDED.collector_config_json,
             heartbeat_interval=EXCLUDED.heartbeat_interval,
             runbook_markdown=EXCLUDED.runbook_markdown,
+            ip_address=CASE WHEN EXCLUDED.ip_address<>'' THEN EXCLUDED.ip_address ELSE agents.ip_address END,
             last_seen=EXCLUDED.last_seen;
     )",
-                         30, nullptr, params, nullptr, nullptr, 0));
+                         31, nullptr, params, nullptr, nullptr, 0));
     check_res(res.r, "upsert_agent");
 }
 
@@ -643,7 +649,7 @@ namespace
         "memory_warning_pct_of_avg,memory_degraded_pct_of_avg,memory_critical_pct_of_avg,"
         "disk_warning_pct_of_avg,disk_degraded_pct_of_avg,disk_critical_pct_of_avg,"
         "network_warning_pct_of_avg,network_degraded_pct_of_avg,network_critical_pct_of_avg,"
-        "collector_config_json,description,heartbeat_interval,runbook_markdown FROM agents";
+        "collector_config_json,description,heartbeat_interval,runbook_markdown,ip_address FROM agents";
 } // namespace
 
 std::optional<AgentRecord> PostgresStore::get_agent(const std::string& agent_id)
@@ -909,19 +915,112 @@ std::vector<int64_t> PostgresStore::get_user_groups(int64_t user_id)
     return out;
 }
 
+namespace
+{
+    // Condition true when removing or demoting the row would leave no enabled
+    // global admin. The legacy role name 'admin' still counts, for databases
+    // that predate the six-role model.
+    constexpr const char* WOULD_REMOVE_LAST_ADMIN =
+        "(role IN ('global_admin','admin') AND disabled=FALSE AND "
+        "(SELECT COUNT(*) FROM users WHERE role IN ('global_admin','admin') AND disabled=FALSE) <= 1)";
+
+    // Arbitrary application-wide key for the advisory lock that serialises
+    // changes able to remove a global admin.
+    constexpr const char* USER_ADMIN_LOCK_SQL = "SELECT pg_advisory_xact_lock(7467001);";
+
+    void run(PGconn* conn, const char* sql, const char* ctx)
+    {
+        Res res(PQexec(conn, sql));
+        check_res(res.r, ctx);
+    }
+
+    // A transaction that holds the user-admin advisory lock until it ends.
+    // Two concurrent removals therefore run one after the other, and the
+    // second one sees the first one's committed result when it counts admins
+    // (READ COMMITTED takes a fresh snapshot for every statement). Rolls back
+    // unless commit() was called.
+    class UserAdminTransaction
+    {
+    public:
+        explicit UserAdminTransaction(PGconn* conn)
+            : conn_(conn)
+        {
+            run(conn_, "BEGIN;", "begin user admin transaction");
+            try
+            {
+                run(conn_, USER_ADMIN_LOCK_SQL, "lock user admin changes");
+            }
+            catch (...)
+            {
+                rollback();
+                throw;
+            }
+        }
+        ~UserAdminTransaction()
+        {
+            rollback();
+        }
+        UserAdminTransaction(const UserAdminTransaction&) = delete;
+        UserAdminTransaction& operator=(const UserAdminTransaction&) = delete;
+
+        void commit()
+        {
+            open_ = false;
+            run(conn_, "COMMIT;", "commit user admin transaction");
+        }
+
+    private:
+        void rollback() noexcept
+        {
+            if (!open_)
+                return;
+            open_ = false;
+            Res res(PQexec(conn_, "ROLLBACK;"));
+        }
+
+        PGconn* conn_;
+        bool open_ = true;
+    };
+
+    int affected_rows(PGresult* res)
+    {
+        const char* affected = PQcmdTuples(res);
+        return affected != nullptr ? std::atoi(affected) : 0;
+    }
+
+    // True when the user exists, is not built-in, and is the only enabled
+    // global admin. Used to tell a refused change from an unknown id.
+    bool is_last_global_admin(PGconn* conn, int64_t user_id)
+    {
+        const auto p = s(user_id);
+        const char* params[] = {p.c_str()};
+        const auto sql = std::string("SELECT 1 FROM users WHERE user_id=$1 AND built_in=FALSE AND ") +
+                         WOULD_REMOVE_LAST_ADMIN + ";";
+        Res res(PQexecParams(conn, sql.c_str(), 1, nullptr, params, nullptr, nullptr, 0));
+        check_res(res.r, "is_last_global_admin");
+        return PQntuples(res.r) > 0;
+    }
+} // namespace
+
 // Disables a non-built-in user. Returns the affected row count, so 0 means an
-// unknown id or a built-in user. Throws on SQL error.
+// unknown id or a built-in user, and kLastGlobalAdmin means this is the only
+// enabled global admin. Throws on SQL error.
 int PostgresStore::disable_user(int64_t user_id)
 {
     const auto p = s(user_id);
     const char* params[] = {p.c_str()};
+    UserAdminTransaction tx(conn_);
     // SEC-14: the built-in admin must not be disableable — deleting it would
     // let the next bootstrap recreate it with the public default password.
-    Res res(PQexecParams(conn_, "UPDATE users SET disabled=TRUE WHERE user_id=$1 AND built_in=FALSE;", 1, nullptr,
-                         params, nullptr, nullptr, 0));
+    const auto sql = std::string("UPDATE users SET disabled=TRUE WHERE user_id=$1 AND built_in=FALSE AND NOT ") +
+                     WOULD_REMOVE_LAST_ADMIN + ";";
+    Res res(PQexecParams(conn_, sql.c_str(), 1, nullptr, params, nullptr, nullptr, 0));
     check_res(res.r, "disable_user");
-    const char* affected = PQcmdTuples(res.r);
-    return affected != nullptr ? std::atoi(affected) : 0;
+    auto changed = affected_rows(res.r);
+    if (changed == 0 && is_last_global_admin(conn_, user_id))
+        changed = kLastGlobalAdmin;
+    tx.commit();
+    return changed;
 }
 
 void PostgresStore::enable_user(int64_t user_id)
@@ -934,17 +1033,74 @@ void PostgresStore::enable_user(int64_t user_id)
 }
 
 // Deletes a non-built-in user. Returns the affected row count, so 0 means an
-// unknown id or a built-in user. Throws on SQL error.
+// unknown id or a built-in user, and kLastGlobalAdmin means this is the only
+// enabled global admin. Throws on SQL error.
 int PostgresStore::delete_user(int64_t user_id)
 {
     const auto p = s(user_id);
     const char* params[] = {p.c_str()};
+    UserAdminTransaction tx(conn_);
     // SEC-14: same built_in guard as SQLite — never delete the bootstrap admin.
-    Res res(PQexecParams(conn_, "DELETE FROM users WHERE user_id=$1 AND built_in=FALSE;", 1, nullptr, params, nullptr,
-                         nullptr, 0));
+    const auto sql =
+        std::string("DELETE FROM users WHERE user_id=$1 AND built_in=FALSE AND NOT ") + WOULD_REMOVE_LAST_ADMIN + ";";
+    Res res(PQexecParams(conn_, sql.c_str(), 1, nullptr, params, nullptr, nullptr, 0));
     check_res(res.r, "delete_user");
-    const char* affected = PQcmdTuples(res.r);
-    return affected != nullptr ? std::atoi(affected) : 0;
+    auto changed = affected_rows(res.r);
+    if (changed == 0 && is_last_global_admin(conn_, user_id))
+        changed = kLastGlobalAdmin;
+    tx.commit();
+    return changed;
+}
+
+// Sets role and/or groups in one transaction. Returns 1 on success, 0 for an
+// unknown or built-in user and kLastGlobalAdmin when the new role would leave
+// no enabled global admin. An unknown group id throws and rolls everything back.
+int PostgresStore::update_user_access(int64_t user_id, const std::optional<std::string>& role,
+                                      const std::optional<std::vector<int64_t>>& group_ids)
+{
+    const auto p_uid = s(user_id);
+    UserAdminTransaction tx(conn_);
+    if (role)
+    {
+        // Keeping an admin role cannot remove the last admin, so only a
+        // demotion needs the guard.
+        const bool keeps_admin = *role == "global_admin" || *role == "admin";
+        const auto sql = std::string("UPDATE users SET role=$1 WHERE user_id=$2 AND built_in=FALSE") +
+                         (keeps_admin ? ";" : std::string(" AND NOT ") + WOULD_REMOVE_LAST_ADMIN + ";");
+        const char* params[] = {role->c_str(), p_uid.c_str()};
+        Res res(PQexecParams(conn_, sql.c_str(), 2, nullptr, params, nullptr, nullptr, 0));
+        check_res(res.r, "update_user_access role");
+        if (affected_rows(res.r) == 0)
+            return is_last_global_admin(conn_, user_id) ? kLastGlobalAdmin : 0;
+    }
+    else
+    {
+        // Groups only: still refuse unknown and built-in users.
+        const char* params[] = {p_uid.c_str()};
+        Res res(PQexecParams(conn_, "SELECT 1 FROM users WHERE user_id=$1 AND built_in=FALSE;", 1, nullptr, params,
+                             nullptr, nullptr, 0));
+        check_res(res.r, "update_user_access lookup");
+        if (PQntuples(res.r) == 0)
+            return 0;
+    }
+    if (group_ids)
+    {
+        const char* del_params[] = {p_uid.c_str()};
+        Res del(PQexecParams(conn_, "DELETE FROM user_groups WHERE user_id=$1;", 1, nullptr, del_params, nullptr,
+                             nullptr, 0));
+        check_res(del.r, "update_user_access delete groups");
+        for (const auto group_id : *group_ids)
+        {
+            const auto p_gid = s(group_id);
+            const char* params[] = {p_uid.c_str(), p_gid.c_str()};
+            Res ins(PQexecParams(conn_,
+                                 "INSERT INTO user_groups(user_id,group_id) VALUES($1,$2) ON CONFLICT DO NOTHING;", 2,
+                                 nullptr, params, nullptr, nullptr, 0));
+            check_res(ins.r, "update_user_access insert group");
+        }
+    }
+    tx.commit();
+    return 1;
 }
 
 void PostgresStore::update_user_password(int64_t user_id, const std::string& password_hash)

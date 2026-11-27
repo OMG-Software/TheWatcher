@@ -26,7 +26,7 @@ namespace
         "memory_warning_pct_of_avg,memory_degraded_pct_of_avg,memory_critical_pct_of_avg,"
         "disk_warning_pct_of_avg,disk_degraded_pct_of_avg,disk_critical_pct_of_avg,"
         "network_warning_pct_of_avg,network_degraded_pct_of_avg,network_critical_pct_of_avg,"
-        "collector_config_json,description,heartbeat_interval,runbook_markdown";
+        "collector_config_json,description,heartbeat_interval,runbook_markdown,ip_address";
 
     struct Stmt
     {
@@ -99,6 +99,7 @@ namespace
         r.description = text_col(s, 27);
         r.heartbeat_interval = sqlite3_column_int(s, 28);
         r.runbook_markdown = text_col(s, 29);
+        r.ip_address = text_col(s, 30);
         return r;
     }
 
@@ -282,7 +283,8 @@ void SqliteStore::init_schema()
             collector_config_json       TEXT NOT NULL DEFAULT '',
             description                 TEXT NOT NULL DEFAULT '',
             heartbeat_interval          INTEGER NOT NULL DEFAULT 5,
-            runbook_markdown            TEXT NOT NULL DEFAULT ''
+            runbook_markdown            TEXT NOT NULL DEFAULT '',
+            ip_address                  TEXT NOT NULL DEFAULT ''
         );
     )");
     add_column_if_missing("agents", "rejected", "ALTER TABLE agents ADD COLUMN rejected INTEGER NOT NULL DEFAULT 0;");
@@ -329,6 +331,8 @@ void SqliteStore::init_schema()
                           "ALTER TABLE agents ADD COLUMN heartbeat_interval INTEGER NOT NULL DEFAULT 5;");
     add_column_if_missing("agents", "runbook_markdown",
                           "ALTER TABLE agents ADD COLUMN runbook_markdown TEXT NOT NULL DEFAULT '';");
+    add_column_if_missing("agents", "ip_address",
+                          "ALTER TABLE agents ADD COLUMN ip_address TEXT NOT NULL DEFAULT '';");
     // Schema break in 0.3.0: metrics column changed from JSON TEXT to CBOR BLOB.
     // Existing 0.2.x dev databases drop and recreate the metrics table on first start.
     if (column_exists("metrics", "metrics_json") && !column_exists("metrics", "metrics_cbor"))
@@ -531,8 +535,8 @@ void SqliteStore::upsert_agent(const AgentRecord& rec)
                rec.agent_id.c_str(), rec.approved ? 1 : 0, rec.rejected ? 1 : 0, rec.connected ? 1 : 0,
                rec.maintenance ? 1 : 0, rec.collection_interval, rec.process_limit);
     const char* sql = R"(
-        INSERT INTO agents(agent_id,hostname,platform,curve_public_key_z85,approved,rejected,connected,maintenance,maintenance_reason,maintenance_until,collection_interval,process_limit,first_seen,last_seen,cpu_warning_pct_of_avg,cpu_degraded_pct_of_avg,cpu_critical_pct_of_avg,memory_warning_pct_of_avg,memory_degraded_pct_of_avg,memory_critical_pct_of_avg,disk_warning_pct_of_avg,disk_degraded_pct_of_avg,disk_critical_pct_of_avg,network_warning_pct_of_avg,network_degraded_pct_of_avg,network_critical_pct_of_avg,collector_config_json,description,heartbeat_interval,runbook_markdown)
-        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        INSERT INTO agents(agent_id,hostname,platform,curve_public_key_z85,approved,rejected,connected,maintenance,maintenance_reason,maintenance_until,collection_interval,process_limit,first_seen,last_seen,cpu_warning_pct_of_avg,cpu_degraded_pct_of_avg,cpu_critical_pct_of_avg,memory_warning_pct_of_avg,memory_degraded_pct_of_avg,memory_critical_pct_of_avg,disk_warning_pct_of_avg,disk_degraded_pct_of_avg,disk_critical_pct_of_avg,network_warning_pct_of_avg,network_degraded_pct_of_avg,network_critical_pct_of_avg,collector_config_json,description,heartbeat_interval,runbook_markdown,ip_address)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         ON CONFLICT(agent_id) DO UPDATE SET
             hostname=excluded.hostname,
             platform=excluded.platform,
@@ -546,6 +550,8 @@ void SqliteStore::upsert_agent(const AgentRecord& rec)
             collector_config_json=excluded.collector_config_json,
             heartbeat_interval=excluded.heartbeat_interval,
             runbook_markdown=excluded.runbook_markdown,
+            -- An update that carries no address keeps the last known one.
+            ip_address=CASE WHEN excluded.ip_address<>'' THEN excluded.ip_address ELSE agents.ip_address END,
             last_seen=excluded.last_seen;
     )";
     Stmt st;
@@ -581,6 +587,7 @@ void SqliteStore::upsert_agent(const AgentRecord& rec)
     sqlite3_bind_text(st.s, 28, rec.description.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_int(st.s, 29, rec.heartbeat_interval);
     sqlite3_bind_text(st.s, 30, rec.runbook_markdown.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st.s, 31, rec.ip_address.c_str(), -1, SQLITE_TRANSIENT);
     check(sqlite3_step(st.s), db_, "step upsert_agent");
 }
 
@@ -844,26 +851,56 @@ int64_t SqliteStore::create_user(const std::string& username, const std::string&
     return sqlite3_last_insert_rowid(db_);
 }
 
+namespace
+{
+    // Replaces a user's group rows. The caller owns the transaction.
+    void replace_user_groups(sqlite3* db, int64_t user_id, const std::vector<int64_t>& group_ids)
+    {
+        Stmt del;
+        check(sqlite3_prepare_v2(db, "DELETE FROM user_groups WHERE user_id=?;", -1, &del.s, nullptr), db,
+              "prepare delete user groups");
+        sqlite3_bind_int64(del.s, 1, user_id);
+        check(sqlite3_step(del.s), db, "step delete user groups");
+        for (auto group_id : group_ids)
+        {
+            Stmt ins;
+            check(sqlite3_prepare_v2(db, "INSERT OR IGNORE INTO user_groups(user_id,group_id) VALUES(?,?);", -1,
+                                     &ins.s, nullptr),
+                  db, "prepare insert user group");
+            sqlite3_bind_int64(ins.s, 1, user_id);
+            sqlite3_bind_int64(ins.s, 2, group_id);
+            check(sqlite3_step(ins.s), db, "step insert user group");
+        }
+    }
+
+    // SQL condition that is true when removing or demoting the row would leave
+    // no enabled global admin. Embedded in the same statement as the write so
+    // the check and the change are one atomic step.
+    // The legacy role name 'admin' still counts, for databases that predate the
+    // six-role model.
+    constexpr const char* WOULD_REMOVE_LAST_ADMIN =
+        "(role IN ('global_admin','admin') AND disabled=0 AND "
+        "(SELECT COUNT(*) FROM users WHERE role IN ('global_admin','admin') AND disabled=0) <= 1)";
+
+    // True when the user exists, is not built-in, and is the only enabled
+    // global admin. Used to tell a refused change from an unknown id.
+    bool is_last_global_admin(sqlite3* db, int64_t user_id)
+    {
+        const auto sql = std::string("SELECT 1 FROM users WHERE user_id=? AND built_in=0 AND ") +
+                         WOULD_REMOVE_LAST_ADMIN + ";";
+        Stmt st;
+        check(sqlite3_prepare_v2(db, sql.c_str(), -1, &st.s, nullptr), db, "prepare is_last_global_admin");
+        sqlite3_bind_int64(st.s, 1, user_id);
+        return sqlite3_step(st.s) == SQLITE_ROW;
+    }
+} // namespace
+
 void SqliteStore::set_user_groups(int64_t user_id, const std::vector<int64_t>& group_ids)
 {
     exec("BEGIN IMMEDIATE;");
     try
     {
-        Stmt del;
-        check(sqlite3_prepare_v2(db_, "DELETE FROM user_groups WHERE user_id=?;", -1, &del.s, nullptr), db_,
-              "prepare delete user groups");
-        sqlite3_bind_int64(del.s, 1, user_id);
-        check(sqlite3_step(del.s), db_, "step delete user groups");
-        for (auto group_id : group_ids)
-        {
-            Stmt ins;
-            check(sqlite3_prepare_v2(db_, "INSERT OR IGNORE INTO user_groups(user_id,group_id) VALUES(?,?);", -1,
-                                     &ins.s, nullptr),
-                  db_, "prepare insert user group");
-            sqlite3_bind_int64(ins.s, 1, user_id);
-            sqlite3_bind_int64(ins.s, 2, group_id);
-            check(sqlite3_step(ins.s), db_, "step insert user group");
-        }
+        replace_user_groups(db_, user_id, group_ids);
         exec("COMMIT;");
     }
     catch (...)
@@ -888,13 +925,16 @@ std::vector<int64_t> SqliteStore::get_user_groups(int64_t user_id)
 
 int SqliteStore::disable_user(int64_t user_id)
 {
+    // The last-admin guard is part of the UPDATE, so it is atomic with the write.
+    const auto sql = std::string("UPDATE users SET disabled=1 WHERE user_id=? AND built_in=0 AND NOT ") +
+                     WOULD_REMOVE_LAST_ADMIN + ";";
     Stmt st;
-    check(sqlite3_prepare_v2(db_, "UPDATE users SET disabled=1 WHERE user_id=? AND built_in=0;", -1, &st.s, nullptr),
-          db_, "prepare disable_user");
+    check(sqlite3_prepare_v2(db_, sql.c_str(), -1, &st.s, nullptr), db_, "prepare disable_user");
     sqlite3_bind_int64(st.s, 1, user_id);
     check(sqlite3_step(st.s), db_, "step disable_user");
     // SEC-13/14: report affected rows so the API can reject no-ops.
-    return sqlite3_changes(db_);
+    const auto changed = sqlite3_changes(db_);
+    return changed == 0 && is_last_global_admin(db_, user_id) ? kLastGlobalAdmin : changed;
 }
 
 void SqliteStore::enable_user(int64_t user_id)
@@ -908,12 +948,65 @@ void SqliteStore::enable_user(int64_t user_id)
 
 int SqliteStore::delete_user(int64_t user_id)
 {
+    const auto sql = std::string("DELETE FROM users WHERE user_id=? AND built_in=0 AND NOT ") +
+                     WOULD_REMOVE_LAST_ADMIN + ";";
     Stmt st;
-    check(sqlite3_prepare_v2(db_, "DELETE FROM users WHERE user_id=? AND built_in=0;", -1, &st.s, nullptr), db_,
-          "prepare delete_user");
+    check(sqlite3_prepare_v2(db_, sql.c_str(), -1, &st.s, nullptr), db_, "prepare delete_user");
     sqlite3_bind_int64(st.s, 1, user_id);
     check(sqlite3_step(st.s), db_, "step delete_user");
-    return sqlite3_changes(db_);
+    const auto changed = sqlite3_changes(db_);
+    return changed == 0 && is_last_global_admin(db_, user_id) ? kLastGlobalAdmin : changed;
+}
+
+int SqliteStore::update_user_access(int64_t user_id, const std::optional<std::string>& role,
+                                    const std::optional<std::vector<int64_t>>& group_ids)
+{
+    exec("BEGIN IMMEDIATE;");
+    try
+    {
+        if (role)
+        {
+            // Demoting is a removal as far as the guard is concerned: the
+            // condition is true only for an enabled global admin who is the
+            // last one, so it is checked only when the new role is not global admin.
+            const bool keeps_admin = *role == "global_admin" || *role == "admin";
+            const auto sql = std::string("UPDATE users SET role=? WHERE user_id=? AND built_in=0") +
+                             (keeps_admin ? ";" : std::string(" AND NOT ") + WOULD_REMOVE_LAST_ADMIN + ";");
+            Stmt st;
+            check(sqlite3_prepare_v2(db_, sql.c_str(), -1, &st.s, nullptr), db_, "prepare update_user_access");
+            sqlite3_bind_text(st.s, 1, role->c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_int64(st.s, 2, user_id);
+            check(sqlite3_step(st.s), db_, "step update_user_access");
+            if (sqlite3_changes(db_) == 0)
+            {
+                const auto refused = is_last_global_admin(db_, user_id) ? kLastGlobalAdmin : 0;
+                exec("ROLLBACK;");
+                return refused;
+            }
+        }
+        else
+        {
+            // Groups only: still refuse unknown and built-in users.
+            Stmt st;
+            check(sqlite3_prepare_v2(db_, "SELECT 1 FROM users WHERE user_id=? AND built_in=0;", -1, &st.s, nullptr),
+                  db_, "prepare update_user_access lookup");
+            sqlite3_bind_int64(st.s, 1, user_id);
+            if (sqlite3_step(st.s) != SQLITE_ROW)
+            {
+                exec("ROLLBACK;");
+                return 0;
+            }
+        }
+        if (group_ids)
+            replace_user_groups(db_, user_id, *group_ids);
+        exec("COMMIT;");
+        return 1;
+    }
+    catch (...)
+    {
+        exec("ROLLBACK;");
+        throw;
+    }
 }
 
 void SqliteStore::update_user_password(int64_t user_id, const std::string& password_hash)

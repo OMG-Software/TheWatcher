@@ -18,6 +18,9 @@ struct AgentRecord
     std::string hostname;
     std::string platform;
     std::string curve_public_key_z85;
+    // Address the server last saw this agent connect from (the TCP peer, so
+    // the NAT or proxy address when one sits in between). Empty until known.
+    std::string ip_address;
     bool approved = false;
     bool rejected = false;
     bool connected = false;
@@ -175,6 +178,11 @@ struct ViewRecord
     int64_t created_at = 0;
 };
 
+// Returned by disable_user, delete_user and update_user_access when the change
+// would leave the system without an enabled global admin. Distinct from 0
+// (unknown or built-in user).
+constexpr int kLastGlobalAdmin = -1;
+
 class Store
 {
 public:
@@ -204,12 +212,19 @@ public:
                                 const std::string& role) = 0;
     virtual void set_user_groups(int64_t user_id, const std::vector<int64_t>& group_ids) = 0;
     virtual std::vector<int64_t> get_user_groups(int64_t user_id) = 0;
-    // disable_user/delete_user return the number of affected rows: 0 means
-    // the id was unknown or the built_in guard refused the change, which
-    // the API layer maps to 404.
+    // disable_user/delete_user/update_user_access return the number of
+    // affected rows: 0 means the id was unknown or the built_in guard refused
+    // the change (the API layer maps that to 404), and kLastGlobalAdmin means
+    // the change would leave no enabled global admin. The last-admin check
+    // runs inside the same statement or transaction as the write, so two
+    // concurrent requests cannot both pass it.
     virtual int disable_user(int64_t user_id) = 0;
     virtual void enable_user(int64_t user_id) = 0;
     virtual int delete_user(int64_t user_id) = 0;
+    // Sets a user's role and/or group membership in one transaction; an empty
+    // optional leaves that part unchanged. The built-in user is refused (0).
+    virtual int update_user_access(int64_t user_id, const std::optional<std::string>& role,
+                                   const std::optional<std::vector<int64_t>>& group_ids) = 0;
     virtual void update_user_password(int64_t user_id, const std::string& password_hash) = 0;
     virtual void create_session(const SessionRecord& session) = 0;
     // Returns the session for token, or nullopt when the token is unknown,

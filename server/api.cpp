@@ -208,6 +208,7 @@ namespace
             {"hostname",             a.hostname                          },
             {"platform",             a.platform                          },
             {"curve_public_key_z85", a.curve_public_key_z85              },
+            {"ip_address",           a.ip_address                        },
             {"approved",             a.approved                          },
             {"rejected",             a.rejected                          },
             {"connected",            a.connected                         },
@@ -762,6 +763,75 @@ namespace
         for (const auto group_id : store.get_user_groups(user_id))
             groups.insert(group_id);
         return groups;
+    }
+
+    // ── User management scope (issue #64) ─────────────────────────────────────
+    // A global admin manages every user. A group admin manages only the users
+    // of their own groups, and never a user who holds a global role.
+
+    std::optional<UserRecord> find_user_by_id(Store& store, int64_t user_id)
+    {
+        for (auto& user : store.list_users())
+        {
+            if (user.user_id == user_id)
+                return std::move(user);
+        }
+        return std::nullopt;
+    }
+
+    bool shares_group(const std::vector<int64_t>& a, const std::vector<int64_t>& b)
+    {
+        return std::any_of(a.begin(), a.end(), [&](int64_t id) {
+            return std::find(b.begin(), b.end(), id) != b.end();
+        });
+    }
+
+    // May the session change this user's membership of the session's own
+    // groups? True for a global admin, and for a group admin when the target
+    // is group-scoped and shares one of their groups.
+    bool may_edit_membership(Store& store, const SessionRecord& session, const UserRecord& target)
+    {
+        if (normalize_role(session.role) == "global_admin")
+            return true;
+        if (normalize_role(session.role) != "group_admin" || is_global_role(target.role))
+            return false;
+        return shares_group(store.get_user_groups(session.user_id), store.get_user_groups(target.user_id));
+    }
+
+    // May the session act on the whole account (role, disable, enable,
+    // delete)? Those reach every group the user is in, so a group admin needs
+    // all of the target's groups to be their own.
+    bool may_manage_account(Store& store, const SessionRecord& session, const UserRecord& target)
+    {
+        if (normalize_role(session.role) == "global_admin")
+            return true;
+        if (!may_edit_membership(store, session, target))
+            return false;
+        const auto own = store.get_user_groups(session.user_id);
+        const auto theirs = store.get_user_groups(target.user_id);
+        return std::all_of(theirs.begin(), theirs.end(), [&](int64_t id) {
+            return std::find(own.begin(), own.end(), id) != own.end();
+        });
+    }
+
+    // Common checks for disable, enable and delete. Writes the error response
+    // and returns false when the session may not act on user_id.
+    bool authorize_account_change(Store& store, const SessionRecord& session, int64_t user_id, httplib::Response& res)
+    {
+        const auto target = find_user_by_id(store, user_id);
+        if (!target)
+        {
+            res.status = 404;
+            res.set_content(R"({"error":"user not found"})", "application/json");
+            return false;
+        }
+        if (!may_manage_account(store, session, *target))
+        {
+            res.status = 403;
+            res.set_content(R"({"error":"user is outside the user's groups"})", "application/json");
+            return false;
+        }
+        return true;
     }
 
     bool group_visible_to_session(Store& store, const SessionRecord& session, int64_t group_id)
@@ -2536,12 +2606,159 @@ void ApiServer::setup_routes()
         set_json(res, out);
     });
 
-    // PUT /api/users/:id/disable — disable a user account (admin only, not built-in)
+    // PUT /api/users/:id — change a user's role and/or group membership (issue #64).
+    // A global admin may set any role and any groups. A group admin may only
+    // act on group-scoped users who share one of their groups: roles are limited
+    // to group roles, a role change needs every group of the target to be the
+    // admin's own, and the groups field replaces only the target's membership
+    // of the admin's own groups. Sessions need no revocation: they hold only the
+    // user id, so the next request already sees the new role and groups.
+    http_->Put("/api/users/:id", [this](const httplib::Request& req, httplib::Response& res) {
+        auto session = require_role(req, res, "viewer");
+        if (!session)
+            return;
+        if (!can_administer_users(session->role))
+        {
+            res.status = 403;
+            set_json(res, json{
+                              {"error", "permission denied"}
+            });
+            return;
+        }
+        try
+        {
+            if (!is_json_content_type(req))
+            {
+                res.status = 415;
+                set_json(res, json{
+                                  {"error", "Content-Type must be application/json"}
+                });
+                return;
+            }
+            const auto user_id = std::stoll(req.path_params.at("id"));
+            const auto body = json::parse(req.body);
+            if (!body.is_object())
+                throw std::runtime_error("request body must be a JSON object");
+
+            const auto target = find_user_by_id(store_, user_id);
+            if (!target)
+            {
+                res.status = 404;
+                set_json(res, json{
+                                  {"error", "user not found"}
+                });
+                return;
+            }
+            if (target->built_in)
+            {
+                res.status = 409;
+                set_json(res, json{
+                                  {"error", "the built-in user cannot be modified"}
+                });
+                return;
+            }
+
+            std::optional<std::string> role;
+            if (body.contains("role"))
+            {
+                const auto requested = normalize_role(body.at("role").get<std::string>());
+                if (!is_valid_role(requested))
+                    throw std::runtime_error("invalid role");
+                // Re-sending the current role is not a role change.
+                if (requested != normalize_role(target->role))
+                    role = requested;
+            }
+            std::optional<std::vector<int64_t>> requested_groups;
+            if (body.contains("group_ids"))
+            {
+                requested_groups = body.at("group_ids").get<std::vector<int64_t>>();
+                const auto known = store_.list_groups();
+                for (const auto group_id : *requested_groups)
+                {
+                    if (std::none_of(known.begin(), known.end(), [&](const GroupRecord& g) {
+                            return g.group_id == group_id;
+                        }))
+                        throw std::runtime_error("unknown group");
+                }
+            }
+            if (!body.contains("role") && !body.contains("group_ids"))
+                throw std::runtime_error("role or group_ids is required");
+
+            std::optional<std::vector<int64_t>> new_groups = requested_groups;
+            if (normalize_role(session->role) != "global_admin")
+            {
+                const auto own = store_.get_user_groups(session->user_id);
+                const bool allowed = may_edit_membership(store_, *session, *target) &&
+                                     (!role || (!is_global_role(*role) && may_manage_account(store_, *session, *target)));
+                if (!allowed)
+                {
+                    res.status = 403;
+                    set_json(res, json{
+                                      {"error", "user or role is outside the user's groups"}
+                    });
+                    return;
+                }
+                if (requested_groups)
+                {
+                    for (const auto group_id : *requested_groups)
+                    {
+                        if (std::find(own.begin(), own.end(), group_id) == own.end())
+                        {
+                            res.status = 403;
+                            set_json(res, json{
+                                              {"error", "group admins can only assign users to their own groups"}
+                            });
+                            return;
+                        }
+                    }
+                    // Keep the target's membership of groups this admin does not manage.
+                    new_groups = requested_groups;
+                    for (const auto group_id : store_.get_user_groups(target->user_id))
+                    {
+                        if (std::find(own.begin(), own.end(), group_id) == own.end())
+                            new_groups->push_back(group_id);
+                    }
+                }
+            }
+
+            const auto changed = store_.update_user_access(user_id, role, new_groups);
+            if (changed == kLastGlobalAdmin)
+            {
+                res.status = 409;
+                set_json(res, json{
+                                  {"error", "cannot remove or demote the last global admin"}
+                });
+                return;
+            }
+            if (changed == 0)
+            {
+                res.status = 404;
+                set_json(res, json{
+                                  {"error", "user not found or built-in"}
+                });
+                return;
+            }
+            LOGF_INFO("Updated user access user_id=%lld by=%s role_changed=%d groups_changed=%d",
+                      static_cast<long long>(user_id), session->username.c_str(), role ? 1 : 0, new_groups ? 1 : 0);
+            set_json(res, json{
+                              {"ok", true}
+            });
+        }
+        catch (const std::exception& e)
+        {
+            res.status = 400;
+            set_json(res, json{
+                              {"error", e.what()}
+            });
+        }
+    });
+
+    // PUT /api/users/:id/disable — disable a user account (global admin, or a group admin for users wholly in their groups; not built-in)
     http_->Put("/api/users/:id/disable", [this](const httplib::Request& req, httplib::Response& res) {
         auto session = require_role(req, res, "viewer");
         if (!session)
             return;
-        if (normalize_role(session->role) != "global_admin")
+        if (!can_administer_users(session->role))
         {
             res.status = 403;
             set_json(res, json{
@@ -2552,7 +2769,17 @@ void ApiServer::setup_routes()
         try
         {
             const auto user_id = std::stoll(req.path_params.at("id"));
+            if (!authorize_account_change(store_, *session, user_id, res))
+                return;
             const auto affected = store_.disable_user(user_id);
+            if (affected == kLastGlobalAdmin)
+            {
+                res.status = 409;
+                set_json(res, json{
+                                  {"error", "cannot remove or demote the last global admin"}
+                });
+                return;
+            }
             if (affected == 0)
             {
                 // SEC-14: unknown id or the built_in guard refused the change;
@@ -2577,12 +2804,12 @@ void ApiServer::setup_routes()
         }
     });
 
-    // PUT /api/users/:id/enable — re-enable a user account (admin only)
+    // PUT /api/users/:id/enable — re-enable a user account (same scope as disable)
     http_->Put("/api/users/:id/enable", [this](const httplib::Request& req, httplib::Response& res) {
         auto session = require_role(req, res, "viewer");
         if (!session)
             return;
-        if (normalize_role(session->role) != "global_admin")
+        if (!can_administer_users(session->role))
         {
             res.status = 403;
             set_json(res, json{
@@ -2593,6 +2820,8 @@ void ApiServer::setup_routes()
         try
         {
             const auto user_id = std::stoll(req.path_params.at("id"));
+            if (!authorize_account_change(store_, *session, user_id, res))
+                return;
             store_.enable_user(user_id);
             LOGF_INFO("Enabled user user_id=%lld", static_cast<long long>(user_id));
             set_json(res, json{
@@ -2608,12 +2837,12 @@ void ApiServer::setup_routes()
         }
     });
 
-    // DELETE /api/users/:id — delete a user (admin only, not built-in)
+    // DELETE /api/users/:id — delete a user (same scope as disable; not built-in)
     http_->Delete("/api/users/:id", [this](const httplib::Request& req, httplib::Response& res) {
         auto session = require_role(req, res, "viewer");
         if (!session)
             return;
-        if (normalize_role(session->role) != "global_admin")
+        if (!can_administer_users(session->role))
         {
             res.status = 403;
             set_json(res, json{
@@ -2624,7 +2853,17 @@ void ApiServer::setup_routes()
         try
         {
             const auto user_id = std::stoll(req.path_params.at("id"));
+            if (!authorize_account_change(store_, *session, user_id, res))
+                return;
             const auto affected = store_.delete_user(user_id);
+            if (affected == kLastGlobalAdmin)
+            {
+                res.status = 409;
+                set_json(res, json{
+                                  {"error", "cannot remove or demote the last global admin"}
+                });
+                return;
+            }
             if (affected == 0)
             {
                 // SEC-14: unknown id or the built_in guard refused the change.
