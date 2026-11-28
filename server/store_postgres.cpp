@@ -1205,32 +1205,43 @@ std::optional<int> PostgresStore::update_user_password_and_revoke_sessions(int64
 }
 
 PasswordChangeResult PostgresStore::update_user_password_if_current_and_revoke_sessions(
-    int64_t user_id, const std::string& expected_hash, const std::string& new_hash, const std::string& keep_token)
+    int64_t user_id, const std::string& expected_hash, const std::string& new_hash, const std::string& caller_token)
 {
     const auto p_uid = s(user_id);
+    // An empty caller_token hashes to "" and matches no session.
+    const auto caller_hash = hash_kept_session_token(caller_token);
     postgres::Transaction tx(conn_);
-    // The comparison and the update are one statement. If an admin reset holds
-    // the row lock, this waits for it and re-evaluates the WHERE against the
-    // committed row (READ COMMITTED), so a changed hash updates nothing.
-    const char* upd_params[] = {new_hash.c_str(), p_uid.c_str(), expected_hash.c_str()};
-    Res upd(PQexecParams(conn_, "UPDATE users SET password_hash=$1 WHERE user_id=$2::bigint AND password_hash=$3;", 3,
-                         nullptr, upd_params, nullptr, nullptr, 0));
+    // Every condition is in the one statement. If an admin reset or a disable
+    // holds the row lock, this waits for it and re-evaluates the WHERE against
+    // the committed row (READ COMMITTED), so a changed hash or a disabled
+    // user updates nothing. A disable also deletes the caller's session, and a
+    // later enable does not bring it back, so the EXISTS still fails after a
+    // disable and enable that both committed before this statement started.
+    const char* upd_params[] = {new_hash.c_str(), p_uid.c_str(), expected_hash.c_str(), caller_hash.c_str()};
+    Res upd(PQexecParams(conn_,
+                         "UPDATE users SET password_hash=$1 "
+                         "WHERE user_id=$2::bigint AND password_hash=$3 AND disabled=FALSE "
+                         "AND EXISTS (SELECT 1 FROM sessions "
+                         "WHERE sessions.token=$4 AND sessions.user_id=users.user_id);",
+                         4, nullptr, upd_params, nullptr, nullptr, 0));
     check_res(upd.r, "update_user_password_if_current update");
     const char* changed = PQcmdTuples(upd.r);
     if (changed == nullptr || std::atoi(changed) == 0)
     {
-        // Nothing written; the guard rolls back. Tell a missing user from a
-        // hash that is no longer the expected one.
-        const char* exists_params[] = {p_uid.c_str()};
-        Res exists(PQexecParams(conn_, "SELECT 1 FROM users WHERE user_id=$1::bigint;", 1, nullptr, exists_params,
-                                nullptr, nullptr, 0));
-        check_res(exists.r, "update_user_password_if_current exists");
-        return {PQntuples(exists.r) > 0 ? PasswordChangeResult::Status::PasswordChanged
-                                        : PasswordChangeResult::Status::UserNotFound,
-                0};
+        // Nothing written; the guard rolls back. A changed hash is reported
+        // before an ended session, because an admin reset also revokes the
+        // caller's session and the conflict is the more useful answer.
+        const char* stored_params[] = {p_uid.c_str()};
+        Res stored(PQexecParams(conn_, "SELECT password_hash FROM users WHERE user_id=$1::bigint;", 1, nullptr,
+                                stored_params, nullptr, nullptr, 0));
+        check_res(stored.r, "update_user_password_if_current stored hash");
+        if (PQntuples(stored.r) == 0)
+            return {PasswordChangeResult::Status::UserNotFound, 0};
+        if (expected_hash != PQgetvalue(stored.r, 0, 0))
+            return {PasswordChangeResult::Status::PasswordChanged, 0};
+        return {PasswordChangeResult::Status::SessionEnded, 0};
     }
-    const auto kept_hash = hash_kept_session_token(keep_token);
-    const char* del_params[] = {p_uid.c_str(), kept_hash.c_str()};
+    const char* del_params[] = {p_uid.c_str(), caller_hash.c_str()};
     Res del(PQexecParams(conn_, "DELETE FROM sessions WHERE user_id=$1::bigint AND token<>$2;", 2, nullptr, del_params,
                          nullptr, nullptr, 0));
     check_res(del.r, "update_user_password_if_current delete");

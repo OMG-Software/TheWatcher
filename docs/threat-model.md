@@ -164,16 +164,23 @@ working document for audit, design review, and regression testing.
   enabled user succeeds and revokes nothing. Expired sessions are purged at
   most every five minutes (a failed purge is retried) from login and session
   validation, and from the server's periodic job, so an idle server purges
-  too.
+  too. The five minutes are counted on a monotonic clock from the end of the
+  last successful purge, so a slow purge or a wall-clock jump cannot make
+  purges run back to back or stop them.
 - A username containing a NUL byte is rejected (400) at login and user
   creation, before the throttle keys are built. The stores bind names as C
   strings, so otherwise `admin\0x` would reach `admin` under fresh throttle
   keys and sidestep the per-pair and per-username limits.
 - A self-service password change is applied only while the stored hash is
-  still the one the current password was verified against, in the same
-  transaction that revokes sessions. An admin reset that lands in between wins:
-  the change is refused with 409, nothing is revoked and no success is audited
-  (`password_change` `conflict`).
+  still the one the current password was verified against, the user is still
+  enabled and the session that sent the request still exists, all checked in
+  the one UPDATE, in the same transaction that revokes sessions. An admin reset
+  that lands in between wins: the change is refused with 409, nothing is
+  revoked and no success is audited (`password_change` `conflict`). A disable
+  (even one followed by an enable), a sign-out or any other revocation of the
+  caller's session that lands in between also wins: the change is refused with
+  401, nothing is changed and `password_change` `session_ended` is audited, so
+  a session that was ended cannot still set a new password.
 - A wrong current password is audited once, as `password_change` `failure`.
   Handlers that audit their own 403 mark the response, and the post-routing
   hook then skips its generic `permission_denied` line; every other 403 is

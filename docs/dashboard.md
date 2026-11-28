@@ -223,8 +223,9 @@ refuses anyone else with 403. On your own account (any role, including a
 global admin) the form asks for the Current password as well as the New
 password, and Save stays disabled until both are filled in. The form stays open
 until the server accepts the change: a refusal (wrong current password 403,
-throttled 429, or an admin reset that landed first 409) is shown inside the
-form, the new password is kept and the current one is cleared so you can retry.
+throttled 429, an admin reset that landed first 409, or your session ended
+while the change was in flight 401) is shown inside the form, the new password
+is kept and the current one is cleared so you can retry.
 Both fields are cleared on success or Cancel. While a change is saving, both
 fields are locked. Closing the form before the server answers is final: the
 answer is discarded, so a refusal does not reopen the form and a late answer
@@ -301,7 +302,7 @@ The dashboard consumes:
 | `POST /api/groups` | Create a group. |
 | `GET /api/users` | List users and group memberships. |
 | `POST /api/users` | Create a user with hashed password, role, and group memberships. |
-| `PUT /api/users/:id/password` | Change a password. Own account (any role): body needs `password` and `current_password` (400 if missing, 403 if wrong, 429 when throttled). A global admin resetting another user sends only `password` (only a global admin may reset another user; 403 otherwise). A self-service change keeps the requesting session and revokes the account's others (409 if an admin reset landed first); an admin reset revokes all of the target's sessions. |
+| `PUT /api/users/:id/password` | Change a password. Own account (any role): body needs `password` and `current_password` (400 if missing, 403 if wrong, 429 when throttled). A global admin resetting another user sends only `password` (only a global admin may reset another user; 403 otherwise). A self-service change keeps the requesting session and revokes the account's others (409 if an admin reset landed first; 401 if the account was disabled or the requesting session ended first, and nothing changes); an admin reset revokes all of the target's sessions. |
 | `GET /api/alerts` | List active, non-deleted alerts. |
 | `GET /api/alerts/unacknowledged` | List active unacknowledged alerts. |
 | `POST /api/alerts/:id/ack` | Acknowledge an alert. |

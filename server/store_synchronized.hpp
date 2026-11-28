@@ -257,11 +257,11 @@ public:
     PasswordChangeResult update_user_password_if_current_and_revoke_sessions(int64_t user_id,
                                                                              const std::string& expected_hash,
                                                                              const std::string& new_hash,
-                                                                             const std::string& keep_token) override
+                                                                             const std::string& caller_token) override
     {
         const std::lock_guard<std::mutex> lock(mutex_);
         return inner_->update_user_password_if_current_and_revoke_sessions(user_id, expected_hash, new_hash,
-                                                                           keep_token);
+                                                                           caller_token);
     }
 
     std::optional<int> enable_user_and_revoke_sessions(int64_t user_id) override

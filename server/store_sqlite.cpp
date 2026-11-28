@@ -1129,35 +1129,60 @@ namespace
         sqlite3_bind_int64(st.s, 1, user_id);
         return step_row(st.s, db, __func__);
     }
+
+    // The stored password hash of user_id, or nullopt when there is no such
+    // user. Caller holds a transaction.
+    std::optional<std::string> stored_password_hash(sqlite3* db, int64_t user_id)
+    {
+        Stmt st;
+        check(sqlite3_prepare_v2(db, "SELECT password_hash FROM users WHERE user_id=?;", -1, &st.s, nullptr), db,
+              "prepare stored_password_hash");
+        sqlite3_bind_int64(st.s, 1, user_id);
+        if (!step_row(st.s, db, __func__))
+            return std::nullopt;
+        return text_col(st.s, 0);
+    }
 } // namespace
 
 PasswordChangeResult SqliteStore::update_user_password_if_current_and_revoke_sessions(int64_t user_id,
                                                                                       const std::string& expected_hash,
                                                                                       const std::string& new_hash,
-                                                                                      const std::string& keep_token)
+                                                                                      const std::string& caller_token)
 {
     sqlite::Transaction tx(db_);
     {
-        // The hash comparison and the update are one statement, so an admin
-        // reset cannot slip in between them.
+        // Every condition is in the one statement, so an admin reset, a
+        // disable or a revocation of the caller's session cannot slip in
+        // between the check and the write. An empty caller_token hashes to ""
+        // and matches no session.
         Stmt st;
-        check(sqlite3_prepare_v2(db_, "UPDATE users SET password_hash=? WHERE user_id=? AND password_hash=?;", -1,
-                                 &st.s, nullptr),
+        check(sqlite3_prepare_v2(db_,
+                                 "UPDATE users SET password_hash=? "
+                                 "WHERE user_id=? AND password_hash=? AND disabled=0 "
+                                 "AND EXISTS (SELECT 1 FROM sessions "
+                                 "WHERE sessions.token=? AND sessions.user_id=users.user_id);",
+                                 -1, &st.s, nullptr),
               db_, "prepare update_user_password_if_current");
+        const auto caller_hash = hash_kept_session_token(caller_token);
         sqlite3_bind_text(st.s, 1, new_hash.c_str(), -1, SQLITE_TRANSIENT);
         sqlite3_bind_int64(st.s, 2, user_id);
         sqlite3_bind_text(st.s, 3, expected_hash.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(st.s, 4, caller_hash.c_str(), -1, SQLITE_TRANSIENT);
         check(sqlite3_step(st.s), db_, "step update_user_password_if_current");
     }
     if (sqlite3_changes(db_) == 0)
     {
-        // Nothing written: the guard rolls back. Tell a missing user from a
-        // hash that is no longer the expected one.
-        const auto status = user_row_exists(db_, user_id) ? PasswordChangeResult::Status::PasswordChanged
-                                                          : PasswordChangeResult::Status::UserNotFound;
-        return {status, 0};
+        // Nothing written: the guard rolls back. A changed hash is reported
+        // before an ended session, because an admin reset also revokes the
+        // caller's session and the conflict is the more useful answer.
+        const auto stored = stored_password_hash(db_, user_id);
+        if (!stored)
+            return {PasswordChangeResult::Status::UserNotFound, 0};
+        if (*stored != expected_hash)
+            return {PasswordChangeResult::Status::PasswordChanged, 0};
+        return {PasswordChangeResult::Status::SessionEnded, 0};
     }
-    const auto revoked = delete_sessions_for_user(user_id, keep_token);
+    const auto revoked = delete_sessions_for_user(user_id, caller_token);
     tx.commit();
     return {PasswordChangeResult::Status::Changed, revoked};
 }

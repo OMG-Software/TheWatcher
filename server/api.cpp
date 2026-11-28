@@ -271,6 +271,11 @@ void ApiServer::set_password_change_test_hook(std::function<void(int64_t)> after
     password_change_hook_ = std::move(after_current_password_verified);
 }
 
+void ApiServer::set_session_purge_clock(std::function<int64_t()> clock)
+{
+    purge_clock_ = std::move(clock);
+}
+
 // Marks a response whose handler already wrote its own audit line, so the
 // post-routing hook does not add a permission_denied line for it. The header
 // is internal: the hook removes it before the response is sent.
@@ -360,33 +365,55 @@ void ApiServer::audit(const char* event, const char* outcome, const std::string&
     LOG_NOTICE(line);
 }
 
+int64_t ApiServer::session_purge_clock_ms() const
+{
+    if (purge_clock_)
+        return purge_clock_();
+    return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
 // Purges expired sessions at most once every five minutes. Called from login
 // and session validation, and from the server's periodic job so an idle server
-// purges too. The interval only restarts after a successful purge, so a
-// failure is retried, and one flag keeps concurrent callers from purging
+// purges too. now_ms (wall clock) is only the expiry cutoff; the spacing runs
+// on the monotonic purge clock from the end of the last successful purge, so a
+// failure is retried, a slow purge does not shorten the gap and a wall-clock
+// jump changes nothing. One flag keeps concurrent callers from purging
 // together.
 void ApiServer::purge_expired_sessions_if_due(int64_t now_ms)
 {
     constexpr int64_t purge_interval_ms = 5LL * 60LL * 1000LL;
-    if (now_ms - last_session_purge_ms_.load() < purge_interval_ms || session_purge_running_.exchange(true))
+    const auto due = [this] {
+        const auto last = last_session_purge_done_ms_.load();
+        return last == never_purged || session_purge_clock_ms() - last >= purge_interval_ms;
+    };
+    if (!due() || session_purge_running_.exchange(true))
         return;
+    // Clears the in-flight flag on every way out of this function.
+    struct RunningFlagReset
+    {
+        std::atomic<bool>& flag;
+        ~RunningFlagReset()
+        {
+            flag.store(false);
+        }
+    } reset{session_purge_running_};
     // Recheck while holding the flag: another request may have finished a
     // purge between our first check and taking the flag.
-    if (now_ms - last_session_purge_ms_.load() >= purge_interval_ms)
+    if (!due())
+        return;
+    try
     {
-        try
-        {
-            const auto removed = store_.delete_expired_sessions(now_ms);
-            last_session_purge_ms_.store(now_ms); // only after a successful purge
-            if (removed > 0)
-                LOGF_DEBUG("Purged %d expired session(s)", removed);
-        }
-        catch (const std::exception& e)
-        {
-            LOGF_WARNING("Expired session purge failed: %s", e.what());
-        }
+        const auto removed = store_.delete_expired_sessions(now_ms);
+        // Stamped when the purge finished, and only if it succeeded.
+        last_session_purge_done_ms_.store(session_purge_clock_ms());
+        if (removed > 0)
+            LOGF_DEBUG("Purged %d expired session(s)", removed);
     }
-    session_purge_running_.store(false);
+    catch (const std::exception& e)
+    {
+        LOGF_WARNING("Expired session purge failed: %s", e.what());
+    }
 }
 
 ApiServer::LoginReservation::LoginReservation(ApiServer& api, std::string pair_key, std::string username,
@@ -3154,11 +3181,12 @@ void ApiServer::setup_routes()
                 if (password_change_hook_)
                     password_change_hook_(user_id);
                 // Applied only while the hash the current password was verified
-                // against is still the stored one. If an admin reset landed in
-                // between, the reset wins: 409 Conflict (the request is valid
-                // but clashes with the account's new state), nothing changed,
-                // no session revoked and no success audited. The user can retry
-                // with the new password the admin chose.
+                // against is still the stored one, the user is still enabled
+                // and this request's session still exists. If an admin reset
+                // landed in between, the reset wins: 409 Conflict (the request
+                // is valid but clashes with the account's new state), nothing
+                // changed, no session revoked and no success audited. The user
+                // can retry with the new password the admin chose.
                 const auto outcome = store_.update_user_password_if_current_and_revoke_sessions(
                     user_id, target_user->password_hash, new_hash, cookie_value(req, "tw_session"));
                 if (outcome.status == PasswordChangeResult::Status::PasswordChanged)
@@ -3168,6 +3196,20 @@ void ApiServer::setup_routes()
                     set_json(res,
                              json{
                                  {"error", "password was changed by someone else; sign in again with the new one"}
+                    });
+                    return;
+                }
+                // The account was disabled, or this session was revoked or
+                // signed out, after the session was checked: the request no
+                // longer speaks for a live session, so it is refused as
+                // unauthenticated (even if an enable followed) and nothing
+                // changes.
+                if (outcome.status == PasswordChangeResult::Status::SessionEnded)
+                {
+                    audit("password_change", "session_ended", session->username, remote, target_user->username);
+                    res.status = 401;
+                    set_json(res, json{
+                                      {"error", "session ended before the change was saved; sign in again"}
                     });
                     return;
                 }

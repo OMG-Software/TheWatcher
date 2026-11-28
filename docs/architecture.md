@@ -263,6 +263,15 @@ Files: `server/store_synchronized.hpp`, `server/sqlite_raii.hpp`,
   never throws from the destructor, so the original error is kept. Do not
   start a transaction inside another one: share a private helper that does
   not begin its own (see `replace_agent_groups`).
+  PostgreSQL runs at READ COMMITTED whatever the DSN, role or database
+  default says: `postgres::Connection` sets it as the session default right
+  after connecting (this covers single-statement writes such as the login's
+  `FOR SHARE` insert), and `postgres::Transaction` begins with
+  `BEGIN ISOLATION LEVEL READ COMMITTED`. The store's compare-and-swap updates
+  and row locks rely on READ COMMITTED re-checking a row after waiting for its
+  lock; under REPEATABLE READ or SERIALIZABLE (for example `options=-c
+  default_transaction_isolation=serializable` in the DSN) those waits would
+  end in serialization errors.
 - Insert-if-absent across server nodes (`insert_heartbeat_alert_if_absent`)
   cannot rely on the in-process mutex. On PostgreSQL the check and the insert
   run in one transaction holding

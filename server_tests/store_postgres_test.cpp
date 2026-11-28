@@ -1,5 +1,6 @@
 #ifdef HAVE_LIBPQ
 
+#include "../server/postgres_raii.hpp"
 #include "../server/session_token.hpp"
 #include "../server/store_postgres.hpp"
 #include "../server/store_synchronized.hpp"
@@ -1598,15 +1599,129 @@ SCENARIO("[postgres] A self-service change applies only to the hash that was ver
             }
         }
 
+        WHEN("the user was disabled, and their sessions revoked, after the password was verified")
+        {
+            REQUIRE(store.disable_user_and_revoke_sessions(user_id) == 1);
+            const auto result =
+                store.update_user_password_if_current_and_revoke_sessions(user_id, old_hash, "new-" + suffix, keep);
+
+            THEN("nothing changes and the store reports that the session ended")
+            {
+                CHECK(result.status == Status::SessionEnded);
+                CHECK(result.revoked == 0);
+                CHECK(store.get_user_by_username("own-" + suffix)->password_hash == old_hash);
+            }
+        }
+
+        WHEN("the user was disabled and enabled again after the password was verified")
+        {
+            REQUIRE(store.disable_user_and_revoke_sessions(user_id) == 1);
+            REQUIRE(store.enable_user_and_revoke_sessions(user_id).has_value());
+            const auto result =
+                store.update_user_password_if_current_and_revoke_sessions(user_id, old_hash, "new-" + suffix, keep);
+
+            THEN("nothing changes: the session that verified the password is gone")
+            {
+                CHECK(result.status == Status::SessionEnded);
+                CHECK(result.revoked == 0);
+                CHECK(store.get_user_by_username("own-" + suffix)->password_hash == old_hash);
+            }
+        }
+
+        WHEN("the user was disabled without their sessions being revoked")
+        {
+            REQUIRE(store.disable_user(user_id) == 1);
+            const auto result =
+                store.update_user_password_if_current_and_revoke_sessions(user_id, old_hash, "new-" + suffix, keep);
+
+            THEN("nothing changes or is revoked while the user is disabled")
+            {
+                CHECK(result.status == Status::SessionEnded);
+                CHECK(result.revoked == 0);
+                CHECK(store.get_user_by_username("own-" + suffix)->password_hash == old_hash);
+                // Re-enabled without a revoke, both sessions are still there.
+                REQUIRE(store.enable_user(user_id) == 1);
+                CHECK(store.get_session(keep, 5000).has_value());
+                CHECK(store.get_session(other, 5000).has_value());
+            }
+        }
+
+        WHEN("the caller's session ended after the password was verified")
+        {
+            store.delete_session(keep);
+            const auto result =
+                store.update_user_password_if_current_and_revoke_sessions(user_id, old_hash, "new-" + suffix, keep);
+
+            THEN("nothing changes and the user's other session is kept")
+            {
+                CHECK(result.status == Status::SessionEnded);
+                CHECK(result.revoked == 0);
+                CHECK(store.get_user_by_username("own-" + suffix)->password_hash == old_hash);
+                CHECK(store.get_session(other, 5000).has_value());
+            }
+        }
+
         WHEN("the user does not exist")
         {
             THEN("the store reports it")
             {
-                CHECK(store.update_user_password_if_current_and_revoke_sessions(-1, "x", "y").status ==
+                CHECK(store.update_user_password_if_current_and_revoke_sessions(-1, "x", "y", keep).status ==
                       Status::UserNotFound);
             }
         }
         store.delete_user(user_id);
+    }
+}
+
+namespace
+{
+// Value of `SHOW transaction_isolation` on conn: inside a transaction block
+// the block's level, outside one the level a single statement runs at.
+std::string isolation_level(PGconn* conn)
+{
+    const std::unique_ptr<PGresult, decltype(&PQclear)> res(PQexec(conn, "SHOW transaction_isolation"), &PQclear);
+    REQUIRE(PQresultStatus(res.get()) == PGRES_TUPLES_OK);
+    return PQgetvalue(res.get(), 0, 0);
+}
+} // namespace
+
+SCENARIO("[postgres] Store statements run at READ COMMITTED whatever the connection's default")
+{
+    if (!postgres_is_available())
+        SKIP("PostgreSQL not available");
+    // The store's compare-and-swap updates and row locks rely on READ COMMITTED
+    // re-checking a row after a lock wait. A DSN option, ALTER ROLE or ALTER
+    // DATABASE can make a stricter level the default for every connection.
+    GIVEN("a connection whose default isolation level was changed to REPEATABLE READ after it opened")
+    {
+        PgSideConnection side;
+        side.run("SET default_transaction_isolation = 'repeatable read'");
+
+        WHEN("a store transaction is opened on it")
+        {
+            postgres::Transaction tx(side.conn);
+            const auto level = isolation_level(side.conn);
+
+            THEN("the transaction runs at READ COMMITTED")
+            {
+                REQUIRE(level == "read committed");
+            }
+        }
+    }
+
+    GIVEN("a store connection opened with a DSN that makes SERIALIZABLE the default")
+    {
+        postgres::Connection conn(std::string(test_dsn()) + " options='-c default_transaction_isolation=serializable'");
+
+        WHEN("a statement runs outside any transaction block")
+        {
+            const auto level = isolation_level(conn);
+
+            THEN("it runs at READ COMMITTED too")
+            {
+                REQUIRE(level == "read committed");
+            }
+        }
     }
 }
 

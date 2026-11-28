@@ -88,6 +88,7 @@ struct PasswordChangeResult
         Changed,         // hash replaced, sessions revoked
         UserNotFound,    // no such user
         PasswordChanged, // the stored hash is no longer the expected one; nothing changed
+        SessionEnded,    // the user was disabled or the caller's session is gone; nothing changed
     };
     Status status = Status::UserNotFound;
     int revoked = 0; // sessions revoked, meaningful for Changed
@@ -288,15 +289,20 @@ public:
     virtual std::optional<int> update_user_password_and_revoke_sessions(int64_t user_id,
                                                                         const std::string& password_hash,
                                                                         const std::string& keep_token = "") = 0;
-    // Self-service password change: replaces the hash and revokes the user's
-    // sessions except keep_token (empty keeps none) in one transaction, but
-    // only while the stored hash still equals expected_hash (the hash the
-    // caller verified the current password against). If an admin reset landed
-    // in between, nothing is changed or revoked and PasswordChanged is
-    // returned. UserNotFound: no such user. Atomic.
+    // Self-service password change: replaces the hash and revokes every other
+    // session of the user in one transaction, keeping caller_token (the raw
+    // token of the session that asked). The update is one statement that
+    // applies only while the stored hash still equals expected_hash (the hash
+    // the caller verified the current password against), the user is enabled
+    // and caller_token is still one of the user's sessions. Otherwise nothing
+    // is changed or revoked and the status says why, checked in this order:
+    // UserNotFound (no such user), PasswordChanged (an admin reset landed in
+    // between; it may also have revoked the caller's session), SessionEnded
+    // (the user was disabled, or the caller's session was revoked or signed
+    // out, so the request no longer speaks for a live session). Atomic.
     virtual PasswordChangeResult update_user_password_if_current_and_revoke_sessions(
         int64_t user_id, const std::string& expected_hash, const std::string& new_hash,
-        const std::string& keep_token = "") = 0;
+        const std::string& caller_token) = 0;
     // Enables the user and, only when that is a real disabled-to-enabled
     // change, revokes every leftover session of the user, in one transaction.
     // Returns the number of sessions revoked (0 for an already enabled user,

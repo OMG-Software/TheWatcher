@@ -7,6 +7,7 @@
 #include <array>
 #include <atomic>
 #include <functional>
+#include <limits>
 #include <mutex>
 #include <optional>
 #include <queue>
@@ -88,11 +89,20 @@ public:
     // admin reset exactly in that window. Empty in production.
     void set_password_change_test_hook(std::function<void(int64_t)> after_current_password_verified);
 
-    // Deletes expired sessions when at least five minutes passed since the last
-    // successful purge (a failed purge is retried on the next call). Safe to
-    // call from any thread. Requests call it opportunistically; the server's
-    // periodic job calls it too, so an idle server still purges.
+    // Deletes the sessions that expired at or before now_ms (wall-clock time)
+    // when at least five minutes passed since the last successful purge
+    // finished. The five minutes are measured on a monotonic clock, so a
+    // wall-clock jump neither stops purges nor runs them back to back, and a
+    // slow purge does not shorten the gap to the next one. A failed purge is
+    // retried on the next call. Safe to call from any thread. Requests call it
+    // opportunistically; the server's periodic job calls it too, so an idle
+    // server still purges.
     void purge_expired_sessions_if_due(int64_t now_ms);
+
+    // Test seam, call before the first purge: replaces the monotonic clock
+    // (milliseconds) that spaces the purges. Empty in production, which uses
+    // std::chrono::steady_clock.
+    void set_session_purge_clock(std::function<int64_t()> clock);
 
     // Decides whether an agent can receive a command right now. Without a
     // check the persisted `connected` flag is used. The server installs a
@@ -125,6 +135,9 @@ private:
     // (its own bucket); the peer address is used when the peer is not trusted
     // or no forwarding header was sent.
     std::string client_ip(const httplib::Request& req);
+    // Monotonic milliseconds that space the session purges (the test clock
+    // when one is installed).
+    int64_t session_purge_clock_ms() const;
     // Writes an AUDIT line (NOTICE) for an authentication or authorization
     // event. user/target are sanitised; detail must not contain secrets.
     void audit(const char* event, const char* outcome, const std::string& user, const std::string& source,
@@ -209,9 +222,14 @@ private:
     // Argon2 hash of a throwaway password; verified when a login names an
     // unknown or disabled user so those paths cost the same as a real one.
     std::string dummy_password_hash_;
-    std::atomic<int64_t> last_session_purge_ms_{0};  // advanced only after a successful purge
+    // Purge-clock time at which the last successful purge finished, or
+    // never_purged before the first one (so the first call always purges,
+    // whatever the monotonic clock's origin).
+    static constexpr int64_t never_purged = std::numeric_limits<int64_t>::min();
+    std::atomic<int64_t> last_session_purge_done_ms_{never_purged};
     std::atomic<bool> session_purge_running_{false}; // at most one purge in flight
     std::function<int64_t()> login_clock_;
+    std::function<int64_t()> purge_clock_;
     std::function<void(const std::string&)> after_reservation_hook_;
     std::function<void(int64_t)> password_change_hook_;
 };

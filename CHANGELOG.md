@@ -136,6 +136,22 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   wait no longer counts. The `auth_sessions` suite gets a 120-second test
   timeout like `login_rate_limit`, because its real Argon2 work exceeded
   meson's 30-second default on the Linux and FreeBSD CI runners.
+- A self-service password change is now also refused when the account was
+  disabled, or the session that sent it ended, between the current-password
+  check and the update: the one UPDATE also requires the user to be enabled
+  and the caller's session to exist. The answer is 401, nothing changes and
+  `password_change` `session_ended` is audited (new
+  `PasswordChangeResult::Status::SessionEnded`). Before, a disable followed by
+  an enable in that window let a session that had been revoked still set a new
+  password. The store method's token argument is now the required
+  `caller_token`. Expired-session purges are now spaced five minutes from the
+  end of the previous successful purge on a monotonic clock, so a slow purge or
+  a wall-clock jump cannot make them run back to back or stop them.
+  PostgreSQL now always runs at READ COMMITTED: `postgres::Connection` sets it
+  as the session default after connecting and `postgres::Transaction` begins
+  with `BEGIN ISOLATION LEVEL READ COMMITTED`, so a stricter default from the
+  DSN, role or database cannot turn the store's lock-wait re-checks into
+  serialization errors (#145).
 - Session tokens are stored as their SHA-256 (lowercase hex) instead of raw, so a
   database copy or backup no longer contains usable logins. The stores hash
   inside `create_session`, `get_session`, `delete_session`,

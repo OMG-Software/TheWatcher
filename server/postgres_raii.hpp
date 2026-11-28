@@ -31,12 +31,20 @@ class Connection
 public:
     // Connects with `dsn`. PQconnectdb returns a handle even on failure; it is
     // owned before the status check, so a throwing constructor cannot leak it.
+    // The session's default isolation level is then pinned to READ COMMITTED,
+    // whatever the DSN options, role or database settings say, so statements
+    // run outside a Transaction (single-statement writes such as the login's
+    // FOR SHARE insert) get the same lock-wait re-checks as those inside one.
     explicit Connection(const std::string& dsn)
         : conn_(PQconnectdb(dsn.c_str()))
     {
         if (!conn_ || PQstatus(conn_.get()) != CONNECTION_OK)
             throw std::runtime_error("PostgreSQL connect failed: " +
                                      std::string(conn_ ? PQerrorMessage(conn_.get()) : "out of memory"));
+        const std::unique_ptr<PGresult, decltype(&PQclear)> res(
+            PQexec(conn_.get(), "SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL READ COMMITTED"), &PQclear);
+        if (!res || PQresultStatus(res.get()) != PGRES_COMMAND_OK)
+            throw std::runtime_error("PostgreSQL isolation setup failed: " + std::string(PQerrorMessage(conn_.get())));
     }
 
     Connection(const Connection&) = delete;
@@ -71,13 +79,21 @@ inline bool run_command(PGconn* conn, const char* sql) noexcept
 // Scope guard for a transaction. Unless commit() succeeds, the destructor
 // rolls back; it never throws, so an in-flight exception is not masked by a
 // failing ROLLBACK (for example on a dropped connection).
+//
+// The isolation level is pinned to READ COMMITTED here as well as on the
+// Connection, so a transaction on a connection opened some other way (or one
+// whose default was changed with SET) still gets it. The store's
+// compare-and-swap updates and row locks rely on it: a statement that waits
+// for a row lock re-checks its WHERE against the newly committed row. Under
+// REPEATABLE READ or SERIALIZABLE the same wait ends in a serialization
+// failure instead.
 class Transaction
 {
 public:
     explicit Transaction(PGconn* conn)
         : conn_(conn)
     {
-        if (!run_command(conn_, "BEGIN"))
+        if (!run_command(conn_, "BEGIN ISOLATION LEVEL READ COMMITTED"))
             throw std::runtime_error(std::string("BEGIN failed: ") + PQerrorMessage(conn_));
         open_ = true;
     }

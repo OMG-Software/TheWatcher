@@ -931,6 +931,15 @@ struct SideConnection
         REQUIRE(message.empty());
         REQUIRE(rc == SQLITE_OK);
     }
+    // Runs a query that returns one integer, for example a row count, without
+    // going through the store under test.
+    int64_t scalar(const std::string& sql)
+    {
+        thewatcher::server::sqlite::Stmt st;
+        REQUIRE(sqlite3_prepare_v2(conn, sql.c_str(), -1, &st.s, nullptr) == SQLITE_OK);
+        REQUIRE(sqlite3_step(st.s) == SQLITE_ROW);
+        return sqlite3_column_int64(st.s, 0);
+    }
     thewatcher::server::sqlite::Connection conn;
 };
 
@@ -1003,6 +1012,8 @@ SCENARIO("A login attempted during a failing password reset waits for it and kee
             std::atomic<bool> login_returned{false};
             std::atomic<bool> login_created{false};
             std::atomic<bool> login_threw{false};
+            // Written by the reset thread before it returns; read only after join().
+            std::string reset_error;
 
             // Declared before the writer, so on an early failure the writer is
             // closed (releasing the write lock) before the threads are joined.
@@ -1021,8 +1032,9 @@ SCENARIO("A login attempted during a failing password reset waits for it and kee
                 {
                     store->update_user_password_and_revoke_sessions(victim, new_hash);
                 }
-                catch (const std::exception&)
+                catch (const std::exception& e)
                 {
+                    reset_error = e.what();
                     reset_threw = true;
                 }
                 reset_returned = true;
@@ -1078,12 +1090,104 @@ SCENARIO("A login attempted during a failing password reset waits for it and kee
                 REQUIRE(login_waited);
                 REQUIRE(both_returned);
                 REQUIRE(reset_threw.load());
+                // The reset failed because of the planted trigger, not for some
+                // other reason such as a busy timeout on the writer's lock.
+                REQUIRE(reset_error.find("forced") != std::string::npos);
                 REQUIRE_FALSE(login_threw.load());
                 REQUIRE(login_created.load());
                 const auto now = now_ms();
                 REQUIRE(store->get_session("other-session", now));
                 REQUIRE(store->get_user_by_username("victim")->password_hash == victim_hash);
                 REQUIRE(store->get_session("victim-session", now));
+            }
+        }
+    }
+}
+
+SCENARIO("Session purges are spaced five minutes from the end of the previous purge")
+{
+    GIVEN("an API server over a file-backed store whose purge clock the test controls")
+    {
+        thewatcher::test::ScopedTempDir dir{"auth-purge-spacing"};
+        const auto path = (dir / "purge.db").string();
+        auto store = thewatcher::server::make_store("sqlite", path);
+        zmq::context_t ctx{1};
+        thewatcher::server::ZapHandler zap{ctx};
+        // Never started: the test calls the purge directly.
+        thewatcher::server::ApiServer api(*store, zap, "127.0.0.1", free_http_port());
+        std::atomic<int64_t> purge_clock_ms{0};
+        api.set_session_purge_clock([&purge_clock_ms] {
+            return purge_clock_ms.load();
+        });
+        const auto admin_id = store->get_user_by_username("thewatcher")->user_id;
+        // Reads the row count on a connection of its own, so whether a purge
+        // ran is seen without asking the store under test.
+        SideConnection observer(path);
+        const auto plant_expired_session = [&](const std::string& token) {
+            store->create_session(make_session(token, admin_id, 1));
+        };
+        const auto session_rows = [&] {
+            return observer.scalar("SELECT COUNT(*) FROM sessions;");
+        };
+
+        WHEN("a purge is held up by another writer and finishes eight seconds after it started")
+        {
+            plant_expired_session("expired-1");
+            std::atomic<bool> purge_returned{false};
+            // Declared before the writer, so on an early failure the writer is
+            // closed (releasing the write lock) before the thread is joined.
+            ScopedThread purge;
+            SideConnection writer(path);
+            writer.exec("BEGIN IMMEDIATE;");
+            purge.start([&] {
+                api.purge_expired_sessions_if_due(now_ms());
+                purge_returned = true;
+            });
+            // An unblocked purge returns within milliseconds, so one still
+            // running after this pause is waiting for the writer's lock.
+            std::this_thread::sleep_for(200ms);
+            const bool purge_held = !purge_returned.load();
+            purge_clock_ms = 8'000;
+            writer.exec("ROLLBACK;");
+            purge.join();
+            const auto after_slow_purge = session_rows();
+
+            plant_expired_session("expired-2");
+            purge_clock_ms = 300'000; // five minutes after the start, not after the end
+            api.purge_expired_sessions_if_due(now_ms());
+            const auto five_minutes_after_start = session_rows();
+            purge_clock_ms = 308'000; // five minutes after the end
+            api.purge_expired_sessions_if_due(now_ms());
+            const auto five_minutes_after_end = session_rows();
+
+            THEN("the next purge runs only once five minutes have passed since the slow one finished")
+            {
+                REQUIRE(purge_held);
+                REQUIRE(after_slow_purge == 0);
+                REQUIRE(five_minutes_after_start == 1);
+                REQUIRE(five_minutes_after_end == 0);
+            }
+        }
+
+        WHEN("the wall clock jumps a day ahead and then an hour behind between purges")
+        {
+            plant_expired_session("expired-1");
+            api.purge_expired_sessions_if_due(now_ms());
+            const auto after_first = session_rows();
+
+            plant_expired_session("expired-2");
+            purge_clock_ms = 1'000;
+            api.purge_expired_sessions_if_due(now_ms() + 24 * hour_ms);
+            const auto after_forward_jump = session_rows();
+            purge_clock_ms = 301'000;
+            api.purge_expired_sessions_if_due(now_ms() - hour_ms);
+            const auto after_backward_jump = session_rows();
+
+            THEN("the spacing follows the purge clock, not the wall clock")
+            {
+                REQUIRE(after_first == 0);
+                REQUIRE(after_forward_jump == 1);  // one second on the purge clock: too soon
+                REQUIRE(after_backward_jump == 0); // five minutes on the purge clock: due
             }
         }
     }
@@ -1217,9 +1321,72 @@ SCENARIO("A self-service change applies only to the password hash that was verif
             }
         }
 
+        WHEN("the user was disabled, and their sessions revoked, after the password was verified")
+        {
+            REQUIRE(store->disable_user_and_revoke_sessions(user_id) == 1);
+            const auto result =
+                store->update_user_password_if_current_and_revoke_sessions(user_id, old_hash, "new-hash", "gina-1");
+
+            THEN("nothing changes and the store reports that the session ended")
+            {
+                REQUIRE(result.status == Status::SessionEnded);
+                REQUIRE(result.revoked == 0);
+                REQUIRE(store->get_user_by_username("gina")->password_hash == old_hash);
+            }
+        }
+
+        WHEN("the user was disabled and enabled again after the password was verified")
+        {
+            REQUIRE(store->disable_user_and_revoke_sessions(user_id) == 1);
+            REQUIRE(store->enable_user_and_revoke_sessions(user_id).has_value());
+            const auto result =
+                store->update_user_password_if_current_and_revoke_sessions(user_id, old_hash, "new-hash", "gina-1");
+
+            THEN("nothing changes: the session that verified the password is gone")
+            {
+                REQUIRE(result.status == Status::SessionEnded);
+                REQUIRE(result.revoked == 0);
+                REQUIRE(store->get_user_by_username("gina")->password_hash == old_hash);
+            }
+        }
+
+        WHEN("the user was disabled without their sessions being revoked")
+        {
+            REQUIRE(store->disable_user(user_id) == 1);
+            const auto result =
+                store->update_user_password_if_current_and_revoke_sessions(user_id, old_hash, "new-hash", "gina-1");
+
+            THEN("nothing changes or is revoked while the user is disabled")
+            {
+                REQUIRE(result.status == Status::SessionEnded);
+                REQUIRE(result.revoked == 0);
+                REQUIRE(store->get_user_by_username("gina")->password_hash == old_hash);
+                // Re-enabled without a revoke, both sessions are still there.
+                REQUIRE(store->enable_user(user_id) == 1);
+                REQUIRE(store->get_session("gina-1", now_ms()));
+                REQUIRE(store->get_session("gina-2", now_ms()));
+            }
+        }
+
+        WHEN("the caller's session ended after the password was verified")
+        {
+            store->delete_session("gina-1");
+            const auto result =
+                store->update_user_password_if_current_and_revoke_sessions(user_id, old_hash, "new-hash", "gina-1");
+
+            THEN("nothing changes and the user's other session is kept")
+            {
+                REQUIRE(result.status == Status::SessionEnded);
+                REQUIRE(result.revoked == 0);
+                REQUIRE(store->get_user_by_username("gina")->password_hash == old_hash);
+                REQUIRE(store->get_session("gina-2", now_ms()));
+            }
+        }
+
         WHEN("the user does not exist")
         {
-            const auto result = store->update_user_password_if_current_and_revoke_sessions(987654, old_hash, "x");
+            const auto result =
+                store->update_user_password_if_current_and_revoke_sessions(987654, old_hash, "x", "gina-1");
 
             THEN("the store reports it")
             {
@@ -1238,9 +1405,11 @@ SCENARIO("An admin reset that lands between verification and update wins over a 
         std::string reset_hash;
         int64_t carol_id = 0;
         ApiFixture fx([&](ApiFixture& f) {
+            // The same store call the admin reset route makes: new hash, and
+            // every session of the user revoked, in one transaction.
             f.api.set_password_change_test_hook([&armed, &reset_hash, &carol_id, fixture = &f](int64_t user_id) {
                 if (armed.load() && user_id == carol_id)
-                    fixture->store->update_user_password(user_id, reset_hash);
+                    fixture->store->update_user_password_and_revoke_sessions(user_id, reset_hash, "");
             });
         });
         const auto admin = fx.login("thewatcher", "look_at_me");
@@ -1260,18 +1429,104 @@ SCENARIO("An admin reset that lands between verification and update wins over a 
                               R"({"password":"carol-pass-new","current_password":"carol-pass-1"})", "application/json");
             REQUIRE(res);
 
-            THEN("it is refused with 409, the admin hash stays and no session is revoked")
+            THEN("it is refused with 409, the admin hash stays and the reset's revocation stands")
             {
+                // 409, not 401: the hash changed, which says more than the
+                // ended session (the reset revoked it too).
                 REQUIRE(res->status == 409);
                 REQUIRE(fx.store->get_user_by_username("carol")->password_hash == reset_hash);
-                REQUIRE(fx.session_status(carol_a) == 200);
-                REQUIRE(fx.session_status(carol_b) == 200);
+                REQUIRE(fx.session_status(carol_a) == 401);
+                REQUIRE(fx.session_status(carol_b) == 401);
             }
 
             THEN("no success is audited")
             {
                 log.settle();
                 REQUIRE(log.read().find("event=password_change outcome=success") == std::string::npos);
+            }
+        }
+    }
+}
+
+SCENARIO("A disable that lands between verification and update stops a self-service change")
+{
+    GIVEN("a user who sends the correct current password while an admin acts on the account mid-request")
+    {
+        CapturedLog log;
+        // What the hook does in the window: 0 nothing, 1 disable, 2 disable and
+        // enable again. Each is the store call the matching admin route makes.
+        std::atomic<int> interference{0};
+        int64_t hank_id = 0;
+        ApiFixture fx([&](ApiFixture& f) {
+            f.api.set_password_change_test_hook([&interference, &hank_id, fixture = &f](int64_t user_id) {
+                if (user_id != hank_id)
+                    return;
+                const auto mode = interference.load();
+                if (mode >= 1)
+                    fixture->store->disable_user_and_revoke_sessions(user_id);
+                if (mode == 2)
+                    fixture->store->enable_user_and_revoke_sessions(user_id);
+            });
+        });
+        const auto admin = fx.login("thewatcher", "look_at_me");
+        hank_id = fx.create_user(admin, "hank", "hank-pass-1");
+        const auto hank = fx.login("hank", "hank-pass-1");
+        REQUIRE_FALSE(hank.empty());
+        const auto old_hash = fx.store->get_user_by_username("hank")->password_hash;
+        const auto change_password = [&] {
+            auto res =
+                fx.client.Put("/api/users/" + std::to_string(hank_id) + "/password",
+                              {
+                                  {"Cookie", hank}
+            },
+                              R"({"password":"hank-pass-new","current_password":"hank-pass-1"})", "application/json");
+            REQUIRE(res);
+            return res->status;
+        };
+
+        WHEN("the account is disabled in that window")
+        {
+            interference = 1;
+            const auto status = change_password();
+
+            THEN("the change is refused with 401 and the stored hash is unchanged")
+            {
+                REQUIRE(status == 401);
+                REQUIRE(fx.store->get_user_by_username("hank")->password_hash == old_hash);
+            }
+
+            THEN("the refusal is audited and no success is")
+            {
+                REQUIRE(log.eventually_contains("event=password_change outcome=session_ended"));
+                log.settle();
+                REQUIRE(log.read().find("event=password_change outcome=success") == std::string::npos);
+            }
+        }
+
+        WHEN("the account is disabled and enabled again in that window")
+        {
+            interference = 2;
+            const auto status = change_password();
+
+            THEN("the change is refused with 401: the old password still signs in and the new one does not")
+            {
+                REQUIRE(status == 401);
+                REQUIRE(fx.store->get_user_by_username("hank")->password_hash == old_hash);
+                REQUIRE(fx.session_status(hank) == 401);
+                REQUIRE_FALSE(fx.login("hank", "hank-pass-1").empty());
+                REQUIRE(fx.login("hank", "hank-pass-new").empty());
+            }
+        }
+
+        WHEN("nothing happens to the account in that window")
+        {
+            const auto status = change_password();
+
+            THEN("the change succeeds and the session that made it is kept")
+            {
+                REQUIRE(status == 200);
+                REQUIRE(fx.session_status(hank) == 200);
+                REQUIRE_FALSE(fx.login("hank", "hank-pass-new").empty());
             }
         }
     }
