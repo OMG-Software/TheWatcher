@@ -142,6 +142,9 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   follow-up instead of starting concurrent requests; and a failed settings
   reload after a successful save keeps the saved values visible with a warning
   (#104, #105).
+- Dashboard: overlapping actions no longer clear each other's busy state;
+  `runAction` refuses a key that is already running (no second request) and
+  `useRunAction` gains `isBusy(key)` (#104, #105).
 
 - Dashboard: destructive actions (delete agent, user, view, maintenance
   window; bulk archive) now ask for confirmation in a dialog that names the

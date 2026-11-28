@@ -149,3 +149,66 @@ describe('GIVEN an action whose refresh is still running', () => {
     expect(result.current.busyAction).toBeNull();
   });
 });
+
+describe('GIVEN two overlapping actions', () => {
+  const start = (hook: ReturnType<typeof renderHook<ReturnType<typeof useRunAction>, unknown>>, key: string, action: () => Promise<void>) => {
+    let running!: Promise<boolean>;
+    act(() => {
+      running = hook.result.current.runAction(key, action);
+    });
+    return running;
+  };
+
+  it('WHEN A finishes first THEN B stays busy, and A can run again only after it finished', async () => {
+    const hook = renderHook(() => useRunAction(vi.fn().mockResolvedValue(null)));
+    const a = deferred<string>();
+    const b = deferred<string>();
+    const runA = start(hook, 'A', () => a.promise.then(() => undefined));
+    const runB = start(hook, 'B', () => b.promise.then(() => undefined));
+
+    expect(hook.result.current.isBusy('A')).toBe(true);
+    expect(hook.result.current.isBusy('B')).toBe(true);
+    expect(hook.result.current.busyAction).toBe('B'); // the most recently started
+
+    await act(async () => {
+      a.resolve('done');
+      await runA;
+    });
+    expect(hook.result.current.isBusy('A')).toBe(false);
+    expect(hook.result.current.isBusy('B')).toBe(true);
+    expect(hook.result.current.busyAction).toBe('B');
+
+    const again = vi.fn().mockResolvedValue(undefined);
+    await act(async () => {
+      expect(await hook.result.current.runAction('A', again)).toBe(true);
+    });
+    expect(again).toHaveBeenCalledTimes(1);
+    await act(async () => {
+      b.resolve('done');
+      await runB;
+    });
+    expect(hook.result.current.busyAction).toBeNull();
+  });
+
+  it('WHEN a key is already active THEN a second runAction with it sends no request, returns false and keeps the first running', async () => {
+    const hook = renderHook(() => useRunAction(vi.fn().mockResolvedValue(null)));
+    const first = deferred<string>();
+    const firstAction = vi.fn(() => first.promise.then(() => undefined));
+    const second = vi.fn().mockResolvedValue(undefined);
+    const runFirst = start(hook, 'create', firstAction);
+
+    let refused: boolean | undefined;
+    await act(async () => {
+      refused = await hook.result.current.runAction('create', second);
+    });
+
+    expect(refused).toBe(false);
+    expect(second).not.toHaveBeenCalled();
+    expect(hook.result.current.isBusy('create')).toBe(true);
+    await act(async () => {
+      first.resolve('done');
+      expect(await runFirst).toBe(true);
+    });
+    expect(firstAction).toHaveBeenCalledTimes(1);
+  });
+});
