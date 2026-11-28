@@ -16,7 +16,7 @@ only when installing or running under Windows Service Control Manager.
 Install:
 
 ```powershell
-.\builddir-release\server\TheWatcherServer.exe --install-service --config C:\ProgramData\TheWatcher\server.json
+.\builddir-release\server\TheWatcherServer.exe --install-service --config C:\ProgramData\TheWatcher\TheWatcherServer.conf
 ```
 
 Start and stop:

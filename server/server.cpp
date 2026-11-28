@@ -91,10 +91,10 @@ namespace
     {
         LOGF_DEBUG(
             "Received metrics agent_id=%s host=%s platform=%s timestamp_ms=%lld payload_size=%zu uptime_seconds=%.0f "
-            "cpu_usage=%.2f memory_usage=%.2f disks=%zu networks=%zu temperatures=%zu processes=%zu",
+            "cpu_usage=%.2f memory_usage=%.2f disks=%zu networks=%zu processes=%zu",
             agent_id.c_str(), metrics.hostname.c_str(), metrics.platform.c_str(), static_cast<long long>(timestamp_ms),
             payload_size, metrics.uptime_seconds, metrics.cpu.usage_percent, metrics.memory.usage_percent,
-            metrics.disks.size(), metrics.networks.size(), metrics.temperatures.size(), metrics.top_processes.size());
+            metrics.disks.size(), metrics.networks.size(), metrics.top_processes.size());
         if (!metrics.disks.empty())
         {
             const auto& disk = metrics.disks.front();
