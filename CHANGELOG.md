@@ -9,6 +9,24 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Security
 
+- The config-directory check now covers every existing ancestor up to the
+  filesystem root, not only the directory itself: another user who can write
+  to an ancestor (for example `/shared` for `/shared/thewatcher/...`) could
+  rename or replace the checked directory between the check and the open.
+  POSIX: an ancestor must be owned by root or the current user and must not be
+  group/other writable unless it has the sticky bit (like `/tmp`). Windows: the
+  owner must be SYSTEM, Administrators, TrustedInstaller or the current user,
+  and no other account may hold `DELETE`, `FILE_DELETE_CHILD`, `WRITE_DAC`,
+  `WRITE_OWNER` or `GENERIC_ALL` on it (inherit-only entries and the add-file
+  right Users have on `C:\ProgramData` are ignored). Default locations still
+  pass.
+- The Windows ACL check no longer skips entries it cannot read: an
+  object-specific allow entry (or any type other than allow/deny) now makes the
+  directory unsafe, and the error names the entry type. Deny entries are
+  skipped.
+- `--uninstall-service` is handled before the config directory is validated, so
+  a machine with a loose or missing config directory can still remove the
+  service. `--install-service` and a normal start keep the check.
 - **Behaviour change:** the server refuses to start when the directory that
   holds its config can be changed by other local users (Windows: an owner other
   than SYSTEM, Administrators or the current user, or a write-type allow entry

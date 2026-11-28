@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cstring>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <system_error>
@@ -13,6 +14,8 @@
 #include <sodium.h>
 
 #ifdef _WIN32
+#include "secure_file_acl.hpp"
+
 #include <windows.h>
 // windows.h first: sddl.h depends on its declarations.
 #include <aclapi.h>
@@ -173,6 +176,17 @@ void write_private_file_atomic(const fs::path& target, const std::string& conten
 
 namespace
 {
+    // Which directory is being judged: the one that holds the secret, or one above it.
+#ifdef _WIN32
+    using DirRole = detail::AclRole;
+#else
+    enum class DirRole
+    {
+        Leaf,
+        Ancestor,
+    };
+#endif
+
     std::string fix_advice(const fs::path& dir)
     {
 #ifdef _WIN32
@@ -190,6 +204,25 @@ namespace
     {
         throw std::runtime_error("The directory " + dir.string() + " is not private: " + reason + ". " +
                                  fix_advice(dir));
+    }
+
+    // `ancestor` is a directory above `dir`: whoever can rename or replace it can
+    // swap `dir` between the check and the open.
+    [[noreturn]] void refuse_ancestor(const fs::path& dir, const fs::path& ancestor, const std::string& reason)
+    {
+#ifdef _WIN32
+        const std::string advice = "Remove the delete, change-permissions and take-ownership rights that other "
+                                   "accounts hold on it (icacls \"" +
+                                   ancestor.string() +
+                                   "\"), or pass --config with a path under a directory only you control.";
+#else
+        const std::string advice = "Run: chmod go-w '" + ancestor.string() +
+                                   "' (or set its sticky bit and own it as root or the user that runs the server), or "
+                                   "pass --config with a path under a directory only you control.";
+#endif
+        throw std::runtime_error("The directory " + dir.string() + " is not private: its parent directory " +
+                                 ancestor.string() + " can be replaced by other users (" + reason +
+                                 "), so they could swap " + dir.string() + " after it is checked. " + advice);
     }
 
 #ifdef _WIN32
@@ -212,6 +245,11 @@ namespace
                 CloseHandle(h);
         }
     };
+
+    // Rights that let an account rename, replace or re-permission a directory or
+    // one of its children, which is what an ancestor must not allow. Adding a file
+    // or subdirectory is not among them: C:\ and C:\ProgramData grant it to Users.
+    constexpr DWORD replace_rights = DELETE | FILE_DELETE_CHILD | WRITE_DAC | WRITE_OWNER | GENERIC_ALL;
 
     // Rights that let an account change what is in the directory or who may.
     constexpr DWORD write_like_rights = FILE_ADD_FILE | FILE_ADD_SUBDIRECTORY | FILE_WRITE_DATA | FILE_APPEND_DATA |
@@ -265,8 +303,21 @@ namespace
         return "an unknown account";
     }
 
-    // Checks an existing directory; throws via refuse() when it is not private.
-    void verify_private_directory(const fs::path& dir)
+    // SID of NT SERVICE\TrustedInstaller, which owns parts of the system drive.
+    std::vector<unsigned char> trusted_installer_sid()
+    {
+        PSID raw = nullptr;
+        if (!ConvertStringSidToSidW(L"S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464", &raw))
+            throw std::runtime_error("Cannot build the TrustedInstaller SID (error " + std::to_string(GetLastError()) +
+                                     ")");
+        LocalMemory guard(raw);
+        const auto length = GetLengthSid(raw);
+        const auto* begin = static_cast<const unsigned char*>(raw);
+        return std::vector<unsigned char>(begin, begin + length);
+    }
+
+    // Why `dir` is not safe for `role`, or nothing when it is.
+    std::optional<std::string> unsafe_reason(const fs::path& dir, DirRole role)
     {
         PSID owner = nullptr;
         PACL dacl = nullptr;
@@ -275,46 +326,25 @@ namespace
             GetNamedSecurityInfoW(dir.c_str(), SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
                                   &owner, nullptr, &dacl, nullptr, &raw_descriptor);
         if (status != ERROR_SUCCESS)
-            refuse(dir, "its permissions cannot be read (error " + std::to_string(status) + ")");
+            return "its permissions cannot be read (error " + std::to_string(status) + ")";
         LocalMemory descriptor(raw_descriptor);
 
         const auto system_sid = well_known_sid(WinLocalSystemSid);
         const auto admins_sid = well_known_sid(WinBuiltinAdministratorsSid);
-        const auto creator_owner_sid = well_known_sid(WinCreatorOwnerSid);
-        // OWNER RIGHTS (S-1-3-4): rights of whoever owns the directory, which is checked above.
-        const auto owner_rights_sid = well_known_sid(WinCreatorOwnerRightsSid);
         const auto user_sid = current_user_sid();
         const auto same = [](PSID a, const std::vector<unsigned char>& b) {
             return EqualSid(a, const_cast<unsigned char*>(b.data())) != FALSE;
         };
 
-        if (owner == nullptr || !(same(owner, system_sid) || same(owner, admins_sid) || same(owner, user_sid)))
-            refuse(dir, "it is owned by " + (owner != nullptr ? describe_sid(owner) : std::string("nobody")) +
-                            ", not by SYSTEM, Administrators or the user running the server");
-
-        // A missing DACL means everybody has full access.
-        if (dacl == nullptr)
-            refuse(dir, "it has no access control list, so every user has full access");
-
-        for (DWORD i = 0; i < dacl->AceCount; ++i)
-        {
-            void* ace_raw = nullptr;
-            if (!GetAce(dacl, i, &ace_raw))
-                refuse(dir, "its access control list cannot be read");
-            const auto* header = static_cast<const ACE_HEADER*>(ace_raw);
-            // Plain and callback allow entries share one layout. Inherit-only entries
-            // count too: they apply to the files created in the directory.
-            if (header->AceType != ACCESS_ALLOWED_ACE_TYPE && header->AceType != ACCESS_ALLOWED_CALLBACK_ACE_TYPE)
-                continue;
-            const auto* ace = static_cast<const ACCESS_ALLOWED_ACE*>(ace_raw);
-            PSID trustee = const_cast<DWORD*>(&ace->SidStart);
-            if ((ace->Mask & write_like_rights) == 0)
-                continue;
-            if (same(trustee, system_sid) || same(trustee, admins_sid) || same(trustee, creator_owner_sid) ||
-                same(trustee, owner_rights_sid) || same(trustee, user_sid) || EqualSid(trustee, owner))
-                continue;
-            refuse(dir, describe_sid(trustee) + " is allowed to write to it");
-        }
+        const bool ancestor = role == detail::AclRole::Ancestor;
+        const bool trusted_owner =
+            owner != nullptr && (same(owner, system_sid) || same(owner, admins_sid) || same(owner, user_sid) ||
+                                 (ancestor && same(owner, trusted_installer_sid())));
+        if (!trusted_owner)
+            return "it is owned by " + (owner != nullptr ? describe_sid(owner) : std::string("nobody")) +
+                   (ancestor ? ", not by SYSTEM, Administrators, TrustedInstaller or the user running the server"
+                             : ", not by SYSTEM, Administrators or the user running the server");
+        return detail::find_unsafe_dacl_entry(dacl, owner, role);
     }
 
     // Creates one directory with a protected DACL: SYSTEM, Administrators and the
@@ -334,18 +364,26 @@ namespace
                                      ")");
     }
 #else
-    void verify_private_directory(const fs::path& dir)
+    // Why `dir` is not safe for `role`, or nothing when it is.
+    std::optional<std::string> unsafe_reason(const fs::path& dir, DirRole role)
     {
         struct stat info{};
         if (::stat(dir.c_str(), &info) != 0)
-            refuse(dir, std::string("it cannot be inspected: ") + std::strerror(errno));
+            return std::string("it cannot be inspected: ") + std::strerror(errno);
         if (!S_ISDIR(info.st_mode))
-            refuse(dir, "it is not a directory");
+            return "it is not a directory";
         if (info.st_uid != 0 && info.st_uid != ::geteuid())
-            refuse(dir, "it is owned by user id " + std::to_string(info.st_uid) +
-                            ", not by root or the user running the server");
-        if ((info.st_mode & (S_IWGRP | S_IWOTH)) != 0)
-            refuse(dir, "it is writable by its group or by other users");
+            return "it is owned by user id " + std::to_string(info.st_uid) +
+                   ", not by root or the user running the server";
+        if ((info.st_mode & (S_IWGRP | S_IWOTH)) == 0)
+            return std::nullopt;
+        // A sticky ancestor (such as /tmp) only lets users rename their own
+        // entries; the entry below it is held to the owner rule on its own.
+        if (role == DirRole::Ancestor && (info.st_mode & S_ISVTX) != 0)
+            return std::nullopt;
+        if (role == DirRole::Ancestor)
+            return "it is writable by its group or by other users and does not have the sticky bit";
+        return "it is writable by its group or by other users";
     }
 
     void create_private_directory_level(const fs::path& dir)
@@ -359,11 +397,72 @@ namespace
 #endif
 } // namespace
 
+#ifdef _WIN32
+namespace detail
+{
+    std::optional<std::string> find_unsafe_dacl_entry(PACL dacl, PSID owner, AclRole role)
+    {
+        // A missing DACL means everybody has full access.
+        if (dacl == nullptr)
+            return "it has no access control list, so every user has full access";
+
+        const bool ancestor = role == AclRole::Ancestor;
+        const auto system_sid = well_known_sid(WinLocalSystemSid);
+        const auto admins_sid = well_known_sid(WinBuiltinAdministratorsSid);
+        const auto creator_owner_sid = well_known_sid(WinCreatorOwnerSid);
+        // OWNER RIGHTS (S-1-3-4): rights of whoever owns the directory, which the caller checks.
+        const auto owner_rights_sid = well_known_sid(WinCreatorOwnerRightsSid);
+        const auto user_sid = current_user_sid();
+        const auto trusted_installer = trusted_installer_sid();
+        const auto same = [](PSID a, const std::vector<unsigned char>& b) {
+            return EqualSid(a, const_cast<unsigned char*>(b.data())) != FALSE;
+        };
+        const DWORD refused_rights = ancestor ? replace_rights : write_like_rights;
+
+        for (DWORD i = 0; i < dacl->AceCount; ++i)
+        {
+            void* ace_raw = nullptr;
+            if (!GetAce(dacl, i, &ace_raw))
+                return "its access control list cannot be read";
+            const auto* header = static_cast<const ACE_HEADER*>(ace_raw);
+            // An ancestor is judged on what applies to it; the secret's directory also on
+            // inherit-only entries, which apply to the files created in it.
+            if (ancestor && (header->AceFlags & INHERIT_ONLY_ACE) != 0)
+                continue;
+            switch (header->AceType)
+            {
+            case ACCESS_ALLOWED_ACE_TYPE:
+            case ACCESS_ALLOWED_CALLBACK_ACE_TYPE:
+                break; // plain and callback allow entries share one layout: read the mask below
+            case ACCESS_DENIED_ACE_TYPE:
+            case ACCESS_DENIED_CALLBACK_ACE_TYPE:
+            case ACCESS_DENIED_OBJECT_ACE_TYPE:
+            case ACCESS_DENIED_CALLBACK_OBJECT_ACE_TYPE:
+                continue; // can only remove access
+            default:
+                // Object-specific allow entries and anything newer: fail closed.
+                return "it has an access control entry of type " + std::to_string(header->AceType) +
+                       " that cannot be checked";
+            }
+            const auto* ace = static_cast<const ACCESS_ALLOWED_ACE*>(ace_raw);
+            PSID trustee = const_cast<DWORD*>(&ace->SidStart);
+            if ((ace->Mask & refused_rights) == 0)
+                continue;
+            if (same(trustee, system_sid) || same(trustee, admins_sid) || same(trustee, creator_owner_sid) ||
+                same(trustee, owner_rights_sid) || same(trustee, user_sid) ||
+                (ancestor && same(trustee, trusted_installer)) || (owner != nullptr && EqualSid(trustee, owner)))
+                continue;
+            return describe_sid(trustee) + (ancestor ? " is allowed to delete, rename or change the permissions of it"
+                                                     : " is allowed to write to it");
+        }
+        return std::nullopt;
+    }
+} // namespace detail
+#endif
+
 void ensure_private_directory(const fs::path& dir)
 {
     // Levels that do not exist yet, deepest first; each is created private.
-    // Levels that already exist (such as C:\ProgramData or /etc) are not judged:
-    // only the directory that holds the secret is.
     std::vector<fs::path> missing;
     std::error_code ec;
     for (fs::path level = dir; !level.empty() && !fs::exists(level, ec); level = level.parent_path())
@@ -375,7 +474,30 @@ void ensure_private_directory(const fs::path& dir)
     for (auto it = missing.rbegin(); it != missing.rend(); ++it)
         create_private_directory_level(*it);
 
-    verify_private_directory(dir);
+    if (const auto reason = unsafe_reason(dir, DirRole::Leaf))
+        refuse(dir, *reason);
+
+    // Every existing ancestor, from the parent up to the root: whoever can rename
+    // or replace one of them can swap `dir` between this check and the open.
+    // Resolved first, so a symlink in the path is judged by where it leads.
+    // A directory this user cannot open (owner-only ACL checked above) cannot be
+    // resolved itself; its parent can.
+    std::error_code resolve_ec;
+    fs::path resolved = fs::weakly_canonical(dir, resolve_ec);
+    if (resolve_ec)
+    {
+        resolve_ec.clear();
+        resolved = fs::weakly_canonical(fs::absolute(dir, resolve_ec).parent_path(), resolve_ec) / dir.filename();
+    }
+    if (resolve_ec)
+        refuse(dir, "its path cannot be resolved: " + resolve_ec.message());
+    for (fs::path ancestor = resolved.parent_path(); !ancestor.empty(); ancestor = ancestor.parent_path())
+    {
+        if (const auto reason = unsafe_reason(ancestor, DirRole::Ancestor))
+            refuse_ancestor(dir, ancestor, *reason);
+        if (ancestor == ancestor.parent_path())
+            break;
+    }
 }
 
 } // namespace thewatcher::common

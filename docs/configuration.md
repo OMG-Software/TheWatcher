@@ -34,6 +34,28 @@ changed. The server refuses to start (exit code 1) when:
 - POSIX: the owner is not root or the user running the server, or the group or
   other users can write to it.
 
+Every existing directory above it, up to the filesystem root, is checked too,
+because whoever can rename or replace an ancestor can swap the checked
+directory for their own between the check and the open. The server also
+refuses (naming the ancestor) when:
+
+- Windows: an ancestor's owner is not SYSTEM, Administrators, TrustedInstaller
+  or the user running the server, or any other account is allowed `DELETE`,
+  `FILE_DELETE_CHILD`, `WRITE_DAC`, `WRITE_OWNER` or `GENERIC_ALL` on it.
+  Entries that only apply to children (inherit-only) are ignored, and so is
+  the right to add files and subfolders that Users have on `C:\` and
+  `C:\ProgramData`, which cannot replace an existing directory.
+- POSIX: an ancestor is not owned by root or the user running the server, or
+  it is group or other writable without the sticky bit (like OpenSSH
+  `StrictModes`). A sticky directory such as `/tmp` is accepted.
+
+On Windows the check fails closed: an allow entry of a kind it cannot read
+(for example an object-specific allow entry) makes the directory unsafe, and
+deny entries are skipped because they can only remove access. `/etc`,
+`/usr/local/etc` and `C:\ProgramData` pass as ancestors on a stock install.
+`--uninstall-service` is handled before any of this, so it works with a loose
+or missing config directory.
+
 The error names the directory and the reason. To fix it, run the installer
 (it sets the right ACL), or on Windows run
 `icacls "<dir>" /inheritance:r /grant:r *S-1-5-32-544:(OI)(CI)F *S-1-5-18:(OI)(CI)F`,

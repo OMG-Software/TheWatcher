@@ -128,7 +128,14 @@ working document for audit, design review, and regression testing.
   missing one private (SYSTEM, Administrators and owner on Windows, `0700` on
   POSIX). Without this, a standard user could pre-create
   `C:\ProgramData\TheWatcher` and plant or swap `TheWatcherServer.conf`. The
-  directory is checked, not repaired. Residual risk: the agent config under its
+  directory is checked, not repaired. Every existing ancestor up to the root is
+  checked as well (owner trusted; no group/other write without the sticky bit on
+  POSIX; no delete, delete-child, change-permissions, take-ownership or
+  generic-all right for other accounts on Windows), so a user who can write to
+  `/shared` cannot rename the checked directory away after the check. On
+  Windows an ACL entry the check cannot interpret (object-specific allow) is
+  treated as unsafe rather than skipped. `--uninstall-service` runs before the
+  check. Residual risk: the agent config under its
   own data directory is not checked yet.
 - Config parser file and line sizes are bounded to avoid unbounded local input,
   and values are range-checked at load (ports, offline interval, database type,

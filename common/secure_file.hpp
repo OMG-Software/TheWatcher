@@ -25,8 +25,22 @@ void write_private_file_atomic(const std::filesystem::path& target, const std::s
 //   grants write, delete, WRITE_DAC or WRITE_OWNER rights to any other account
 //   (Users, Authenticated Users, Everyone, ...); on POSIX, an owner other than
 //   root or the effective user, or group/other write permission.
-// Throws std::runtime_error naming the directory, the reason and how to fix it
-// (fix the permissions, run the installer, or choose a private --config path).
+// - Ancestors: every existing directory above `dir`, up to the filesystem root
+//   (on the resolved path), is checked too, because whoever can rename or
+//   replace one can swap `dir` between the check and the open. POSIX (like
+//   OpenSSH StrictModes): owned by root or the effective user, and not group- or
+//   other-writable unless the sticky bit is set (as on /tmp). Windows: owned by
+//   SYSTEM, Administrators, TrustedInstaller or the current user, and no other
+//   account holds DELETE, FILE_DELETE_CHILD, WRITE_DAC, WRITE_OWNER or
+//   GENERIC_ALL on it; entries that only apply to children are ignored, and the
+//   FILE_ADD_FILE / FILE_ADD_SUBDIRECTORY that Users hold on C:\ProgramData are
+//   fine.
+// - Windows ACL entries are classified fail-closed: allow entries are checked,
+//   deny entries are skipped (they only remove access), and any other entry type
+//   (such as an object-specific allow entry) makes the directory unsafe.
+// Throws std::runtime_error naming the directory (and the ancestor, when that is
+// the problem), the reason and how to fix it (fix the permissions, run the
+// installer, or choose a private --config path).
 void ensure_private_directory(const std::filesystem::path& dir);
 
 } // namespace thewatcher::common

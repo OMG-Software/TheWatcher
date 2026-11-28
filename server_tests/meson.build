@@ -126,3 +126,16 @@ if libpq_dep.found()
     env: ['THEWATCHER_POSTGRES_TEST_DSN=host=localhost dbname=thewatcher_test user=thewatcher_test password=thewatcher_test'],
   )
 endif
+
+server_uninstall_order_test = executable(
+  'server_uninstall_order_test',
+  ['server_uninstall_order_test.cpp'],
+  include_directories: root_inc,
+  dependencies: [catch2_dep, platform_deps],
+)
+test(
+  'server_uninstall_order',
+  server_uninstall_order_test,
+  env: {'THEWATCHER_SERVER_EXE': server_exe.full_path()},
+  depends: server_exe,
+)
