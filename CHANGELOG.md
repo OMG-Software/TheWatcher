@@ -183,6 +183,10 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
     an in-flight write fails and is not repeated, an in-flight read is
     retried, a transaction fails and rolls back, and the next call
     reconnects (#82).
+  - `store_postgres_suite` with no PostgreSQL server now shows as a Meson
+    SKIP (exit code 77) instead of a FAIL: Catch2 exits with 4 when every
+    test case is skipped, and the PostgreSQL test `main` maps that to 77.
+    `THEWATCHER_REQUIRE_POSTGRES=1` still turns it into a failure (#82).
 
 ### Changed
 

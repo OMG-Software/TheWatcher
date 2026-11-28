@@ -288,16 +288,12 @@ SCENARIO("[postgres] A write that dies with its connection is reported, not repe
 
         WHEN("the write is made")
         {
-            THEN("it fails, because it may have been applied and so is never silently retried")
+            THEN("it fails and is not repeated, then the next calls reconnect by themselves")
             {
+                // The one injected fault is consumed by this first call.
                 REQUIRE_THROWS_AS(store.set_setting("reconnect", "lost"), std::runtime_error);
                 CHECK(fired->load() == 1);
-            }
-
-            AND_THEN("the next calls reconnect by themselves; the lost write was not applied")
-            {
-                REQUIRE_THROWS(store.set_setting("reconnect", "lost"));
-                CHECK(store.get_setting("reconnect", "absent") == "absent");
+                CHECK(store.get_setting("reconnect", "absent") == "absent"); // the lost write was not applied
                 REQUIRE_NOTHROW(store.set_setting("reconnect", "second"));
                 CHECK(store.get_setting("reconnect", "absent") == "second");
             }
@@ -366,15 +362,11 @@ SCENARIO("[postgres] A connection cut inside a transaction fails the call and ro
 
         WHEN("the group list is replaced")
         {
-            THEN("the call fails instead of carrying on outside the transaction")
+            THEN("the call fails, the old membership is intact, and the store works again")
             {
+                // The one injected fault is consumed by this first call.
                 REQUIRE_THROWS_AS(store.set_agent_groups("txn-agent", {new_group}), std::runtime_error);
                 CHECK(fired->load() == 1);
-            }
-
-            AND_THEN("the original membership is intact and the store works again")
-            {
-                REQUIRE_THROWS(store.set_agent_groups("txn-agent", {new_group}));
                 CHECK(store.get_agent_groups("txn-agent") == std::vector<int64_t>{old_group});
                 REQUIRE_NOTHROW(store.set_agent_groups("txn-agent", {new_group}));
                 CHECK(store.get_agent_groups("txn-agent") == std::vector<int64_t>{new_group});

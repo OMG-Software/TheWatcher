@@ -116,7 +116,7 @@ meson test -C builddir-release store_postgres store_postgres_suite --print-error
 
 With no reachable server the tests skip, loudly: Catch2 prints a `SKIP` with
 the connection error, and the executable exits with 77, which Meson reports as
-SKIP rather than OK. Set `THEWATCHER_REQUIRE_POSTGRES=1` to make an unreachable
+SKIP rather than OK. This holds for `store_postgres` and for `store_postgres_suite`, where every test skips and Catch2 itself would exit with 4 (a Meson FAIL); the test `main` translates that to 77. Set `THEWATCHER_REQUIRE_POSTGRES=1` to make an unreachable
 server a failure instead; CI does, so a broken PostgreSQL service cannot turn
 the job green. `meson.build` does not set the DSN, so whatever you export wins.
 
