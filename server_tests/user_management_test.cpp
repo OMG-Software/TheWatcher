@@ -18,8 +18,11 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <functional>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
@@ -380,22 +383,40 @@ SCENARIO("Concurrent removal of the last two global admins leaves one")
         const auto first = find_user(*store, "thewatcher")->user_id;
         const auto second = store->create_user("second", "hash", "global_admin");
 
-        WHEN("two threads delete one admin each at the same moment")
+        WHEN("two threads, each with its own connection, delete one admin each at the same moment")
         {
+            // One connection per thread: a SqliteStore connection itself is not
+            // shared between threads in this suite. Locked-database errors from
+            // the competing writer are retried.
             std::atomic<bool> go{false};
             std::atomic<int> removed{0};
             std::atomic<int> refused{0};
-            auto remove = [&](int64_t id) {
+            // Open both connections before the race: opening runs the bootstrap writes.
+            auto store_1 = make_store("sqlite", db_path);
+            auto store_2 = make_store("sqlite", db_path);
+            auto remove = [&](Store& own, int64_t id) {
                 while (!go)
                     std::this_thread::yield();
-                const auto result = store->delete_user(id);
+                int result = 0;
+                for (int attempt = 0; attempt < 200; ++attempt)
+                {
+                    try
+                    {
+                        result = own.delete_user(id);
+                        break;
+                    }
+                    catch (const std::runtime_error&)
+                    {
+                        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                    }
+                }
                 if (result == 1)
                     ++removed;
                 else if (result == kLastGlobalAdmin)
                     ++refused;
             };
-            std::thread t1(remove, first);
-            std::thread t2(remove, second);
+            std::thread t1(remove, std::ref(*store_1), first);
+            std::thread t2(remove, std::ref(*store_2), second);
             go = true;
             t1.join();
             t2.join();

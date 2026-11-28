@@ -1020,10 +1020,13 @@ namespace
         return target;
     }
 
-    // 1 when the scope may act on the user, 0 for an unknown or built-in user,
-    // kOutOfScope otherwise. The transaction is already open.
+    // 1 when the scope may act on the user (always for an unrestricted actor),
+    // 0 for an unknown or built-in user, kOutOfScope otherwise. The transaction
+    // is already open.
     int account_scope_verdict(PGconn* conn, int64_t user_id, const UserScope& scope)
     {
+        if (!scope.restricted)
+            return 1;
         const auto target = read_target(conn, user_id);
         if (!target)
             return 0;
@@ -1052,11 +1055,8 @@ int PostgresStore::disable_user(int64_t user_id, const UserScope& scope)
     const auto p = s(user_id);
     const char* params[] = {p.c_str()};
     UserAdminTransaction tx(conn_);
-    if (scope.restricted)
-    {
-        if (const auto verdict = account_scope_verdict(conn_, user_id, scope); verdict != 1)
-            return verdict;
-    }
+    if (const auto verdict = account_scope_verdict(conn_, user_id, scope); verdict != 1)
+        return verdict;
     // SEC-14: the built-in admin must not be disableable — deleting it would
     // let the next bootstrap recreate it with the public default password.
     const auto sql = std::string("UPDATE users SET disabled=TRUE WHERE user_id=$1 AND built_in=FALSE AND NOT ") +
@@ -1075,11 +1075,8 @@ int PostgresStore::enable_user(int64_t user_id, const UserScope& scope)
     const auto p = s(user_id);
     const char* params[] = {p.c_str()};
     UserAdminTransaction tx(conn_);
-    if (scope.restricted)
-    {
-        if (const auto verdict = account_scope_verdict(conn_, user_id, scope); verdict != 1)
-            return verdict;
-    }
+    if (const auto verdict = account_scope_verdict(conn_, user_id, scope); verdict != 1)
+        return verdict;
     Res res(PQexecParams(conn_, "UPDATE users SET disabled=FALSE WHERE user_id=$1;", 1, nullptr, params, nullptr,
                          nullptr, 0));
     check_res(res.r, "enable_user");
@@ -1096,11 +1093,8 @@ int PostgresStore::delete_user(int64_t user_id, const UserScope& scope)
     const auto p = s(user_id);
     const char* params[] = {p.c_str()};
     UserAdminTransaction tx(conn_);
-    if (scope.restricted)
-    {
-        if (const auto verdict = account_scope_verdict(conn_, user_id, scope); verdict != 1)
-            return verdict;
-    }
+    if (const auto verdict = account_scope_verdict(conn_, user_id, scope); verdict != 1)
+        return verdict;
     // SEC-14: same built_in guard as SQLite — never delete the bootstrap admin.
     const auto sql =
         std::string("DELETE FROM users WHERE user_id=$1 AND built_in=FALSE AND NOT ") + WOULD_REMOVE_LAST_ADMIN + ";";
@@ -1128,44 +1122,30 @@ int PostgresStore::update_user_access(int64_t user_id, const std::optional<std::
     if (!target)
         return 0;
 
-    // Re-sending the current role is not a role change.
-    std::optional<std::string> new_role = role;
-    if (new_role && normalized_role_name(*new_role) == normalized_role_name(target->role))
-        new_role.reset();
+    const auto plan = plan_access_update(scope, role, group_ids, target->role, target->groups);
+    if (plan.verdict != 1)
+        return plan.verdict;
 
-    if (scope.restricted)
-    {
-        // A role change reaches every group of the user and may only pick a
-        // group role; a membership change only needs the target to share a group.
-        const bool allowed = new_role ? !is_global_role_name(*new_role) &&
-                                            within_scope(scope, target->role, target->groups, ScopeKind::Account)
-                                      : within_scope(scope, target->role, target->groups, ScopeKind::Membership);
-        if (!allowed || (group_ids && !all_in_scope(scope, *group_ids)))
-            return kOutOfScope;
-    }
-
-    if (new_role)
+    if (plan.role)
     {
         // Keeping an admin role cannot remove the last admin, so only a
         // demotion needs the guard.
-        const bool keeps_admin = *new_role == "global_admin" || *new_role == "admin";
+        const bool keeps_admin = keeps_admin_role(*plan.role);
         const auto sql = std::string("UPDATE users SET role=$1 WHERE user_id=$2 AND built_in=FALSE") +
                          (keeps_admin ? ";" : std::string(" AND NOT ") + WOULD_REMOVE_LAST_ADMIN + ";");
-        const char* params[] = {new_role->c_str(), p_uid.c_str()};
+        const char* params[] = {plan.role->c_str(), p_uid.c_str()};
         Res res(PQexecParams(conn_, sql.c_str(), 2, nullptr, params, nullptr, nullptr, 0));
         check_res(res.r, "update_user_access role");
         if (affected_rows(res.r) == 0)
             return is_last_global_admin(conn_, user_id) ? kLastGlobalAdmin : 0;
     }
-    if (group_ids)
+    if (plan.groups)
     {
-        const auto final_groups =
-            scope.restricted ? merge_scoped_memberships(scope, target->groups, *group_ids) : *group_ids;
         const char* del_params[] = {p_uid.c_str()};
         Res del(PQexecParams(conn_, "DELETE FROM user_groups WHERE user_id=$1;", 1, nullptr, del_params, nullptr,
                              nullptr, 0));
         check_res(del.r, "update_user_access delete groups");
-        for (const auto group_id : final_groups)
+        for (const auto group_id : *plan.groups)
         {
             const auto p_gid = s(group_id);
             const char* params[] = {p_uid.c_str(), p_gid.c_str()};

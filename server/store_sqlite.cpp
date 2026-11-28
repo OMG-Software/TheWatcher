@@ -992,10 +992,16 @@ namespace
         return target;
     }
 
-    // 1 when the scope may act on the user, 0 for an unknown or built-in user,
-    // kOutOfScope otherwise. The transaction is already open.
-    int account_scope_verdict(sqlite3* db, int64_t user_id, const UserScope& scope)
+    // For a restricted actor: opens the write transaction and checks the scope
+    // against the target as it is now. Returns 1 to go ahead (always for an
+    // unrestricted actor, which keeps the single guarded statement), 0 for an
+    // unknown or built-in user, kOutOfScope otherwise.
+    int begin_account_change(sqlite3* db, std::optional<ImmediateTransaction>& tx, int64_t user_id,
+                             const UserScope& scope)
     {
+        if (!scope.restricted)
+            return 1;
+        tx.emplace(db);
         const auto target = read_target(db, user_id);
         if (!target)
             return 0;
@@ -1008,12 +1014,8 @@ int SqliteStore::disable_user(int64_t user_id, const UserScope& scope)
     // A restricted actor's scope is checked inside the transaction that does the
     // write. Others keep the single guarded statement.
     std::optional<ImmediateTransaction> tx;
-    if (scope.restricted)
-    {
-        tx.emplace(db_);
-        if (const auto verdict = account_scope_verdict(db_, user_id, scope); verdict != 1)
-            return verdict;
-    }
+    if (const auto verdict = begin_account_change(db_, tx, user_id, scope); verdict != 1)
+        return verdict;
     // The last-admin guard is part of the UPDATE, so it is atomic with the write.
     const auto sql = std::string("UPDATE users SET disabled=1 WHERE user_id=? AND built_in=0 AND NOT ") +
                      WOULD_REMOVE_LAST_ADMIN + ";";
@@ -1032,12 +1034,8 @@ int SqliteStore::disable_user(int64_t user_id, const UserScope& scope)
 int SqliteStore::enable_user(int64_t user_id, const UserScope& scope)
 {
     std::optional<ImmediateTransaction> tx;
-    if (scope.restricted)
-    {
-        tx.emplace(db_);
-        if (const auto verdict = account_scope_verdict(db_, user_id, scope); verdict != 1)
-            return verdict;
-    }
+    if (const auto verdict = begin_account_change(db_, tx, user_id, scope); verdict != 1)
+        return verdict;
     Stmt st;
     check(sqlite3_prepare_v2(db_, "UPDATE users SET disabled=0 WHERE user_id=?;", -1, &st.s, nullptr), db_,
           "prepare enable_user");
@@ -1052,12 +1050,8 @@ int SqliteStore::enable_user(int64_t user_id, const UserScope& scope)
 int SqliteStore::delete_user(int64_t user_id, const UserScope& scope)
 {
     std::optional<ImmediateTransaction> tx;
-    if (scope.restricted)
-    {
-        tx.emplace(db_);
-        if (const auto verdict = account_scope_verdict(db_, user_id, scope); verdict != 1)
-            return verdict;
-    }
+    if (const auto verdict = begin_account_change(db_, tx, user_id, scope); verdict != 1)
+        return verdict;
     const auto sql =
         std::string("DELETE FROM users WHERE user_id=? AND built_in=0 AND NOT ") + WOULD_REMOVE_LAST_ADMIN + ";";
     Stmt st;
@@ -1080,42 +1074,27 @@ int SqliteStore::update_user_access(int64_t user_id, const std::optional<std::st
     if (!target)
         return 0;
 
-    // Re-sending the current role is not a role change.
-    std::optional<std::string> new_role = role;
-    if (new_role && normalized_role_name(*new_role) == normalized_role_name(target->role))
-        new_role.reset();
+    const auto plan = plan_access_update(scope, role, group_ids, target->role, target->groups);
+    if (plan.verdict != 1)
+        return plan.verdict;
 
-    if (scope.restricted)
-    {
-        // A role change reaches every group of the user and may only pick a
-        // group role; a membership change only needs the target to share a group.
-        const bool allowed = new_role ? !is_global_role_name(*new_role) &&
-                                            within_scope(scope, target->role, target->groups, ScopeKind::Account)
-                                      : within_scope(scope, target->role, target->groups, ScopeKind::Membership);
-        if (!allowed || (group_ids && !all_in_scope(scope, *group_ids)))
-            return kOutOfScope;
-    }
-
-    if (new_role)
+    if (plan.role)
     {
         // Demoting is a removal as far as the guard is concerned; keeping an
         // admin role cannot remove the last admin, so only demotions are guarded.
-        const bool keeps_admin = *new_role == "global_admin" || *new_role == "admin";
+        const bool keeps_admin = keeps_admin_role(*plan.role);
         const auto sql = std::string("UPDATE users SET role=? WHERE user_id=? AND built_in=0") +
                          (keeps_admin ? ";" : std::string(" AND NOT ") + WOULD_REMOVE_LAST_ADMIN + ";");
         Stmt st;
         check(sqlite3_prepare_v2(db_, sql.c_str(), -1, &st.s, nullptr), db_, "prepare update_user_access");
-        sqlite3_bind_text(st.s, 1, new_role->c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(st.s, 1, plan.role->c_str(), -1, SQLITE_TRANSIENT);
         sqlite3_bind_int64(st.s, 2, user_id);
         check(sqlite3_step(st.s), db_, "step update_user_access");
         if (sqlite3_changes(db_) == 0)
             return is_last_global_admin(db_, user_id) ? kLastGlobalAdmin : 0;
     }
-    if (group_ids)
-    {
-        replace_user_groups(
-            db_, user_id, scope.restricted ? merge_scoped_memberships(scope, target->groups, *group_ids) : *group_ids);
-    }
+    if (plan.groups)
+        replace_user_groups(db_, user_id, *plan.groups);
     tx.commit();
     return 1;
 }

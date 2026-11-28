@@ -270,6 +270,47 @@ inline bool all_in_scope(const UserScope& scope, const std::vector<int64_t>& ids
     });
 }
 
+// What update_user_access should do once the target's current state is known.
+struct AccessPlan
+{
+    int verdict = 1;                            // 1 = go ahead, kOutOfScope = refuse
+    std::optional<std::string> role;            // set only when the role really changes
+    std::optional<std::vector<int64_t>> groups; // the final memberships to store
+};
+
+// Both stores call this inside the write transaction with the target's role and
+// groups read there, so the scope rules live in one place.
+inline AccessPlan plan_access_update(const UserScope& scope, const std::optional<std::string>& role,
+                                     const std::optional<std::vector<int64_t>>& group_ids,
+                                     const std::string& target_role, const std::vector<int64_t>& target_groups)
+{
+    AccessPlan plan;
+    // Re-sending the current role is not a role change.
+    if (role && normalized_role_name(*role) != normalized_role_name(target_role))
+        plan.role = role;
+    plan.groups = group_ids;
+    if (!scope.restricted)
+        return plan;
+
+    // A role change reaches every group of the user and may only pick a group
+    // role; a membership change only needs the target to share a group.
+    const bool allowed = plan.role ? !is_global_role_name(*plan.role) &&
+                                         within_scope(scope, target_role, target_groups, ScopeKind::Account)
+                                   : within_scope(scope, target_role, target_groups, ScopeKind::Membership);
+    if (!allowed || (group_ids && !all_in_scope(scope, *group_ids)))
+        plan.verdict = kOutOfScope;
+    else if (group_ids)
+        plan.groups = merge_scoped_memberships(scope, target_groups, *group_ids);
+    return plan;
+}
+
+// Keeping an admin role cannot remove the last admin, so only a demotion needs
+// the last-admin guard.
+inline bool keeps_admin_role(const std::string& role)
+{
+    return role == "global_admin" || role == "admin";
+}
+
 class Store
 {
 public:
