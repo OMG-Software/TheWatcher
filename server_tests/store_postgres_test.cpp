@@ -113,6 +113,20 @@ thewatcher::server::WallClock fixed_clock(int64_t ms)
     };
 }
 
+// A clock that reads `first` once and `later` on every read after that, so a
+// store that reads the clock only once never sees `later`. The flag is shared
+// so copies of the clock agree on whether it has been read.
+thewatcher::server::WallClock clock_reaching(int64_t first, int64_t later)
+{
+    auto read_before = std::make_shared<bool>(false);
+    return [first, later, read_before] {
+        if (*read_before)
+            return later;
+        *read_before = true;
+        return first;
+    };
+}
+
 // Returns true if a PostgreSQL server is reachable at the test DSN.
 // Result is cached after the first probe so subsequent calls are free.
 bool postgres_is_available()
@@ -1759,6 +1773,22 @@ SCENARIO("[postgres] A self-service change applies only to the hash that was ver
                 CHECK(store.get_session(other, 5000).has_value());
             }
         }
+
+        WHEN("the caller's session expires after the change first reads the clock, before it commits")
+        {
+            // The first reading is the last instant the session is valid; every
+            // later reading is the expiry itself.
+            const auto result = store.update_user_password_if_current_and_revoke_sessions(
+                user_id, old_hash, "new-" + suffix, keep, clock_reaching(3'999'999'999'999LL, 4'000'000'000'000LL));
+
+            THEN("nothing changes or is revoked and the store reports that the session ended")
+            {
+                CHECK(result.status == Status::SessionEnded);
+                CHECK(result.revoked == 0);
+                CHECK(store.get_user_by_username("own-" + suffix)->password_hash == old_hash);
+                CHECK(store.get_session(other, 5000).has_value());
+            }
+        }
         store.delete_user(user_id);
     }
 }
@@ -1940,7 +1970,10 @@ SCENARIO("A test DSN gains a server option whatever form it is written in")
 
     GIVEN("a URI-form DSN with credentials, a port and a query parameter")
     {
-        const std::string dsn = "postgresql://tw_user:s3cret@db.example:6543/tw_db?sslmode=disable";
+        // The password is made at run time, so no credential is written in the
+        // source; any value shows that the password survives the rebuild.
+        const auto secret = "pw" + unique_suffix();
+        const std::string dsn = "postgresql://tw_user:" + secret + "@db.example:6543/tw_db?sslmode=disable";
 
         WHEN("the server option is added")
         {
@@ -1950,7 +1983,7 @@ SCENARIO("A test DSN gains a server option whatever form it is written in")
             {
                 REQUIRE_FALSE(settings.empty());
                 CHECK(settings.at("user") == "tw_user");
-                CHECK(settings.at("password") == "s3cret");
+                CHECK(settings.at("password") == secret);
                 CHECK(settings.at("host") == "db.example");
                 CHECK(settings.at("port") == "6543");
                 CHECK(settings.at("dbname") == "tw_db");

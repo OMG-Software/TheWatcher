@@ -197,11 +197,11 @@ working document for audit, design review, and regression testing.
   order a disable and an admin reset use, and a sign-out locks only the
   sessions row, so none of them can deadlock. An expired-session purge skips
   locked rows, so it never waits behind a change either.
-- Expiry is judged when the change runs, not when the request arrived:
-  SQLite reads the clock once it holds the write lock, and PostgreSQL reads it
-  when its transaction begins and again after its last statement, just before
-  it commits. A session that expires while the change waits for a lock ends
-  the change with 401 and `password_change` `session_ended`.
+- Expiry is judged when the change runs, not when the request arrived: both
+  stores read the clock once their transaction has begun (SQLite then holds
+  the write lock) and again after their last statement, just before they
+  commit. A session that expires while the change waits for a lock, or while
+  it runs, ends the change with 401 and `password_change` `session_ended`.
 - A wrong current password is audited once, as `password_change` `failure`.
   Handlers that audit their own 403 mark the response, and the post-routing
   hook then skips its generic `permission_denied` line; every other 403 is

@@ -1142,6 +1142,20 @@ namespace
             return std::nullopt;
         return text_col(st.s, 0);
     }
+
+    // True when the session stored as token_hash belongs to user_id and is
+    // valid at now_ms (expires_at > now, the test get_session applies).
+    bool session_valid_at(sqlite3* db, const std::string& token_hash, int64_t user_id, int64_t now_ms)
+    {
+        Stmt st;
+        check(sqlite3_prepare_v2(db, "SELECT 1 FROM sessions WHERE token=? AND user_id=? AND expires_at>?;", -1, &st.s,
+                                 nullptr),
+              db, "prepare session_valid_at");
+        sqlite3_bind_text(st.s, 1, token_hash.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(st.s, 2, user_id);
+        sqlite3_bind_int64(st.s, 3, now_ms);
+        return step_row(st.s, db, __func__);
+    }
 } // namespace
 
 PasswordChangeResult SqliteStore::update_user_password_if_current_and_revoke_sessions(int64_t user_id,
@@ -1155,14 +1169,16 @@ PasswordChangeResult SqliteStore::update_user_password_if_current_and_revoke_ses
     sqlite::Transaction tx(db_);
     // Read only now: BEGIN IMMEDIATE may have waited (busy timeout) for
     // another writer, and the session must still be valid when the change is
-    // made. Nothing below waits, so this one reading holds until the commit.
+    // made. Time also passes while the statements below run, so expiry is
+    // judged again on a fresh reading just before the commit.
     const int64_t now_ms = clock();
+    // An empty caller_token hashes to "" and matches no session.
+    const auto caller_hash = hash_kept_session_token(caller_token);
     {
         // Every condition is in the one statement, so an admin reset, a
         // disable, a revocation or the expiry of the caller's session cannot
         // slip in between the check and the write. A session is valid while
-        // expires_at > now, the same test get_session applies. An empty
-        // caller_token hashes to "" and matches no session.
+        // expires_at > now, the same test get_session applies.
         Stmt st;
         check(sqlite3_prepare_v2(db_,
                                  "UPDATE users SET password_hash=? "
@@ -1172,7 +1188,6 @@ PasswordChangeResult SqliteStore::update_user_password_if_current_and_revoke_ses
                                  "AND sessions.expires_at>?);",
                                  -1, &st.s, nullptr),
               db_, "prepare update_user_password_if_current");
-        const auto caller_hash = hash_kept_session_token(caller_token);
         sqlite3_bind_text(st.s, 1, new_hash.c_str(), -1, SQLITE_TRANSIENT);
         sqlite3_bind_int64(st.s, 2, user_id);
         sqlite3_bind_text(st.s, 3, expected_hash.c_str(), -1, SQLITE_TRANSIENT);
@@ -1193,6 +1208,12 @@ PasswordChangeResult SqliteStore::update_user_password_if_current_and_revoke_ses
         return {PasswordChangeResult::Status::SessionEnded, 0};
     }
     const auto revoked = delete_sessions_for_user(user_id, caller_token);
+    // Final check, after the last statement, as on PostgreSQL: the caller's
+    // session must still be valid now. No other writer can remove it inside
+    // this transaction, but it can expire. Otherwise the guard rolls back the
+    // UPDATE and the DELETE.
+    if (!session_valid_at(db_, caller_hash, user_id, clock()))
+        return {PasswordChangeResult::Status::SessionEnded, 0};
     tx.commit();
     return {PasswordChangeResult::Status::Changed, revoked};
 }

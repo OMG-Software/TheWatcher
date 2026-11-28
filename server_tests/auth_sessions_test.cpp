@@ -55,6 +55,20 @@ thewatcher::server::WallClock fixed_clock(int64_t ms)
     };
 }
 
+// A clock that reads `first` once and `later` on every read after that, so a
+// store that reads the clock only once never sees `later`. The flag is shared
+// so copies of the clock agree on whether it has been read.
+thewatcher::server::WallClock clock_reaching(int64_t first, int64_t later)
+{
+    auto read_before = std::make_shared<bool>(false);
+    return [first, later, read_before] {
+        if (*read_before)
+            return later;
+        *read_before = true;
+        return first;
+    };
+}
+
 std::string hash_for(const std::string& password)
 {
     REQUIRE(sodium_init() >= 0);
@@ -1590,6 +1604,22 @@ SCENARIO("A self-service change applies only to the password hash that was verif
                 user_id, old_hash, "new-hash", "gina-1", fixed_clock(expires));
 
             THEN("nothing changes and the store reports that the session ended")
+            {
+                REQUIRE(result.status == Status::SessionEnded);
+                REQUIRE(result.revoked == 0);
+                REQUIRE(store->get_user_by_username("gina")->password_hash == old_hash);
+                REQUIRE(store->get_session("gina-2", now_ms()));
+            }
+        }
+
+        WHEN("the caller's session expires after the change first reads the clock, before it commits")
+        {
+            // The first reading is the last instant the session is valid; every
+            // later reading is the expiry itself.
+            const auto result = store->update_user_password_if_current_and_revoke_sessions(
+                user_id, old_hash, "new-hash", "gina-1", clock_reaching(expires - 1, expires));
+
+            THEN("nothing changes or is revoked and the store reports that the session ended")
             {
                 REQUIRE(result.status == Status::SessionEnded);
                 REQUIRE(result.revoked == 0);

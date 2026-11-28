@@ -156,15 +156,15 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   `caller_token`, and it takes a `WallClock` (`std::function<int64_t()>`)
   instead of a fixed time: the caller's session must also be unexpired
   (`expires_at > now`, as `get_session` checks), judged when the change runs,
-  not when the request arrived: SQLite reads the clock once it holds the write
-  lock, so a change that waited for it cannot use a stale time. On PostgreSQL
-  the change then locks the caller's session row
-  `FOR SHARE` before it revokes or commits, so a sign-out of that session on
-  another node either commits first, and the change is refused with 401, or
-  waits for the change to commit; it reads the clock once more just before it
-  commits, and refuses with 401 if the session expired while it waited. The
-  lock order (users row, then sessions row) matches a disable and an admin
-  reset, and a sign-out locks only the sessions row, so they cannot deadlock.
+  not when the request arrived: both stores read the clock once their
+  transaction has begun (SQLite then holds the write lock) and again after
+  their last statement, just before they commit, and refuse with 401 if the
+  session expired meanwhile. On PostgreSQL the change then locks the caller's
+  session row `FOR SHARE` before it revokes or commits, so a sign-out of that
+  session on another node either commits first, and the change is refused
+  with 401, or waits for the change to commit. The lock order (users row, then
+  sessions row) matches a disable and an admin reset, and a sign-out locks
+  only the sessions row, so they cannot deadlock.
   The PostgreSQL expired-session purge now skips rows another transaction
   holds (`FOR UPDATE SKIP LOCKED`) and leaves them to a later purge, so it
   never waits behind a password change. A request's session lookup reads the
@@ -180,7 +180,9 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   DSN, role or database cannot turn the store's lock-wait re-checks into
   serialization errors (#145). The isolation test adds its server option
   through libpq's own DSN parser, so it also works when
-  `THEWATCHER_POSTGRES_TEST_DSN` is a `postgresql://` URI.
+  `THEWATCHER_POSTGRES_TEST_DSN` is a `postgresql://` URI. The parser's own
+  test makes its URI password at run time, so no credential is written in the
+  source.
 - Session tokens are stored as their SHA-256 (lowercase hex) instead of raw, so a
   database copy or backup no longer contains usable logins. The stores hash
   inside `create_session`, `get_session`, `delete_session`,

@@ -291,9 +291,9 @@ Files: `server/store_synchronized.hpp`, `server/sqlite_raii.hpp`,
   order in new code so these cannot deadlock.
 - A store method that judges time inside a transaction takes a `WallClock`
   (`std::function<int64_t()>`, milliseconds since the epoch) rather than a
-  fixed time, and reads it after any wait for a lock (SQLite once it holds
-  the write lock, PostgreSQL again after its last statement), so time spent
-  waiting counts.
+  fixed time, and reads it after any wait for a lock and again after its last
+  statement, just before the commit, so time spent waiting or running
+  counts.
 - Insert-if-absent across server nodes (`insert_heartbeat_alert_if_absent`)
   cannot rely on the in-process mutex. On PostgreSQL the check and the insert
   run in one transaction holding

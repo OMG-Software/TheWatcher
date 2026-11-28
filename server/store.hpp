@@ -305,10 +305,10 @@ public:
     // the caller verified the current password against), the user is enabled
     // and caller_token is still one of the user's sessions and unexpired
     // (expires_at > now, as get_session checks). The request's arrival time is
-    // not used: SQLite reads `clock` once it holds the write lock, and
-    // PostgreSQL reads it when its transaction begins and again after its
-    // last statement, just before the commit, because a statement can wait
-    // for a row lock while the session runs out. Otherwise nothing
+    // not used: both stores read `clock` once their transaction has begun
+    // (SQLite then holds the write lock) and again after their last
+    // statement, just before the commit, because the session can run out
+    // while a statement waits for a lock or runs. Otherwise nothing
     // is changed or revoked and the status says why, checked in this order:
     // UserNotFound (no such user), PasswordChanged (an admin reset landed in
     // between; it may also have revoked the caller's session), SessionEnded
