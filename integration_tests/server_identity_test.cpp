@@ -213,9 +213,10 @@ SCENARIO("A command for an agent with no learned route is not sent to a peer usi
 
         WHEN("an operator sends a command to the victim")
         {
+            // #54: the victim is not connected, so the API refuses the command.
             auto res = fx.client.Post("/api/agents/agent-victim/get_status", "", "application/json");
             REQUIRE(res);
-            REQUIRE(res->status == 200);
+            REQUIRE(res->status == 409);
 
             THEN("the rogue does not receive it")
             {

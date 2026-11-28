@@ -1079,3 +1079,44 @@ SCENARIO("Webhook URLs are masked for global operators and cannot be changed by 
         }
     }
 }
+
+// ── Commands to an offline agent respect group scope (#54 with #62) ──────────
+
+SCENARIO("A command for an offline agent is refused after the access check, not instead of it")
+{
+    GIVEN("an offline agent in group B and another in group A")
+    {
+        AccessWorld w;
+        w.agents_reachable = false;
+
+        WHEN("a group A operator commands the group B agent")
+        {
+            const auto res = w.request("POST", "/api/agents/agent-b/get_status", "a_op");
+
+            THEN("they get 403, so the agent's connection state is not revealed")
+            {
+                REQUIRE(res.status == 403);
+            }
+        }
+
+        WHEN("a group A operator commands their own offline agent")
+        {
+            const auto res = w.request("POST", "/api/agents/agent-a/get_status", "a_op");
+
+            THEN("they get the 409 that says the command was not queued")
+            {
+                REQUIRE(res.status == 409);
+            }
+        }
+
+        WHEN("a group viewer commands their own offline agent")
+        {
+            const auto res = w.request("POST", "/api/agents/agent-a/get_status", "a_viewer");
+
+            THEN("they get 403: the role check comes first")
+            {
+                REQUIRE(res.status == 403);
+            }
+        }
+    }
+}

@@ -73,7 +73,8 @@ dedicated dashboard controls exist.
 
 | Key | Default | Description |
 | --- | --- | --- |
-| `notifications.webhook_url` | empty | Optional HTTP webhook URL. The server posts alert JSON when an alert is generated. `http://` URLs are supported by the current build. Localhost, private, link-local, multicast, documentation, benchmark, malformed authority, userinfo, and invalid-port targets are rejected before sending. Only a global admin can read or change this URL and `reports.webhook_url` through the API; global operators see them masked (`https://host/…`). |
+| `notifications.webhook_url` | empty | Optional HTTP webhook URL. The server posts alert JSON when an alert is generated. `http://` URLs are supported by the current build. Localhost, private, link-local, multicast, documentation, benchmark, malformed authority, userinfo, and invalid-port targets are rejected before sending. Delivery runs on a background worker with a 2 second timeout and up to 3 attempts; only a 2xx response counts as delivered. Only a global admin can read or change this URL and `reports.webhook_url` through the API; global operators see them masked (`https://host/…`). |
+| `reports.enabled`, `reports.webhook_url`, `reports.schedule`, `reports.hour`, `reports.day_of_week`, `reports.last_sent_ms` | disabled | Scheduled fleet digest. See [Scheduled reports](architecture.md#scheduled-reports). |
 
 ## Per-Agent Collector Configuration
 
@@ -289,7 +290,8 @@ Ordinary patterns such as `ERROR.*disk.*full`, `(ERROR|WARN) disk` and
 Each indicator tails its file independently. A monitor starts at the end of an
 existing file, so enabling it does not report old lines; a file that is created
 later is read from its first byte. A line is matched once it ends with a
-newline (a trailing `` is dropped, so CRLF logs work with `$`). If the file
+newline (a trailing `
+` is dropped, so CRLF logs work with `$`). If the file
 is replaced, deleted and recreated, or becomes shorter than the read position,
 it is read again from the start (#90).
 

@@ -1,6 +1,10 @@
 libpq_dep = dependency('libpq', required: false, static: false)
 
 server_store_sources = [
+  'alert_pipeline.cpp',
+  'notification_worker.cpp',
+  'offline_alerts.cpp',
+  'report_generator.cpp',
   'status_engine.cpp',
   'store_sqlite.cpp',
   'webhook_security.cpp',
@@ -75,7 +79,6 @@ server_lib = static_library(
   'watcher_server_lib',
   [
     'api.cpp',
-    'report_generator.cpp',
     'server.cpp',
     'zap_handler.cpp',
   ],

@@ -63,6 +63,13 @@ public:
     // ignored and the TCP peer address is always used.
     void set_trusted_proxies(std::vector<std::string> proxies);
 
+    // Decides whether an agent can receive a command right now. Without a
+    // check the persisted `connected` flag is used. The server installs a
+    // check backed by its live routes, because after a restart an agent can
+    // still be stored as connected with no route. Call before start().
+    using ConnectivityCheck = std::function<bool(const std::string& agent_id)>;
+    void set_connectivity_check(ConnectivityCheck check);
+
     // Drain pending commands into caller's vector (called from ZMQ thread).
     void drain_commands(std::vector<PendingCommand>& out);
 
@@ -74,6 +81,12 @@ private:
     bool can_access_agent(const SessionRecord& session, const std::string& agent_id);
     std::optional<SessionRecord> require_agent_access(const httplib::Request& req, httplib::Response& res,
                                                       const std::string& role, const std::string& agent_id);
+    // True when a command sent to agent_id now can be delivered.
+    bool agent_reachable(const std::string& agent_id);
+    // Command admission (#54): call first in every route that queues a command,
+    // before anything is changed or queued. Replies 409 and returns false when
+    // the agent cannot receive commands.
+    bool admit_command(const std::string& agent_id, httplib::Response& res);
     std::string enqueue_simple_command(const std::string& id, CommandType ct);
     // Client address used for login throttling: honours X-Forwarded-For /
     // X-Real-IP only when the TCP peer is a trusted proxy. Falls back to the
@@ -88,6 +101,7 @@ private:
     std::unique_ptr<httplib::Server> http_;
     std::thread thread_;
 
+    ConnectivityCheck connectivity_check_;
     std::queue<PendingCommand> cmd_queue_;
     std::mutex cmd_mutex_;
     std::mutex config_mutex_; // serialises Configure saves (revision check + write)

@@ -10,6 +10,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <memory>
@@ -40,6 +41,10 @@ public:
     {
         client.set_connection_timeout(5, 0);
         client.set_read_timeout(5, 0);
+        // Commands to an agent that is not connected are refused with 409 (#54); tests decide who is reachable.
+        api.set_connectivity_check([this](const std::string&) {
+            return agents_reachable.load();
+        });
         api.start();
     }
 
@@ -120,6 +125,9 @@ public:
                    std::chrono::system_clock::now().time_since_epoch())
             .count();
     }
+
+    // Whether the API treats every agent as connected. Tests flip it to see the offline behaviour.
+    std::atomic<bool> agents_reachable{true};
 
     // Declared first so it is initialised before `api` uses it.
     int port = free_http_port();
