@@ -185,3 +185,127 @@ describe('GIVEN a polling hook', () => {
     expect(fetcher).toHaveBeenCalledTimes(1);
   });
 });
+
+describe('GIVEN a polling hook whose fetcher takes an abort signal', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  /** A fetcher that stays pending until its signal aborts, like a real fetch. */
+  function abortableFetcher() {
+    const signals: AbortSignal[] = [];
+    const fetcher = vi.fn((signal: AbortSignal) => {
+      signals.push(signal);
+      return new Promise<string>((_resolve, reject) => {
+        signal.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')));
+      });
+    });
+    return { fetcher, signals };
+  }
+
+  it('WHEN a request starts THEN the fetcher gets a live signal', async () => {
+    const { fetcher, signals } = abortableFetcher();
+
+    renderHook(() => usePolling(fetcher));
+    await advance(0);
+
+    expect(signals).toHaveLength(1);
+    expect(signals[0].aborted).toBe(false);
+  });
+
+  it('WHEN the hook unmounts mid-request THEN the request is aborted', async () => {
+    const { fetcher, signals } = abortableFetcher();
+    const { unmount } = renderHook(() => usePolling(fetcher));
+    await advance(0);
+
+    unmount();
+
+    expect(signals[0].aborted).toBe(true);
+  });
+
+  it('WHEN polling is disabled mid-request THEN the request is aborted and no error is shown', async () => {
+    const { fetcher, signals } = abortableFetcher();
+    const { result, rerender } = renderHook(({ enabled }) => usePolling(fetcher, { enabled }), { initialProps: { enabled: true } });
+    await advance(0);
+
+    rerender({ enabled: false });
+    await advance(0);
+
+    expect(signals[0].aborted).toBe(true);
+    expect(result.current.error).toBeNull();
+  });
+
+  it('WHEN a request is aborted by the hook THEN its refresh promise resolves null and nothing is reported', async () => {
+    const { fetcher } = abortableFetcher();
+    const { result, unmount } = renderHook(() => usePolling(fetcher));
+    let refreshing!: Promise<string | null>;
+    act(() => {
+      refreshing = result.current.refresh();
+    });
+
+    unmount();
+
+    expect(await refreshing).toBeNull();
+  });
+
+  it('WHEN the fetcher rejects with an abort the hook did not cause THEN it is not shown as an error', async () => {
+    const fetcher = vi.fn().mockRejectedValue(new DOMException('aborted', 'AbortError'));
+
+    const { result } = renderHook(() => usePolling(fetcher));
+    await advance(0);
+
+    expect(result.current.error).toBeNull();
+  });
+
+  it('WHEN a fetcher ignores the signal and resolves after unmount THEN the late result is still ignored', async () => {
+    const late = deferred<string>();
+    const fetcher = vi.fn(() => late.promise);
+    const { result, unmount } = renderHook(() => usePolling(fetcher));
+    await advance(0);
+
+    unmount();
+    late.resolve('late');
+    await advance(0);
+
+    expect(result.current.data).toBeNull();
+  });
+
+  it('WHEN reload is called mid-request THEN the old request is aborted, its result is ignored and the fresh one is shown', async () => {
+    const first = deferred<string>();
+    const signals: AbortSignal[] = [];
+    const fetcher = vi.fn((signal: AbortSignal) => {
+      signals.push(signal);
+      return signals.length === 1 ? first.promise : Promise.resolve('fresh');
+    });
+    const { result } = renderHook(() => usePolling(fetcher));
+    await advance(0);
+
+    let reloading!: Promise<string | null>;
+    act(() => {
+      reloading = result.current.reload();
+    });
+    await act(async () => {
+      first.resolve('stale');
+      await reloading;
+    });
+
+    expect(signals[0].aborted).toBe(true);
+    expect(fetcher).toHaveBeenCalledTimes(2);
+    expect(result.current.data).toBe('fresh');
+  });
+
+  it('WHEN reload is called with nothing in flight THEN it simply loads', async () => {
+    const fetcher = vi.fn().mockResolvedValueOnce('one').mockResolvedValueOnce('two');
+    const { result } = renderHook(() => usePolling(fetcher));
+    await advance(0);
+
+    await act(async () => {
+      expect(await result.current.reload()).toBeNull();
+    });
+
+    expect(result.current.data).toBe('two');
+  });
+});

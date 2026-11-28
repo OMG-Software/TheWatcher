@@ -18,6 +18,7 @@ describe('GIVEN a mutation that succeeds', () => {
     expect(saved).toBe(true);
     expect(action).toHaveBeenCalledTimes(1);
     expect(result.current.failure?.inline).toBe(false);
+    expect(result.current.failure?.kind).toBe('refresh');
     expect(result.current.failure?.message).toMatch(/could not be refreshed.*store unavailable/);
   });
 });
@@ -34,7 +35,7 @@ describe('GIVEN a mutation that fails', () => {
 
     expect(saved).toBe(false);
     expect(refresh).not.toHaveBeenCalled();
-    expect(result.current.failure).toEqual({ key: 'x', message: 'nope', inline: true });
+    expect(result.current.failure).toEqual({ key: 'x', kind: 'action', message: 'nope', inline: true });
   });
 });
 

@@ -18,13 +18,13 @@ const ARCHIVED_POLL_MS = 5000;
 export function AlertsPage({
   agents,
   alerts,
-  busyAction,
+  isBusy,
   operator,
-  runAction,
+  runAction: runPageAction,
 }: {
   agents: DashboardAgent[];
   alerts: ReturnType<typeof toDisplayAlerts>;
-  busyAction: string | null;
+  isBusy: (key: string) => boolean;
   operator: boolean;
   runAction: RunAction;
 }) {
@@ -37,9 +37,22 @@ export function AlertsPage({
 
   // Archived alerts poll on their own timer, and only while they are shown.
   // (They used to re-fetch whenever the live list changed, i.e. on every poll.)
-  const archived = usePolling(React.useCallback(() => fetchAlerts(true), []), { intervalMs: ARCHIVED_POLL_MS, enabled: showArchived });
+  const archived = usePolling(React.useCallback((signal: AbortSignal) => fetchAlerts(true, signal), []), { intervalMs: ARCHIVED_POLL_MS, enabled: showArchived });
+  const reloadArchived = archived.reload;
   const archivedAlerts = React.useMemo(() => toDisplayAlerts(archived.data ?? [], agents), [archived.data, agents]);
+  // Until the first archived load succeeds there is no archived list: the table must not read as "no alerts".
   const archivedUnavailable = showArchived && archived.data === null;
+
+  // A successful action reloads the archived list too (it polls only every few seconds). `reload` drops
+  // an archived request that started before the action, so its old result cannot be shown afterwards.
+  const runAction = React.useCallback<RunAction>(
+    async (key, action, options) => {
+      const saved = await runPageAction(key, action, options);
+      if (saved && showArchived) await reloadArchived();
+      return saved;
+    },
+    [reloadArchived, runPageAction, showArchived],
+  );
 
   const baseAlerts = showArchived ? archivedAlerts : alerts;
   const displayed = baseAlerts.filter((a) => {
@@ -88,7 +101,7 @@ export function AlertsPage({
   return (
     <main className="table-wrap management-wrap">
       {ackTarget !== null ? (
-        <AcknowledgeModal busy={busyAction === ackKey} bulk={ackTarget === 'bulk'} errorKey={ackKey} onClose={() => setAckTarget(null)} onSubmit={handleAckSubmit} />
+        <AcknowledgeModal busy={isBusy(ackKey)} bulk={ackTarget === 'bulk'} errorKey={ackKey} onClose={() => setAckTarget(null)} onSubmit={handleAckSubmit} />
       ) : null}
       {runbookTarget ? (
         <RunbookModal
@@ -121,8 +134,8 @@ export function AlertsPage({
         <div className="bulk-action-bar">
           <span>{selectedCount} selected</span>
           <div className="button-row">
-            <ActionButton busy={busyAction === 'bulk:ack'} icon={<Check size={14} />} label={`Acknowledge (${selectedCount})`} onClick={() => setAckTarget('bulk')} />
-            <ActionButton busy={busyAction === 'bulk:archive'} danger icon={<Archive size={14} />} label={`Archive (${selectedCount})`} onClick={() => runAction('bulk:archive', async () => { await bulkArchiveAlerts([...selected]); afterAction(); })} />
+            <ActionButton busy={isBusy('bulk:ack')} icon={<Check size={14} />} label={`Acknowledge (${selectedCount})`} onClick={() => setAckTarget('bulk')} />
+            <ActionButton busy={isBusy('bulk:archive')} danger icon={<Archive size={14} />} label={`Archive (${selectedCount})`} onClick={() => runAction('bulk:archive', async () => { await bulkArchiveAlerts([...selected]); afterAction(); })} />
           </div>
         </div>
       ) : null}
@@ -189,18 +202,25 @@ export function AlertsPage({
                     <div className="button-row">
                       {!isAcknowledged ? (
                         <>
-                          <ActionButton busy={busyAction === `alert:${alert.alert_id}:ack`} disabled={!operator} icon={<Check size={14} />} label="Acknowledge" onClick={() => setAckTarget(alert.alert_id)} />
-                          <ActionButton busy={busyAction === `alert:${alert.alert_id}:ack-archive`} disabled={!operator} icon={<Archive size={14} />} label="Acknowledge & Archive" onClick={() => runAction(`alert:${alert.alert_id}:ack-archive`, async () => { await acknowledgeAlert(alert.alert_id); await archiveAlert(alert.alert_id); })} />
+                          <ActionButton busy={isBusy(`alert:${alert.alert_id}:ack`)} disabled={!operator} icon={<Check size={14} />} label="Acknowledge" onClick={() => setAckTarget(alert.alert_id)} />
+                          <ActionButton busy={isBusy(`alert:${alert.alert_id}:ack-archive`)} disabled={!operator} icon={<Archive size={14} />} label="Acknowledge & Archive" onClick={() => runAction(`alert:${alert.alert_id}:ack-archive`, async () => { await acknowledgeAlert(alert.alert_id); await archiveAlert(alert.alert_id); })} />
                         </>
                       ) : (
-                        <ActionButton busy={busyAction === `alert:${alert.alert_id}:archive`} danger disabled={!operator} icon={<Archive size={14} />} label="Archive" onClick={() => runAction(`alert:${alert.alert_id}:archive`, () => archiveAlert(alert.alert_id))} />
+                        <ActionButton busy={isBusy(`alert:${alert.alert_id}:archive`)} danger disabled={!operator} icon={<Archive size={14} />} label="Archive" onClick={() => runAction(`alert:${alert.alert_id}:archive`, () => archiveAlert(alert.alert_id))} />
                       )}
                     </div>
                   ) : <span className="uptime">Archived</span>}
                 </td>
               </tr>
             );
-          })}</tbody>
+          })}
+            {archivedUnavailable ? (
+              // While loading, the banner above already says so; only a failed load needs a row.
+              archived.loading ? null : <tr><td colSpan={8} className="empty-row">Archived alerts are unavailable.</td></tr>
+            ) : displayed.length === 0 ? (
+              <tr><td colSpan={8} className="empty-row">{baseAlerts.length === 0 ? 'No alerts.' : 'No alerts match the filters.'}</td></tr>
+            ) : null}
+          </tbody>
         </table>
       </div>
     </main>

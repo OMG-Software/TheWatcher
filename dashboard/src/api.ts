@@ -39,6 +39,15 @@ export function errorMessage(err: unknown, fallback: string): string {
 // and useSession returns the UI to the login screen.
 const unauthorizedListeners = new Set<() => void>();
 
+// Bumped whenever the signed-in session changes (sign-in, expiry, sign-out). A request remembers the
+// value it started under, so a late 401 from an earlier session cannot end a newer one.
+let sessionGeneration = 0;
+
+/** Tells the client the session changed; a 401 from a request that started before this is ignored. */
+export function markSessionChanged(): void {
+  sessionGeneration++;
+}
+
 /** Registers a callback for "the session is no longer valid"; returns the unsubscribe function. */
 export function onUnauthorized(listener: () => void): () => void {
   unauthorizedListeners.add(listener);
@@ -58,17 +67,19 @@ async function readError(response: Response): Promise<ApiError> {
   return new ApiError(response.status, message);
 }
 
-async function request<T>(path: string, init: RequestInit, signedOutIsNormal = false): Promise<T> {
-  const response = await fetch(`${API_BASE}${path}`, { ...init, credentials: 'include' });
+async function request<T>(path: string, init: RequestInit, signedOutIsNormal = false, signal?: AbortSignal): Promise<T> {
+  const generation = sessionGeneration;
+  const response = await fetch(`${API_BASE}${path}`, { ...init, credentials: 'include', ...(signal ? { signal } : {}) });
   if (!response.ok) {
-    if (response.status === 401 && !signedOutIsNormal) unauthorizedListeners.forEach((listener) => listener());
+    // Only the session the request started under may be ended by its 401.
+    if (response.status === 401 && !signedOutIsNormal && generation === sessionGeneration) unauthorizedListeners.forEach((listener) => listener());
     throw await readError(response);
   }
   return response.json() as Promise<T>;
 }
 
-function fetchJson<T>(path: string, signedOutIsNormal = false): Promise<T> {
-  return request<T>(path, {}, signedOutIsNormal);
+function fetchJson<T>(path: string, signedOutIsNormal = false, signal?: AbortSignal): Promise<T> {
+  return request<T>(path, {}, signedOutIsNormal, signal);
 }
 
 function mutateJson<T>(path: string, init: RequestInit, signedOutIsNormal = false): Promise<T> {
@@ -99,24 +110,24 @@ export async function logout(): Promise<void> {
   await mutateJson<{ ok: boolean }>('/api/logout', { method: 'POST' }, true);
 }
 
-export async function fetchAgents(): Promise<AgentRecord[]> {
-  return fetchJson<AgentRecord[]>('/api/agents');
+export async function fetchAgents(signal?: AbortSignal): Promise<AgentRecord[]> {
+  return fetchJson<AgentRecord[]>('/api/agents', false, signal);
 }
 
-export async function fetchPendingEnrollments(): Promise<AgentRecord[]> {
-  return fetchJson<AgentRecord[]>('/api/pending-enrollments');
+export async function fetchPendingEnrollments(signal?: AbortSignal): Promise<AgentRecord[]> {
+  return fetchJson<AgentRecord[]>('/api/pending-enrollments', false, signal);
 }
 
-export async function fetchLatestMetrics(): Promise<MetricsSnapshot[]> {
-  return fetchJson<MetricsSnapshot[]>('/api/metrics');
+export async function fetchLatestMetrics(signal?: AbortSignal): Promise<MetricsSnapshot[]> {
+  return fetchJson<MetricsSnapshot[]>('/api/metrics', false, signal);
 }
 
-export async function fetchGroups(): Promise<GroupRecord[]> {
-  return fetchJson<GroupRecord[]>('/api/groups');
+export async function fetchGroups(signal?: AbortSignal): Promise<GroupRecord[]> {
+  return fetchJson<GroupRecord[]>('/api/groups', false, signal);
 }
 
-export async function fetchUsers(): Promise<UserRecord[]> {
-  return fetchJson<UserRecord[]>('/api/users');
+export async function fetchUsers(signal?: AbortSignal): Promise<UserRecord[]> {
+  return fetchJson<UserRecord[]>('/api/users', false, signal);
 }
 
 export async function createGroup(name: string): Promise<void> {
@@ -127,12 +138,12 @@ export async function createUser(username: string, password: string, role: UserR
   await jsonPost<{ user_id: number }>('/api/users', { username, password, role, group_ids: groupIds });
 }
 
-export async function fetchAlerts(includeArchived = false): Promise<AlertRecord[]> {
-  return fetchJson<AlertRecord[]>(includeArchived ? '/api/alerts?include_archived=1' : '/api/alerts');
+export async function fetchAlerts(includeArchived = false, signal?: AbortSignal): Promise<AlertRecord[]> {
+  return fetchJson<AlertRecord[]>(includeArchived ? '/api/alerts?include_archived=1' : '/api/alerts', false, signal);
 }
 
-export async function fetchUnacknowledgedAlerts(): Promise<AlertRecord[]> {
-  return fetchJson<AlertRecord[]>('/api/alerts/unacknowledged');
+export async function fetchUnacknowledgedAlerts(signal?: AbortSignal): Promise<AlertRecord[]> {
+  return fetchJson<AlertRecord[]>('/api/alerts/unacknowledged', false, signal);
 }
 
 /** Sections of the dashboard that load independently of the core agent/metrics data. */
@@ -167,25 +178,26 @@ export interface DashboardData {
  * role may not see that section (shown as empty), any other failure is recorded
  * in `errors` so the UI can say the section could not be loaded.
  */
-export async function loadDashboardData(): Promise<DashboardData> {
+export async function loadDashboardData(signal?: AbortSignal): Promise<DashboardData> {
   const errors: DashboardData['errors'] = {};
   const section = <T>(name: DashboardSection, load: Promise<T[]>): Promise<T[]> =>
     load.catch((err: unknown) => {
+      if (signal?.aborted) throw err; // an abort cancels the whole load; it is not a failed section
       if (!(err instanceof ApiError && err.status === 403)) errors[name] = errorMessage(err, 'Failed to load');
       return [];
     });
   const [agents, metrics, pending, groups, alerts, allAlerts, users, maintenanceWindows, silences, views] =
     await Promise.all([
-      fetchAgents(),
-      fetchLatestMetrics(),
-      section('pending', fetchPendingEnrollments()),
-      section('groups', fetchGroups()),
-      section('alerts', fetchUnacknowledgedAlerts()),
-      section('allAlerts', fetchAlerts()),
-      section('users', fetchUsers()),
-      section('maintenanceWindows', fetchMaintenanceWindows()),
-      section('silences', fetchSilences()),
-      section('views', fetchViews()),
+      fetchAgents(signal),
+      fetchLatestMetrics(signal),
+      section('pending', fetchPendingEnrollments(signal)),
+      section('groups', fetchGroups(signal)),
+      section('alerts', fetchUnacknowledgedAlerts(signal)),
+      section('allAlerts', fetchAlerts(false, signal)),
+      section('users', fetchUsers(signal)),
+      section('maintenanceWindows', fetchMaintenanceWindows(signal)),
+      section('silences', fetchSilences(signal)),
+      section('views', fetchViews(signal)),
     ]);
   return { agents, pending, metrics, groups, alerts, allAlerts, users, maintenanceWindows, silences, views, errors };
 }
@@ -249,8 +261,8 @@ export async function fetchMetricHistory(agentId: string, limit = 20): Promise<M
   return fetchJson<MetricsSnapshot[]>(`/api/metrics/${encodeURIComponent(agentId)}?limit=${limit}`);
 }
 
-export async function fetchMaintenanceWindows(): Promise<MaintenanceWindowRecord[]> {
-  return fetchJson<MaintenanceWindowRecord[]>('/api/maintenance-windows');
+export async function fetchMaintenanceWindows(signal?: AbortSignal): Promise<MaintenanceWindowRecord[]> {
+  return fetchJson<MaintenanceWindowRecord[]>('/api/maintenance-windows', false, signal);
 }
 
 export async function createMaintenanceWindow(
@@ -275,8 +287,8 @@ export async function setAgentDescription(agentId: string, description: string):
   await jsonPost<{ ok: boolean }>(`/api/agents/${encodeURIComponent(agentId)}/description`, { description });
 }
 
-export async function fetchSettings(): Promise<ServerSettings> {
-  return fetchJson<ServerSettings>('/api/settings');
+export async function fetchSettings(signal?: AbortSignal): Promise<ServerSettings> {
+  return fetchJson<ServerSettings>('/api/settings', false, signal);
 }
 
 export async function updateSettings(settings: Partial<ServerSettings>): Promise<void> {
@@ -311,8 +323,8 @@ export async function changeUserPassword(userId: number, password: string): Prom
   });
 }
 
-export async function fetchSilences(): Promise<SilenceRecord[]> {
-  return fetchJson<SilenceRecord[]>('/api/silences');
+export async function fetchSilences(signal?: AbortSignal): Promise<SilenceRecord[]> {
+  return fetchJson<SilenceRecord[]>('/api/silences', false, signal);
 }
 
 export async function createSilence(
@@ -345,8 +357,8 @@ export async function fetchLogMatches(agentId: string, limit = 200): Promise<Log
   );
 }
 
-export async function fetchViews(): Promise<ViewRecord[]> {
-  return fetchJson<ViewRecord[]>('/api/views');
+export async function fetchViews(signal?: AbortSignal): Promise<ViewRecord[]> {
+  return fetchJson<ViewRecord[]>('/api/views', false, signal);
 }
 
 export async function createView(name: string, agentIds: string[], isPublic: boolean, groupId: number): Promise<ViewRecord> {
@@ -365,8 +377,8 @@ export async function deleteView(viewId: number): Promise<void> {
   await mutateJson<{ ok: boolean }>(`/api/views/${viewId}`, { method: 'DELETE' });
 }
 
-export async function fetchRunbooks(): Promise<RunbookRecord[]> {
-  return fetchJson<RunbookRecord[]>('/api/runbooks');
+export async function fetchRunbooks(signal?: AbortSignal): Promise<RunbookRecord[]> {
+  return fetchJson<RunbookRecord[]>('/api/runbooks', false, signal);
 }
 
 export async function fetchIndicatorKinds(): Promise<IndicatorKind[]> {

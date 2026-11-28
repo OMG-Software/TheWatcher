@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { ApiError, deleteAgent, fetchAgents, fetchSession, loadDashboardData, login, onUnauthorized, updateSettings } from './api';
+import { ApiError, deleteAgent, fetchAgents, fetchAlerts, fetchRunbooks, fetchSession, fetchSettings, loadDashboardData, login, markSessionChanged, onUnauthorized, updateSettings } from './api';
 
 function failure(status: number, statusText: string, body?: unknown) {
   return {
@@ -106,5 +106,84 @@ describe('GIVEN loadDashboardData with failing sections', () => {
     vi.stubGlobal('fetch', respond({ '/api/agents': failure(500, 'Internal Server Error', { error: 'store unavailable' }) }));
 
     await expect(loadDashboardData()).rejects.toMatchObject({ status: 500, message: 'store unavailable' });
+  });
+});
+
+describe('GIVEN a request started under an earlier session', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it('WHEN a 401 arrives after the session changed THEN the listeners are not told, so the newer session survives', async () => {
+    let answer!: (reply: unknown) => void;
+    vi.stubGlobal('fetch', vi.fn(() => new Promise((resolve) => { answer = resolve; })));
+    const listener = vi.fn();
+    const stop = onUnauthorized(listener);
+
+    const pending = fetchAgents().catch((err: unknown) => err);
+    markSessionChanged(); // the user signed in again while the request was out
+    answer(failure(401, 'Unauthorized', { error: 'authentication required' }));
+    const error = await pending;
+    stop();
+
+    expect(error).toBeInstanceOf(ApiError); // the caller still sees the failure
+    expect(listener).not.toHaveBeenCalled();
+  });
+
+  it('WHEN a request starts after the session changed and returns 401 THEN the listeners are told', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(failure(401, 'Unauthorized', { error: 'authentication required' })));
+    const listener = vi.fn();
+    const stop = onUnauthorized(listener);
+
+    markSessionChanged();
+    await expect(fetchAgents()).rejects.toBeInstanceOf(ApiError);
+    stop();
+
+    expect(listener).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('GIVEN an abort signal passed to a polled API function', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  const okReply = { ok: true, status: 200, json: async () => [] };
+
+  it.each([
+    ['fetchAlerts', (signal: AbortSignal) => fetchAlerts(true, signal)],
+    ['fetchSettings', (signal: AbortSignal) => fetchSettings(signal)],
+    ['fetchRunbooks', (signal: AbortSignal) => fetchRunbooks(signal)],
+    ['loadDashboardData', (signal: AbortSignal) => loadDashboardData(signal)],
+  ])('WHEN %s runs THEN every request it makes carries the signal', async (_name, call) => {
+    const fetchMock = vi.fn().mockResolvedValue(okReply);
+    vi.stubGlobal('fetch', fetchMock);
+    const controller = new AbortController();
+
+    await call(controller.signal);
+
+    expect(fetchMock).toHaveBeenCalled();
+    for (const [, init] of fetchMock.mock.calls) expect((init as RequestInit).signal).toBe(controller.signal);
+  });
+
+  it('WHEN the dashboard load is aborted THEN the abort rejects the load instead of being recorded as a section error', async () => {
+    const controller = new AbortController();
+    vi.stubGlobal('fetch', vi.fn((_url: string, init: RequestInit) => new Promise((_resolve, reject) => {
+      init.signal?.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')));
+    })));
+
+    const loading = loadDashboardData(controller.signal).catch((err: unknown) => err);
+    controller.abort();
+
+    expect(await loading).toMatchObject({ name: 'AbortError' });
+  });
+
+  it('WHEN no signal is given THEN the request has none, as before', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(okReply);
+    vi.stubGlobal('fetch', fetchMock);
+
+    await fetchAgents();
+
+    expect((fetchMock.mock.calls[0][1] as RequestInit).signal).toBeUndefined();
   });
 });

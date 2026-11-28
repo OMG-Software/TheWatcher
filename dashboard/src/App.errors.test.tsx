@@ -213,3 +213,154 @@ describe('GIVEN a successful settings save', () => {
     expect(screen.getByLabelText('Offline after (seconds)')).toHaveValue(90);
   });
 });
+
+describe('GIVEN the archived alerts list', () => {
+  const ARCHIVED = 'GET /api/alerts?include_archived=1';
+  const showArchived = () => fireEvent.click(screen.getByLabelText('Show archived'));
+  const openAlerts = async (api: FakeApi) => {
+    await openDashboard(api);
+    goTo('Alerts');
+    await screen.findByRole('heading', { name: 'Alerts' });
+  };
+
+  it('WHEN the request is still pending THEN it shows loading and no empty-list text', async () => {
+    const reply = deferred<FakeReply>();
+    await openAlerts(alertsApi().on(ARCHIVED, () => reply.promise));
+
+    showArchived();
+
+    expect(await screen.findByText(/Loading archived alerts/)).toBeInTheDocument();
+    expect(screen.queryByText('No alerts.')).toBeNull();
+    reply.resolve(ok([]));
+    expect(await screen.findByText('No alerts.')).toBeInTheDocument();
+  });
+
+  it('WHEN the request fails THEN the table says the list is unavailable instead of empty', async () => {
+    await openAlerts(alertsApi().on(ARCHIVED, fail(500, 'archive db locked')));
+
+    showArchived();
+
+    expect(await screen.findByText(/Could not load archived alerts: archive db locked/)).toBeInTheDocument();
+    expect(within(screen.getByRole('table')).getByText('Archived alerts are unavailable.')).toBeInTheDocument();
+    expect(screen.queryByText('No alerts.')).toBeNull();
+  });
+
+  it('WHEN it loads and has no alerts THEN the empty-list text shows', async () => {
+    await openAlerts(alertsApi().on(ARCHIVED, ok([])));
+
+    showArchived();
+
+    expect(await screen.findByText('No alerts.')).toBeInTheDocument();
+    expect(screen.queryByText('Archived alerts are unavailable.')).toBeNull();
+  });
+
+  it('WHEN an alert is acknowledged while the list is shown THEN the list is reloaded and shows the new state', async () => {
+    let acknowledged = false;
+    const api = alertsApi()
+      .on(ARCHIVED, () => ok([{ ...alertRecord, acknowledged_by: acknowledged ? 'tester' : '', acknowledged_at: acknowledged ? 2000 : 0 }]))
+      .on('POST /api/alerts/9/ack', () => {
+        acknowledged = true;
+        return ok();
+      });
+    await openAlerts(api);
+    showArchived();
+    fireEvent.click(await screen.findByRole('button', { name: 'Acknowledge' }));
+
+    fireEvent.click(within(ackModal()).getByRole('button', { name: 'Acknowledge' }));
+
+    // The list polls only every 5 s, so seeing the change now means the action reloaded it.
+    expect(await screen.findByRole('button', { name: 'Archive' })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Acknowledge' })).toBeNull();
+  });
+});
+
+describe('GIVEN a view whose save is still running', () => {
+  const view = (id: number, name: string) => ({ view_id: id, name, owner_user_id: 1, owner_username: 'tester', is_public: false, group_id: 0, agent_ids: [], created_at: 1000 });
+
+  it('WHEN another action starts meanwhile THEN Cancel stays disabled until the save settles', async () => {
+    const save = deferred<FakeReply>();
+    const removal = deferred<FakeReply>();
+    const api = new FakeApi('global_admin')
+      .on('GET /api/views', ok([view(1, 'first'), view(2, 'second')]))
+      .on('PUT /api/views/1', () => save.promise)
+      .on('DELETE /api/views/2', () => removal.promise);
+    await openDashboard(api);
+    fireEvent.click(await within(screen.getByRole('navigation')).findByRole('button', { name: /^Views/ }));
+    fireEvent.click((await screen.findAllByRole('button', { name: 'Edit' }))[0]);
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Delete' })); // starts a newer action
+
+    await waitFor(() => expect(api.count('DELETE /api/views/2')).toBe(1));
+    expect(screen.getByRole('button', { name: 'Cancel' })).toBeDisabled();
+    save.resolve(ok());
+    removal.resolve(ok());
+    await waitFor(() => expect(screen.queryByRole('button', { name: 'Cancel' })).toBeNull());
+  });
+});
+
+describe('GIVEN settings where only one field was edited', () => {
+  it('WHEN the save succeeds, the reload fails and another admin changes a different field THEN Retry shows the new server value and keeps the edit', async () => {
+    let gets = 0;
+    const api = new FakeApi('global_admin')
+      .on('GET /api/settings', () => {
+        gets += 1;
+        if (gets === 1) return ok(settings);
+        if (gets === 2) return fail(500, 'config unreadable');
+        return ok({ ...settings, webhook_url: 'https://hooks.example.com/a', metrics_retention_days: 90 });
+      })
+      .on('PUT /api/settings', ok());
+    await openDashboard(api);
+    goTo('Settings');
+    fireEvent.change(await screen.findByLabelText('Webhook URL'), { target: { value: 'https://hooks.example.com/a' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Save Settings' }));
+    await screen.findByText(/Could not refresh settings: config unreadable/);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Retry' }));
+
+    await waitFor(() => expect(screen.getByLabelText('Metrics retention (days)')).toHaveValue(90));
+    expect(screen.getByLabelText('Webhook URL')).toHaveValue('https://hooks.example.com/a');
+  });
+
+  it('WHEN a field is edited and saved THEN the unedited fields are sent with their server values', async () => {
+    const api = new FakeApi('global_admin').on('GET /api/settings', ok(settings)).on('PUT /api/settings', ok());
+    await openDashboard(api);
+    goTo('Settings');
+    fireEvent.change(await screen.findByLabelText('Offline after (seconds)'), { target: { value: '90' } });
+
+    fireEvent.click(screen.getByRole('button', { name: 'Save Settings' }));
+
+    await waitFor(() => expect(api.count('PUT /api/settings')).toBe(1));
+    expect(api.calls.find((call) => call.method === 'PUT')?.body).toEqual({ ...settings, offline_after_seconds: 90 });
+  });
+});
+
+describe('GIVEN a sign-out the server does not confirm', () => {
+  it('WHEN the request fails THEN the dashboard stays, says the session is still active, and a retry signs out', async () => {
+    const api = new FakeApi('global_admin').on('POST /api/logout', fail(500, 'session store down'));
+    await openDashboard(api);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Log out' }));
+
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent(/Sign.?out failed/i);
+    expect(alert).toHaveTextContent('session store down');
+    expect(alert).toHaveTextContent(/still active/i);
+    expect(screen.getByRole('navigation', { name: 'Dashboard views' })).toBeInTheDocument();
+
+    api.on('POST /api/logout', ok());
+    fireEvent.click(within(alert).getByRole('button', { name: 'Try again' }));
+
+    expect(await screen.findByRole('button', { name: 'Sign in' })).toBeInTheDocument();
+  });
+
+  it('WHEN the server answers 401 THEN the session was already over and the login screen shows without an error', async () => {
+    const api = new FakeApi('global_admin').on('POST /api/logout', fail(401, 'authentication required'));
+    await openDashboard(api);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Log out' }));
+
+    expect(await screen.findByRole('button', { name: 'Sign in' })).toBeInTheDocument();
+    expect(screen.queryByText(/still active/i)).toBeNull();
+  });
+});
