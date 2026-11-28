@@ -1052,15 +1052,21 @@ bool SqliteStore::create_session_if_credentials_current(const SessionRecord& ses
     return sqlite3_changes(db_) > 0;
 }
 
-int SqliteStore::update_user_password_and_revoke_sessions(int64_t user_id, const std::string& password_hash,
-                                                          const std::string& keep_token)
+std::optional<int> SqliteStore::update_user_password_and_revoke_sessions(int64_t user_id,
+                                                                         const std::string& password_hash,
+                                                                         const std::string& keep_token)
 {
     exec("BEGIN IMMEDIATE;");
     try
     {
         update_user_password(user_id, password_hash);
-        const auto revoked = delete_sessions_for_user(user_id, keep_token);
+        // Zero rows changed means the user does not exist (or was deleted a
+        // moment ago): nothing to revoke and nothing to report as changed.
+        const bool found = sqlite3_changes(db_) > 0;
+        const auto revoked = found ? delete_sessions_for_user(user_id, keep_token) : 0;
         exec("COMMIT;");
+        if (!found)
+            return std::nullopt;
         return revoked;
     }
     catch (...)

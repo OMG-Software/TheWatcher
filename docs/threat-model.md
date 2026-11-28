@@ -153,7 +153,9 @@ working document for audit, design review, and regression testing.
 - Sessions are revoked when a user's password changes (all of the user's
   sessions, except the caller's own on a self-service change), when a user is
   disabled (one atomic store operation, so re-enabling cannot restore old
-  sessions; enabling also drops any leftover sessions) or deleted (the sessions
+  sessions; enabling also drops any leftover sessions; on PostgreSQL the login
+  locks the user row with FOR SHARE and the change runs UPDATE then DELETE as
+  two statements in one transaction) or deleted (the sessions
   table cascades). Expired
   sessions are purged at most every five minutes (a failed purge is retried) from login and session
   validation.

@@ -51,6 +51,29 @@ std::string db_file(thewatcher::test::ScopedTempDir& dir)
     return (dir.path() / "store.db").string();
 }
 
+// Joins a worker thread when the scope ends, including when a failed REQUIRE
+// unwinds it; destroying a joinable std::thread would call std::terminate.
+// `stop`, when given, is set first so a looping worker can exit.
+struct JoinOnExit
+{
+    std::thread& worker;
+    std::atomic<bool>* stop;
+
+    explicit JoinOnExit(std::thread& w, std::atomic<bool>* stop_flag = nullptr)
+        : worker(w)
+        , stop(stop_flag)
+    {
+    }
+    JoinOnExit(const JoinOnExit&) = delete;
+    JoinOnExit& operator=(const JoinOnExit&) = delete;
+    ~JoinOnExit()
+    {
+        if (stop != nullptr)
+            *stop = true;
+        if (worker.joinable())
+            worker.join();
+    }
+};
 } // namespace
 
 // ── #100: RAII helpers ───────────────────────────────────────────────────────
@@ -241,6 +264,8 @@ SCENARIO("A saved heartbeat interval survives concurrent heartbeats")
             }
         });
 
+        JoinOnExit heartbeats_guard(heartbeats, &stop);
+
         WHEN("an operator saves a new heartbeat interval meanwhile")
         {
             for (int i = 0; i < 50; ++i)
@@ -254,11 +279,6 @@ SCENARIO("A saved heartbeat interval survives concurrent heartbeats")
                 REQUIRE(errors == 0);
                 REQUIRE(store->get_agent("a1")->heartbeat_interval == 33);
             }
-        }
-        if (heartbeats.joinable())
-        {
-            stop = true;
-            heartbeats.join();
         }
     }
 }
@@ -489,6 +509,7 @@ SCENARIO("A write waits for a briefly held lock instead of failing")
                 std::this_thread::sleep_for(std::chrono::milliseconds(300));
                 side.run("COMMIT;");
             });
+            JoinOnExit releaser_guard(releaser);
 
             THEN("the write succeeds")
             {
@@ -496,8 +517,6 @@ SCENARIO("A write waits for a briefly held lock instead of failing")
                 releaser.join();
                 REQUIRE(store.get_setting("k", "") == "v");
             }
-            if (releaser.joinable())
-                releaser.join();
         }
     }
 }

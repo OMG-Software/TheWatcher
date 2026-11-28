@@ -740,11 +740,41 @@ SCENARIO("A rolled-back password reset never takes other threads' sessions with 
         std::atomic<int> reset_throws{0};
         std::atomic<int> create_errors{0};
         std::atomic<int> resets_done{0};
+        std::atomic<int> acknowledged{0};
         std::vector<std::vector<std::string>> created(creators);
 
         WHEN("failing resets run while other users keep logging in")
         {
             std::vector<std::thread> threads;
+            // Creators start first, and the resets are only released once a
+            // login was acknowledged, so the creators cannot be starved.
+            for (int c = 0; c < creators; ++c)
+            {
+                threads.emplace_back([&, c] {
+                    for (int i = 0; resets_done.load() < resetters; ++i)
+                    {
+                        const auto token = "other-" + std::to_string(c) + "-" + std::to_string(i);
+                        try
+                        {
+                            if (store->create_session_if_credentials_current(make_session(token, other, expires),
+                                                                             other_hash))
+                            {
+                                created[c].push_back(token);
+                                ++acknowledged;
+                            }
+                        }
+                        catch (const std::exception&)
+                        {
+                            ++create_errors;
+                        }
+                    }
+                });
+            }
+            const bool logins_running = thewatcher::test::eventually(
+                [&] {
+                    return acknowledged.load() >= 1;
+                },
+                10s, 5ms);
             for (int r = 0; r < resetters; ++r)
             {
                 threads.emplace_back([&] {
@@ -763,30 +793,12 @@ SCENARIO("A rolled-back password reset never takes other threads' sessions with 
                     ++resets_done;
                 });
             }
-            for (int c = 0; c < creators; ++c)
-            {
-                threads.emplace_back([&, c] {
-                    for (int i = 0; resets_done.load() < resetters; ++i)
-                    {
-                        const auto token = "other-" + std::to_string(c) + "-" + std::to_string(i);
-                        try
-                        {
-                            if (store->create_session_if_credentials_current(make_session(token, other, expires),
-                                                                             other_hash))
-                                created[c].push_back(token);
-                        }
-                        catch (const std::exception&)
-                        {
-                            ++create_errors;
-                        }
-                    }
-                });
-            }
             for (auto& t : threads)
                 t.join();
 
             THEN("every reset failed, every acknowledged login survives and the password is unchanged")
             {
+                REQUIRE(logins_running);
                 REQUIRE(reset_throws.load() == resetters * resets_each);
                 REQUIRE(create_errors.load() == 0);
                 const auto now = now_ms();
@@ -800,6 +812,36 @@ SCENARIO("A rolled-back password reset never takes other threads' sessions with 
                 REQUIRE(total > 0);
                 REQUIRE(store->get_user_by_username("victim")->password_hash == victim_hash);
                 REQUIRE(store->get_session("victim-session", now));
+            }
+        }
+    }
+}
+
+SCENARIO("A password change tells a missing user apart from a user with no sessions")
+{
+    GIVEN("a store with a user who has no sessions")
+    {
+        auto store = thewatcher::server::make_store("sqlite", ":memory:");
+        const auto user_id = store->create_user("kate", hash_for("pw"), "global_viewer");
+
+        WHEN("the password of an existing user is replaced")
+        {
+            const auto result = store->update_user_password_and_revoke_sessions(user_id, hash_for("new-pw"));
+
+            THEN("the change is reported with zero sessions revoked")
+            {
+                REQUIRE(result.has_value());
+                REQUIRE(*result == 0);
+            }
+        }
+
+        WHEN("the password of a user that does not exist is replaced")
+        {
+            const auto result = store->update_user_password_and_revoke_sessions(987654, hash_for("new-pw"));
+
+            THEN("the store reports that no user was updated")
+            {
+                REQUIRE_FALSE(result.has_value());
             }
         }
     }

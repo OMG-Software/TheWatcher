@@ -3020,10 +3020,20 @@ void ApiServer::setup_routes()
             const auto kept_token = user_id == session->user_id ? cookie_value(req, "tw_session") : std::string{};
             const auto revoked =
                 store_.update_user_password_and_revoke_sessions(user_id, hash_password(password), kept_token);
+            // No value: the user was deleted after the lookup above, so
+            // nothing changed and nothing is audited as a success.
+            if (!revoked)
+            {
+                res.status = 404;
+                set_json(res, json{
+                                  {"error", "user not found"}
+                });
+                return;
+            }
             LOGF_INFO("Changed password for user_id=%lld by=%s", static_cast<long long>(user_id),
                       session->username.c_str());
             audit("password_change", "success", session->username, client_ip(req), target_user->username);
-            if (revoked > 0)
+            if (*revoked > 0)
                 audit("session_revoke", "success", session->username, client_ip(req), target_user->username);
             set_json(res, json{
                               {"ok", true}

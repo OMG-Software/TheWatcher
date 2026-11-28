@@ -51,6 +51,13 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Enabling a user now relies on a single UPDATE that reports the rows it
   changed (`enable_user` returns a count), so enabling an id deleted a moment
   earlier returns 404 instead of success (#145).
+- On PostgreSQL a login now locks the user row (`FOR SHARE`) before inserting
+  its session, and the password reset and disable run UPDATE then DELETE as
+  two statements in one transaction, so a login racing a reset or disable
+  can no longer leave a session behind. A password change for a user deleted
+  mid-request now returns 404 instead of being audited as a success
+  (`update_user_password_and_revoke_sessions` returns no value for an unknown
+  user) (#145).
 - The agent no longer trusts the server key in an enrollment reply: it must
   be 40 Z85 characters decoding to a 32-byte key, and the config writer
   refuses any value containing CR or LF. Before, a crafted key could inject

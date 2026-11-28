@@ -241,8 +241,8 @@ public:
         return inner_->create_session_if_credentials_current(session, password_hash);
     }
 
-    int update_user_password_and_revoke_sessions(int64_t user_id, const std::string& password_hash,
-                                                 const std::string& keep_token = "") override
+    std::optional<int> update_user_password_and_revoke_sessions(int64_t user_id, const std::string& password_hash,
+                                                                const std::string& keep_token = "") override
     {
         const std::lock_guard<std::mutex> lock(mutex_);
         return inner_->update_user_password_and_revoke_sessions(user_id, password_hash, keep_token);

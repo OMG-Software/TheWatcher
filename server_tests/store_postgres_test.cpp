@@ -7,10 +7,14 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdlib>
+#include <future>
 #include <memory>
 #include <thread>
 #include <vector>
+
+#include <libpq-fe.h>
 
 using namespace thewatcher;
 using namespace thewatcher::server;
@@ -911,4 +915,151 @@ SCENARIO("[postgres] Two server nodes racing to raise a dead-agent alert create 
     }
 }
 
+// ── #145: sessions and credentials ───────────────────────────────────────────
+
+namespace
+{
+
+// Closing the connection rolls back anything still open, so a failed
+// assertion cannot leave a row lock behind that blocks the worker thread.
+struct PgSideConnection
+{
+    PgSideConnection()
+        : conn(PQconnectdb(test_dsn()))
+    {
+    }
+    PgSideConnection(const PgSideConnection&) = delete;
+    PgSideConnection& operator=(const PgSideConnection&) = delete;
+    ~PgSideConnection()
+    {
+        PQfinish(conn);
+    }
+    void run(const std::string& sql)
+    {
+        PGresult* res = PQexec(conn, sql.c_str());
+        const auto status = PQresultStatus(res);
+        PQclear(res);
+        REQUIRE((status == PGRES_COMMAND_OK || status == PGRES_TUPLES_OK));
+    }
+    PGconn* conn;
+};
+
+} // namespace
+
+SCENARIO("[postgres] A login waits for a concurrent credential change instead of creating a session")
+{
+    if (!postgres_is_available())
+        SKIP("PostgreSQL not available");
+    GIVEN("a user whose password or enabled flag is being changed in an open transaction")
+    {
+        PostgresStore store(test_dsn());
+        const auto suffix = std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
+        const auto old_hash = "old-hash-" + suffix;
+        const auto user_id = store.create_user("race-" + suffix, old_hash, "global_viewer");
+        SessionRecord session;
+        session.token = "race-token-" + suffix;
+        session.user_id = user_id;
+        session.created_at = 1;
+        session.expires_at = 4'000'000'000'000LL;
+
+        // Declared before the side connection so that connection closes (and
+        // releases its lock) first if an assertion fails.
+        std::future<bool> login;
+        PgSideConnection side;
+        REQUIRE(PQstatus(side.conn) == CONNECTION_OK);
+        side.run("BEGIN");
+
+        WHEN("the password is changed and not yet committed")
+        {
+            side.run("UPDATE users SET password_hash='new-hash-" + suffix +
+                     "' WHERE user_id=" + std::to_string(user_id));
+            login = std::async(std::launch::async, [&] {
+                return store.create_session_if_credentials_current(session, old_hash);
+            });
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            const bool blocked = login.wait_for(std::chrono::seconds(0)) == std::future_status::timeout;
+            side.run("COMMIT");
+            const bool created = login.get();
+
+            THEN("the login waited for the change and then created no session")
+            {
+                CHECK(blocked);
+                CHECK_FALSE(created);
+                CHECK(store.delete_sessions_for_user(user_id) == 0);
+            }
+        }
+
+        WHEN("the user is disabled and not yet committed")
+        {
+            side.run("UPDATE users SET disabled=TRUE WHERE user_id=" + std::to_string(user_id));
+            login = std::async(std::launch::async, [&] {
+                return store.create_session_if_credentials_current(session, old_hash);
+            });
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            const bool blocked = login.wait_for(std::chrono::seconds(0)) == std::future_status::timeout;
+            side.run("COMMIT");
+            const bool created = login.get();
+
+            THEN("the login waited for the change and then created no session")
+            {
+                CHECK(blocked);
+                CHECK_FALSE(created);
+                CHECK(store.delete_sessions_for_user(user_id) == 0);
+            }
+        }
+        side.run("ROLLBACK");
+        store.delete_user(user_id);
+    }
+}
+
+SCENARIO("[postgres] Password change and disable report a missing user and revoke sessions")
+{
+    if (!postgres_is_available())
+        SKIP("PostgreSQL not available");
+    GIVEN("a user with a session")
+    {
+        PostgresStore store(test_dsn());
+        const auto suffix = std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
+        const auto user_id = store.create_user("rev-" + suffix, "hash-" + suffix, "global_viewer");
+        SessionRecord session;
+        session.token = "rev-token-" + suffix;
+        session.user_id = user_id;
+        session.created_at = 1;
+        session.expires_at = 4'000'000'000'000LL;
+        store.create_session(session);
+
+        WHEN("the password is replaced")
+        {
+            const auto revoked = store.update_user_password_and_revoke_sessions(user_id, "new-" + suffix);
+
+            THEN("the session is revoked and the hash changed")
+            {
+                REQUIRE(revoked.has_value());
+                CHECK(*revoked == 1);
+                CHECK_FALSE(store.get_session(session.token, 1));
+                CHECK(store.get_user_by_username("rev-" + suffix)->password_hash == "new-" + suffix);
+            }
+        }
+
+        WHEN("the password of an unknown user is replaced")
+        {
+            THEN("no user is reported as updated")
+            {
+                CHECK_FALSE(store.update_user_password_and_revoke_sessions(-1, "x").has_value());
+            }
+        }
+
+        WHEN("the user is disabled")
+        {
+            const auto affected = store.disable_user_and_revoke_sessions(user_id);
+
+            THEN("the user is disabled and the session is gone")
+            {
+                CHECK(affected == 1);
+                CHECK_FALSE(store.get_session(session.token, 1));
+            }
+        }
+        store.delete_user(user_id);
+    }
+}
 #endif // HAVE_LIBPQ

@@ -268,8 +268,9 @@ public:
     // Replaces the password hash and revokes the user's sessions except
     // keep_token (empty keeps none) as one atomic operation: either both
     // happen or neither does. Returns the number of sessions revoked.
-    virtual int update_user_password_and_revoke_sessions(int64_t user_id, const std::string& password_hash,
-                                                         const std::string& keep_token = "") = 0;
+    virtual std::optional<int> update_user_password_and_revoke_sessions(int64_t user_id,
+                                                                        const std::string& password_hash,
+                                                                        const std::string& keep_token = "") = 0;
     // Disables the user and revokes all of their sessions as one atomic
     // operation, so re-enabling cannot revive old sessions. Returns the number
     // of users affected (0: unknown id or built-in; nothing is revoked then).

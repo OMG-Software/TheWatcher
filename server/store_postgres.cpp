@@ -1087,11 +1087,20 @@ bool PostgresStore::create_session_if_credentials_current(const SessionRecord& s
     const auto p_cat = s(session.created_at);
     const auto p_eat = s(session.expires_at);
     const char* params[] = {session.token.c_str(), p_uid.c_str(), p_cat.c_str(), p_eat.c_str(), password_hash.c_str()};
-    // One statement, so the check and the insert are atomic.
+    // Under READ COMMITTED a plain INSERT ... SELECT reads users from the
+    // statement's snapshot without locking the row, so a reset or disable that
+    // commits (and deletes the user's sessions) in between would leave this
+    // new session behind. FOR SHARE locks the row first: it conflicts with the
+    // reset's UPDATE (FOR NO KEY UPDATE; FOR KEY SHARE would not), so a login
+    // that arrives during a change waits for it and then re-checks the updated
+    // row (and inserts nothing), while a login that wins commits before the
+    // change's UPDATE can proceed. The change then deletes the sessions in a
+    // later statement, with a fresh snapshot that sees this row.
     Res res(PQexecParams(conn_,
+                         "WITH u AS (SELECT user_id FROM users "
+                         "WHERE user_id=$2::bigint AND password_hash=$5 AND disabled=FALSE FOR SHARE) "
                          "INSERT INTO sessions(token,user_id,created_at,expires_at) "
-                         "SELECT $1::text,user_id,$3::bigint,$4::bigint FROM users "
-                         "WHERE user_id=$2::bigint AND password_hash=$5 AND disabled=FALSE "
+                         "SELECT $1::text,user_id,$3::bigint,$4::bigint FROM u "
                          "ON CONFLICT DO NOTHING;",
                          5, nullptr, params, nullptr, nullptr, 0));
     check_res(res.r, "create_session_if_credentials_current");
@@ -1099,37 +1108,55 @@ bool PostgresStore::create_session_if_credentials_current(const SessionRecord& s
     return affected != nullptr && std::atoi(affected) > 0;
 }
 
-int PostgresStore::update_user_password_and_revoke_sessions(int64_t user_id, const std::string& password_hash,
-                                                            const std::string& keep_token)
+std::optional<int> PostgresStore::update_user_password_and_revoke_sessions(int64_t user_id,
+                                                                           const std::string& password_hash,
+                                                                           const std::string& keep_token)
 {
     const auto p_uid = s(user_id);
-    const char* params[] = {password_hash.c_str(), p_uid.c_str(), keep_token.c_str()};
-    // A single statement is atomic: the sessions are deleted only for the
-    // user row that was just updated.
-    Res res(PQexecParams(conn_, R"(
-        WITH upd AS (UPDATE users SET password_hash=$1 WHERE user_id=$2::bigint RETURNING user_id)
-        DELETE FROM sessions WHERE user_id IN (SELECT user_id FROM upd) AND token<>$3;
-    )",
-                         3, nullptr, params, nullptr, nullptr, 0));
-    check_res(res.r, "update_user_password_and_revoke_sessions");
-    const char* affected = PQcmdTuples(res.r);
-    return affected != nullptr ? std::atoi(affected) : 0;
+    // UPDATE first, then DELETE as a separate statement in the same
+    // transaction: the DELETE gets a new snapshot after the UPDATE holds the
+    // row lock, so it sees every session a concurrent login committed first.
+    postgres::Transaction tx(conn_);
+    const char* upd_params[] = {password_hash.c_str(), p_uid.c_str()};
+    Res upd(PQexecParams(conn_, "UPDATE users SET password_hash=$1 WHERE user_id=$2::bigint;", 2, nullptr, upd_params,
+                         nullptr, nullptr, 0));
+    check_res(upd.r, "update_user_password_and_revoke_sessions update");
+    const char* changed = PQcmdTuples(upd.r);
+    if (changed == nullptr || std::atoi(changed) == 0)
+    {
+        tx.commit();
+        return std::nullopt; // no such user
+    }
+    const char* del_params[] = {p_uid.c_str(), keep_token.c_str()};
+    Res del(PQexecParams(conn_, "DELETE FROM sessions WHERE user_id=$1::bigint AND token<>$2;", 2, nullptr, del_params,
+                         nullptr, nullptr, 0));
+    check_res(del.r, "update_user_password_and_revoke_sessions delete");
+    const char* affected = PQcmdTuples(del.r);
+    const int revoked = affected != nullptr ? std::atoi(affected) : 0;
+    tx.commit();
+    return revoked;
 }
 
 int PostgresStore::disable_user_and_revoke_sessions(int64_t user_id)
 {
-    const auto p = s(user_id);
-    const char* params[] = {p.c_str()};
-    // One statement is atomic. The built-in admin is excluded exactly as in
-    // disable_user, and only the user row that was updated loses sessions.
-    Res res(PQexecParams(conn_, R"(
-        WITH upd AS (UPDATE users SET disabled=TRUE WHERE user_id=$1::bigint AND built_in=FALSE RETURNING user_id),
-             del AS (DELETE FROM sessions WHERE user_id IN (SELECT user_id FROM upd))
-        SELECT COUNT(*) FROM upd;
-    )",
-                         1, nullptr, params, nullptr, nullptr, 0));
-    check_res(res.r, "disable_user_and_revoke_sessions");
-    return PQntuples(res.r) > 0 ? std::atoi(PQgetvalue(res.r, 0, 0)) : 0;
+    const auto p_uid = s(user_id);
+    // Same two-statement order as the password reset, for the same reason.
+    // The built-in admin is excluded exactly as in disable_user.
+    postgres::Transaction tx(conn_);
+    const char* params[] = {p_uid.c_str()};
+    Res upd(PQexecParams(conn_, "UPDATE users SET disabled=TRUE WHERE user_id=$1::bigint AND built_in=FALSE;", 1,
+                         nullptr, params, nullptr, nullptr, 0));
+    check_res(upd.r, "disable_user_and_revoke_sessions update");
+    const char* changed = PQcmdTuples(upd.r);
+    const int affected = changed != nullptr ? std::atoi(changed) : 0;
+    if (affected > 0)
+    {
+        Res del(PQexecParams(conn_, "DELETE FROM sessions WHERE user_id=$1::bigint;", 1, nullptr, params, nullptr,
+                             nullptr, 0));
+        check_res(del.r, "disable_user_and_revoke_sessions delete");
+    }
+    tx.commit();
+    return affected;
 }
 
 // ── Metrics ───────────────────────────────────────────────────────────────────
