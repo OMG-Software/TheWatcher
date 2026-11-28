@@ -3,6 +3,8 @@
 #include "../server/api.hpp"
 #include "../server/sqlite_raii.hpp"
 #include "../server/store.hpp"
+#include "../server/store_sqlite.hpp"
+#include "../server/store_synchronized.hpp"
 #include "../server/zap_handler.hpp"
 #include "common/SingleLog.hpp"
 #include "test_support/net_helpers.hpp"
@@ -20,6 +22,7 @@
 #include <memory>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -69,7 +72,14 @@ struct ApiFixture
     // `configure` runs before the listener starts (for test hooks); anything its
     // callbacks capture must outlive the fixture.
     explicit ApiFixture(const std::function<void(ApiFixture&)>& configure = {})
-        : store(thewatcher::server::make_store("sqlite", ":memory:"))
+        : ApiFixture(thewatcher::server::make_store("sqlite", ":memory:"), configure)
+    {
+    }
+
+    // The same, over a store the test built (for example a file-backed one).
+    explicit ApiFixture(std::unique_ptr<thewatcher::server::Store> backing,
+                        const std::function<void(ApiFixture&)>& configure = {})
+        : store(std::move(backing))
         , api(*store, zap, "127.0.0.1", port)
         , client("http://127.0.0.1:" + std::to_string(port))
     {
@@ -973,27 +983,66 @@ private:
 
 } // namespace
 
-// The invariant here is serialisation. make_store wraps the store in
-// SynchronizedStore, which runs one call at a time on the one connection, so a
-// login attempted during a reset cannot run inside the reset's transaction: it
-// waits until the reset has rolled back and returned. Without that wrapper the
-// login's insert lands inside the reset's open transaction and the rollback
-// discards it (this test fails against a bare SqliteStore). Rollback while
-// other store work is in flight on the same connection cannot happen, so it is
-// not what this test exercises.
-SCENARIO("A login attempted during a failing password reset waits for it and keeps its session")
+SCENARIO("make_store wraps every backend in SynchronizedStore")
 {
-    GIVEN("a file-backed store where revoking one user's sessions is forced to fail")
+    GIVEN("a store opened through make_store")
     {
+        auto store = thewatcher::server::make_store("sqlite", ":memory:");
+
+        THEN("it is a SynchronizedStore, so its calls run one at a time")
+        {
+            REQUIRE(dynamic_cast<thewatcher::server::SynchronizedStore*>(store.get()) != nullptr);
+        }
+    }
+}
+
+// The invariant here is serialisation. make_store wraps every backend in
+// SynchronizedStore (checked above), which runs one call at a time on the one
+// connection, so a login that arrives during a reset cannot run inside the
+// reset's transaction: it waits until the reset has rolled back and returned.
+// Without the wrapper the login's insert would land inside the reset's open
+// transaction and the rollback would discard it. The store's lock observer
+// makes both halves of the overlap facts the test waits for, rather than
+// inferring them from timing: the reset holds the lock (and is stuck behind a
+// SQLite writer), and then the login, sent over HTTP, waits for that lock.
+SCENARIO("A login during a failing password reset waits for it and keeps its session")
+{
+    GIVEN("an API server over a synchronized file-backed store where revoking one user's sessions is forced to fail")
+    {
+        using thewatcher::server::SynchronizedStore;
+        using LockEvent = SynchronizedStore::LockEvent;
+        constexpr std::string_view reset_method = "update_user_password_and_revoke_sessions";
+
         thewatcher::test::ScopedTempDir dir{"auth-rollback"};
         const auto path = (dir / "rollback.db").string();
-        auto store = thewatcher::server::make_store("sqlite", path);
+        // Read by the lock observer, so declared before the store that owns it.
+        std::atomic<bool> observing{false}; // setup calls before the barrier do not count
+        std::atomic<bool> reset_returned{false};
+        std::atomic<bool> reset_holds_lock{false};
+        std::atomic<bool> reset_waited{false};
+        std::atomic<bool> login_waited_for_reset{false};
+        auto synchronized =
+            std::make_unique<SynchronizedStore>(std::make_unique<thewatcher::server::SqliteStore>(path));
+        synchronized->set_lock_observer([&](const char* method, LockEvent event) {
+            if (!observing.load())
+                return;
+            const bool is_reset = method == reset_method;
+            if (is_reset && event == LockEvent::Acquired)
+                reset_holds_lock = true;
+            else if (is_reset && event == LockEvent::Waiting)
+                reset_waited = true; // something else held the lock first
+            else if (!is_reset && event == LockEvent::Waiting && reset_holds_lock.load() && !reset_returned.load())
+                // The reset and the HTTP login are the only callers while the
+                // test observes, so this is the login waiting for the reset.
+                login_waited_for_reset = true;
+        });
+        ApiFixture fx(std::move(synchronized));
+        auto& store = *fx.store;
+
         const auto victim_hash = hash_for("victim-password");
-        const auto other_hash = hash_for("other-password");
-        const auto victim = store->create_user("victim", victim_hash, "global_viewer");
-        const auto other = store->create_user("other", other_hash, "global_viewer");
-        const int64_t expires = now_ms() + hour_ms;
-        store->create_session(make_session("victim-session", victim, expires));
+        const auto victim = store.create_user("victim", victim_hash, "global_viewer");
+        store.create_user("other", hash_for("other-password"), "global_viewer");
+        store.create_session(make_session("victim-session", victim, now_ms() + hour_ms));
         {
             // The reset updates the password first, then fails on the revoke
             // and must roll the whole transaction back.
@@ -1003,17 +1052,14 @@ SCENARIO("A login attempted during a failing password reset waits for it and kee
         }
         const auto new_hash = hash_for("new-victim-password");
 
-        WHEN("another user's login is attempted while the failing reset is still inside its store call")
+        WHEN("another user signs in while the failing reset holds the store")
         {
-            std::atomic<bool> reset_entered{false};
-            std::atomic<bool> reset_returned{false};
             std::atomic<bool> reset_threw{false};
-            std::atomic<bool> login_attempting{false};
             std::atomic<bool> login_returned{false};
-            std::atomic<bool> login_created{false};
-            std::atomic<bool> login_threw{false};
-            // Written by the reset thread before it returns; read only after join().
+            std::atomic<int> login_status{0};
+            // Written by the threads before they return; read only after join().
             std::string reset_error;
+            std::string login_cookie;
 
             // Declared before the writer, so on an early failure the writer is
             // closed (releasing the write lock) before the threads are joined.
@@ -1021,16 +1067,16 @@ SCENARIO("A login attempted during a failing password reset waits for it and kee
             ScopedThread login;
             // Holds SQLite's write lock. The reset's BEGIN IMMEDIATE waits for it
             // (busy timeout 5 s) inside the store call, holding the store's
-            // mutex, until the test releases it: the reset is active for as long
-            // as the test needs. No Catch2 assertions run off the main thread.
+            // lock, until the test releases it. No Catch2 assertions run off the
+            // main thread.
             SideConnection writer(path);
             writer.exec("BEGIN IMMEDIATE;");
+            observing = true;
 
             reset.start([&] {
-                reset_entered = true;
                 try
                 {
-                    store->update_user_password_and_revoke_sessions(victim, new_hash);
+                    store.update_user_password_and_revoke_sessions(victim, new_hash);
                 }
                 catch (const std::exception& e)
                 {
@@ -1039,66 +1085,67 @@ SCENARIO("A login attempted during a failing password reset waits for it and kee
                 }
                 reset_returned = true;
             });
-            const bool reset_started = thewatcher::test::eventually(
+            const bool reset_held = thewatcher::test::eventually(
                 [&] {
-                    return reset_entered.load();
+                    return reset_holds_lock.load();
                 },
                 5s, 1ms);
-            // An unblocked call returns within milliseconds, so a reset still
-            // running after this pause is held inside its store call.
-            std::this_thread::sleep_for(200ms);
-            const bool reset_held = reset_started && !reset_returned.load();
 
+            // Sent only once the reset holds the lock, so the login cannot get
+            // there first.
             login.start([&] {
-                login_attempting = true;
-                try
-                {
-                    login_created = store->create_session_if_credentials_current(
-                        make_session("other-session", other, expires), other_hash);
+                auto res = fx.client.Post("/api/login",
+                                          json{
+                                              {"username", "other"         },
+                                              {"password", "other-password"}
                 }
-                catch (const std::exception&)
+                                              .dump(),
+                                          "application/json");
+                if (res)
                 {
-                    login_threw = true;
+                    login_status = res->status;
+                    const auto set_cookie = res->get_header_value("Set-Cookie");
+                    login_cookie = set_cookie.substr(0, set_cookie.find(';'));
                 }
                 login_returned = true;
             });
-            const bool login_started = thewatcher::test::eventually(
+            // The barrier: the login's first store call found the lock held by
+            // the reset, which is still inside its call.
+            const bool login_waited = thewatcher::test::eventually(
                 [&] {
-                    return login_attempting.load();
+                    return login_waited_for_reset.load();
                 },
                 5s, 1ms);
-            std::this_thread::sleep_for(200ms);
-            // The barrier: the login has attempted its call while the reset is
-            // held, and is waiting for it (the store runs one call at a time);
-            // neither has returned.
-            const bool login_waited = login_started && !reset_returned.load() && !login_returned.load();
+            const bool login_still_waiting = !login_returned.load();
 
             writer.exec("ROLLBACK;");
             const bool both_returned = thewatcher::test::eventually(
                 [&] {
                     return reset_returned.load() && login_returned.load();
                 },
-                5s, 1ms);
+                10s, 1ms);
             reset.join();
             login.join();
+            observing = false;
 
-            THEN("the login waits for the reset to roll back, then creates a session that survives")
+            THEN("the login waits for the reset to roll back, then gets a session that survives it")
             {
                 // Each barrier fails the test on timeout instead of letting it
-                // pass without the wait it is meant to prove.
+                // pass without the overlap it is meant to prove.
                 REQUIRE(reset_held);
+                REQUIRE_FALSE(reset_waited.load());
                 REQUIRE(login_waited);
+                REQUIRE(login_still_waiting);
                 REQUIRE(both_returned);
                 REQUIRE(reset_threw.load());
                 // The reset failed because of the planted trigger, not for some
                 // other reason such as a busy timeout on the writer's lock.
                 REQUIRE(reset_error.find("forced") != std::string::npos);
-                REQUIRE_FALSE(login_threw.load());
-                REQUIRE(login_created.load());
-                const auto now = now_ms();
-                REQUIRE(store->get_session("other-session", now));
-                REQUIRE(store->get_user_by_username("victim")->password_hash == victim_hash);
-                REQUIRE(store->get_session("victim-session", now));
+                REQUIRE(login_status.load() == 200);
+                REQUIRE_FALSE(login_cookie.empty());
+                REQUIRE(fx.session_status(login_cookie) == 200);
+                REQUIRE(store.get_user_by_username("victim")->password_hash == victim_hash);
+                REQUIRE(store.get_session("victim-session", now_ms()));
             }
         }
     }

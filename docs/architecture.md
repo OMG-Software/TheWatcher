@@ -254,7 +254,13 @@ Files: `server/store_synchronized.hpp`, `server/sqlite_raii.hpp`,
   compiler enforces this only for pure virtuals (`= 0`); a virtual with a
   default implementation would not need an override and would run unlocked,
   so every `Store` method is declared pure (today none has a default body)
-  and new ones must be too.
+  and new ones must be too. Each forwarder takes the lock with
+  `const auto lock = lock_for_call(__func__);`, and new ones must too. Tests
+  can install a lock observer (`set_lock_observer`) that is told, with the
+  method's name, when a call has to wait for the lock and when it takes it;
+  race tests use it to prove that two calls really overlapped instead of
+  inferring it from sleeps. Production installs none, and the lock is then a
+  plain blocking lock.
   Backends never call back into the wrapper. Tests that construct
   `SqliteStore` or `PostgresStore` directly are single-threaded.
 - A method that writes more than one row or statement is atomic. Use the
