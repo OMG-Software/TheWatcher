@@ -195,3 +195,21 @@ describe('GIVEN the runbooks page before its first load settles', () => {
     expect(await screen.findByText('No runbooks configured.')).toBeInTheDocument();
   });
 });
+
+describe('GIVEN a successful settings save', () => {
+  it('WHEN the page reloads THEN settings are fetched exactly once more, and a failing reload keeps the saved values', async () => {
+    let gets = 0;
+    const api = new FakeApi('global_admin')
+      .on('GET /api/settings', () => (++gets === 1 ? ok(settings) : fail(500, 'config unreadable')))
+      .on('PUT /api/settings', ok());
+    await openDashboard(api);
+    goTo('Settings');
+    fireEvent.change(await screen.findByLabelText('Offline after (seconds)'), { target: { value: '90' } });
+
+    fireEvent.click(screen.getByRole('button', { name: 'Save Settings' }));
+    await screen.findByText(/Could not refresh settings: config unreadable/);
+
+    expect(api.count('GET /api/settings')).toBe(2); // the first load plus one reload, no extra
+    expect(screen.getByLabelText('Offline after (seconds)')).toHaveValue(90);
+  });
+});
