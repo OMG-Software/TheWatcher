@@ -1,7 +1,12 @@
-import { defineConfig } from 'vite';
+import { readFileSync } from 'node:fs';
+import { defineConfig } from 'vitest/config';
 import react from '@vitejs/plugin-react';
 
+// The dashboard's own version, from package.json, injected at build time.
+const { version } = JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf8')) as { version: string };
+
 export default defineConfig({
+  define: { __APP_VERSION__: JSON.stringify(version) },
   plugins: [react()],
   server: {
     port: 5173,
@@ -12,6 +17,10 @@ export default defineConfig({
         changeOrigin: true,
       },
     },
+  },
+  test: {
+    // Collect only the TypeScript test sources, never compiled twins.
+    include: ['src/**/*.test.{ts,tsx}'],
   },
   build: {
     outDir: 'dist',
