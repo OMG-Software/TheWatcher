@@ -267,6 +267,28 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Dashboard: overlapping actions no longer clear each other's busy state;
   `runAction` refuses a key that is already running (no second request) and
   `useRunAction` gains `isBusy(key)` (#104, #105).
+- Dashboard review fixes: Show archived no longer reads as an empty list while
+  loading or after a failed load ("No alerts." only for a loaded empty list;
+  a failed load says "Archived alerts are unavailable."), and a successful
+  alert action reloads the archived list and drops a request that started
+  before it; every page uses the per-key `isBusy(key)` instead of
+  `busyAction`, so the view editor's Cancel stays disabled while its own save
+  runs even if another action starts; a 401 from a request that started under
+  an earlier session no longer signs out a newer one; a saved change whose
+  refresh failed is no longer labelled "Action failed"; an inline failure whose
+  form has closed or unmounted is shown in the page banner instead of being
+  lost; and Settings tracks only the fields the user changed, so a reload
+  cannot be overridden by untouched values (#187).
+- **Behaviour change:** signing out keeps the user signed in until the server
+  confirms. A 401 counts as signed out; any other failure shows "Sign out
+  failed, and your session is still active" with Try again, instead of
+  clearing the screen while the session cookie may still be valid (#187).
+- Dashboard: `usePolling` aborts the in-flight request on cleanup, unmount and
+  when polling is disabled, passing an `AbortSignal` to the fetcher (an abort is
+  never shown as an error, a late response is still ignored, and a fetcher
+  that ignores the signal still works); it also gains `reload()` to replace an
+  out-of-date request. The API functions the polling callers use take an
+  optional `signal` (#187, #190).
 
 ### Changed
 

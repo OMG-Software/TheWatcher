@@ -9,13 +9,13 @@ import { canManageGroups, canManageUsers, isGlobal } from '../permissions';
 import { accountTypeLabel } from '../uiLogic';
 
 export function UsersPage({
-  busyAction,
+  isBusy,
   groups,
   runAction,
   session,
   users,
 }: {
-  busyAction: string | null;
+  isBusy: (key: string) => boolean;
   groups: GroupRecord[];
   runAction: RunAction;
   session: SessionInfo;
@@ -30,7 +30,7 @@ export function UsersPage({
   const [pwValue, setPwValue] = React.useState('');
   const { clear } = React.useContext(ActionFailureContext);
   const pwKey = `user:${pwUserId}:pw`;
-  const pwBusy = busyAction === pwKey;
+  const pwBusy = isBusy(pwKey);
   // The password dialog cannot be dismissed while saving; dismissing drops its old failure.
   const closePw = () => {
     if (pwBusy) return;
@@ -72,7 +72,7 @@ export function UsersPage({
               <button className="text-button secondary" disabled={pwBusy} onClick={closePw}>Cancel</button>
               <button
                 className="text-button"
-                disabled={!pwValue || busyAction === `user:${pwUserId}:pw`}
+                disabled={!pwValue || isBusy(`user:${pwUserId}:pw`)}
                 onClick={() => {
                   const id = pwUserId;
                   // Close and clear only once the server accepted the new password.
@@ -104,7 +104,7 @@ export function UsersPage({
           }}
         >
           <input aria-label="Group name" placeholder="Group name" value={groupName} onChange={(event) => setGroupName(event.target.value)} />
-          <ActionButton busy={busyAction === 'group:create'} icon={<Plus size={14} />} label="Group" onClick={() => undefined} type="submit" />
+          <ActionButton busy={isBusy('group:create')} icon={<Plus size={14} />} label="Group" onClick={() => undefined} type="submit" />
         </form> : null}
         {admin ? <form
           className="inline-form user-form"
@@ -134,7 +134,7 @@ export function UsersPage({
               <option key={group.group_id} value={group.group_id}>{group.name}</option>
             ))}
           </select>
-          <ActionButton busy={busyAction === 'user:create'} icon={<Plus size={14} />} label="User" onClick={() => undefined} type="submit" />
+          <ActionButton busy={isBusy('user:create')} icon={<Plus size={14} />} label="User" onClick={() => undefined} type="submit" />
         </form> : null}
       </div>
       <div className="table-container">
@@ -152,7 +152,7 @@ export function UsersPage({
                   <div className="button-row">
                     {canChangePw ? (
                       <ActionButton
-                        busy={busyAction === `user:${user.user_id}:pw`}
+                        busy={isBusy(`user:${user.user_id}:pw`)}
                         icon={<SlidersHorizontal size={14} />}
                         label="Password"
                         onClick={() => { setPwUserId(user.user_id); setPwValue(''); }}
@@ -161,14 +161,14 @@ export function UsersPage({
                     {globalAdmin && !user.built_in ? (
                       user.disabled ? (
                         <ActionButton
-                          busy={busyAction === `user:${user.user_id}:enable`}
+                          busy={isBusy(`user:${user.user_id}:enable`)}
                           icon={<Play size={14} />}
                           label="Enable"
                           onClick={() => runAction(`user:${user.user_id}:enable`, () => enableUser(user.user_id))}
                         />
                       ) : (
                         <ActionButton
-                          busy={busyAction === `user:${user.user_id}:disable`}
+                          busy={isBusy(`user:${user.user_id}:disable`)}
                           icon={<Pause size={14} />}
                           label="Disable"
                           onClick={() => runAction(`user:${user.user_id}:disable`, () => disableUser(user.user_id))}
@@ -177,7 +177,7 @@ export function UsersPage({
                     ) : null}
                     {globalAdmin && !user.built_in ? (
                       <ActionButton
-                        busy={busyAction === `user:${user.user_id}:delete`}
+                        busy={isBusy(`user:${user.user_id}:delete`)}
                         danger
                         icon={<Trash2 size={14} />}
                         label="Delete"

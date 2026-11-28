@@ -28,15 +28,35 @@ import { NAV_ITEMS, accountTypeLabel, colorLabel, type DashboardView } from './u
 
 /** Session gate: the login page until signed in, then the dashboard. */
 export function App() {
-  const { session, expired, signIn, signOut } = useSession();
+  const { session, expired, signingOut, signOutError, signIn, signOut, dismissSignOutError } = useSession();
   if (!session) {
     return <LoginPage onLogin={signIn} notice={expired ? 'Your session expired. Sign in again.' : null} />;
   }
-  return <Dashboard session={session} onSignOut={signOut} />;
+  return (
+    <Dashboard
+      session={session}
+      signingOut={signingOut}
+      signOutError={signOutError}
+      onDismissSignOutError={dismissSignOutError}
+      onSignOut={() => void signOut()}
+    />
+  );
 }
 
 /** Everything behind the login: top bar, summary cards and the page router. Unmounting it stops all polling. */
-function Dashboard({ session, onSignOut }: { session: SessionInfo; onSignOut: () => void }) {
+function Dashboard({
+  session,
+  signingOut,
+  signOutError,
+  onDismissSignOutError,
+  onSignOut,
+}: {
+  session: SessionInfo;
+  signingOut: boolean;
+  signOutError: string | null;
+  onDismissSignOutError: () => void;
+  onSignOut: () => void;
+}) {
   const [view, setView] = React.useState<DashboardView>('monitoring');
   const { activeViewId, setActiveViewId } = useActiveView();
   const [expanded, setExpanded] = React.useState<Set<string>>(new Set());
@@ -44,7 +64,7 @@ function Dashboard({ session, onSignOut }: { session: SessionInfo; onSignOut: ()
   const [overviewGroupFilter, setOverviewGroupFilter] = React.useState<OverviewGroupFilter>('all');
 
   const { agents, pending, groups, alerts, allAlerts, users, maintenanceWindows, silences, customViews, sectionErrors, loadedAt, error, loading, refresh } = useDashboardData();
-  const { busyAction, runAction, failure, clearFailure } = useRunAction(refresh);
+  const { isBusy, runAction, clearFailure, context: failureState } = useRunAction(refresh);
 
   const counts = summaryCounts(agents);
   const displayAlerts = toDisplayAlerts(alerts, agents);
@@ -59,7 +79,6 @@ function Dashboard({ session, onSignOut }: { session: SessionInfo; onSignOut: ()
     clearFailure();
     setView(next);
   };
-  const failureState = React.useMemo(() => ({ failure, clear: clearFailure }), [failure, clearFailure]);
   const retry = () => void refresh();
 
   return (
@@ -87,7 +106,7 @@ function Dashboard({ session, onSignOut }: { session: SessionInfo; onSignOut: ()
           <button className="icon-button" onClick={retry} aria-label="Refresh dashboard">
             <RefreshCw size={14} />
           </button>
-          <button className="icon-button" onClick={onSignOut} aria-label="Log out">
+          <button className="icon-button" disabled={signingOut} onClick={onSignOut} aria-label="Log out">
             <LogOut size={14} />
           </button>
         </div>
@@ -105,6 +124,13 @@ function Dashboard({ session, onSignOut }: { session: SessionInfo; onSignOut: ()
       {/* A failed refresh with older data on screen is flagged; with no data yet it replaces the page below. */}
       {error && loadedAt ? <LoadFailed what="dashboard data" message={error} stale onRetry={retry} /> : null}
       <ActionErrorBanner onDismiss={() => clearFailure()} />
+      {signOutError ? (
+        <div className="banner error" role="alert">
+          {signOutError}
+          <button className="text-button banner-action" disabled={signingOut} onClick={onSignOut} type="button">Try again</button>
+          <button className="text-button banner-action" onClick={onDismissSignOutError} type="button">Dismiss</button>
+        </div>
+      ) : null}
 
       {unloaded && error ? <LoadFailed what="dashboard data" message={error} onRetry={retry} /> : null}
       {unloaded && !error && loading ? <div className="banner">Loading dashboard data...</div> : null}
@@ -152,7 +178,7 @@ function Dashboard({ session, onSignOut }: { session: SessionInfo; onSignOut: ()
           {sectionErrors.groups ? <LoadFailed what="groups" message={sectionErrors.groups} onRetry={retry} /> : null}
           <ViewsPage
             agents={agents}
-            busyAction={busyAction}
+            isBusy={isBusy}
             loadFailed={Boolean(sectionErrors.views)}
             operator={operator}
             runAction={runAction}
@@ -169,7 +195,7 @@ function Dashboard({ session, onSignOut }: { session: SessionInfo; onSignOut: ()
           {sectionErrors.groups ? <LoadFailed what="groups" message={sectionErrors.groups} onRetry={retry} /> : null}
           <AgentsPage
             agents={agents}
-            busyAction={busyAction}
+            isBusy={isBusy}
             groups={groups}
             onConfigure={setConfigAgentId}
             operator={operator}
@@ -183,7 +209,7 @@ function Dashboard({ session, onSignOut }: { session: SessionInfo; onSignOut: ()
       {configAgent ? (
         <AgentConfigModal
           agent={configAgent}
-          busy={busyAction === `${configAgent.id}:collector_config`}
+          busy={isBusy(`${configAgent.id}:collector_config`)}
           onClose={() => setConfigAgentId(null)}
           operator={operator && canManageAgent(configAgent)}
           global={global}
@@ -194,26 +220,26 @@ function Dashboard({ session, onSignOut }: { session: SessionInfo; onSignOut: ()
       {!unloaded && view === 'alerts' ? (
         <>
           {sectionErrors.allAlerts ? <LoadFailed what="alerts" message={sectionErrors.allAlerts} onRetry={retry} /> : null}
-          <AlertsPage agents={agents} alerts={toDisplayAlerts(allAlerts, agents)} busyAction={busyAction} operator={operator} runAction={runAction} />
+          <AlertsPage agents={agents} alerts={toDisplayAlerts(allAlerts, agents)} isBusy={isBusy} operator={operator} runAction={runAction} />
         </>
       ) : null}
       {!unloaded && view === 'maintenance' ? (
         <>
           {sectionErrors.maintenanceWindows ? <LoadFailed what="maintenance windows" message={sectionErrors.maintenanceWindows} onRetry={retry} /> : null}
-          <MaintenancePage agents={agents} busyAction={busyAction} global={global} loadFailed={Boolean(sectionErrors.maintenanceWindows)} operator={operator} runAction={runAction} windows={maintenanceWindows} />
+          <MaintenancePage agents={agents} isBusy={isBusy} global={global} loadFailed={Boolean(sectionErrors.maintenanceWindows)} operator={operator} runAction={runAction} windows={maintenanceWindows} />
         </>
       ) : null}
       {!unloaded && view === 'silences' ? (
         <>
           {sectionErrors.silences ? <LoadFailed what="silence rules" message={sectionErrors.silences} onRetry={retry} /> : null}
-          <SilencesPage agents={agents} busyAction={busyAction} global={global} loadFailed={Boolean(sectionErrors.silences)} operator={operator} runAction={runAction} silences={silences} />
+          <SilencesPage agents={agents} isBusy={isBusy} global={global} loadFailed={Boolean(sectionErrors.silences)} operator={operator} runAction={runAction} silences={silences} />
         </>
       ) : null}
       {!unloaded && view === 'users' ? (
         <>
           {sectionErrors.users ? <LoadFailed what="users" message={sectionErrors.users} onRetry={retry} /> : null}
           {sectionErrors.groups ? <LoadFailed what="groups" message={sectionErrors.groups} onRetry={retry} /> : null}
-          <UsersPage busyAction={busyAction} groups={groups} runAction={runAction} session={session} users={users} />
+          <UsersPage isBusy={isBusy} groups={groups} runAction={runAction} session={session} users={users} />
         </>
       ) : null}
       {view === 'settings' ? <SettingsPage runAction={runAction} /> : null}

@@ -12,7 +12,7 @@ import { colorLabel } from '../uiLogic';
 
 export function AgentsPage({
   agents,
-  busyAction,
+  isBusy,
   groups,
   onConfigure,
   operator,
@@ -22,7 +22,7 @@ export function AgentsPage({
   runAction,
 }: {
   agents: DashboardAgent[];
-  busyAction: string | null;
+  isBusy: (key: string) => boolean;
   groups: GroupRecord[];
   onConfigure: (agentId: string) => void;
   operator: boolean;
@@ -35,7 +35,7 @@ export function AgentsPage({
 
   return (
     <main className="table-wrap management-wrap">
-      {showPending ? <PendingEnrollments agents={pending} busyAction={busyAction} groups={groups} loadFailed={pendingLoadFailed} runAction={runAction} /> : null}
+      {showPending ? <PendingEnrollments agents={pending} isBusy={isBusy} groups={groups} loadFailed={pendingLoadFailed} runAction={runAction} /> : null}
       <div className="management-header"><h1>Agent Management</h1></div>
       <div className="table-container">
         <table className="management-table">
@@ -69,7 +69,7 @@ export function AgentsPage({
                           onChange={(event) => setDescDrafts((current) => ({ ...current, [agent.id]: event.target.value }))}
                         />
                         <ActionButton
-                          busy={busyAction === `${agent.id}:desc`}
+                          busy={isBusy(`${agent.id}:desc`)}
                           disabled={!operator || descValue === agent.description}
                           icon={<Check size={14} />}
                           label="Set"
@@ -84,21 +84,21 @@ export function AgentsPage({
                   <td>{agent.groupIds.map((id) => groups.find((group) => group.group_id === id)?.name ?? id).join(', ') || 'No group'}</td>
                   <td>
                     <div className="button-row">
-                      <ActionButton busy={busyAction === `${agent.id}:${maintenanceCommand}`} disabled={!manageable} icon={agent.maintenance ? <Play size={14} /> : <Pause size={14} />} label={maintenanceActionLabel(agent)} onClick={() => runAction(`${agent.id}:${maintenanceCommand}`, () => agent.maintenance ? resumeAgent(agent.id) : setMaintenance(agent.id, 'operator request', 0))} />
-                      <ActionButton busy={busyAction === `${agent.id}:restart`} disabled={!manageable} icon={<RotateCw size={14} />} label="Restart" onClick={() => runAction(`${agent.id}:restart`, () => restartAgentCollectors(agent.id))} />
-                      <ActionButton busy={busyAction === `${agent.id}:status`} disabled={!manageable} icon={<Search size={14} />} label="Status" onClick={() => runAction(`${agent.id}:status`, () => requestAgentStatus(agent.id))} />
+                      <ActionButton busy={isBusy(`${agent.id}:${maintenanceCommand}`)} disabled={!manageable} icon={agent.maintenance ? <Play size={14} /> : <Pause size={14} />} label={maintenanceActionLabel(agent)} onClick={() => runAction(`${agent.id}:${maintenanceCommand}`, () => agent.maintenance ? resumeAgent(agent.id) : setMaintenance(agent.id, 'operator request', 0))} />
+                      <ActionButton busy={isBusy(`${agent.id}:restart`)} disabled={!manageable} icon={<RotateCw size={14} />} label="Restart" onClick={() => runAction(`${agent.id}:restart`, () => restartAgentCollectors(agent.id))} />
+                      <ActionButton busy={isBusy(`${agent.id}:status`)} disabled={!manageable} icon={<Search size={14} />} label="Status" onClick={() => runAction(`${agent.id}:status`, () => requestAgentStatus(agent.id))} />
                     </div>
                   </td>
                   <td>
                     <ActionButton
-                      busy={busyAction === `${agent.id}:configure`}
+                      busy={isBusy(`${agent.id}:configure`)}
                       disabled={!manageable}
                       icon={<SlidersHorizontal size={14} />}
                       label="Configure"
                       onClick={() => onConfigure(agent.id)}
                     />
                   </td>
-                  <td><ActionButton busy={busyAction === `${agent.id}:delete`} danger disabled={!manageable} icon={<Trash2 size={14} />} label="Delete" onClick={() => runAction(`${agent.id}:delete`, () => deleteAgent(agent.id))} /></td>
+                  <td><ActionButton busy={isBusy(`${agent.id}:delete`)} danger disabled={!manageable} icon={<Trash2 size={14} />} label="Delete" onClick={() => runAction(`${agent.id}:delete`, () => deleteAgent(agent.id))} /></td>
                 </tr>
               );
             })}
