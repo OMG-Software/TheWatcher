@@ -290,8 +290,7 @@ Ordinary patterns such as `ERROR.*disk.*full`, `(ERROR|WARN) disk` and
 Each indicator tails its file independently. A monitor starts at the end of an
 existing file, so enabling it does not report old lines; a file that is created
 later is read from its first byte. A line is matched once it ends with a
-newline (a trailing `
-` is dropped, so CRLF logs work with `$`). If the file
+newline (a trailing `\r` is dropped, so CRLF logs work with `$`). If the file
 is replaced, deleted and recreated, or becomes shorter than the read position,
 it is read again from the start (#90).
 
