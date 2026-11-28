@@ -18,9 +18,12 @@ export function InfoTip({ label, text }: { label: string; text: string }) {
         className="info-tip-button"
         onBlur={() => setOpen(false)}
         onClick={() => setOpen((current) => !current)}
-        // Escape closes the tip first; it must not also close a dialog the tip sits in.
+        // Escape closes the tip first; it must not also close a dialog the tip sits in. A native
+        // dialog treats any Escape keydown that was not cancelled as a close request, so stopping
+        // propagation alone is not enough.
         onKeyDown={(event) => {
           if (event.key === 'Escape' && open) {
+            event.preventDefault();
             event.stopPropagation();
             setOpen(false);
           }

@@ -293,6 +293,15 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   expansion, status in words on component dots, labelled icon buttons and
   selects, `aria-current` tabs, visible focus, `autocomplete` on login, and an
   accessible info tooltip replacing `title=` help (#115).
+- Dashboard: every dialog, the Configure modal included, is now a native
+  `<dialog>` opened with `showModal()`. It replaces the clickable backdrop `div`
+  and `role="dialog"` panel that Sonar flagged (S6848). The browser makes the
+  page behind it inert, so the scripted Tab trap is gone. Escape, backdrop click
+  and focus in and back work as before, and the look is unchanged
+  (`::backdrop`). A backdrop click now needs both the press and the release
+  outside the dialog, so dragging a text selection out of a dialog no longer
+  closes it. Escape inside an open info tip no longer also closes the dialog
+  in a real browser.
 - Dashboard: a view filter whose view was deleted or is not visible is dropped
   instead of showing an empty fleet (#165).
 - Dashboard: components with nothing monitored (no disks, interfaces or process

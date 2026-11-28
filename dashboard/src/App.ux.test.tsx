@@ -210,67 +210,12 @@ describe('GIVEN accessibility of rows and dialogs (issue #115)', () => {
   it('WHEN a busy action button is rendered THEN it keeps its name', () => {
     render(<ConfirmDialog busy confirmLabel="Delete agent" errorKey="k" message="m" onCancel={() => undefined} onConfirm={async () => true} title="t" />);
 
-    expect(screen.getByRole('dialog')).toHaveAttribute('aria-modal', 'true');
+    expect(screen.getByRole('dialog')).toHaveAttribute('open');
     expect(screen.getByRole('button', { name: 'Delete agent' })).toBeDisabled();
   });
 });
 
-describe('GIVEN the Modal component', () => {
-  function Harness({ dismissible = true }: { dismissible?: boolean }) {
-    const [open, setOpen] = React.useState(false);
-    return (
-      <>
-        <button onClick={() => setOpen(true)}>open</button>
-        {open ? (
-          <Modal dismissible={dismissible} onClose={() => setOpen(false)} title="Example">
-            <button>first</button>
-            <button>last</button>
-          </Modal>
-        ) : null}
-      </>
-    );
-  }
-
-  it('WHEN it opens THEN it is a named modal dialog and focus moves inside', () => {
-    render(<Harness />);
-    fireEvent.click(screen.getByText('open'));
-
-    expect(screen.getByRole('dialog', { name: 'Example' })).toHaveAttribute('aria-modal', 'true');
-    expect(dialog().contains(document.activeElement)).toBe(true);
-  });
-
-  it('WHEN Escape is pressed THEN it closes and focus returns to the opener', () => {
-    render(<Harness />);
-    const opener = screen.getByText('open');
-    opener.focus();
-    fireEvent.click(opener);
-
-    fireEvent.keyDown(dialog(), { key: 'Escape' });
-
-    expect(screen.queryByRole('dialog')).toBeNull();
-    expect(document.activeElement).toBe(opener);
-  });
-
-  it('WHEN Tab is pressed on the last control THEN focus wraps to the first', () => {
-    render(<Harness />);
-    fireEvent.click(screen.getByText('open'));
-    const last = screen.getByText('last');
-    last.focus();
-
-    fireEvent.keyDown(dialog(), { key: 'Tab' });
-
-    expect(document.activeElement).toBe(within(dialog()).getByRole('button', { name: 'Close' }));
-  });
-
-  it('WHEN it is not dismissible (a request is running) THEN Escape does not close it', () => {
-    render(<Harness dismissible={false} />);
-    fireEvent.click(screen.getByText('open'));
-
-    fireEvent.keyDown(dialog(), { key: 'Escape' });
-
-    expect(screen.getByRole('dialog')).toBeInTheDocument();
-  });
-});
+// The Modal component's own behaviour (open, focus, Escape, backdrop) is tested in components/Modal.test.tsx.
 
 describe('GIVEN the retention settings (issue: settings fields)', () => {
   const base = { webhook_url: '', offline_after_seconds: 45, escalation_timeout_seconds: 600, metrics_retention_days: 7, reports_enabled: false, reports_schedule: 'daily', reports_hour: 8, reports_day_of_week: 1, reports_webhook_url: '' };

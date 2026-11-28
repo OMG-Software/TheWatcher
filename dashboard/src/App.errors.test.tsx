@@ -2,6 +2,7 @@ import { fireEvent, render, screen, waitFor, within } from '@testing-library/rea
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { App } from './App';
 import { RunbooksPage } from './pages/RunbooksPage';
+import { clickBackdrop } from './testing/dialog';
 import { FakeApi, deferred, fail, ok, type FakeReply } from './testing/fakeApi';
 
 async function openDashboard(api: FakeApi) {
@@ -102,7 +103,7 @@ describe('GIVEN a dialog whose request is still running', () => {
 
     expect(within(ackModal()).getByRole('button', { name: 'Cancel' })).toBeDisabled();
     fireEvent.click(within(ackModal()).getByRole('button', { name: 'Cancel' }));
-    fireEvent.click(ackModal().parentElement as HTMLElement); // the backdrop
+    clickBackdrop(ackModal());
     expect(screen.getByRole('heading', { name: 'Acknowledge alert' })).toBeInTheDocument();
 
     reply.resolve(fail(409, 'alert already archived'));
