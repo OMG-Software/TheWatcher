@@ -14,9 +14,9 @@ Current capabilities:
   persist);
 - monitoring view of agent health and latest metrics;
 - approved-agent-only monitoring;
-- pending enrollment approval/rejection on the Agents page (an approved agent
-  is currently assigned to the first group in the group list, or to no group
-  when none exist; there is no group picker yet);
+- pending enrollment approval/rejection on the Agents page (each pending row
+  has a group picker; approving with "No group (global users only)" is valid
+  and assigns no group);
 - hostname-based alert notifications, alert acknowledgement (with a note) and
   archive workflow;
 - custom Views, Silences, Maintenance windows and Settings pages;
@@ -272,8 +272,7 @@ Pending enrollment rows show unapproved agents awaiting approval. Each row has
 a Group picker; it starts at "No group (global users only)". Approving with that
 choice is valid and sends an empty group list; the operator picks a group only
 when the agent should belong to one, because the approval names its groups
-explicitly. Reject
-marks the enrollment rejected. Approve/Reject buttons disappear once an
+explicitly. Reject marks the enrollment rejected. Approve/Reject buttons disappear once an
 enrollment is decided.
 
 Agent Management handles approved agents:
