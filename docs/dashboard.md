@@ -38,7 +38,8 @@ dashboard/src/pages/            one file per page (Monitoring, Views, Agents, Al
                                 Silences, Maintenance, Users, Runbooks, Settings, Login)
 dashboard/src/components/       shared components and modals (ActionButton, StatusDot,
                                 AgentConfigModal, AcknowledgeModal, RunbookModal, ...)
-dashboard/src/hooks/            data loading and polling, action runner, session, active view
+dashboard/src/hooks/            usePolling, useDashboardData, useRunAction, useSession, useActiveView
+dashboard/src/testing/          fake REST server for UI tests
 dashboard/src/permissions.ts    role helpers: isGlobal, canOperate, canManageUsers, canManageGroups
 dashboard/src/api.ts            REST client
 dashboard/src/models.ts         API row types
@@ -101,6 +102,101 @@ separately (for example behind a reverse proxy that also forwards `/api` to the
 server) over HTTPS, because the session cookie is `Secure`. Set
 `VITE_API_BASE_URL` at build time if the API lives on another origin.
 
+## Errors, session expiry and polling
+
+- **API errors.** `api.ts` throws `ApiError` (HTTP `status` plus the server's
+  `{"error": "..."}` message, or the status line when there is no body).
+  `errorMessage(err, fallback)` turns any caught value into text.
+- **Failed actions.** `runAction(key, fn, { inline })` resolves `true`/`false`.
+  A failure shows the server's message in a dismissible banner under the
+  summary cards, or, with `{ inline: true }`, next to the form or dialog that
+  started it via `<ActionError actionKey="...">`. Forms and dialogs clear or
+  close only when `runAction` resolves `true`, so input survives a failed save.
+  `true` means the mutation itself succeeded: if the refresh afterwards fails,
+  that is reported in the page banner ("Saved, but the dashboard could not be
+  refreshed"), never as a failed action, so a retry cannot duplicate the change.
+  The failure carries a `kind`: `action` (the change failed; the banner reads
+  "Action failed: ...") or `refresh` (the change was saved; the banner shows
+  only its own "Saved, but ..." message, with no "Action failed" prefix).
+  An inline failure needs a form to show it: each `<ActionError>` registers
+  itself while it is on screen, and when none is on screen for the failing key
+  (the user navigated away or closed the form before the failure arrived, or
+  closes it afterwards) the page banner shows the failure instead of dropping
+  it. Per-control busy state uses `isBusy(key)`, which the pages receive as
+  `isBusy`; a control must never use `busyAction` (only the latest running key)
+  to decide whether its own action is still running, or Cancel could close an
+  editor whose save is still in flight.
+  A dialog or form with a Cancel (acknowledge, agent configuration, password,
+  view editor) cannot be dismissed while its request runs, because the failure
+  would have nowhere to show, and it drops its own failure when closed, so
+  reopening it does not show an old error (`clear(key)` from
+  `ActionFailureContext`). Settings disables its form while a save runs, so
+  nothing typed meanwhile is lost.
+- **Failed loads are not "no data".** If the first load of the required data
+  fails, the page is replaced by "Could not load dashboard data" with Retry. If
+  a later refresh fails, the old data stays under a "Could not refresh" banner.
+  Optional sections (alerts, silences, maintenance windows, users, views,
+  pending enrollments, groups) load independently: a 403 means the role may not
+  see them (empty); any other failure is flagged and the last good data is kept.
+  A failed group list is flagged on every page that uses groups (Monitoring,
+  Views, Agents, Users). A page that loads for itself (runbooks, settings,
+  archived alerts) shows "Loading..." until its first request settles, never
+  its empty state. The Monitoring detail row loads metric history and log
+  matches independently, each with its own error.
+  Settings shows an error instead of a form when it cannot load, so defaults can
+  never be saved over the real settings.
+- **Session expiry.** Any API call that returns 401 (except the login and
+  session probes) tells `useSession`, which returns to the login screen with
+  "Your session expired" and unmounts the dashboard, which stops all polling.
+  Each request remembers the session it started under (a counter in `api.ts`
+  that `useSession` advances on every sign-in, expiry and sign-out); a 401 from
+  a request that started under an earlier session is ignored, so a slow
+  request from a previous session cannot sign out a newer one.
+- **Signing out.** The user stays signed in until the server confirms
+  (`POST /api/logout`), because the session cookie survives a failed request
+  and a reload would restore the session. A 401 answer means the session was
+  already gone and counts as signed out. Any other failure keeps the dashboard
+  open and shows "Sign out failed, and your session is still active: ..." with
+  Try again and Dismiss. The Log out button is disabled while the request runs.
+  The login page warns when served over plain HTTP from a non-local host: the
+  session cookie is `Secure`, so the browser drops it there.
+- **Polling.** `usePolling(fetcher, { intervalMs, enabled })` keeps at most one
+  request in flight and skips a tick while one runs. `refresh()` during an
+  in-flight request queues exactly one follow-up load, which starts when the
+  current one settles (the running one may predate the change that prompted the
+  refresh); further `refresh()` calls share that follow-up. Disabling or
+  unmounting aborts the in-flight request (its result is ignored even if the
+  fetcher did not honour the abort) and drops the queued follow-up. The
+  poll pauses while the tab is hidden and refreshes as soon as it is visible
+  again. `useDashboardData` polls every 5 s with it. `refresh()` resolves to
+  the load error message of a load that started after the call (null on
+  success) and never rejects. `runAction` tracks every running action by key: a
+  key that is already running is refused (resolves `false`, no request), and
+  finishing removes only its own key. `isBusy(key)` tells whether one runs;
+  `busyAction` is the most recently started running key, kept for
+  compatibility. `runAction` stays busy until the mutation and
+  its refresh have both settled, so a control guarded by `busyAction` cannot
+  repeat the change while the result loads, and it uses the refresh result to
+  report a failed post-action refresh. An optional `merge(next, previous)`
+  combines an accepted result with the previous data and never sees a stale
+  one; `useDashboardData` uses it to keep the last good value of a failed
+  section. `useSession` ignores a slow startup session probe that settles
+  after a sign-in or sign-out. After a successful settings save whose reload
+  fails, the form keeps the saved values and shows a "Could not refresh
+  settings" warning. There is no request timeout in `api.ts`, so a hung request
+  keeps its action busy, as a hung mutation always has.
+- **Aborting requests.** `usePolling` creates one `AbortController` per request
+  and calls the fetcher as `fetcher(signal)`. It aborts the request on cleanup,
+  unmount, when polling is disabled and on `reload()`; an abort is never shown
+  as an error (an `AbortError` is not a load failure) and a late response is
+  still ignored. `api.ts` takes an optional `signal` on the low-level request
+  and on the functions the polling callers use (`loadDashboardData` and every
+  list it loads, `fetchAlerts`, `fetchSettings`, `fetchRunbooks`); pass it on to
+  `fetch`. A fetcher that ignores the signal keeps working. `reload()` is
+  `refresh()` for when the request in flight is known to be out of date: it
+  aborts it, ignores its result and starts a new request at once (`refresh()`
+  instead waits for the running one and queues one follow-up).
+
 ## Tests
 
 ```powershell
@@ -113,6 +209,15 @@ worst-status summary counts, missing-metrics behavior, maintenance state, agent
 management API calls, grouped views, role helpers, navigation and label logic,
 and role-aware user/group API calls. Tests are collected from
 `src/**/*.test.ts(x)` only; `tsc` never writes into `src`.
+
+UI behaviour tests (`*.test.tsx`) use Vitest with jsdom and React Testing
+Library. `src/testing/fakeApi.ts` is a fake REST server: routes are keyed
+`"METHOD /path"`, unlisted routes answer an empty list, and `calls` records
+requests. Tests are written as GIVEN/WHEN/THEN `describe`/`it` names. They cover
+role gating, action and load errors, 401 to login, the polling guard and
+hidden-tab pause (fake timers), Settings after a failed load and forms after a
+failed save. These dev dependencies install without install scripts
+(`npm ci --ignore-scripts`, as CI does).
 
 ## Views
 
@@ -201,7 +306,13 @@ The Alerts view lists active, non-deleted alerts visible to the current user's
 groups. Operators and admins can acknowledge alerts (with an optional note),
 acknowledge and archive them in one step, or archive them; the list supports
 agent and status filters, bulk selection, and a Show archived toggle. Archiving
-is a soft delete on the server. The
+is a soft delete on the server. An empty list reads "No alerts." Show archived
+loads its list on its own timer: while the first request is pending the table
+shows nothing but the "Loading archived alerts..." banner, and when it fails the
+table says "Archived alerts are unavailable." next to the error banner (never
+"No alerts."). A successful alert action reloads the archived list at once and
+drops an archived request that started before the action, so the table shows
+the new state and not an older response. The
 Monitoring alert dot is green unless the host has an unacknowledged alert, in
 which case it is red. Monitoring alert notifications and Alert rows show the
 known hostname as primary text and the agent id as smaller secondary text.
@@ -265,7 +376,10 @@ Visible to global operators and admins only. Edits the webhook URL, offline
 threshold (seconds), escalation timeout (seconds), metrics retention (days) and
 the scheduled digest report (enabled, daily or weekly schedule, day of week,
 report webhook URL). Save Settings persists them; Send Report Now sends the
-report immediately.
+report immediately. The form tracks only the fields the user changed and shows
+every other field from the latest server copy, so a reload (or a change another
+administrator made) is never overridden by values the user did not touch. The
+changed fields stay across a failed save or a failed reload.
 
 ## API Contract
 

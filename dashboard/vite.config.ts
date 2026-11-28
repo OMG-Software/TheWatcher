@@ -21,6 +21,9 @@ export default defineConfig({
   test: {
     // Collect only the TypeScript test sources, never compiled twins.
     include: ['src/**/*.test.{ts,tsx}'],
+    // UI tests render React into a DOM; the pure-logic tests do not mind it.
+    environment: 'jsdom',
+    setupFiles: ['src/test-setup.ts'],
   },
   build: {
     outDir: 'dist',

@@ -198,6 +198,70 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   front instead of appending with `vector::insert`, which tripped a GCC 11
   `-Wstringop-overread` false positive.
 
+- Dashboard: errors are no longer lost or disguised. API errors keep the
+  HTTP status and the server's message (`ApiError`); a failed action shows
+  that message (page banner, or inline in the form or dialog that started
+  it) on every page (#104). A failed load is shown as "could not load", never
+  as "no data" or an all-clear: a failed required load replaces the page with
+  an error and Retry, a failed section (alerts, silences, maintenance, users,
+  views, pending enrollments) is flagged and keeps its last good data (#105).
+- Dashboard: a 401 from any call returns to the login screen with a "session
+  expired" notice and stops polling; the login page warns when it is served
+  over plain HTTP, where the `Secure` session cookie is dropped (#106).
+- Dashboard: polling skips a tick while a request is in flight, ignores
+  responses that a newer request overtook, and pauses while the tab is
+  hidden. The archived-alerts list polls on its own timer instead of
+  re-fetching on every dashboard poll (#107).
+- Dashboard: Settings no longer falls back to built-in defaults when loading
+  fails, so Save cannot overwrite the real settings; it shows an error and
+  Retry instead (#108).
+- Dashboard: forms and dialogs (silence, maintenance, group, user, view,
+  password, acknowledge, settings, runbook) keep their input and stay open
+  when a save fails (#166).
+- Dashboard: review fixes for the error handling. A slow startup session probe
+  can no longer overwrite a newer sign-in; an overtaken older load can no
+  longer become the snapshot a failed section falls back to; a failed refresh
+  after a successful change no longer reports the change as failed (and so
+  cannot invite a duplicate); metric history and log matches load and fail
+  independently; Settings is locked while a save runs; acknowledge, agent
+  configuration, password and view dialogs cannot be dismissed while saving
+  and drop their old error on close; the groups load failure is flagged on
+  Monitoring and Views; and the runbooks page shows "Loading" instead of "No
+  runbooks configured." before its first load; a failed reload after a successful
+  change is now actually reported (`refresh()` returns the load error); modal
+  backdrops are marked `role="presentation"` (#104, #105, #106, #166).
+- Dashboard: an action stays busy until its post-action refresh has settled, so
+  a control cannot repeat a create or acknowledge while the result loads;
+  `refresh()` coalesces into at most one in-flight request plus one queued
+  follow-up instead of starting concurrent requests; and a failed settings
+  reload after a successful save keeps the saved values visible with a warning
+  (#104, #105).
+- Dashboard: overlapping actions no longer clear each other's busy state;
+  `runAction` refuses a key that is already running (no second request) and
+  `useRunAction` gains `isBusy(key)` (#104, #105).
+- Dashboard review fixes: Show archived no longer reads as an empty list while
+  loading or after a failed load ("No alerts." only for a loaded empty list;
+  a failed load says "Archived alerts are unavailable."), and a successful
+  alert action reloads the archived list and drops a request that started
+  before it; every page uses the per-key `isBusy(key)` instead of
+  `busyAction`, so the view editor's Cancel stays disabled while its own save
+  runs even if another action starts; a 401 from a request that started under
+  an earlier session no longer signs out a newer one; a saved change whose
+  refresh failed is no longer labelled "Action failed"; an inline failure whose
+  form has closed or unmounted is shown in the page banner instead of being
+  lost; and Settings tracks only the fields the user changed, so a reload
+  cannot be overridden by untouched values (#187).
+- **Behaviour change:** signing out keeps the user signed in until the server
+  confirms. A 401 counts as signed out; any other failure shows "Sign out
+  failed, and your session is still active" with Try again, instead of
+  clearing the screen while the session cookie may still be valid (#187).
+- Dashboard: `usePolling` aborts the in-flight request on cleanup, unmount and
+  when polling is disabled, passing an `AbortSignal` to the fetcher (an abort is
+  never shown as an error, a late response is still ignored, and a fetcher
+  that ignores the signal still works); it also gains `reload()` to replace an
+  out-of-date request. The API functions the polling callers use take an
+  optional `signal` (#187, #190).
+
 ### Changed
 
 - Documentation: PostgreSQL is documented as an implemented backend selected
@@ -252,6 +316,10 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   and `npm audit --omit=dev` (#120).
 - Dashboard: the footer shows the dashboard version from `package.json`
   (#127).
+- Dashboard UI behaviour tests with React Testing Library and jsdom (exact
+  devDependency versions): role gating, action and load errors, 401 to login,
+  polling guard and hidden-tab pause, Settings after a failed load, and forms
+  after a failed save (#118).
 
 ## [0.8.0] - 2026-11-02
 
