@@ -5,8 +5,11 @@
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <string>
+#include <string_view>
 #include <unordered_map>
+#include <vector>
 
 namespace thewatcher::agent
 {
@@ -18,6 +21,47 @@ namespace thewatcher::agent
 // usage_percent = used / (used + available), so usage reaches 100% when a
 // normal process gets ENOSPC.
 void apply_space_info(DiskMetrics& disk, const std::filesystem::space_info& space);
+
+// One row of a mount table (/proc/self/mounts or getmntinfo).
+struct MountEntry
+{
+    std::string device;
+    std::string mount_point;
+    std::string filesystem;
+    std::string canonical_device; // device after resolving symlinks; set by filter_mounts
+};
+
+// Decodes the octal escapes (\040 for a space, \011 tab, \012 newline, \134
+// backslash) the Linux kernel writes into /proc/self/mounts fields. Anything
+// that is not a complete three-digit octal escape is left as is (issue #96).
+std::string unescape_mount_field(std::string_view field);
+
+// Parses /proc/self/mounts text. Lines with fewer than three fields are
+// skipped; device and mount point are unescaped.
+std::vector<MountEntry> parse_mount_table(std::string_view text);
+
+// True for filesystems that have no storage worth monitoring: kernel pseudo
+// filesystems, stacked filesystems, and squashfs (snap packages), which is
+// always 100% used.
+bool is_pseudo_filesystem(std::string_view filesystem);
+
+// Keeps the mounts worth reporting: drops pseudo filesystems and loop devices,
+// and keeps only the first mount of each device so bind mounts and btrfs
+// subvolumes are not reported twice. With require_block_device only /dev/*
+// devices are kept (Linux); BSD passes false so ZFS datasets survive.
+// resolve maps a device path to its canonical node (realpath); it is applied
+// once per mount and its result is used for the loop check, the de-duplication
+// and MountEntry::canonical_device, while `device` keeps the original string.
+// A null resolver means the device is already canonical.
+using DeviceResolver = std::function<std::string(const std::string&)>;
+std::vector<MountEntry> filter_mounts(const std::vector<MountEntry>& entries, bool require_block_device,
+                                      const DeviceResolver& resolve = {});
+
+// Name under which a mounted device appears in /proc/diskstats. dm_names maps
+// a device-mapper name (the /dev/mapper/<name> alias) to its dm-N node, as
+// read from /sys/block/dm-N/dm/name; other devices use their basename.
+std::string diskstats_name_for_device(std::string_view device,
+                                      const std::unordered_map<std::string, std::string>& dm_names);
 
 class DiskCollector final : public Collector
 {
