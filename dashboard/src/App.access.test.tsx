@@ -154,3 +154,71 @@ describe('GIVEN a bookmark to a view that does not exist', () => {
     expect(window.location.hash).toBe('');
   });
 });
+
+describe('GIVEN an approved agent', () => {
+  const agentsApi = (role: UserRole) => apiFor(role).on('GET /api/agents', ok([agentRecord('agent-1', 'web-01')]));
+
+  it.each(['global_operator', 'group_operator'] as const)('WHEN a %s opens the agents page THEN there is no Delete button', async (role) => {
+    await openDashboard(agentsApi(role));
+    goTo('Agents');
+
+    await screen.findByRole('button', { name: 'Configure' });
+
+    expect(screen.queryByRole('button', { name: 'Delete' })).toBeNull();
+  });
+
+  it.each(['global_admin', 'group_admin'] as const)('WHEN a %s opens the agents page THEN Delete is offered', async (role) => {
+    await openDashboard(agentsApi(role));
+    goTo('Agents');
+
+    expect(await screen.findByRole('button', { name: 'Delete' })).toBeInTheDocument();
+  });
+});
+
+describe('GIVEN webhook URLs on the settings page', () => {
+  const settings = (masked: boolean) => ({
+    webhook_url: masked ? 'https://hooks.slack.com/…' : 'https://hooks.slack.com/services/secret',
+    offline_after_seconds: 120,
+    escalation_timeout_seconds: 3600,
+    metrics_retention_days: 30,
+    reports_enabled: false,
+    reports_schedule: 'daily',
+    reports_hour: 8,
+    reports_day_of_week: 1,
+    reports_webhook_url: '',
+    webhooks_masked: masked,
+  });
+
+  it('WHEN a global operator saves THEN the webhook fields are read-only, explained, and not sent', async () => {
+    const api = apiFor('global_operator').on('GET /api/settings', ok(settings(true)));
+    await openDashboard(api);
+    goTo('Settings');
+
+    const webhook = await screen.findByLabelText('Webhook URL');
+    expect(webhook).toHaveValue('https://hooks.slack.com/…');
+    expect(webhook).toHaveAttribute('readonly');
+    expect(screen.getByText(/only be changed by a global admin/)).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Save Settings' }));
+
+    await waitFor(() => expect(api.count('PUT /api/settings')).toBe(1));
+    const body = api.calls.find((call) => call.method === 'PUT')?.body as Record<string, unknown>;
+    expect(body).not.toHaveProperty('webhook_url');
+    expect(body).not.toHaveProperty('reports_webhook_url');
+    expect(body.offline_after_seconds).toBe(120);
+  });
+
+  it('WHEN a global admin saves THEN the real URL is editable and sent', async () => {
+    const api = apiFor('global_admin').on('GET /api/settings', ok(settings(false)));
+    await openDashboard(api);
+    goTo('Settings');
+
+    const webhook = await screen.findByLabelText('Webhook URL');
+    expect(webhook).not.toHaveAttribute('readonly');
+
+    fireEvent.click(screen.getByRole('button', { name: 'Save Settings' }));
+
+    await waitFor(() => expect(api.count('PUT /api/settings')).toBe(1));
+    expect((api.calls.find((call) => call.method === 'PUT')?.body as Record<string, unknown>).webhook_url).toBe('https://hooks.slack.com/services/secret');
+  });
+});

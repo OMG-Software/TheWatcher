@@ -29,6 +29,7 @@ struct AccessWorld : ApiFixture
     {
         add_user("admin", "global_admin");
         add_user("global_viewer", "global_viewer");
+        add_user("g_op", "global_operator");
         add_user("a_admin", "group_admin", {group_a});
         add_user("a_op", "group_operator", {group_a});
         add_user("a_viewer", "group_viewer", {group_a});
@@ -893,6 +894,187 @@ SCENARIO("Rejecting an agent only works on a pending enrollment")
             THEN("it is a 409")
             {
                 REQUIRE(w.request("POST", "/api/agents/rejected-host/reject", "admin").status == 409);
+            }
+        }
+    }
+}
+
+// ── Deleting an agent is an admin action ─────────────────────────────────────
+
+SCENARIO("Only admins delete agents")
+{
+    GIVEN("agents in groups A and B")
+    {
+        AccessWorld w;
+        w.add_agent("a-1", true, {w.group_a});
+        w.add_agent("a-2", true, {w.group_a});
+        w.add_agent("b-1", true, {w.group_b});
+
+        WHEN("a global operator or a group operator deletes an agent")
+        {
+            const auto global_op = w.request("DELETE", "/api/agents/a-1", "g_op");
+            const auto group_op = w.request("DELETE", "/api/agents/a-1", "a_op");
+
+            THEN("both are refused and the agent is kept")
+            {
+                REQUIRE(global_op.status == 403);
+                REQUIRE(group_op.status == 403);
+                REQUIRE(w.store->get_agent("a-1").has_value());
+            }
+        }
+
+        WHEN("a group admin deletes an agent of their own group")
+        {
+            const auto res = w.request("DELETE", "/api/agents/a-1", "a_admin");
+
+            THEN("it is deleted")
+            {
+                REQUIRE(res.status == 200);
+                REQUIRE_FALSE(w.store->get_agent("a-1").has_value());
+            }
+        }
+
+        WHEN("a group admin deletes an agent of another group, or an unknown id")
+        {
+            const auto other = w.request("DELETE", "/api/agents/b-1", "a_admin");
+            const auto unknown = w.request("DELETE", "/api/agents/ghost", "a_admin");
+
+            THEN("both are 403 and nothing is deleted")
+            {
+                REQUIRE(other.status == 403);
+                REQUIRE(unknown.status == 403);
+                REQUIRE(w.store->get_agent("b-1").has_value());
+            }
+        }
+
+        WHEN("a global admin deletes any agent or an unknown id")
+        {
+            const auto other = w.request("DELETE", "/api/agents/b-1", "admin");
+            const auto unknown = w.request("DELETE", "/api/agents/ghost", "admin");
+
+            THEN("the agent is deleted and the unknown id is a 404")
+            {
+                REQUIRE(other.status == 200);
+                REQUIRE(unknown.status == 404);
+                REQUIRE_FALSE(w.store->get_agent("b-1").has_value());
+            }
+        }
+    }
+}
+
+// ── Webhook URLs are secrets: only admins read or change them ────────────────
+
+SCENARIO("Webhook URLs are masked for global operators and cannot be changed by them")
+{
+    GIVEN("stored webhook URLs with a secret path")
+    {
+        AccessWorld w;
+        const std::string alert_url = "https://hooks.slack.com/services/T000/B000/secret";
+        const std::string report_url = "https://reports.example.com:8443/in/token?key=abc";
+        const std::string alert_mask = "https://hooks.slack.com/\xE2\x80\xA6";
+        const std::string report_mask = "https://reports.example.com:8443/\xE2\x80\xA6";
+        w.store->set_setting("notifications.webhook_url", alert_url);
+        w.store->set_setting("reports.webhook_url", report_url);
+
+        WHEN("a global admin reads the settings")
+        {
+            const auto res = w.request("GET", "/api/settings", "admin");
+
+            THEN("the full URLs are returned and nothing is flagged as masked")
+            {
+                REQUIRE(res.status == 200);
+                REQUIRE(res.body.at("webhook_url") == alert_url);
+                REQUIRE(res.body.at("reports_webhook_url") == report_url);
+                REQUIRE(res.body.at("webhooks_masked") == false);
+            }
+        }
+
+        WHEN("a global operator reads the settings")
+        {
+            const auto res = w.request("GET", "/api/settings", "g_op");
+
+            THEN("only scheme and host are shown and the response says so")
+            {
+                REQUIRE(res.status == 200);
+                REQUIRE(res.body.at("webhook_url") == alert_mask);
+                REQUIRE(res.body.at("reports_webhook_url") == report_mask);
+                REQUIRE(res.body.at("webhooks_masked") == true);
+                REQUIRE(res.body.at("offline_after_seconds").is_number());
+            }
+        }
+
+        WHEN("a global operator changes a webhook URL, clears it, or changes it along with other settings")
+        {
+            const auto change = w.request("PUT", "/api/settings", "g_op",
+                                          {
+                                              {"webhook_url", "https://evil.example/hook"}
+            });
+            const auto clear = w.request("PUT", "/api/settings", "g_op",
+                                         {
+                                             {"reports_webhook_url", ""}
+            });
+            const auto mixed =
+                w.request("PUT", "/api/settings", "g_op",
+                          {
+                              {"offline_after_seconds", 300                        },
+                              {"webhook_url",           "https://evil.example/hook"}
+            });
+
+            THEN("all are 403 and nothing is written, not even the other settings")
+            {
+                REQUIRE(change.status == 403);
+                REQUIRE(clear.status == 403);
+                REQUIRE(mixed.status == 403);
+                REQUIRE(w.store->get_setting("notifications.webhook_url") == alert_url);
+                REQUIRE(w.store->get_setting("reports.webhook_url") == report_url);
+                REQUIRE(w.store->get_setting("offline_after_seconds", "120") == "120");
+            }
+        }
+
+        WHEN("a global operator saves other settings, with the masked placeholders sent back unchanged")
+        {
+            const auto res = w.request(
+                "PUT", "/api/settings", "g_op",
+                {
+                    {"offline_after_seconds", 300        },
+                    {"webhook_url",           alert_mask },
+                    {"reports_webhook_url",   report_mask}
+            });
+
+            THEN("the other setting is saved and the stored URLs are untouched")
+            {
+                REQUIRE(res.status == 200);
+                REQUIRE(w.store->get_setting("offline_after_seconds") == "300");
+                REQUIRE(w.store->get_setting("notifications.webhook_url") == alert_url);
+                REQUIRE(w.store->get_setting("reports.webhook_url") == report_url);
+            }
+        }
+
+        WHEN("a global admin saves the masked placeholder back")
+        {
+            const auto res = w.request("PUT", "/api/settings", "admin",
+                                       {
+                                           {"webhook_url", alert_mask}
+            });
+
+            THEN("the placeholder is never stored over the real URL")
+            {
+                REQUIRE(res.status == 200);
+                REQUIRE(w.store->get_setting("notifications.webhook_url") == alert_url);
+            }
+        }
+
+        WHEN("a global admin sets a new URL")
+        {
+            const auto res = w.request("PUT", "/api/settings", "admin",
+                                       {
+                                           {"webhook_url", "https://new.example/hook"}
+            });
+
+            THEN("it is stored")
+            {
+                REQUIRE(res.status == 200);
+                REQUIRE(w.store->get_setting("notifications.webhook_url") == "https://new.example/hook");
             }
         }
     }

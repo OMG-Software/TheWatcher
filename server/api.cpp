@@ -853,6 +853,34 @@ namespace
         return hex.data();
     }
 
+    // Webhook URLs usually carry a secret in the path or query, so only a
+    // global admin sees or changes them. The mask keeps scheme and host (and
+    // port) and drops credentials, path and query: "https://hooks.slack.com/…".
+    // An empty URL stays empty.
+    std::string mask_webhook_url(const std::string& url)
+    {
+        if (url.empty())
+            return url;
+        const auto scheme_end = url.find("://");
+        if (scheme_end == std::string::npos)
+            return "\xE2\x80\xA6";
+        const auto authority_start = scheme_end + 3;
+        const auto authority_end = url.find_first_of("/?#", authority_start);
+        auto authority = url.substr(
+            authority_start, authority_end == std::string::npos ? std::string::npos : authority_end - authority_start);
+        if (const auto at = authority.rfind('@'); at != std::string::npos)
+            authority.erase(0, at + 1);
+        return url.substr(0, authority_start) + authority + "/\xE2\x80\xA6";
+    }
+
+    // The two settings that hold a webhook URL: request key and store key.
+    constexpr std::array<std::pair<std::string_view, std::string_view>, 2> webhook_settings = {
+        {
+         {"webhook_url", "notifications.webhook_url"},
+         {"reports_webhook_url", "reports.webhook_url"},
+         }
+    };
+
     // Serialises body as the response. Issue #147: invalid UTF-8 already in
     // the database (for example a note cut by an older version) is replaced
     // with U+FFFD instead of throwing and failing the whole list for everyone.
@@ -1804,11 +1832,21 @@ void ApiServer::setup_routes()
         try
         {
             auto id = req.path_params.at("id");
-            auto session = require_agent_access(req, res, "operator", id);
+            // Admins only: deleting a host also revokes its key and erases its
+            // history. This is also how an approved agent is revoked.
+            auto session = require_agent_access(req, res, "admin", id);
             if (!session)
                 return;
-            LOGF_INFO("Deleting agent id=%s", id.c_str());
             auto rec = store_.get_agent(id);
+            if (!rec)
+            {
+                res.status = 404;
+                set_json(res, json{
+                                  {"error", "agent not found"}
+                });
+                return;
+            }
+            LOGF_INFO("Deleting agent id=%s", id.c_str());
             if (rec)
             {
                 zap_.remove_key(rec->curve_public_key_z85);
@@ -2595,6 +2633,7 @@ void ApiServer::setup_routes()
             });
             return;
         }
+        const bool admin = normalize_role(session->role) == "global_admin";
         json out = json::object();
         out["webhook_url"] = store_.get_setting("notifications.webhook_url", "");
         out["offline_after_seconds"] = std::stoi(store_.get_setting("offline_after_seconds", "120"));
@@ -2605,6 +2644,13 @@ void ApiServer::setup_routes()
         out["reports_hour"] = std::stoi(store_.get_setting("reports.hour", "8"));
         out["reports_day_of_week"] = std::stoi(store_.get_setting("reports.day_of_week", "1"));
         out["reports_webhook_url"] = store_.get_setting("reports.webhook_url", "");
+        // Other global roles see the URLs masked, and the client is told so.
+        out["webhooks_masked"] = !admin;
+        if (!admin)
+        {
+            for (const auto& [field, ignored] : webhook_settings)
+                out[std::string(field)] = mask_webhook_url(out.at(std::string(field)).get<std::string>());
+        }
         set_json(res, out);
     });
 
@@ -2624,13 +2670,41 @@ void ApiServer::setup_routes()
         try
         {
             const auto body = json::parse(req.body);
+            // Webhook URLs: a value equal to the stored URL, or to its masked
+            // form (what GET shows non-admins), changes nothing, so the
+            // placeholder is never saved over a real URL. Any other value is
+            // a change, which only a global admin may make. Checked before
+            // anything is written.
+            const bool admin = normalize_role(session->role) == "global_admin";
+            std::vector<std::pair<std::string, std::string>> webhook_writes;
+            for (const auto& [field, setting] : webhook_settings)
+            {
+                if (!body.contains(std::string(field)))
+                    continue;
+                const auto value = body.at(std::string(field)).get<std::string>();
+                const auto stored = store_.get_setting(std::string(setting), "");
+                if (value == stored || value == mask_webhook_url(stored))
+                    continue;
+                if (!admin)
+                {
+                    res.status = 403;
+                    set_json(res, json{
+                                      {"error", "only a global admin can change webhook URLs"}
+                    });
+                    return;
+                }
+                webhook_writes.emplace_back(std::string(setting), value);
+            }
             // Issue #147: a truncated URL is a different URL, so an oversize one
             // is rejected. Checked before any setting is written, so this
             // rejection does not leave earlier fields of the request applied.
             if (body.contains("reports_webhook_url") && body.at("reports_webhook_url").get<std::string>().size() > 2048)
                 throw std::runtime_error("reports_webhook_url must be 2048 bytes or fewer");
-            if (body.contains("webhook_url"))
-                store_.set_setting("notifications.webhook_url", body.at("webhook_url").get<std::string>());
+            for (const auto& [setting, value] : webhook_writes)
+            {
+                if (value.size() > 2048)
+                    throw std::runtime_error("webhook URLs must be 2048 bytes or fewer");
+            }
             if (body.contains("offline_after_seconds"))
             {
                 const auto v = body.at("offline_after_seconds").get<int>();
@@ -2675,8 +2749,8 @@ void ApiServer::setup_routes()
                     throw std::runtime_error("reports_day_of_week must be between 0 and 6");
                 store_.set_setting("reports.day_of_week", std::to_string(v));
             }
-            if (body.contains("reports_webhook_url"))
-                store_.set_setting("reports.webhook_url", body.at("reports_webhook_url").get<std::string>());
+            for (const auto& [setting, value] : webhook_writes)
+                store_.set_setting(setting, value);
             set_json(res, json{
                               {"ok", true}
             });

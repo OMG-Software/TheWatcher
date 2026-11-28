@@ -38,6 +38,8 @@ export interface ServerSettings {
   reports_hour: number;
   reports_day_of_week: number;
   reports_webhook_url: string;
+  /** True when the server masked the webhook URLs because the caller is not a global admin. */
+  webhooks_masked?: boolean;
 }
 
 export interface IndicatorThresholds {

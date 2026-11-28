@@ -73,6 +73,21 @@ test. Do not change a single route to 404 without changing the rule.
 - **Maintenance windows and silences.** Group users manage entries for agents in
   their groups. Windows for all agents (`*`) are listed to group users, read
   only; creating or deleting `*` windows or silences needs a global operator.
+- **Deleting an agent is an admin action.** `global_admin` deletes any agent
+  (404 for an unknown id); `group_admin` deletes agents of their own groups
+  (403 outside them, and for an unknown id, because scope is checked before
+  existence). Operators and viewers get 403. Because reject now applies to
+  pending agents only, deleting is also how an approved agent is revoked, so a
+  global operator can no longer revoke an approved agent.
+- **Webhook URLs are admin-only.** `GET /api/settings` returns the full
+  `webhook_url` and `reports_webhook_url` to a `global_admin`. A
+  `global_operator` gets them masked to scheme and host plus `/…`
+  (credentials, path and query dropped; an empty URL stays empty) and
+  `webhooks_masked: true`. A `PUT` from a global operator that carries a
+  webhook field different from the stored URL, including an empty value, is a
+  403 and writes nothing. Sending a field back unchanged, or its masked form,
+  or leaving it out, changes nothing, and the masked form is never stored over
+  a real URL, for any role. Other settings stay writable by global operators.
 - **Settings, reports, groups and runbooks** are global. Creating groups,
   users with global roles, and runbooks needs `global_admin`.
 
@@ -100,12 +115,12 @@ resource in another group (group users get 403).
 | `POST /api/agents/:id/approve`, `/reject` | 401 | 200 (404 unknown, 409 not pending) | same | 403 | 403 | 403 | 403 |
 | `GET /api/agents`, `GET /api/metrics` | 401 | 200 | 200 | 200 | 200 | 200 | 200 |
 | `POST /api/agents/:id/groups` | 401 | 200 | 200 | 403 | 403 | 403 | 403 |
-| `DELETE /api/agents/:id` | 401 | 200 | 200 | 403 | scoped | scoped | 403 |
+| `DELETE /api/agents/:id` | 401 | 200 (404 unknown) | 403 | 403 | 200 for own groups, 403 otherwise | 403 | 403 |
 | `GET /api/metrics/:id`, `/log-matches`, `/history`, `GET /api/uptime/:id` | 401 | 200 | 200 | 200 | scoped | scoped | scoped |
 | `POST /api/agents/:id/` `command`, `set_interval`, `set_process_limit`, `thresholds`, `collector_config`, `maintenance`, `pause`, `resume`, `restart_collectors`, `disconnect`, `get_status`, `description`, `runbook` | 401 | 200 | 200 | 403 | scoped | scoped | 403 |
 | `GET /api/maintenance-windows`, `GET /api/silences` | 401 | 200 | 200 | 200 | 200 (own agents and, for windows, `*`) | same | same |
 | `POST /api/maintenance-windows`, `POST /api/silences`, and `DELETE` of either | 401 | 200 | 200 | 403 | scoped (never `*`) | scoped (never `*`) | 403 |
-| `GET /api/settings`, `PUT /api/settings`, `POST /api/reports/send` | 401 | 200 | 200 | 403 | 403 | 403 | 403 |
+| `GET /api/settings`, `PUT /api/settings`, `POST /api/reports/send` | 401 | 200 | 200 (webhook URLs masked, read-only) | 403 | 403 | 403 | 403 |
 | `GET /api/runbooks` | 401 | 200 | 200 | 200 | 200 | 200 | 200 |
 | `POST /api/runbooks`, `DELETE /api/runbooks/:id` | 401 | 200/201 | 403 | 403 | 403 | 403 | 403 |
 | `GET /api/views`, `GET /api/views/:id` | 401 | 200 | 200 | 200 | visible views | visible views | visible views |
@@ -117,10 +132,6 @@ in the test.
 
 ## Known gaps (not changed here)
 
-- `DELETE /api/agents/:id` is open to group operators for agents of their
-  groups. Deleting a host and its history is arguably an admin action.
-- `GET /api/settings` includes the webhook URLs and is open to global
-  operators, not only admins.
 - A non-numeric id in a path (`/api/alerts/abc/ack`, `/api/views/abc`)
   is answered 500 by some routes and 400 by others; the validation work
   (#184) makes it a uniform 400.

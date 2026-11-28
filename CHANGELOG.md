@@ -9,6 +9,17 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Security
 
+- **Behaviour change:** `DELETE /api/agents/:id` is admins only: a global admin
+  for any agent, a group admin for agents of their own groups. Global and group
+  operators get 403 (it was open to every operator) and the dashboard no longer
+  shows them Delete. Since reject now applies to pending agents only, deleting
+  is how an approved agent is revoked, and a global operator can no longer do
+  that.
+- **Behaviour change:** webhook URLs in `/api/settings` are admin-only. A global
+  operator gets them masked (`https://host/…`, with `webhooks_masked: true`) and
+  a `PUT` that changes either URL is a 403 with nothing written; the masked
+  value sent back is ignored for every role. The Settings page shows them
+  read-only to operators.
 - `PUT /api/users/:id/password` checks permission before looking the user up:
   a non-admin gets 403 for any id but their own, so user ids can no longer be
   probed. A global admin gets 404 (was 400) for an unknown id.

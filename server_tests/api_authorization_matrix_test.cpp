@@ -162,6 +162,8 @@ World build_world(ApiFixture& fx, int64_t group_a, int64_t group_b, int64_t self
     w.set("group_b", group_b);
     w.set("self", self_id);
 
+    // A stored webhook URL, so a request that clears or replaces it is a change.
+    fx.store->set_setting("reports.webhook_url", "https://hooks.example/secret-token");
     fx.add_agent("agent-a", true, {group_a});
     fx.add_agent("agent-b", true, {group_b});
     fx.add_agent("agent-del-a", true, {group_a});
@@ -299,8 +301,9 @@ const std::vector<Row>& rows()
         // ── Agents ────────────────────────────────────────────────────────────
         {"GET",    "/api/agents",                              "",                                                                                                     ANYONE                             },
         {"POST",   "/api/agents/{agent_a}/groups",             R"({"group_ids":[{group_a}]})",                                                                         GLOBAL_OPS                         },
-        {"DELETE", "/api/agents/agent-del-a",                  "",                                                                                                     OPERATORS                          },
-        {"DELETE", "/api/agents/agent-del-b",                  "",                                                                                                     GLOBAL_OPS                         },
+        {"DELETE", "/api/agents/agent-del-a",                  "",                                                                                                     {401, 200, 403, 403, 200, 403, 403}},
+        {"DELETE", "/api/agents/agent-del-b",                  "",                                                                                                     {401, 200, 403, 403, 403, 403, 403}},
+        {"DELETE", "/api/agents/ghost-agent",                  "",                                                                                                     {401, 404, 403, 403, 403, 403, 403}},
         {"GET",    "/api/metrics",                             "",                                                                                                     ANYONE                             },
         {"GET",    "/api/metrics/{agent_a}",                   "",                                                                                                     ANYONE                             },
         {"GET",    "/api/metrics/{agent_b}",                   "",                                                                                                     GLOBAL_READ                        },
@@ -356,6 +359,11 @@ const std::vector<Row>& rows()
         // ── Settings and reports ──────────────────────────────────────────────
         {"GET",    "/api/settings",                            "",                                                                                                     GLOBAL_OPS                         },
         {"PUT",    "/api/settings",                            R"({"offline_after_seconds":120})",                                                                     GLOBAL_OPS                         },
+        // Webhook URLs belong to admins: operators may save other keys but not these.
+        {"PUT",
+         "/api/settings",                                      R"({"webhook_url":"https://other.example/hook"})",
+         {401, 200, 403, 403, 403, 403, 403}                                                                                                                                                              },
+        {"PUT",    "/api/settings",                            R"({"reports_webhook_url":""})",                                                                        {401, 200, 403, 403, 403, 403, 403}},
         {"POST",   "/api/reports/send",                        "",                                                                                                     GLOBAL_OPS                         },
         // ── Runbooks ──────────────────────────────────────────────────────────
         {"GET",    "/api/runbooks",                            "",                                                                                                     ANYONE                             },

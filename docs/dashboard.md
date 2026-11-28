@@ -248,7 +248,8 @@ Agent Management handles approved agents:
   read-only. Saving sends the `config_revision` the modal opened with; if
   someone else saved the agent in the meantime the server answers 409 and the
   modal shows the message (close and reopen it to load their changes);
-- approved agents show command buttons, then Configure, then Delete;
+- approved agents show command buttons, then Configure, then Delete (Delete is
+  shown to global and group admins only; operators do not see it);
 - approved agent identity shows the hostname, primary non-loopback IP address,
   and agent id;
 - the Configure modal updates heartbeat interval, poll interval, process sample
@@ -347,6 +348,11 @@ the scheduled digest report (enabled, daily or weekly schedule, day of week,
 report webhook URL). Save Settings persists them; Send Report Now sends the
 report immediately.
 
+Webhook URLs can carry a secret, so only the global admin sees and edits them.
+A global operator sees both URLs masked to scheme and host
+(`https://hooks.slack.com/…`), read-only with a short note, and Save Settings
+leaves the webhook fields out of the request.
+
 ## API Contract
 
 The dashboard consumes:
@@ -370,7 +376,7 @@ The dashboard consumes:
 | `POST /api/agents/:id/approve` | Approve pending enrollment and assign groups. |
 | `POST /api/agents/:id/reject` | Reject pending enrollment. |
 | `POST /api/agents/:id/groups` | Replace an approved agent's group memberships. |
-| `DELETE /api/agents/:id` | Delete agent and metrics. |
+| `DELETE /api/agents/:id` | Delete agent and metrics, and revoke its key; admins only (group admins for agents of their groups). |
 | `POST /api/agents/:id/set_interval` | Legacy endpoint for poll interval update. |
 | `POST /api/agents/:id/set_process_limit` | Legacy endpoint for process limit update. |
 | `POST /api/agents/:id/thresholds` | Legacy endpoint for old threshold rows. |

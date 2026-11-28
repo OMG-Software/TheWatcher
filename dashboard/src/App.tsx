@@ -22,7 +22,7 @@ import { SilencesPage } from './pages/SilencesPage';
 import { UsersPage } from './pages/UsersPage';
 import { ViewsPage } from './pages/ViewsPage';
 import type { SessionInfo } from './models';
-import { canOperate, isGlobal } from './permissions';
+import { canDeleteAgents, canEditWebhooks, canOperate, isGlobal } from './permissions';
 import { summaryCounts, toDisplayAlerts, type OverviewGroupFilter } from './status';
 import { NAV_ITEMS, accountTypeLabel, colorLabel, type DashboardView } from './uiLogic';
 
@@ -184,6 +184,7 @@ function Dashboard({ session, onSignOut }: { session: SessionInfo; onSignOut: ()
             isBusy={isBusy}
             groups={groups}
             onConfigure={setConfigAgentId}
+            canDelete={canDeleteAgents(session.role)}
             operator={operator}
             pending={global && operator ? pending : []}
             pendingLoadFailed={Boolean(sectionErrors.pending)}
@@ -228,7 +229,7 @@ function Dashboard({ session, onSignOut }: { session: SessionInfo; onSignOut: ()
           <UsersPage busyAction={busyAction} groups={groups} runAction={runAction} session={session} users={users} />
         </>
       ) : null}
-      {view === 'settings' ? <SettingsPage runAction={runAction} /> : null}
+      {view === 'settings' ? <SettingsPage canEditWebhooks={canEditWebhooks(session.role)} runAction={runAction} /> : null}
       <AppFooter />
     </ActionFailureContext.Provider>
   );
