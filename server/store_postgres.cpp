@@ -242,20 +242,12 @@ namespace
 // ── Construction ──────────────────────────────────────────────────────────────
 
 PostgresStore::PostgresStore(const std::string& dsn)
+    : conn_(dsn) // owns the handle from here on, so a throw below cannot leak it
 {
     LOG_FUNCTION_TRACE
+    LOGF_DEBUG("Opened PostgreSQL store dsn=%s", redact_dsn(dsn).c_str());
     if (sodium_init() < 0)
         throw std::runtime_error("libsodium initialization failed");
-    LOGF_DEBUG("Opening PostgreSQL store dsn=%s", redact_dsn(dsn).c_str());
-    conn_ = PQconnectdb(dsn.c_str());
-    if (!conn_ || PQstatus(conn_) != CONNECTION_OK)
-    {
-        const std::string msg = conn_ ? PQerrorMessage(conn_) : "out of memory";
-        if (conn_)
-            PQfinish(conn_);
-        conn_ = nullptr;
-        throw std::runtime_error("PostgreSQL connect failed: " + msg);
-    }
     init_schema();
     bootstrap_defaults();
 }
@@ -263,11 +255,7 @@ PostgresStore::PostgresStore(const std::string& dsn)
 PostgresStore::~PostgresStore()
 {
     LOG_FUNCTION_TRACE
-    if (conn_)
-    {
-        PQfinish(conn_);
-        LOG_DEBUG("PostgreSQL store closed");
-    }
+    LOG_DEBUG("Closing PostgreSQL store");
 }
 
 void PostgresStore::exec(const char* sql)
@@ -784,6 +772,67 @@ void PostgresStore::set_agent_collector_config(const std::string& agent_id, cons
     check_res(res.r, "set_agent_collector_config");
 }
 
+void PostgresStore::touch_agent(const std::string& agent_id, int64_t last_seen_ms, bool connected)
+{
+    const auto p_ls = s(last_seen_ms);
+    const char* params[] = {p_ls.c_str(), connected ? "true" : "false", agent_id.c_str()};
+    Res res(PQexecParams(conn_, "UPDATE agents SET last_seen=$1,connected=$2::boolean WHERE agent_id=$3;", 3, nullptr,
+                         params, nullptr, nullptr, 0));
+    check_res(res.r, "touch_agent");
+}
+
+void PostgresStore::update_agent_int(const char* sql, const char* ctx, const std::string& agent_id, int value)
+{
+    const auto p_value = s(value);
+    const char* params[] = {p_value.c_str(), agent_id.c_str()};
+    Res res(PQexecParams(conn_, sql, 2, nullptr, params, nullptr, nullptr, 0));
+    check_res(res.r, ctx);
+}
+
+void PostgresStore::set_agent_collection_interval(const std::string& agent_id, int seconds)
+{
+    update_agent_int("UPDATE agents SET collection_interval=$1 WHERE agent_id=$2;", "set_agent_collection_interval",
+                     agent_id, seconds);
+}
+
+void PostgresStore::set_agent_heartbeat_interval(const std::string& agent_id, int seconds)
+{
+    update_agent_int("UPDATE agents SET heartbeat_interval=$1 WHERE agent_id=$2;", "set_agent_heartbeat_interval",
+                     agent_id, seconds);
+}
+
+void PostgresStore::set_agent_process_limit(const std::string& agent_id, int limit)
+{
+    update_agent_int("UPDATE agents SET process_limit=$1 WHERE agent_id=$2;", "set_agent_process_limit", agent_id,
+                     limit);
+}
+
+bool PostgresStore::save_agent_configuration(const std::string& agent_id, const AgentConfigUpdate& update)
+{
+    postgres::Transaction tx(conn_);
+    const auto p_ci = s(update.collection_interval);
+    const auto p_hi = s(update.heartbeat_interval);
+    const auto p_pl = s(update.process_limit);
+    const auto cfg_json = nlohmann::json(update.collector_config).dump();
+    // A null runbook parameter keeps the stored runbook.
+    const char* runbook = update.runbook_markdown ? update.runbook_markdown->c_str() : nullptr;
+    const char* params[] = {p_ci.c_str(), p_hi.c_str(), p_pl.c_str(), cfg_json.c_str(), runbook, agent_id.c_str()};
+    {
+        Res res(PQexecParams(conn_,
+                             "UPDATE agents SET collection_interval=$1,heartbeat_interval=$2,process_limit=$3,"
+                             "collector_config_json=$4,runbook_markdown=COALESCE($5::text,runbook_markdown) "
+                             "WHERE agent_id=$6;",
+                             6, nullptr, params, nullptr, nullptr, 0));
+        check_res(res.r, "save_agent_configuration");
+        if (std::string(PQcmdTuples(res.r)) == "0")
+            return false; // unknown agent: the guard rolls back the empty transaction
+    }
+    if (update.group_ids)
+        replace_agent_groups(agent_id, *update.group_ids);
+    tx.commit();
+    return true;
+}
+
 void PostgresStore::set_agent_description(const std::string& agent_id, const std::string& description)
 {
     const char* params[] = {description.c_str(), agent_id.c_str()};
@@ -835,7 +884,7 @@ std::vector<int64_t> PostgresStore::get_agent_groups(const std::string& agent_id
     return out;
 }
 
-void PostgresStore::set_agent_groups(const std::string& agent_id, const std::vector<int64_t>& group_ids)
+void PostgresStore::replace_agent_groups(const std::string& agent_id, const std::vector<int64_t>& group_ids)
 {
     const char* del_params[] = {agent_id.c_str()};
     Res del(PQexecParams(conn_, "DELETE FROM agent_groups WHERE agent_id=$1;", 1, nullptr, del_params, nullptr, nullptr,
@@ -849,6 +898,15 @@ void PostgresStore::set_agent_groups(const std::string& agent_id, const std::vec
                              2, nullptr, params, nullptr, nullptr, 0));
         check_res(ins.r, "set_agent_groups insert");
     }
+}
+
+void PostgresStore::set_agent_groups(const std::string& agent_id, const std::vector<int64_t>& group_ids)
+{
+    // Atomic: a failed insert (for example an unknown group id) rolls the
+    // delete back, so the agent keeps its previous groups.
+    postgres::Transaction tx(conn_);
+    replace_agent_groups(agent_id, group_ids);
+    tx.commit();
 }
 
 // ── Users ─────────────────────────────────────────────────────────────────────
@@ -889,6 +947,7 @@ int64_t PostgresStore::create_user(const std::string& username, const std::strin
 
 void PostgresStore::set_user_groups(int64_t user_id, const std::vector<int64_t>& group_ids)
 {
+    postgres::Transaction tx(conn_); // atomic: see set_agent_groups
     const auto p_uid = s(user_id);
     const char* del_params[] = {p_uid.c_str()};
     Res del(
@@ -902,6 +961,7 @@ void PostgresStore::set_user_groups(int64_t user_id, const std::vector<int64_t>&
                              2, nullptr, params, nullptr, nullptr, 0));
         check_res(ins.r, "set_user_groups insert");
     }
+    tx.commit();
 }
 
 std::vector<int64_t> PostgresStore::get_user_groups(int64_t user_id)
@@ -1277,6 +1337,53 @@ int64_t PostgresStore::insert_alert(const AlertRecord& alert)
     return col_int64(res.r, 0, 0);
 }
 
+int64_t PostgresStore::insert_heartbeat_alert_if_absent(const AlertRecord& alert)
+{
+    // READ COMMITTED lets two server nodes both see "no live alert" and both
+    // insert. A transaction-scoped advisory lock keyed on the agent serialises
+    // them: the second node waits, then its INSERT's fresh snapshot sees the
+    // first node's committed row. No unique index, so this also works on a
+    // database that already holds duplicates. (SQLite has a single writer, so
+    // its single statement is enough.)
+    postgres::Transaction tx(conn_);
+    {
+        const std::string lock_key = "thewatcher:heartbeat:" + alert.agent_id;
+        const char* lock_params[] = {lock_key.c_str()};
+        Res lock(PQexecParams(conn_, "SELECT pg_advisory_xact_lock(hashtext($1));", 1, nullptr, lock_params, nullptr,
+                              nullptr, 0));
+        check_res(lock.r, "insert_heartbeat_alert_if_absent lock");
+    }
+    const auto p_cat = s(alert.created_at);
+    const auto p_aat = s(alert.acknowledged_at);
+    const auto p_dat = s(alert.deleted_at);
+    const auto p_eat = s(alert.escalated_at);
+    const char* params[] = {alert.agent_id.c_str(),
+                            alert.old_status.c_str(),
+                            alert.new_status.c_str(),
+                            alert.message.c_str(),
+                            p_cat.c_str(),
+                            alert.acknowledged_by.c_str(),
+                            p_aat.c_str(),
+                            p_dat.c_str(),
+                            alert.note.c_str(),
+                            p_eat.c_str(),
+                            alert.runbook_url.c_str()};
+    Res res(PQexecParams(conn_, R"(
+        INSERT INTO alerts(agent_id,indicator,old_status,new_status,message,created_at,
+            acknowledged_by,acknowledged_at,deleted_at,note,escalated_at,runbook_url)
+        SELECT $1::text,'Heartbeat',$2,$3,$4,$5::bigint,$6,$7::bigint,$8::bigint,$9,$10::bigint,$11
+        WHERE NOT EXISTS (
+            SELECT 1 FROM alerts WHERE agent_id=$1::text AND indicator='Heartbeat' AND deleted_at=0
+        )
+        RETURNING alert_id;
+    )",
+                         11, nullptr, params, nullptr, nullptr, 0));
+    check_res(res.r, "insert_heartbeat_alert_if_absent");
+    const int64_t alert_id = PQntuples(res.r) > 0 ? col_int64(res.r, 0, 0) : 0;
+    tx.commit();
+    return alert_id;
+}
+
 namespace
 {
     constexpr const char* ALERT_SELECT =
@@ -1328,8 +1435,11 @@ void PostgresStore::acknowledge_alert(int64_t alert_id, const std::string& usern
 void PostgresStore::bulk_acknowledge_alerts(const std::vector<int64_t>& alert_ids, const std::string& username,
                                             int64_t acknowledged_at, const std::string& note)
 {
+    // All or nothing: a failure part-way must not leave half the alerts changed.
+    postgres::Transaction tx(conn_);
     for (const auto id : alert_ids)
         acknowledge_alert(id, username, acknowledged_at, note);
+    tx.commit();
 }
 
 void PostgresStore::soft_delete_alert(int64_t alert_id, int64_t deleted_at)
@@ -1344,8 +1454,10 @@ void PostgresStore::soft_delete_alert(int64_t alert_id, int64_t deleted_at)
 
 void PostgresStore::bulk_soft_delete_alerts(const std::vector<int64_t>& alert_ids, int64_t deleted_at)
 {
+    postgres::Transaction tx(conn_);
     for (const auto id : alert_ids)
         soft_delete_alert(id, deleted_at);
+    tx.commit();
 }
 
 void PostgresStore::clear_active_alerts_for_agent(const std::string& agent_id, int64_t cleared_at)

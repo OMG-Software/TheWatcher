@@ -151,6 +151,51 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   unprivileged writers, and root-reserved blocks count as used (#158).
 - Encoding a frame with an empty payload no longer passes a null pointer to
   libcbor (undefined behaviour reported by UBSan on every heartbeat) (#162).
+- The store is now safe to share between threads. `make_store` returns the
+  backend wrapped in `SynchronizedStore`, which holds one mutex for every
+  call, so HTTP workers, the data-plane thread and the status engine no
+  longer interleave statements or transactions on the single SQLite or
+  PostgreSQL connection (#73).
+- Group assignments on PostgreSQL (`set_agent_groups`, `set_user_groups`) are
+  transactional: a failed insert, such as an unknown group id, no longer
+  leaves the agent or user with no groups. The configure-modal save
+  (`POST /api/agents/:id/collector_config`) is one transaction through the
+  new `save_agent_configuration`, so a failure saves nothing (#72).
+- SQLite reads no longer report a database error as "no rows": a locked or
+  failing database makes `get_session`, `is_silenced`, `has_open_alert`,
+  `get_offline_unalerted_agent_ids` and the list calls throw instead of
+  returning an empty result (an active silence could be ignored, and alert
+  de-duplication could be skipped, creating a duplicate alert). The
+  connection now waits up to 5 seconds for a competing lock (#78).
+- Bulk acknowledge and bulk delete of alerts run in one transaction on both
+  backends, and the dead-agent alert is created with an atomic
+  insert-if-absent (#79). On PostgreSQL this runs under a per-agent advisory
+  lock, so two server nodes cannot create duplicates once every node runs
+  0.9.0. A pre-0.9.0 node does not take the lock: during a rolling upgrade,
+  upgrade every node before running them concurrently, or accept that one
+  duplicate Heartbeat alert per agent is possible in that window. The offline
+  scan reaches it through `AlertPipeline` (`AlertRequest::single_open_heartbeat`),
+  so silences, maintenance and the webhook still apply and the webhook is sent
+  only when the insert happened. `insert_heartbeat_alert_if_absent` now returns
+  the new alert id (0 when a live Heartbeat alert already existed).
+- `SynchronizedStore` forwards `has_open_alert`, and the per-agent
+  `mark_agent_offline`, `latest_status_per_indicator` and retention
+  `prune_*_before` calls (#46, #43, #76), under its lock.
+- A successful DISCONNECT, PAUSE or RESUME ACK is applied by
+  `apply_command_ack` through the server's one `StatusEngine`, so the engine's
+  maintenance state stays in step with the stored flag. A PAUSE ACK keeps the
+  maintenance reason and expiry the API stored before sending the command;
+  only an agent not yet in maintenance gets open-ended `command` maintenance.
+- A heartbeat or an API setting no longer rewrites the whole agent row from a
+  stale snapshot, which silently reverted a collector config, heartbeat
+  interval, runbook or maintenance change saved at the same moment. The data
+  plane and API now use narrow setters (`touch_agent`,
+  `set_agent_collection_interval`, `set_agent_heartbeat_interval`,
+  `set_agent_process_limit`); `upsert_agent` is for enrollment (#51).
+- The store owns its database handles with RAII (`sqlite::Connection`,
+  `postgres::Connection`), so a constructor that throws no longer leaks the
+  connection; prepared statements are movable and transactions use a guard
+  that rolls back without masking the original error (part of #100).
 - The Windows installer registers the server service with
   `TheWatcherServer.conf`, the file the server actually reads, instead of a
   non-existent `server.json`; the docs name the same file and
@@ -228,6 +273,17 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Changed
 
+- `SynchronizedStore` forwarders take the store's lock through
+  `lock_for_call(__func__)`, which holds the mutex only through a
+  `std::unique_lock`: it tries the lock and, if another call holds it, blocks
+  by constructing a new one, never by a bare `lock()`. A test seam,
+  `set_lock_observer`, is told with the method's name when a call waits for
+  the lock and when it takes it, so race tests can prove that two calls
+  overlapped instead of inferring it from sleeps. Production installs no
+  observer and takes the same path without the reports. `store_concurrency`
+  checks the events exactly: `Acquired` alone for an uncontended call,
+  `Waiting` then `Acquired` for a call that arrives while another holds the
+  lock.
 - Documentation: PostgreSQL is documented as an implemented backend selected
   with `DB_TYPE=postgres` / `POSTGRES_DSN` (build-time support required), the
   HA guide uses the real `TheWatcherServer.conf` KEY=VALUE format with its
@@ -274,6 +330,17 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+- A lock rule check: every lock must be held through an RAII wrapper
+  (`std::scoped_lock`, `std::lock_guard`, `std::unique_lock`,
+  `std::shared_lock` or a project RAII type). `scripts/check_raii_locks.py`
+  fails on a bare `lock()`, `unlock()`, `try_lock()` or `lock_shared()` call
+  (and their variants), `std::lock`/`std::try_lock`, or an OS lock function
+  such as `pthread_mutex_lock` or `EnterCriticalSection`. Comments and string
+  literals are ignored. An exceptional case passes only with a
+  `// raii-lock-exception: <reason>` comment on the same line or a
+  comment-only line above. It runs as the `RAII locks` CI job and as the
+  meson `lint` tests `raii_locks_checker` and `raii_locks`, so every platform
+  build checks it too (docs/development.md).
 - Dashboard: ESLint (flat config, `typescript-eslint`, `react-hooks`) with
   `npm run lint`, and a `dashboard` CI job running
   `npm ci --ignore-scripts` (no package install scripts), lint, build, tests

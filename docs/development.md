@@ -15,7 +15,8 @@ dashboard/          React + TypeScript + Vite dashboard.
 docs/               Operator and developer documentation.
 integration_tests/  End-to-end server-agent lifecycle tests.
 plans/              dev-task-planner task plans.
-scripts/            Cross-platform build-environment setup scripts.
+scripts/            Cross-platform build-environment setup scripts and the
+                    RAII-lock checker (check_raii_locks.py).
 server/             Server runtime, API, storage, ZAP auth, config.
 server_tests/       Store, lifecycle, and ZAP tests.
 subprojects/        Meson wrap files and packagefile overlays for libsodium,
@@ -60,6 +61,23 @@ npm.cmd test
   directories and `*.test.ts(x)` files are excluded from duplication
   detection only (BDD scenarios repeat setup deliberately); keep shared
   setup in helpers when it carries logic.
+- Hold every lock through an RAII wrapper: `std::scoped_lock`,
+  `std::lock_guard`, `std::unique_lock`, `std::shared_lock` or a project RAII
+  type. Never call bare `lock()`, `unlock()`, `try_lock()`,
+  `lock_shared()` (and their variants), `std::lock`/`std::try_lock`, or an OS
+  lock function (`pthread_mutex_lock`, `EnterCriticalSection`,
+  `AcquireSRWLockExclusive`, ...). To wait for a lock that a `unique_lock`
+  could not take, construct a new `unique_lock` and move-assign it rather
+  than calling `lock()` on the old one; to release early, end the scope.
+  Only an exceptional case may break the rule, such as the inside of a
+  project RAII type, or `std::weak_ptr::lock()`, which is not a mutex.
+  Justify it on the same line or on a comment-only line directly above:
+  `// raii-lock-exception: <reason>`. `scripts/check_raii_locks.py` enforces
+  this. It runs as the `RAII locks` CI job and as the meson tests
+  `raii_locks_checker` (the checker's own tests) and `raii_locks` (the
+  source tree) in the `lint` suite. Run it locally with
+  `python3 scripts/check_raii_locks.py .`. It is a textual check: it blanks
+  comments and string literals, then matches the calls by name.
 - Keep top-level C++ namespace as `thewatcher`.
 - Prefer structured types in `common/metrics.hpp`, `common/protocol.hpp`, and
   `common/commands.hpp` over ad hoc strings.

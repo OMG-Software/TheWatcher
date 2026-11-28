@@ -23,6 +23,10 @@ struct AlertRequest
     // same agent, indicator and severity exists. Used by sources that can
     // repeat without a state change, such as log matches.
     bool deduplicate = false;
+    // Insert through Store::insert_heartbeat_alert_if_absent, so an agent has
+    // at most one live Heartbeat alert even when several server nodes race (#79).
+    // has_open_alert followed by an insert is not atomic; this is.
+    bool single_open_heartbeat = false;
 };
 
 enum class AlertOutcome

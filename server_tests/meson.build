@@ -12,7 +12,9 @@ store_test = executable(
   include_directories: root_inc,
   dependencies: [server_store_dep, catch2_dep, sqlite_dep, platform_deps],
 )
-test('store', store_test)
+# Every SqliteStore(":memory:") hashes the default admin password, so the
+# suite is slow under load; meson's 30s default timed out on busy machines.
+test('store', store_test, timeout: 120)
 
 status_engine_test = executable(
   'status_engine_test',
@@ -150,3 +152,19 @@ if libpq_dep.found()
     env: ['THEWATCHER_POSTGRES_TEST_DSN=host=localhost dbname=thewatcher_test user=thewatcher_test password=thewatcher_test'],
   )
 endif
+
+store_concurrency_test = executable(
+  'store_concurrency_test',
+  ['store_concurrency_test.cpp'],
+  include_directories: root_inc,
+  dependencies: [server_store_dep, catch2_dep, sqlite_dep, platform_deps],
+)
+test('store_concurrency', store_concurrency_test)
+
+command_ack_test = executable(
+  'command_ack_test',
+  ['command_ack_test.cpp'],
+  include_directories: root_inc,
+  dependencies: [server_store_dep, catch2_dep, sqlite_dep, platform_deps],
+)
+test('command_ack', command_ack_test)

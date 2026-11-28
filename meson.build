@@ -169,3 +169,16 @@ subdir('common_tests')
 subdir('agent_tests')
 subdir('server_tests')
 subdir('integration_tests')
+
+# Lock rule (docs/development.md): every lock is held through an RAII wrapper,
+# so a bare lock()/unlock() call outside a justified raii-lock-exception fails
+# the test run on every platform. The checker's own tests run first.
+lint_python = import('python').find_installation()
+test('raii_locks_checker', lint_python,
+  args: [files('scripts/check_raii_locks_test.py')],
+  suite: 'lint',
+)
+test('raii_locks', lint_python,
+  args: [files('scripts/check_raii_locks.py'), meson.project_source_root()],
+  suite: 'lint',
+)

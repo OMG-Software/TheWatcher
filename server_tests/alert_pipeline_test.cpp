@@ -11,6 +11,7 @@
 #include <nlohmann/json.hpp>
 
 #include <mutex>
+#include <thread>
 #include <vector>
 
 using namespace thewatcher::server;
@@ -211,6 +212,43 @@ SCENARIO("Every alert kind sends the webhook (issue #52)")
                     },
                     5s, 10ms));
                 REQUIRE(capture.bodies[0]["indicator"] == "app-errors");
+            }
+        }
+    }
+}
+
+SCENARIO("Two server nodes racing never both raise a Heartbeat alert (issues #79, #52)")
+{
+    GIVEN("an agent that already has a live Heartbeat alert from another node and a configured webhook")
+    {
+        SqliteStore store(":memory:");
+        add_agent(store, "a1", false, /*connected=*/false);
+        store.set_setting("notifications.webhook_url", "http://hooks.example.net/alert");
+        AlertRecord other_node;
+        other_node.agent_id = "a1";
+        other_node.indicator = "Heartbeat";
+        other_node.old_status = "green";
+        other_node.new_status = "red";
+        other_node.created_at = 4000;
+        REQUIRE(store.insert_heartbeat_alert_if_absent(other_node) > 0);
+        Capture capture;
+        NotificationWorker worker({}, [&](const Notification& n) {
+            return capture.record(n);
+        });
+        AlertPipeline pipeline(store, worker);
+
+        WHEN("this node raises a Heartbeat alert without its own open-alert check having seen the first one")
+        {
+            AlertRequest request{"a1", "Heartbeat", "green", "red", "Agent has gone offline", 5000};
+            request.single_open_heartbeat = true;
+            const auto outcome = pipeline.raise(request);
+
+            THEN("the insert is refused, only one alert exists and no webhook is sent")
+            {
+                REQUIRE(outcome == AlertOutcome::Deduplicated);
+                REQUIRE(store.list_alerts(false).size() == 1);
+                std::this_thread::sleep_for(100ms);
+                REQUIRE(capture.size() == 0);
             }
         }
     }
