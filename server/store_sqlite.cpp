@@ -1194,7 +1194,7 @@ int64_t SqliteStore::insert_alert(const AlertRecord& alert)
     return sqlite3_last_insert_rowid(db_);
 }
 
-bool SqliteStore::insert_heartbeat_alert_if_absent(const AlertRecord& alert)
+int64_t SqliteStore::insert_heartbeat_alert_if_absent(const AlertRecord& alert)
 {
     // One statement, so the existence check and the insert cannot interleave
     // with another writer (or another server node on a shared database).
@@ -1219,7 +1219,7 @@ bool SqliteStore::insert_heartbeat_alert_if_absent(const AlertRecord& alert)
     sqlite3_bind_int64(st.s, 10, alert.escalated_at);
     sqlite3_bind_text(st.s, 11, alert.runbook_url.c_str(), -1, SQLITE_TRANSIENT);
     check(sqlite3_step(st.s), db_, "step insert_heartbeat_alert_if_absent");
-    return sqlite3_changes(db_) > 0;
+    return sqlite3_changes(db_) > 0 ? sqlite3_last_insert_rowid(db_) : 0;
 }
 
 std::vector<AlertRecord> SqliteStore::list_alerts(bool include_deleted)
@@ -1349,6 +1349,21 @@ std::vector<std::string> SqliteStore::get_offline_unalerted_agent_ids()
     while (step_row(st.s, db_, __func__))
         out.push_back(text_col(st.s, 0));
     return out;
+}
+
+bool SqliteStore::has_open_alert(const std::string& agent_id, const std::string& indicator,
+                                 const std::string& new_status)
+{
+    Stmt st;
+    check(sqlite3_prepare_v2(db_,
+                             "SELECT 1 FROM alerts WHERE agent_id=? AND indicator=? AND new_status=? "
+                             "AND deleted_at=0 AND acknowledged_at=0 LIMIT 1;",
+                             -1, &st.s, nullptr),
+          db_, "prepare has_open_alert");
+    sqlite3_bind_text(st.s, 1, agent_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st.s, 2, indicator.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st.s, 3, new_status.c_str(), -1, SQLITE_TRANSIENT);
+    return sqlite3_step(st.s) == SQLITE_ROW;
 }
 
 void SqliteStore::archive_heartbeat_alerts_for_agent(const std::string& agent_id, int64_t deleted_at)

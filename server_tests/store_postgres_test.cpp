@@ -759,8 +759,8 @@ SCENARIO("[postgres] A dead-agent heartbeat alert is created once and bulk alert
 
         WHEN("the heartbeat alert is inserted twice")
         {
-            const bool first = store.insert_heartbeat_alert_if_absent(alert);
-            const bool second = store.insert_heartbeat_alert_if_absent(alert);
+            const bool first = store.insert_heartbeat_alert_if_absent(alert) > 0;
+            const bool second = store.insert_heartbeat_alert_if_absent(alert) > 0;
 
             THEN("only the first creates a row")
             {

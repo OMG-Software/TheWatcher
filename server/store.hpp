@@ -271,8 +271,9 @@ public:
     virtual void clear_pending_status(const std::string& agent_id, const std::string& indicator) = 0;
     virtual int64_t insert_alert(const AlertRecord& alert) = 0;
     // Inserts `alert` only when the agent has no live (not deleted) Heartbeat
-    // alert, as one atomic statement. Returns whether a row was inserted.
-    virtual bool insert_heartbeat_alert_if_absent(const AlertRecord& alert) = 0;
+    // alert, as one atomic statement. Returns the new alert id, or 0 when a live
+    // Heartbeat alert already existed and nothing was inserted.
+    virtual int64_t insert_heartbeat_alert_if_absent(const AlertRecord& alert) = 0;
     virtual std::vector<AlertRecord> list_alerts(bool include_deleted = false) = 0;
     virtual std::vector<AlertRecord> list_unacknowledged_alerts() = 0;
     virtual void acknowledge_alert(int64_t alert_id, const std::string& username, int64_t acknowledged_at,
@@ -285,6 +286,10 @@ public:
     virtual void set_agent_description(const std::string& agent_id, const std::string& description) = 0;
     virtual void set_agent_runbook(const std::string& agent_id, const std::string& markdown) = 0;
     virtual std::vector<std::string> get_offline_unalerted_agent_ids() = 0;
+    // True when an alert for agent_id/indicator with this new_status is still
+    // open: neither acknowledged nor deleted. Used to de-duplicate alerts.
+    virtual bool has_open_alert(const std::string& agent_id, const std::string& indicator,
+                                const std::string& new_status) = 0;
     virtual void archive_heartbeat_alerts_for_agent(const std::string& agent_id, int64_t deleted_at) = 0;
     virtual void escalate_old_alerts(int64_t cutoff_ms, int64_t now_ms) = 0;
     virtual int64_t count_metrics_in_window(const std::string& agent_id, int64_t since_ms, int64_t until_ms) = 0;

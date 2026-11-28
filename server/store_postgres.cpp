@@ -1265,7 +1265,7 @@ int64_t PostgresStore::insert_alert(const AlertRecord& alert)
     return col_int64(res.r, 0, 0);
 }
 
-bool PostgresStore::insert_heartbeat_alert_if_absent(const AlertRecord& alert)
+int64_t PostgresStore::insert_heartbeat_alert_if_absent(const AlertRecord& alert)
 {
     // READ COMMITTED lets two server nodes both see "no live alert" and both
     // insert. A transaction-scoped advisory lock keyed on the agent serialises
@@ -1302,13 +1302,14 @@ bool PostgresStore::insert_heartbeat_alert_if_absent(const AlertRecord& alert)
         SELECT $1::text,'Heartbeat',$2,$3,$4,$5::bigint,$6,$7::bigint,$8::bigint,$9,$10::bigint,$11
         WHERE NOT EXISTS (
             SELECT 1 FROM alerts WHERE agent_id=$1::text AND indicator='Heartbeat' AND deleted_at=0
-        );
+        )
+        RETURNING alert_id;
     )",
                          11, nullptr, params, nullptr, nullptr, 0));
     check_res(res.r, "insert_heartbeat_alert_if_absent");
-    const bool inserted = std::string(PQcmdTuples(res.r)) != "0";
+    const int64_t alert_id = PQntuples(res.r) > 0 ? col_int64(res.r, 0, 0) : 0;
     tx.commit();
-    return inserted;
+    return alert_id;
 }
 
 namespace
@@ -1413,6 +1414,18 @@ std::vector<std::string> PostgresStore::get_offline_unalerted_agent_ids()
     for (int i = 0; i < PQntuples(res.r); ++i)
         out.push_back(col(res.r, i, 0));
     return out;
+}
+
+bool PostgresStore::has_open_alert(const std::string& agent_id, const std::string& indicator,
+                                   const std::string& new_status)
+{
+    const char* params[] = {agent_id.c_str(), indicator.c_str(), new_status.c_str()};
+    Res res(PQexecParams(conn_,
+                         "SELECT 1 FROM alerts WHERE agent_id=$1 AND indicator=$2 AND new_status=$3 "
+                         "AND deleted_at=0 AND acknowledged_at=0 LIMIT 1;",
+                         3, nullptr, params, nullptr, nullptr, 0));
+    check_res(res.r, "has_open_alert");
+    return PQntuples(res.r) > 0;
 }
 
 void PostgresStore::archive_heartbeat_alerts_for_agent(const std::string& agent_id, int64_t deleted_at)
