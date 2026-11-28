@@ -137,7 +137,9 @@ working document for audit, design review, and regression testing.
   treated as unsafe rather than skipped. A config path through a symlink or junction is walked
   component by component and each link is judged where it lives (its
   directory, the link's own owner or ACL), so another user cannot retarget a
-  link on the path after the check. `--uninstall-service` runs before the
+  link on the path after the check, and missing levels are created only after the
+  deepest existing level passed, so a planted link cannot be used to create
+  directories in its target. `--uninstall-service` runs before the
   check. Residual risk: the agent config under its
   own data directory is not checked yet.
 - Config parser file and line sizes are bounded to avoid unbounded local input,

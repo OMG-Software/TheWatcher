@@ -644,9 +644,25 @@ namespace
     }
 } // namespace
 
+// `dir` with every symlink and junction resolved. A directory this user cannot
+// open (owner-only ACL) cannot be resolved itself; its parent can.
+static fs::path resolve_for_check(const fs::path& dir)
+{
+    std::error_code ec;
+    fs::path resolved = fs::weakly_canonical(dir, ec);
+    if (ec)
+    {
+        ec.clear();
+        resolved = fs::weakly_canonical(fs::absolute(dir, ec).parent_path(), ec) / dir.filename();
+    }
+    if (ec)
+        refuse(dir, "its path cannot be resolved: " + ec.message());
+    return resolved;
+}
+
 void ensure_private_directory(const fs::path& dir)
 {
-    // Levels that do not exist yet, deepest first; each is created private.
+    // Levels that do not exist yet, deepest first.
     std::vector<fs::path> missing;
     std::error_code ec;
     for (fs::path level = dir; !level.empty() && !fs::exists(level, ec); level = level.parent_path())
@@ -655,6 +671,20 @@ void ensure_private_directory(const fs::path& dir)
         if (level == level.parent_path())
             break;
     }
+
+    // Nothing is created until the deepest existing level passes the checks its
+    // children will get as an ancestor: otherwise a link another user planted on
+    // the path would make the server create directories inside its target first
+    // and only then refuse.
+    if (!missing.empty())
+    {
+        std::error_code absolute_ec;
+        const fs::path existing = fs::absolute(missing.back(), absolute_ec).parent_path();
+        check_links_on_path(existing);
+        check_ancestor_chain(dir, resolve_for_check(existing));
+    }
+
+    // Each missing level is created private.
     for (auto it = missing.rbegin(); it != missing.rend(); ++it)
         create_private_directory_level(*it);
 
@@ -667,18 +697,8 @@ void ensure_private_directory(const fs::path& dir)
 
     // Every existing ancestor of the resolved path, from the parent up to the root:
     // whoever can rename or replace one of them can swap `dir` between this check
-    // and the open. A directory this user cannot open (owner-only ACL checked
-    // above) cannot be resolved itself; its parent can.
-    std::error_code resolve_ec;
-    fs::path resolved = fs::weakly_canonical(dir, resolve_ec);
-    if (resolve_ec)
-    {
-        resolve_ec.clear();
-        resolved = fs::weakly_canonical(fs::absolute(dir, resolve_ec).parent_path(), resolve_ec) / dir.filename();
-    }
-    if (resolve_ec)
-        refuse(dir, "its path cannot be resolved: " + resolve_ec.message());
-    check_ancestor_chain(dir, resolved.parent_path());
+    // and the open.
+    check_ancestor_chain(dir, resolve_for_check(dir).parent_path());
 }
 
 } // namespace thewatcher::common

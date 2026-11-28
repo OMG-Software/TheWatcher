@@ -595,6 +595,54 @@ SCENARIO("A path that goes through a junction is judged where the junction lives
 }
 #endif
 
+SCENARIO("Nothing is created below a path that fails the checks")
+{
+    GIVEN("a link in a directory other users can change, pointing at a clean target")
+    {
+        const auto target = fresh_parent("private-dir-nocreate-target");
+        const auto loose = fresh_parent("private-dir-nocreate-loose");
+        const auto link = loose / "link";
+#ifdef _WIN32
+        REQUIRE(run_icacls("\"" + loose.string() + "\" /grant *S-1-5-32-545:(OI)(CI)M") == 0);
+        REQUIRE(std::system(("\"mklink /J \"" + link.string() + "\" \"" + target.string() + "\" > NUL\"").c_str()) ==
+                0);
+        // The junction's own ACL is private (/L: the link itself), so only its directory is wrong.
+        REQUIRE(run_icacls("\"" + link.string() +
+                           "\" /L /inheritance:r /grant:r *S-1-5-32-544:F *S-1-5-18:F \"%USERNAME%\":F") == 0);
+#else
+        set_mode(loose, fs::perms::all); // 0777, no sticky bit
+        fs::create_symlink(target, link);
+#endif
+
+        WHEN("ensure_private_directory is called for a path with missing levels below the link")
+        {
+            const auto message = refusal_message(link / "new" / "inner");
+
+            THEN("it is refused as not private")
+            {
+                REQUIRE(message.find("is not private") != std::string::npos);
+            }
+
+            AND_THEN("no missing level was created inside the link's target")
+            {
+                REQUIRE_FALSE(fs::exists(target / "new"));
+            }
+        }
+    }
+
+    GIVEN("a clean path with missing levels")
+    {
+        const auto dir = fresh_parent("private-dir-create-clean") / "new" / "inner";
+
+        THEN("the levels are still created and the result passes the check")
+        {
+            REQUIRE_NOTHROW(ensure_private_directory(dir));
+            REQUIRE(fs::is_directory(dir));
+            REQUIRE_NOTHROW(ensure_private_directory(dir));
+        }
+    }
+}
+
 // Hidden: depends on the machine. Run with "[default-paths]" to see that the
 // real default parents (C:\ProgramData, /etc, /usr/local/etc) and their
 // ancestors are accepted.

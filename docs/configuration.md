@@ -60,6 +60,9 @@ like an ancestor's (read without following it). Links to links are followed.
 The error names the link. For example `--config /tmp/link/TheWatcherServer.conf`
 is refused when `/tmp/link` belongs to another user, even if its target is
 clean.
+Nothing is created until the deepest existing level of the path has passed
+these checks, so a link planted by another user cannot make the server create
+directories inside its target before refusing.
 
 On Windows the check fails closed: an allow entry of a kind it cannot read
 (for example an object-specific allow entry) makes the directory unsafe, and

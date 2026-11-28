@@ -9,6 +9,10 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Security
 
+- The config-directory check now runs on the deepest existing level before
+  any missing level is created, so a symlink planted by another user (for
+  example `/tmp/link/new/...`) no longer makes the server create directories
+  inside the link target before refusing.
 - A config path that goes through a symbolic link or junction is now judged
   where the link lives: the path is walked as given, and each link needs a
   directory that passes the ancestor check and its own owner/ACL (POSIX: a
