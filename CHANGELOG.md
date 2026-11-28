@@ -139,9 +139,10 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   (`POST /api/agents/:id/collector_config`) is one transaction through the
   new `save_agent_configuration`, so a failure saves nothing (#72).
 - SQLite reads no longer report a database error as "no rows": a locked or
-  failing database makes `get_session`, `is_silenced`,
+  failing database makes `get_session`, `is_silenced`, `has_open_alert`,
   `get_offline_unalerted_agent_ids` and the list calls throw instead of
-  returning an empty result (an active silence could be ignored). The
+  returning an empty result (an active silence could be ignored, and alert
+  de-duplication could be skipped, creating a duplicate alert). The
   connection now waits up to 5 seconds for a competing lock (#78).
 - Bulk acknowledge and bulk delete of alerts run in one transaction on both
   backends, and the dead-agent alert is created with an atomic

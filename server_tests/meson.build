@@ -178,3 +178,11 @@ dsn_redaction_test = executable(
   dependencies: [catch2_dep, platform_deps],
 )
 test('dsn_redaction', dsn_redaction_test)
+
+command_ack_test = executable(
+  'command_ack_test',
+  ['command_ack_test.cpp'],
+  include_directories: root_inc,
+  dependencies: [server_store_dep, catch2_dep, sqlite_dep, platform_deps],
+)
+test('command_ack', command_ack_test)

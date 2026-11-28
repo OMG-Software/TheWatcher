@@ -1,5 +1,6 @@
 #include "server.hpp"
 
+#include "command_ack.hpp"
 #include "common/SingleLog.hpp"
 #include "common/commands.hpp"
 #include "common/crypto.hpp"
@@ -538,42 +539,11 @@ void Server::handle_router_frame(zmq::socket_t& router)
                 }
                 else
                 {
-                    if (ack.success &&
-                        (command->second.type == CommandType::DISCONNECT ||
-                         command->second.type == CommandType::PAUSE || command->second.type == CommandType::RESUME))
-                    {
-                        auto command_agent = store_->get_agent(agent_id);
-                        if (command_agent)
-                        {
-                            // Narrow updates only: rewriting the whole row from this
-                            // snapshot would revert concurrent operator saves.
-                            const auto ack_time = now_ms();
-                            if (command->second.type == CommandType::DISCONNECT)
-                            {
-                                store_->touch_agent(agent_id, ack_time, false);
-                                // #156: deliberate, so the offline scan must not alert.
-                                offline_alerts_->mark_operator_disconnect(agent_id);
-                            }
-                            else
-                            {
-                                store_->touch_agent(agent_id, ack_time, command_agent->connected);
-                                if (command->second.type == CommandType::PAUSE)
-                                    store_->set_agent_maintenance(agent_id, true, "command", 0);
-                                else
-                                    store_->set_agent_maintenance(agent_id, false, "", 0);
-                            }
-                            if (command->second.type == CommandType::PAUSE)
-                            {
-                                StatusEngine status_engine(*store_, *alerts_);
-                                status_engine.enter_maintenance(agent_id, "command", 0, ack_time);
-                            }
-                            else if (command->second.type == CommandType::RESUME)
-                            {
-                                StatusEngine status_engine(*store_, *alerts_);
-                                status_engine.exit_maintenance(agent_id);
-                            }
-                        }
-                    }
+                    // Only DISCONNECT, PAUSE and RESUME change the stored agent;
+                    // see apply_command_ack for why other ACKs leave it alone.
+                    if (ack.success)
+                        apply_command_ack(*store_, *offline_alerts_, *alerts_, agent_id, command->second.type,
+                                          now_ms());
                     dispatched_commands_.erase(command);
                 }
             }
