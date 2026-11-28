@@ -126,7 +126,8 @@ api_authorization_test = executable(
   include_directories: root_inc,
   dependencies: [server_dep, common_dep, catch2_dep, http_dep, cppzmq_dep, sqlite_dep, platform_deps],
 )
-test('api_authorization', api_authorization_test, is_parallel: false)
+# Runs about 10 s alone and builds one server per role; leave headroom for a loaded CI host.
+test('api_authorization', api_authorization_test, is_parallel: false, timeout: 120)
 
 store_user_guard_test = executable(
   'store_user_guard_test',
