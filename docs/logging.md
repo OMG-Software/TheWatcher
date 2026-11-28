@@ -131,8 +131,9 @@ Runtime diagnostics go through `SingleLog`.
 ## Audit Log
 
 Authentication and authorization events are written to the server log at
-`NOTICE` level as single `key=value` lines starting with `AUDIT`, so they are
-flushed immediately and can be filtered with one search:
+`NOTICE` level as single-line `key=value` messages that start with `AUDIT`
+(after the SingleLog prefix), so they are flushed immediately and can be
+filtered with one search:
 
 ```text
 2026-11-27 21:57:25.107 +0000  <NOTICE>  audit:  AUDIT event=login outcome=failure user="alice" source=203.0.113.7

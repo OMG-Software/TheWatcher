@@ -12,7 +12,9 @@ store_test = executable(
   include_directories: root_inc,
   dependencies: [server_store_dep, catch2_dep, sqlite_dep, platform_deps],
 )
-test('store', store_test)
+# Every SqliteStore(":memory:") hashes the default admin password, so the
+# suite is slow under load; meson's 30s default timed out on busy machines.
+test('store', store_test, timeout: 120)
 
 status_engine_test = executable(
   'status_engine_test',
@@ -127,3 +129,11 @@ auth_sessions_test = executable(
   dependencies: [server_dep, common_dep, catch2_dep, http_dep, cppzmq_dep, sqlite_dep, sodium_dep, platform_deps],
 )
 test('auth_sessions', auth_sessions_test, is_parallel: false)
+
+store_concurrency_test = executable(
+  'store_concurrency_test',
+  ['store_concurrency_test.cpp'],
+  include_directories: root_inc,
+  dependencies: [server_store_dep, catch2_dep, sqlite_dep, platform_deps],
+)
+test('store_concurrency', store_concurrency_test)

@@ -11,12 +11,15 @@
 #include <catch2/catch_test_macros.hpp>
 #include <nlohmann/json.hpp>
 
+#include <atomic>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
 #include <memory>
 #include <sstream>
 #include <string>
+#include <thread>
+#include <vector>
 
 #include <httplib.h>
 #include <sodium.h>
@@ -551,6 +554,126 @@ SCENARIO("Enabling an unknown user is reported as not found")
             THEN("the API answers 404")
             {
                 REQUIRE(status == 404);
+            }
+        }
+    }
+}
+
+SCENARIO("Enabling a user reports how many rows changed")
+{
+    GIVEN("a store with one disabled user")
+    {
+        auto store = thewatcher::server::make_store("sqlite", ":memory:");
+        const auto user_id = store->create_user("ivy", hash_for("pw"), "global_viewer");
+        store->disable_user(user_id);
+
+        WHEN("an unknown id is enabled")
+        {
+            THEN("no row changes")
+            {
+                REQUIRE(store->enable_user(987654) == 0);
+            }
+        }
+
+        WHEN("the disabled user is enabled")
+        {
+            const auto changed = store->enable_user(user_id);
+
+            THEN("one row changes and the user is enabled")
+            {
+                REQUIRE(changed == 1);
+                REQUIRE_FALSE(store->get_user_by_username("ivy")->disabled);
+            }
+        }
+    }
+}
+
+SCENARIO("Session creation racing a password reset never leaves an old-credential session behind")
+{
+    GIVEN("a file-backed store shared by many threads and a user whose password is about to change")
+    {
+        thewatcher::test::ScopedTempDir dir{"auth-race"};
+        auto store = thewatcher::server::make_store("sqlite", (dir / "race.db").string());
+        const auto old_hash = hash_for("old-password");
+        const auto user_id = store->create_user("jack", old_hash, "global_viewer");
+        const auto new_hash = hash_for("new-password");
+        const int64_t expires = now_ms() + hour_ms;
+
+        constexpr int creators = 6;
+        std::atomic<int> created_count{0};
+        std::atomic<int> errors{0};
+        std::atomic<bool> stop{false};
+        std::vector<std::vector<std::string>> created(creators);
+
+        WHEN("logins keep creating sessions while the password is reset")
+        {
+            std::vector<std::thread> threads;
+            for (int t = 0; t < creators; ++t)
+            {
+                threads.emplace_back([&, t] {
+                    // No Catch2 assertions off the main thread.
+                    for (int i = 0; !stop.load(); ++i)
+                    {
+                        const auto token = "tok-" + std::to_string(t) + "-" + std::to_string(i);
+                        try
+                        {
+                            if (store->create_session_if_credentials_current(make_session(token, user_id, expires),
+                                                                             old_hash))
+                            {
+                                created[t].push_back(token);
+                                ++created_count;
+                            }
+                        }
+                        catch (const std::exception&)
+                        {
+                            ++errors;
+                        }
+                    }
+                });
+            }
+            // Reset once logins are demonstrably in flight.
+            thewatcher::test::eventually(
+                [&] {
+                    return created_count.load() >= 20;
+                },
+                10s, 5ms);
+            // Several resets at once: each is its own transaction, so they must
+            // queue behind one another rather than nest on the shared connection.
+            std::atomic<int> revoke_errors{0};
+            std::vector<std::thread> updaters;
+            for (int u = 0; u < 3; ++u)
+            {
+                updaters.emplace_back([&] {
+                    for (int i = 0; i < 20; ++i)
+                    {
+                        try
+                        {
+                            store->update_user_password_and_revoke_sessions(user_id, new_hash);
+                        }
+                        catch (const std::exception&)
+                        {
+                            ++revoke_errors;
+                        }
+                    }
+                });
+            }
+            for (auto& th : updaters)
+                th.join();
+            // Let a few more attempts hit the new hash before stopping.
+            std::this_thread::sleep_for(100ms);
+            stop = true;
+            for (auto& th : threads)
+                th.join();
+
+            THEN("no call failed and no session made with the old credentials is still valid")
+            {
+                REQUIRE(errors.load() == 0);
+                REQUIRE(revoke_errors.load() == 0);
+                REQUIRE(created_count.load() >= 20);
+                const auto now = now_ms();
+                for (const auto& tokens : created)
+                    for (const auto& token : tokens)
+                        REQUIRE_FALSE(store->get_session(token, now));
             }
         }
     }

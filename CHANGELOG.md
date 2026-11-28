@@ -48,6 +48,9 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   invalid entry anywhere in `X-Forwarded-For` makes the header malformed, and
   the expired-session purge rechecks that it is still due and advances its
   clock only on success (#145, #153, #70).
+- Enabling a user now relies on a single UPDATE that reports the rows it
+  changed (`enable_user` returns a count), so enabling an id deleted a moment
+  earlier returns 404 instead of success (#145).
 - The agent no longer trusts the server key in an enrollment reply: it must
   be 40 Z85 characters decoding to a 32-byte key, and the config writer
   refuses any value containing CR or LF. Before, a crafted key could inject
@@ -117,6 +120,38 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   unprivileged writers, and root-reserved blocks count as used (#158).
 - Encoding a frame with an empty payload no longer passes a null pointer to
   libcbor (undefined behaviour reported by UBSan on every heartbeat) (#162).
+- The store is now safe to share between threads. `make_store` returns the
+  backend wrapped in `SynchronizedStore`, which holds one mutex for every
+  call, so HTTP workers, the data-plane thread and the status engine no
+  longer interleave statements or transactions on the single SQLite or
+  PostgreSQL connection (#73).
+- Group assignments on PostgreSQL (`set_agent_groups`, `set_user_groups`) are
+  transactional: a failed insert, such as an unknown group id, no longer
+  leaves the agent or user with no groups. The configure-modal save
+  (`POST /api/agents/:id/collector_config`) is one transaction through the
+  new `save_agent_configuration`, so a failure saves nothing (#72).
+- SQLite reads no longer report a database error as "no rows": a locked or
+  failing database makes `get_session`, `is_silenced`,
+  `get_offline_unalerted_agent_ids` and the list calls throw instead of
+  returning an empty result (an active silence could be ignored). The
+  connection now waits up to 5 seconds for a competing lock (#78).
+- Bulk acknowledge and bulk delete of alerts run in one transaction on both
+  backends, and the dead-agent alert is created with an atomic
+  insert-if-absent (#79). On PostgreSQL this runs under a per-agent advisory
+  lock, so two server nodes cannot create duplicates once every node runs
+  0.9.0. A pre-0.9.0 node does not take the lock: during a rolling upgrade,
+  upgrade every node before running them concurrently, or accept that one
+  duplicate Heartbeat alert per agent is possible in that window.
+- A heartbeat or an API setting no longer rewrites the whole agent row from a
+  stale snapshot, which silently reverted a collector config, heartbeat
+  interval, runbook or maintenance change saved at the same moment. The data
+  plane and API now use narrow setters (`touch_agent`,
+  `set_agent_collection_interval`, `set_agent_heartbeat_interval`,
+  `set_agent_process_limit`); `upsert_agent` is for enrollment (#51).
+- The store owns its database handles with RAII (`sqlite::Connection`,
+  `postgres::Connection`), so a constructor that throws no longer leaks the
+  connection; prepared statements are movable and transactions use a guard
+  that rolls back without masking the original error (part of #100).
 - The CPU collector reports a real usage value on its first `update()` and
   after a collector restart. The constructor takes a baseline and the first
   update waits until it is at least 100 ms old. Calls closer than 100 ms to

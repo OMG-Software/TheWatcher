@@ -2155,12 +2155,7 @@ void ApiServer::setup_routes()
                 throw std::runtime_error("interval_seconds must be greater than zero");
             LOGF_INFO("Setting collection interval id=%s interval_seconds=%d", id.c_str(), secs);
 
-            auto rec = store_.get_agent(id);
-            if (rec)
-            {
-                rec->collection_interval = secs;
-                store_.upsert_agent(*rec);
-            }
+            store_.set_agent_collection_interval(id, secs);
 
             SetIntervalArgs args{secs};
             CommandMessage cmd;
@@ -2207,12 +2202,7 @@ void ApiServer::setup_routes()
                 throw std::runtime_error("limit must be greater than zero");
             LOGF_INFO("Setting process limit id=%s limit=%d", id.c_str(), limit);
 
-            auto rec = store_.get_agent(id);
-            if (rec)
-            {
-                rec->process_limit = limit;
-                store_.upsert_agent(*rec);
-            }
+            store_.set_agent_process_limit(id, limit);
 
             SetProcessLimitArgs args{limit};
             CommandMessage cmd;
@@ -2330,10 +2320,11 @@ void ApiServer::setup_routes()
                 return;
             }
 
-            rec->collection_interval = interval;
-            rec->heartbeat_interval = heartbeat_interval;
-            rec->process_limit = process_limit;
-            rec->collector_config = config;
+            AgentConfigUpdate update;
+            update.collection_interval = interval;
+            update.heartbeat_interval = heartbeat_interval;
+            update.process_limit = process_limit;
+            update.collector_config = config;
             if (body.contains("runbook_markdown"))
             {
                 // Issue #147: reject, as POST /api/agents/:id/runbook does; a
@@ -2342,15 +2333,23 @@ void ApiServer::setup_routes()
                 auto markdown = body.at("runbook_markdown").get<std::string>();
                 if (markdown.size() > 65536)
                     throw std::runtime_error("runbook_markdown must be 65536 bytes or fewer");
-                rec->runbook_markdown = std::move(markdown);
+                update.runbook_markdown = std::move(markdown);
             }
-            store_.upsert_agent(*rec);
-            store_.set_agent_collector_config(id, config);
             if (body.contains("group_ids"))
             {
                 auto group_ids = body.at("group_ids").get<std::vector<int64_t>>();
                 if (is_global_role(session->role))
-                    store_.set_agent_groups(id, group_ids);
+                    update.group_ids = std::move(group_ids);
+            }
+            // One transaction: a failed group assignment must not leave the
+            // intervals, config and runbook half-saved (#72).
+            if (!store_.save_agent_configuration(id, update))
+            {
+                res.status = 404;
+                set_json(res, json{
+                                  {"error", "agent not found"}
+                });
+                return;
             }
             LOGF_INFO("Updated collector config id=%s interval=%d heartbeat_interval=%d process_limit=%d "
                       "disk_configs=%zu network_configs=%zu "
@@ -2897,10 +2896,12 @@ void ApiServer::setup_routes()
         try
         {
             const auto user_id = std::stoll(req.path_params.at("id"));
-            const auto users = store_.list_users();
-            if (std::none_of(users.begin(), users.end(), [user_id](const UserRecord& u) {
-                    return u.user_id == user_id;
-                }))
+            // Defence in depth: disabling already revoked the sessions; drop any
+            // that exist before the account becomes usable again.
+            store_.delete_sessions_for_user(user_id);
+            // One UPDATE reports whether a row matched, so a concurrent delete
+            // cannot slip between an existence check and the update.
+            if (store_.enable_user(user_id) == 0)
             {
                 res.status = 404;
                 set_json(res, json{
@@ -2908,10 +2909,6 @@ void ApiServer::setup_routes()
                 });
                 return;
             }
-            // Defence in depth: disabling already revoked the sessions; drop any
-            // that exist before the account becomes usable again.
-            store_.delete_sessions_for_user(user_id);
-            store_.enable_user(user_id);
             LOGF_INFO("Enabled user user_id=%lld", static_cast<long long>(user_id));
             audit("user_enable", "success", session->username, client_ip(req), "user_id=" + std::to_string(user_id));
             set_json(res, json{
