@@ -26,7 +26,8 @@ async function openDashboard(api: FakeApi) {
   await screen.findByRole('navigation', { name: 'Dashboard views' });
 }
 
-const goTo = (label: string) => fireEvent.click(within(screen.getByRole('navigation')).getByRole('button', { name: label }));
+// The Views tab gains a count once views load ("Views (3)"), so match by prefix.
+const goTo = (label: string) => fireEvent.click(within(screen.getByRole('navigation')).getByRole('button', { name: new RegExp(`^${label}`) }));
 
 const apiFor = (role: UserRole) => new FakeApi(role).on('GET /api/groups', ok(GROUPS));
 
