@@ -507,6 +507,23 @@ SCENARIO("A read that fails is reported, never treated as an empty result")
             REQUIRE_THROWS(store.is_silenced("a1", "cpu", 1000));
         }
     }
+
+    GIVEN("a file-backed store whose alerts table now errors when read")
+    {
+        thewatcher::test::ScopedTempDir dir("store-readerr-alerts");
+        SqliteStore store(db_file(dir));
+        SideConnection side(db_file(dir));
+        side.run("DROP TABLE alerts;");
+        // Comparing agent_id evaluates abs() of the smallest 64-bit integer,
+        // which overflows at step time, after a successful prepare.
+        side.run("CREATE VIEW alerts AS SELECT abs(-9223372036854775808) AS agent_id, 'cpu' AS indicator, "
+                 "'red' AS new_status, 0 AS deleted_at, 0 AS acknowledged_at;");
+
+        THEN("has_open_alert throws instead of reporting no open alert, so de-duplication cannot be skipped")
+        {
+            REQUIRE_THROWS(store.has_open_alert("a1", "cpu", "red"));
+        }
+    }
 }
 
 SCENARIO("A write waits for a briefly held lock instead of failing")

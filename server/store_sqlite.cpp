@@ -1363,7 +1363,9 @@ bool SqliteStore::has_open_alert(const std::string& agent_id, const std::string&
     sqlite3_bind_text(st.s, 1, agent_id.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(st.s, 2, indicator.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(st.s, 3, new_status.c_str(), -1, SQLITE_TRANSIENT);
-    return sqlite3_step(st.s) == SQLITE_ROW;
+    // step_row throws on SQLITE_BUSY or any other error, so a failed read never
+    // looks like "no open alert" and lets the pipeline insert a duplicate.
+    return step_row(st.s, db_, __func__);
 }
 
 void SqliteStore::archive_heartbeat_alerts_for_agent(const std::string& agent_id, int64_t deleted_at)

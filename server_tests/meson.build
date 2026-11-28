@@ -160,3 +160,11 @@ store_concurrency_test = executable(
   dependencies: [server_store_dep, catch2_dep, sqlite_dep, platform_deps],
 )
 test('store_concurrency', store_concurrency_test)
+
+command_ack_test = executable(
+  'command_ack_test',
+  ['command_ack_test.cpp'],
+  include_directories: root_inc,
+  dependencies: [server_store_dep, catch2_dep, sqlite_dep, platform_deps],
+)
+test('command_ack', command_ack_test)
