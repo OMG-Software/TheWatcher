@@ -1,6 +1,7 @@
 #include "offline_alerts.hpp"
 
 #include "common/SingleLog.hpp"
+#include "common/text_safety.hpp"
 
 #include <nlohmann/json.hpp>
 
@@ -62,7 +63,7 @@ int OfflineAlerts::raise_for_offline_agents(int64_t now_ms)
         if (outcome == AlertOutcome::Raised)
         {
             ++raised;
-            LOGF_INFO("Created dead-agent alert for agent_id=%s", agent_id.c_str());
+            LOGF_INFO("Created dead-agent alert for agent_id=%s", text::sanitize_log_text(agent_id).c_str());
         }
     }
     return raised;

@@ -29,3 +29,11 @@ singlelog_test = executable(
   dependencies: [common_dep, catch2_dep, platform_deps],
 )
 test('singlelog', singlelog_test)
+
+text_safety_test = executable(
+  'text_safety_test',
+  ['text_safety_test.cpp'],
+  include_directories: root_inc,
+  dependencies: [common_dep, catch2_dep, json_dep, platform_deps],
+)
+test('text_safety', text_safety_test)

@@ -293,3 +293,68 @@ SCENARIO("Enrollment refuses a public key that another agent already holds")
         }
     }
 }
+
+SCENARIO("An approved agent that re-enrolls with a different key is told so (issue #155)")
+{
+    GIVEN("a running server with an approved agent holding key K1")
+    {
+        EnrollmentFixture fx;
+        fx.start_and_login();
+
+        thewatcher::crypto::init();
+        const auto k1 = thewatcher::crypto::generate_curve_keypair();
+        const auto k2 = thewatcher::crypto::generate_curve_keypair();
+
+        REQUIRE(enroll(fx.config.enrollment_address, valid_request("rotating-agent", k1.public_key_z85)).has_value());
+        REQUIRE(fx.approve("rotating-agent"));
+
+        // Clear the per-agent_id rate limit so the request reaches the key check.
+        std::this_thread::sleep_for(11s);
+
+        WHEN("the agent enrolls again with a new key K2")
+        {
+            auto reply = enroll(fx.config.enrollment_address, valid_request("rotating-agent", k2.public_key_z85));
+
+            THEN("the reply is an explicit refusal, not an approval")
+            {
+                REQUIRE(reply.has_value());
+                REQUIRE(reply->approved == false);
+                REQUIRE(reply->message.find("public key mismatch") != std::string::npos);
+                REQUIRE(reply->server_public_key_z85.empty());
+            }
+
+            AND_THEN("the record keeps its key and no pending request appears")
+            {
+                REQUIRE_FALSE(fx.pending_contains("rotating-agent"));
+                REQUIRE(fx.error == nullptr);
+            }
+        }
+
+        WHEN("the agent enrolls again with the same key K1")
+        {
+            auto reply = enroll(fx.config.enrollment_address, valid_request("rotating-agent", k1.public_key_z85));
+
+            THEN("it is still told it is approved")
+            {
+                REQUIRE(reply.has_value());
+                REQUIRE(reply->approved == true);
+            }
+        }
+
+        WHEN("an administrator deletes the agent and it enrolls with K2")
+        {
+            auto deleted = fx.client.Delete("/api/agents/rotating-agent");
+            REQUIRE(deleted);
+            REQUIRE(deleted->status == 200);
+            auto reply = enroll(fx.config.enrollment_address, valid_request("rotating-agent", k2.public_key_z85));
+
+            THEN("the new key waits for approval as a fresh pending agent")
+            {
+                REQUIRE(reply.has_value());
+                REQUIRE(reply->approved == false);
+                REQUIRE(reply->message == "pending approval");
+                REQUIRE(fx.pending_contains("rotating-agent"));
+            }
+        }
+    }
+}

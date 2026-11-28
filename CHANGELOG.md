@@ -9,6 +9,20 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Security
 
+- Deleting an agent and approving the same id again with a new key no longer
+  revives the old key's live session. ZAP now reports `<agent_id>:<key>` as
+  the session identity and the server compares the key with the agent's
+  record on every frame (#144).
+- A deleted agent that is approved again with the same key no longer revives
+  the old session: ZAP now reports `<agent_id>:<generation>:<key>`, where the
+  generation changes with every fresh approval of a key, and the server checks
+  it on every frame. The key goes last, so a Z85 key containing `:` parses
+  correctly. Frames whose `agent_id` does not have the enrollment format are
+  dropped, also when CURVE is disabled (#183).
+- The server sanitises every agent-supplied string (log-match indicator,
+  severity and path, hostnames, mount points, interface and process names)
+  before logging it, through one function, so an agent can no longer forge
+  log lines (#157).
 - The agent no longer trusts the server key in an enrollment reply: it must
   be 40 Z85 characters decoding to a 32-byte key, and the config writer
   refuses any value containing CR or LF. Before, a crafted key could inject
@@ -53,6 +67,18 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 
+- A reconnecting agent is no longer shut out by its own dead connection:
+  the ROUTER and the agent DEALER use ZMTP heartbeats and TCP keepalive, and
+  the ROUTER uses `ZMQ_ROUTER_HANDOVER` (#143).
+- **Behaviour change:** an approved agent that enrolls again with a different
+  key is now refused with a "public key mismatch" reply instead of being told
+  it is approved and then never connecting. Rotate a key by deleting the
+  agent and approving the new enrollment (#155, documented in
+  `docs/threat-model.md`).
+- Invalid UTF-8 in agent-reported strings is replaced with U+FFFD when
+  metrics, log matches and enrollment requests arrive, so alerts, reports
+  and storage never see it. A failing scheduled report no longer ends the
+  server loop (rest of #56).
 - All alerts now go through one pipeline that applies maintenance, silences,
   severity validation, de-duplication, the runbook link and the webhook.
   Log-match alerts no longer fire during maintenance, offline and log-match
@@ -252,6 +278,10 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   and `npm audit --omit=dev` (#120).
 - Dashboard: the footer shows the dashboard version from `package.json`
   (#127).
+- Data-plane tests: every frame type through a running server with CURVE
+  keys, ZAP over a real CURVE connection, command dispatch and ACK, stale
+  sessions, reconnect handover and hostile strings. Maintenance flows are
+  tested only as far as the PAUSE/DISCONNECT command entry points (#59).
 
 ## [0.8.0] - 2026-11-02
 

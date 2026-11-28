@@ -1,10 +1,14 @@
 #include "server.hpp"
 
+#include "agent_id.hpp"
 #include "common/SingleLog.hpp"
 #include "common/commands.hpp"
 #include "common/crypto.hpp"
 #include "common/metrics.hpp"
+#include "common/text_safety.hpp"
 #include "common/zmq_limits.hpp"
+#include "common/zmq_liveness.hpp"
+#include "ingest_sanitize.hpp"
 #include "offline_alerts.hpp"
 #include "report_generator.hpp"
 #include "router_send.hpp"
@@ -29,22 +33,14 @@ namespace
             .count();
     }
 
-    // SEC-05: attacker-controlled strings may carry CR/LF or ANSI control
-    // characters used for log forging; replace them before logging. The result
-    // is also truncated to 64 characters.
-    std::string sanitize_log_text(std::string_view text)
+    // SEC-05, #157: every string that came from a peer goes through this one
+    // sanitiser before it is logged (see common/text_safety.hpp).
+    using text::sanitize_log_text;
+
+    // Logs take a C string; keeps the call sites short.
+    std::string safe(const std::string& peer_text)
     {
-        constexpr std::size_t max_length = 64;
-        std::string out;
-        out.reserve(std::min<std::size_t>(text.size(), max_length));
-        for (char c : text)
-        {
-            const auto uc = static_cast<unsigned char>(c);
-            out.push_back((uc < 0x20 || uc == 0x7F) ? '?' : c);
-            if (out.size() >= max_length)
-                break;
-        }
-        return out;
+        return sanitize_log_text(peer_text);
     }
 
     const char* frame_type_name(uint8_t type)
@@ -79,30 +75,30 @@ namespace
         LOGF_DEBUG(
             "Received metrics agent_id=%s host=%s platform=%s timestamp_ms=%lld payload_size=%zu uptime_seconds=%.0f "
             "cpu_usage=%.2f memory_usage=%.2f disks=%zu networks=%zu processes=%zu",
-            agent_id.c_str(), metrics.hostname.c_str(), metrics.platform.c_str(), static_cast<long long>(timestamp_ms),
-            payload_size, metrics.uptime_seconds, metrics.cpu.usage_percent, metrics.memory.usage_percent,
-            metrics.disks.size(), metrics.networks.size(), metrics.top_processes.size());
+            safe(agent_id).c_str(), safe(metrics.hostname).c_str(), safe(metrics.platform).c_str(),
+            static_cast<long long>(timestamp_ms), payload_size, metrics.uptime_seconds, metrics.cpu.usage_percent,
+            metrics.memory.usage_percent, metrics.disks.size(), metrics.networks.size(), metrics.top_processes.size());
         if (!metrics.disks.empty())
         {
             const auto& disk = metrics.disks.front();
             LOGF_TRACE("Received first disk agent_id=%s mount=%s fs=%s usage=%.2f total_bytes=%llu used_bytes=%llu",
-                       agent_id.c_str(), disk.mount_point.c_str(), disk.filesystem.c_str(), disk.usage_percent,
-                       static_cast<unsigned long long>(disk.total_bytes),
+                       safe(agent_id).c_str(), safe(disk.mount_point).c_str(), safe(disk.filesystem).c_str(),
+                       disk.usage_percent, static_cast<unsigned long long>(disk.total_bytes),
                        static_cast<unsigned long long>(disk.used_bytes));
         }
         if (!metrics.networks.empty())
         {
             const auto& network = metrics.networks.front();
             LOGF_TRACE("Received first network agent_id=%s interface=%s up=%d recv_per_sec=%llu sent_per_sec=%llu",
-                       agent_id.c_str(), network.interface_name.c_str(), network.is_up ? 1 : 0,
+                       safe(agent_id).c_str(), safe(network.interface_name).c_str(), network.is_up ? 1 : 0,
                        static_cast<unsigned long long>(network.bytes_recv_per_sec),
                        static_cast<unsigned long long>(network.bytes_sent_per_sec));
         }
         if (!metrics.top_processes.empty())
         {
             const auto& process = metrics.top_processes.front();
-            LOGF_TRACE("Received top process agent_id=%s pid=%u name=%s cpu=%.2f rss_bytes=%llu", agent_id.c_str(),
-                       process.pid, process.name.c_str(), process.cpu_percent,
+            LOGF_TRACE("Received top process agent_id=%s pid=%u name=%s cpu=%.2f rss_bytes=%llu",
+                       safe(agent_id).c_str(), process.pid, safe(process.name).c_str(), process.cpu_percent,
                        static_cast<unsigned long long>(process.memory_rss_bytes));
         }
     }
@@ -174,6 +170,14 @@ void Server::run(StartupSignal* startup)
     // connection handshake so hostile peers cannot exhaust server memory.
     router.set(zmq::sockopt::maxmsgsize, kDataPlaneMaxMessageBytes);
     router.set(zmq::sockopt::handshake_ivl, kHandshakeIvlMs);
+    // #143: heartbeats and TCP keepalive drop peers that vanished without
+    // closing, and handover lets a reconnecting agent replace a connection that
+    // still holds its routing id. Handover is safe because the routing id is
+    // only an address: identity comes from ZAP (#141, SEC-04), commands go to
+    // the route learned from authenticated frames, and every frame is checked
+    // against the session key (#144).
+    apply_connection_liveness(router);
+    router.set(zmq::sockopt::router_handover, true);
 
     if (!config_.server_public_key.empty())
     {
@@ -312,7 +316,15 @@ void Server::run(StartupSignal* startup)
                 }
             }
 
-            maybe_send_report(now);
+            // A bad report setting or a failing webhook must not stop the loop.
+            try
+            {
+                maybe_send_report(now);
+            }
+            catch (const std::exception& e)
+            {
+                LOGF_ERROR("Scheduled report failed: %s", e.what());
+            }
 
             next_offline_scan = std::chrono::steady_clock::now() + std::chrono::seconds{1};
         }
@@ -385,14 +397,27 @@ void Server::handle_router_frame(zmq::socket_t& router)
     }
 
     const std::string& agent_id = frame.agent_id;
+    // The id is a database key and a routing identity: with CURVE the ZAP
+    // identity must equal it, without CURVE nothing else vouches for it, so
+    // it must have the enrollment format before it reaches storage (#183).
+    if (!is_valid_agent_id(agent_id))
+    {
+        LOGF_WARNING("Dropping frame with invalid agent_id format identity_size=%zu length=%zu type=%s",
+                     identity_msg.size(), agent_id.size(), frame_type_name(frame.type));
+        return;
+    }
+    // Peer-supplied: every log line below uses this sanitised copy (#157).
+    const std::string log_id = sanitize_log_text(agent_id);
     LOGF_TRACE("Received frame identity_size=%zu agent_id=%s type=%s raw_type=%u payload_size=%zu frame_timestamp=%lld",
-               identity_msg.size(), sanitize_log_text(agent_id).c_str(), frame_type_name(frame.type),
-               static_cast<unsigned>(frame.type), frame.payload.size(), static_cast<long long>(frame.timestamp_ms));
+               identity_msg.size(), log_id.c_str(), frame_type_name(frame.type), static_cast<unsigned>(frame.type),
+               frame.payload.size(), static_cast<long long>(frame.timestamp_ms));
 
     // SEC-04: when CURVE is enabled, the ZAP-authenticated identity is
     // authoritative. frame.agent_id is attacker-controlled payload; a peer
     // whose key belongs to a different agent must not be able to poison
     // another agent's metrics, alerts or config.
+    std::string session_key;              // the CURVE key this session authenticated with (#144)
+    std::uint64_t session_generation = 0; // the approval generation of that key (#183)
     if (!config_.server_public_key.empty())
     {
         std::string authenticated_id;
@@ -406,13 +431,16 @@ void Server::handle_router_frame(zmq::socket_t& router)
         {
             // Property absent (e.g. peer connected without a ZAP identity).
         }
-        if (authenticated_id != agent_id)
+        const auto session = parse_session_identity(authenticated_id);
+        if (!session || session->agent_id != agent_id)
         {
             LOGF_WARNING("Dropping frame from authenticated agent_id=%s claiming agent_id=%s type=%s",
-                         sanitize_log_text(authenticated_id).c_str(), sanitize_log_text(agent_id).c_str(),
+                         session ? sanitize_log_text(session->agent_id).c_str() : "<none>", log_id.c_str(),
                          frame_type_name(frame.type));
             return;
         }
+        session_key = session->key_z85;
+        session_generation = session->generation;
     }
 
     // SEC-09: approval is enforced per frame, not only at handshake time.
@@ -421,9 +449,24 @@ void Server::handle_router_frame(zmq::socket_t& router)
     auto rec = store_->get_agent(agent_id);
     if (!rec || !rec->approved || rec->rejected)
     {
-        LOGF_WARNING("Dropping frame from non-approved agent_id=%s type=%s", sanitize_log_text(agent_id).c_str(),
+        LOGF_WARNING("Dropping frame from non-approved agent_id=%s type=%s", log_id.c_str(),
                      frame_type_name(frame.type));
         forget_route(agent_id);
+        return;
+    }
+
+    // Issue #144: libzmq fixes the identity at the handshake, so a session
+    // opened with a key that was since deleted or replaced still carries the
+    // agent_id. Accept it only while its key is the record's current key. The
+    // route is left alone: it belongs to the agent's current session.
+    // Issue #183: a deleted agent approved again with the same key has the same
+    // (agent_id, key), so the generation must match too: ZAP gives every fresh
+    // approval a new one.
+    if (!config_.server_public_key.empty() &&
+        (session_key != rec->curve_public_key_z85 || zap_->generation_for_key(session_key) != session_generation))
+    {
+        LOGF_WARNING("Dropping frame from a session whose key approval is no longer current agent_id=%s type=%s",
+                     log_id.c_str(), frame_type_name(frame.type));
         return;
     }
 
@@ -440,9 +483,9 @@ void Server::handle_router_frame(zmq::socket_t& router)
     {
         offline_alerts_->agent_seen(agent_id); // #156: an operator disconnect ends here
         store_->archive_heartbeat_alerts_for_agent(agent_id, now_ms());
-        LOGF_INFO("Agent reconnected, archived heartbeat alerts for agent_id=%s", agent_id.c_str());
+        LOGF_INFO("Agent reconnected, archived heartbeat alerts for agent_id=%s", log_id.c_str());
     }
-    LOGF_TRACE("Updated last_seen for agent_id=%s", agent_id.c_str());
+    LOGF_TRACE("Updated last_seen for agent_id=%s", log_id.c_str());
 
     auto ftype = static_cast<FrameType>(frame.type);
 
@@ -451,6 +494,10 @@ void Server::handle_router_frame(zmq::socket_t& router)
         try
         {
             auto metrics = unpack<SystemMetrics>(frame.payload);
+            // #56: invalid UTF-8 in agent strings must not reach the status
+            // engine, the store or any JSON. Re-encode the payload only when
+            // something changed, so unchanged frames are still stored verbatim.
+            const bool text_changed = sanitize_agent_text(metrics);
             log_received_metrics_summary(agent_id, metrics, frame.timestamp_ms, frame.payload.size());
             // SEC-07: the agent-supplied timestamp is untrusted. Storage,
             // status evaluation and — critically — the retention prune gate
@@ -460,22 +507,22 @@ void Server::handle_router_frame(zmq::socket_t& router)
             MetricsRow row;
             row.agent_id = agent_id;
             row.timestamp_ms = server_now;
-            row.metrics_cbor = frame.payload; // already CBOR-encoded SystemMetrics; store verbatim.
+            row.metrics_cbor = text_changed ? pack(metrics) : frame.payload; // CBOR SystemMetrics, verbatim if clean
             store_->insert_metrics(row);
             StatusEngine status_engine(*store_, *alerts_);
             status_engine.evaluate_metrics(agent_id, metrics, server_now);
-            LOGF_DEBUG("Stored metrics agent_id=%s timestamp_ms=%lld payload_size=%zu", agent_id.c_str(),
+            LOGF_DEBUG("Stored metrics agent_id=%s timestamp_ms=%lld payload_size=%zu", log_id.c_str(),
                        static_cast<long long>(server_now), row.metrics_cbor.size());
         }
         catch (const std::exception& e)
         {
-            LOGF_WARNING("Metrics error for %s: %s", agent_id.c_str(), e.what());
+            LOGF_WARNING("Metrics error for %s: %s", log_id.c_str(), e.what());
         }
     }
     else if (ftype == FrameType::HEARTBEAT)
     {
         // last_seen already updated; no further action needed.
-        LOGF_DEBUG("Heartbeat processed agent_id=%s timestamp_ms=%lld payload_size=%zu", agent_id.c_str(),
+        LOGF_DEBUG("Heartbeat processed agent_id=%s timestamp_ms=%lld payload_size=%zu", log_id.c_str(),
                    static_cast<long long>(frame.timestamp_ms), frame.payload.size());
     }
     else if (ftype == FrameType::CONFIG_REQUEST)
@@ -488,7 +535,7 @@ void Server::handle_router_frame(zmq::socket_t& router)
             LOGF_DEBUG("Sending config update agent_id=%s interval_seconds=%d heartbeat_interval_seconds=%d "
                        "process_limit=%d disk_configs=%zu "
                        "network_configs=%zu process_watches=%zu",
-                       agent_id.c_str(), cfg.interval_seconds, cfg.heartbeat_interval_seconds, cfg.process_limit,
+                       log_id.c_str(), cfg.interval_seconds, cfg.heartbeat_interval_seconds, cfg.process_limit,
                        cfg.collector_config.disks.size(), cfg.collector_config.networks.size(),
                        cfg.collector_config.processes.size());
             Frame response;
@@ -506,7 +553,7 @@ void Server::handle_router_frame(zmq::socket_t& router)
         }
         else
         {
-            LOGF_DEBUG("Ignoring config request from unknown agent_id=%s", agent_id.c_str());
+            LOGF_DEBUG("Ignoring config request from unknown agent_id=%s", log_id.c_str());
         }
     }
     else if (ftype == FrameType::COMMAND_ACK)
@@ -524,7 +571,7 @@ void Server::handle_router_frame(zmq::socket_t& router)
                 if (command->second.target_agent_id != agent_id)
                 {
                     LOGF_WARNING("Ignoring ACK from agent_id=%s for command_id=%s targeted at agent_id=%s",
-                                 agent_id.c_str(), ack.command_id.c_str(), command->second.target_agent_id.c_str());
+                                 log_id.c_str(), safe(ack.command_id).c_str(), command->second.target_agent_id.c_str());
                 }
                 else
                 {
@@ -570,13 +617,12 @@ void Server::handle_router_frame(zmq::socket_t& router)
                     dispatched_commands_.erase(command);
                 }
             }
-            LOGF_INFO("ACK from %s cmd=%s ok=%d msg=%s", sanitize_log_text(agent_id).c_str(),
-                      sanitize_log_text(ack.command_id).c_str(), ack.success ? 1 : 0,
-                      sanitize_log_text(ack.message).c_str());
+            LOGF_INFO("ACK from %s cmd=%s ok=%d msg=%s", log_id.c_str(), sanitize_log_text(ack.command_id).c_str(),
+                      ack.success ? 1 : 0, sanitize_log_text(ack.message).c_str());
         }
         catch (const std::exception& e)
         {
-            LOGF_WARNING("Failed to unpack command ACK from %s: %s", agent_id.c_str(), e.what());
+            LOGF_WARNING("Failed to unpack command ACK from %s: %s", log_id.c_str(), e.what());
         }
     }
     else if (ftype == FrameType::LOG_MATCH)
@@ -584,6 +630,7 @@ void Server::handle_router_frame(zmq::socket_t& router)
         try
         {
             auto match = unpack<LogMatch>(frame.payload);
+            sanitize_agent_text(match); // #56
             // SEC-07: record and alert times come from the server clock; the
             // agent-supplied frame timestamp is untrusted.
             const int64_t server_now = now_ms();
@@ -595,22 +642,26 @@ void Server::handle_router_frame(zmq::socket_t& router)
             log_match_record.severity = match.severity;
             log_match_record.created_at = server_now;
             store_->insert_log_match(log_match_record);
+            LOGF_INFO("Log match agent_id=%s indicator=%s severity=%s path=%s", log_id.c_str(),
+                      safe(match.indicator_name).c_str(), safe(match.severity).c_str(), safe(match.path).c_str());
 
             // Raise an alert on the named indicator so it shows up on the
             // dashboard. The pipeline applies maintenance, silences, severity
-            // validation, de-duplication and the webhook (#52).
+            // validation, de-duplication and the webhook (#52). The text was
+            // cleaned on ingest (#56) and is cut on a character boundary.
             alerts_->raise({agent_id, match.indicator_name, "green", match.severity,
-                            "Log match in " + match.path + ": " + match.matched_line.substr(0, 200), server_now, true});
+                            "Log match in " + match.path + ": " + text::truncate_utf8(match.matched_line, 200),
+                            server_now, true});
         }
         catch (const std::exception& e)
         {
-            LOGF_WARNING("LOG_MATCH error for %s: %s", agent_id.c_str(), e.what());
+            LOGF_WARNING("LOG_MATCH error for %s: %s", log_id.c_str(), e.what());
         }
     }
     else
     {
         LOGF_DEBUG("Ignoring unsupported frame type=%u from agent_id=%s", static_cast<unsigned>(frame.type),
-                   agent_id.c_str());
+                   log_id.c_str());
     }
 }
 
@@ -709,13 +760,10 @@ void Server::handle_enrollment(zmq::socket_t& enroll)
         // and bounds before touching storage, the rate-limit maps or the
         // log. agent_id doubles as a routing identity and DB key, so its
         // charset is deliberately strict.
-        static constexpr std::size_t max_agent_id_len = 64;
         static constexpr std::size_t max_hostname_len = 255;
         static constexpr std::size_t max_platform_len = 64;
         static constexpr std::size_t max_enroll_token_len = 256;
-        if (req.agent_id.empty() || req.agent_id.size() > max_agent_id_len ||
-            req.agent_id.find_first_not_of("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-") !=
-                std::string::npos)
+        if (!is_valid_agent_id(req.agent_id))
         {
             LOGF_WARNING("Enrollment rejected: invalid agent_id format length=%zu", req.agent_id.size());
             send_error("invalid agent_id");
@@ -741,6 +789,10 @@ void Server::handle_enrollment(zmq::socket_t& enroll)
             send_error("invalid enrollment token");
             return;
         }
+
+        // #56: hostname and platform end up in the store and in JSON.
+        text::sanitize_utf8_in_place(req.hostname);
+        text::sanitize_utf8_in_place(req.platform);
 
         // M-9: Validate z85 public key — must be exactly 40 chars, z85 alphabet only.
         static constexpr std::string_view z85_alphabet =
@@ -823,6 +875,19 @@ void Server::handle_enrollment(zmq::socket_t& enroll)
             approved = existing->approved;
             if (approved)
             {
+                // Issue #155: the approved key is the only one ZAP accepts for
+                // this agent. Answering "approved" to a different key would
+                // send the agent off to connect with a key that is refused for
+                // ever, so refuse it here. Replacing a key is an administrator
+                // action: delete the agent, then approve the new enrollment.
+                if (existing->curve_public_key_z85 != req.curve_public_key_z85)
+                {
+                    LOGF_WARNING("Enrollment refused: approved agent_id=%s presented a different public key",
+                                 req.agent_id.c_str());
+                    send_error("public key mismatch: this agent is approved with another key; an administrator "
+                               "must delete the agent before a new key can enroll");
+                    return;
+                }
                 // SEC-06: an approved agent re-enrolling is answered but
                 // nothing is updated. The record is authoritative; an
                 // unauthenticated request must not refresh last_seen (which
@@ -974,7 +1039,7 @@ void Server::dispatch_commands(zmq::socket_t& router)
             }
             dispatched_commands_[pc.cmd.command_id] = {static_cast<CommandType>(pc.cmd.command_type), now_ms(),
                                                        pc.agent_id};
-            LOGF_DEBUG("Dispatched command agent_id=%s command_id=%s type=%u", pc.agent_id.c_str(),
+            LOGF_DEBUG("Dispatched command agent_id=%s command_id=%s type=%u", safe(pc.agent_id).c_str(),
                        pc.cmd.command_id.c_str(), static_cast<unsigned>(pc.cmd.command_type));
         }
         catch (const zmq::error_t& e)
@@ -989,7 +1054,7 @@ void Server::dispatch_commands(zmq::socket_t& router)
         }
         catch (const std::exception& e)
         {
-            LOGF_ERROR("Failed to dispatch command to %s: %s", pc.agent_id.c_str(), e.what());
+            LOGF_ERROR("Failed to dispatch command to %s: %s", safe(pc.agent_id).c_str(), e.what());
         }
     }
 }

@@ -1,6 +1,7 @@
 #include "alert_pipeline.hpp"
 
 #include "common/SingleLog.hpp"
+#include "common/text_safety.hpp"
 #include "webhook_security.hpp"
 
 #include <nlohmann/json.hpp>
@@ -33,30 +34,36 @@ AlertOutcome AlertPipeline::raise(const AlertRequest& request)
 {
     if (!is_alert_severity(request.new_status))
     {
-        LOGF_WARNING("Alert dropped: invalid severity agent_id=%s indicator=%s severity=%s", request.agent_id.c_str(),
-                     request.indicator.c_str(), request.new_status.c_str());
+        LOGF_WARNING("Alert dropped: invalid severity agent_id=%s indicator=%s severity=%s",
+                     text::sanitize_log_text(request.agent_id).c_str(),
+                     text::sanitize_log_text(request.indicator).c_str(),
+                     text::sanitize_log_text(request.new_status).c_str());
         return AlertOutcome::InvalidSeverity;
     }
 
     const auto agent = store_.get_agent(request.agent_id);
     if (agent && agent->maintenance)
     {
-        LOGF_DEBUG("Alert suppressed by maintenance agent_id=%s indicator=%s", request.agent_id.c_str(),
-                   request.indicator.c_str());
+        LOGF_DEBUG("Alert suppressed by maintenance agent_id=%s indicator=%s",
+                   text::sanitize_log_text(request.agent_id).c_str(),
+                   text::sanitize_log_text(request.indicator).c_str());
         return AlertOutcome::SuppressedMaintenance;
     }
 
     if (store_.is_silenced(request.agent_id, request.indicator, request.created_at))
     {
-        LOGF_DEBUG("Alert suppressed by silence rule agent_id=%s indicator=%s", request.agent_id.c_str(),
-                   request.indicator.c_str());
+        LOGF_DEBUG("Alert suppressed by silence rule agent_id=%s indicator=%s",
+                   text::sanitize_log_text(request.agent_id).c_str(),
+                   text::sanitize_log_text(request.indicator).c_str());
         return AlertOutcome::SuppressedSilence;
     }
 
     if (request.deduplicate && store_.has_open_alert(request.agent_id, request.indicator, request.new_status))
     {
-        LOGF_DEBUG("Alert deduplicated agent_id=%s indicator=%s severity=%s", request.agent_id.c_str(),
-                   request.indicator.c_str(), request.new_status.c_str());
+        LOGF_DEBUG("Alert deduplicated agent_id=%s indicator=%s severity=%s",
+                   text::sanitize_log_text(request.agent_id).c_str(),
+                   text::sanitize_log_text(request.indicator).c_str(),
+                   text::sanitize_log_text(request.new_status).c_str());
         return AlertOutcome::Deduplicated;
     }
 
@@ -72,7 +79,8 @@ AlertOutcome AlertPipeline::raise(const AlertRequest& request)
 
     const auto alert_id = store_.insert_alert(alert);
     LOGF_WARNING("Generated alert id=%lld agent_id=%s indicator=%s old=%s new=%s", static_cast<long long>(alert_id),
-                 alert.agent_id.c_str(), alert.indicator.c_str(), alert.old_status.c_str(), alert.new_status.c_str());
+                 text::sanitize_log_text(alert.agent_id).c_str(), text::sanitize_log_text(alert.indicator).c_str(),
+                 text::sanitize_log_text(alert.old_status).c_str(), text::sanitize_log_text(alert.new_status).c_str());
     notify(alert, alert_id);
     return AlertOutcome::Raised;
 }
