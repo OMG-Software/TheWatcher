@@ -44,6 +44,12 @@ std::string server_executable()
 }
 
 // Runs the server with `arguments`, merging stderr into stdout, and returns what it printed.
+//
+// The exit status is not asserted on: the scenarios judge what the server printed,
+// and removing or installing a service this test never created may fail for reasons
+// of its own. It is attached to the next assertion so a failure shows it. (glibc
+// marks system() warn_unused_result under _FORTIFY_SOURCE, so it must not be
+// dropped silently either.)
 std::string run_server(const std::string& arguments, const fs::path& output)
 {
     const std::string exe = server_executable();
@@ -51,10 +57,11 @@ std::string run_server(const std::string& arguments, const fs::path& output)
     command << '"' << exe << "\" " << arguments << " > \"" << output.string() << "\" 2>&1";
 #ifdef _WIN32
     // cmd.exe /c strips the outer quotes.
-    std::system(("\"" + command.str() + "\"").c_str());
+    const int status = std::system(("\"" + command.str() + "\"").c_str());
 #else
-    std::system(command.str().c_str());
+    const int status = std::system(command.str().c_str());
 #endif
+    UNSCOPED_INFO("server exit status for \"" << arguments << "\": " << status);
     return read_all(output);
 }
 

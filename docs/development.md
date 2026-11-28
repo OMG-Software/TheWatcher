@@ -60,6 +60,11 @@ npm.cmd test
   directories and `*.test.ts(x)` files are excluded from duplication
   detection only (BDD scenarios repeat setup deliberately); keep shared
   setup in helpers when it carries logic.
+- Release builds on Ubuntu turn on glibc's `_FORTIFY_SOURCE`, which marks
+  functions such as `system()` and `write()` `warn_unused_result`; with
+  `werror=true` an ignored result fails the build. Debug builds do not, so
+  use the result (assert on it, or attach it with Catch2's `UNSCOPED_INFO`)
+  and check warnings with a `--buildtype=release` build before pushing.
 - Keep top-level C++ namespace as `thewatcher`.
 - Prefer structured types in `common/metrics.hpp`, `common/protocol.hpp`, and
   `common/commands.hpp` over ad hoc strings.
