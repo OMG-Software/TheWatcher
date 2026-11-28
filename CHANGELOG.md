@@ -95,6 +95,30 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   unprivileged writers, and root-reserved blocks count as used (#158).
 - Encoding a frame with an empty payload no longer passes a null pointer to
   libcbor (undefined behaviour reported by UBSan on every heartbeat) (#162).
+- The network collector reports 64-bit counters on Windows (`GetIfEntry2`),
+  so throughput is no longer 0 at counter wraparound, and counts non-unicast
+  packets. A counter reset no longer reports 0 throughput (#91).
+- The Linux network collector reports each interface's IPv4/IPv6 address,
+  MAC and real link state (`IFF_UP`/`IFF_RUNNING`) through `getifaddrs`, so a
+  down interface can alert. FreeBSD, OpenBSD, NetBSD and DragonFly now have a
+  network collector (`getifaddrs` with `if_data` counters). The BSD code was
+  not compiled locally (#92).
+- Interface error and drop counts are sent as the change since the previous
+  sample instead of totals since boot, and the dashboard marks Network red
+  only when the last interval had 10 or more errors/drops, so it no longer
+  stays red until reboot (#152).
+- The default network evaluation (no explicit config) skips loopback, BSD and
+  Windows pseudo interfaces and interfaces that are down, in the status engine
+  and the dashboard. Interfaces named in the collector config are still
+  evaluated, and a down one is red. `NetworkMetrics` gains an `is_loopback`
+  field (#57). Windows loopback adapters are now reported (flagged
+  `is_loopback`) so a config can select them, and the dashboard's primary IP
+  skips loopback and pseudo interfaces.
+- Network collector hardening: IPv6 link-local detection covers all of
+  `fe80::/10`; Windows counters are tracked by interface index so a renamed
+  adapter keeps its history; an unreadable `/proc/net/dev` skips the sample
+  and keeps the baseline instead of producing a huge false delta; if
+  `getifaddrs` fails the `/proc` fallback reports interfaces down (#92, #91).
 - The Windows installer registers the server service with
   `TheWatcherServer.conf`, the file the server actually reads, instead of a
   non-existent `server.json`; the docs name the same file and
@@ -204,6 +228,14 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   history. `*.cmd`/`*.bat` are checked out with CRLF (#128).
 - Version bumped to 0.9.0 in `meson.build`, `dashboard/package.json` and
   the Windows installer.
+- **Protocol:** frames carry a protocol version (`proto::PROTOCOL_VERSION` =
+  2, element 5 of the frame array; a frame without it is version 1), and every
+  decoder accepts longer arrays and ignores unknown trailing fields, so later
+  additive changes stay compatible in both directions. A frame with an
+  unsupported version is rejected with an explicit error. See
+  `docs/architecture.md`. Releases before 0.9.0 need exact array lengths and
+  cannot read 0.9.0 agents' frames, so upgrade the server before the agents
+  (#102).
 - Dashboard: `main.tsx` is split into `App.tsx`, `pages/`, `components/`,
   `hooks/` and `permissions.ts` (role helpers, now unit tested); inline
   styles moved into `styles.css`. No behaviour change (#117).

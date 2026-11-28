@@ -1161,3 +1161,83 @@ SCENARIO("record_transition leaves runbook_url empty when no matching runbook ex
         }
     }
 }
+
+SCENARIO("Status engine default network evaluation skips loopback, pseudo and down interfaces")
+{
+    GIVEN("an approved agent with no explicit network configuration")
+    {
+        SqliteStore store(":memory:");
+        insert_approved_agent(store, "agent-default-net");
+
+        auto make_interface = [](const std::string& name, bool is_up, bool is_loopback) {
+            NetworkMetrics network;
+            network.interface_name = name;
+            network.is_up = is_up;
+            network.is_loopback = is_loopback;
+            return network;
+        };
+
+        auto metrics = metrics_with_cpu(10.0);
+        metrics.networks.clear();
+        metrics.networks.push_back(make_interface("eth0", true, false));
+        metrics.networks.push_back(make_interface("lo", true, true));
+        metrics.networks.push_back(make_interface("lo0", true, false));      // BSD loopback, name only
+        metrics.networks.push_back(make_interface("weirdloop", true, true)); // loopback by flag only
+        metrics.networks.push_back(make_interface("pflog0", false, false));  // BSD pseudo, down
+        metrics.networks.push_back(make_interface("enc0", true, false));     // BSD pseudo
+        metrics.networks.push_back(make_interface("Loopback Pseudo-Interface 1", true, false));
+        metrics.networks.push_back(make_interface("Wi-Fi", false, false)); // disconnected adapter
+
+        WHEN("metrics are evaluated")
+        {
+            StatusEngine engine(store);
+            insert_metrics(store, "agent-default-net", 1000, metrics);
+            engine.evaluate_metrics("agent-default-net", metrics, 1000);
+
+            THEN("only the real, up interface gets a status")
+            {
+                REQUIRE(store.latest_status_for_indicator("agent-default-net", "network:eth0").has_value());
+                for (const auto* name :
+                     {"lo", "lo0", "weirdloop", "pflog0", "enc0", "Loopback Pseudo-Interface 1", "Wi-Fi"})
+                {
+                    INFO(name);
+                    REQUIRE_FALSE(store.latest_status_for_indicator("agent-default-net", std::string("network:") + name)
+                                      .has_value());
+                }
+            }
+        }
+    }
+
+    GIVEN("an agent whose configuration explicitly names a down interface")
+    {
+        SqliteStore store(":memory:");
+        insert_approved_agent(store, "agent-explicit-net");
+        auto agent = store.get_agent("agent-explicit-net");
+        REQUIRE(agent.has_value());
+        NetworkInterfaceConfig network_config;
+        network_config.interface_name = "eth1";
+        agent->collector_config.networks.push_back(network_config);
+        store.set_agent_collector_config(agent->agent_id, agent->collector_config);
+
+        auto metrics = metrics_with_cpu(10.0);
+        metrics.networks.clear();
+        NetworkMetrics eth1;
+        eth1.interface_name = "eth1";
+        eth1.is_up = false;
+        metrics.networks.push_back(eth1);
+
+        WHEN("metrics are evaluated")
+        {
+            StatusEngine engine(store);
+            insert_metrics(store, "agent-explicit-net", 1000, metrics);
+            engine.evaluate_metrics("agent-explicit-net", metrics, 1000);
+
+            THEN("the down interface is still reported red")
+            {
+                auto status = store.latest_status_for_indicator("agent-explicit-net", "network:eth1");
+                REQUIRE(status.has_value());
+                REQUIRE(status->new_status == "red");
+            }
+        }
+    }
+}

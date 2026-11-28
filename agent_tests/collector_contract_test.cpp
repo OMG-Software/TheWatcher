@@ -97,9 +97,9 @@ SCENARIO("Windows network collector reports ipconfig-level adapters")
 
         WHEN("the type is loopback or tunnel plumbing")
         {
-            THEN("the collector filters it out")
+            THEN("loopback is kept (flagged is_loopback) and tunnel plumbing is filtered out")
             {
-                REQUIRE_FALSE(detail::is_windows_reportable_if_type(24));  // Software loopback
+                REQUIRE(detail::is_windows_reportable_if_type(24));        // Software loopback
                 REQUIRE_FALSE(detail::is_windows_reportable_if_type(131)); // Tunnel
             }
         }

@@ -160,6 +160,26 @@ function diskLabel(mountPoint: string, device: string): string {
   return device ? `${mountPoint} (${device})` : mountPoint;
 }
 
+// The agent reports errors and drops as the change since its previous sample,
+// so this is a per-interval count: a few stray drops are normal, a burst is not.
+export const NETWORK_ERROR_DELTA_THRESHOLD = 10;
+
+const PSEUDO_INTERFACE_PREFIXES = ['lo', 'pflog', 'pfsync', 'enc', 'ipfw'];
+const PSEUDO_INTERFACE_FRAGMENTS = ['loopback', 'pseudo-interface', 'isatap', 'teredo', '6to4'];
+
+// Mirrors the server's default network evaluation: with no explicit network
+// config only real, connected interfaces are monitored, so loopback, BSD/Windows
+// pseudo devices and down interfaces are skipped.
+function isPseudoInterfaceName(interfaceName: string): boolean {
+  const name = interfaceName.toLowerCase();
+  if (PSEUDO_INTERFACE_PREFIXES.some((prefix) => name.startsWith(prefix) && /^\d*$/.test(name.slice(prefix.length)))) return true;
+  return PSEUDO_INTERFACE_FRAGMENTS.some((fragment) => name.includes(fragment));
+}
+
+function isDefaultMonitoredNetwork(network: NetworkMetrics): boolean {
+  return network.is_up && network.is_loopback !== true && !isPseudoInterfaceName(network.interface_name);
+}
+
 function networkMbps(network: NetworkMetrics): number {
   return ((network.bytes_recv_per_sec + network.bytes_sent_per_sec) * 8) / 1_000_000;
 }
@@ -230,7 +250,7 @@ function metricComponents(agent: AgentRecord, metrics?: SystemMetrics): Componen
   const networkConfigByName = new Map(config.networks.map((network) => [network.interface_name, network]));
   const monitoredNetworks =
     config.networks.length === 0
-      ? metrics.networks.filter((network) => network.interface_name !== 'lo')
+      ? metrics.networks.filter(isDefaultMonitoredNetwork)
       : metrics.networks.filter((network) => networkConfigByName.get(network.interface_name)?.enabled);
   const networkErrors = monitoredNetworks.reduce(
     (sum, net) => sum + net.errors_in + net.errors_out + net.drops_in + net.drops_out,
@@ -238,7 +258,7 @@ function metricComponents(agent: AgentRecord, metrics?: SystemMetrics): Componen
   );
   const networkStatuses = monitoredNetworks.map((net) => {
     if (!net.is_up) return 'red' as HealthColor;
-    if (net.errors_in + net.errors_out + net.drops_in + net.drops_out > 0) return 'red' as HealthColor;
+    if (net.errors_in + net.errors_out + net.drops_in + net.drops_out >= NETWORK_ERROR_DELTA_THRESHOLD) return 'red' as HealthColor;
     return classifyNetworkMbps(networkMbps(net), networkConfigByName.get(net.interface_name)?.thresholds ?? DEFAULT_NETWORK_THRESHOLDS);
   });
   const networkTraffic = monitoredNetworks.reduce((sum, net) => sum + networkMbps(net), 0);
@@ -287,7 +307,7 @@ function metricComponents(agent: AgentRecord, metrics?: SystemMetrics): Componen
       label: 'Network',
       color: monitoredNetworks.length === 0 ? 'grey' : worstColor(networkStatuses),
       value: monitoredNetworks.length === 0 ? 'none' : `${networkTraffic.toFixed(0)} Mb/s`,
-      detail: networkErrors > 0 ? `${networkErrors} errors/drops` : `${monitoredNetworks.length} interface(s)`,
+      detail: networkErrors > 0 ? `${networkErrors} errors/drops in the last interval` : `${monitoredNetworks.length} interface(s)`,
     },
     {
       key: 'processes',
@@ -311,11 +331,21 @@ function metricComponents(agent: AgentRecord, metrics?: SystemMetrics): Componen
   ];
 }
 
+function isLoopbackNetwork(network: NetworkMetrics): boolean {
+  const ip = network.ip_address?.trim();
+  return (
+    network.is_loopback === true ||
+    isPseudoInterfaceName(network.interface_name) ||
+    ip === '::1' ||
+    (ip?.startsWith('127.') ?? false)
+  );
+}
+
+// The address shown for an agent: the first interface that has one and is not
+// loopback or a pseudo device (lo, lo0, pflog0, ...). Down interfaces count,
+// since their last address is still the best identifier.
 export function primaryIpAddress(metrics?: SystemMetrics): string {
-  const candidates = metrics?.networks.filter((network) => {
-    const ip = network.ip_address?.trim();
-    return ip && ip !== '127.0.0.1' && ip !== '::1' && network.interface_name !== 'lo';
-  }) ?? [];
+  const candidates = metrics?.networks.filter((network) => network.ip_address?.trim() && !isLoopbackNetwork(network)) ?? [];
   return candidates[0]?.ip_address ?? '';
 }
 

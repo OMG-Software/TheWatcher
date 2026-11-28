@@ -29,3 +29,11 @@ singlelog_test = executable(
   dependencies: [common_dep, catch2_dep, platform_deps],
 )
 test('singlelog', singlelog_test)
+
+protocol_compat_test = executable(
+  'protocol_compat_test',
+  ['protocol_compat_test.cpp'],
+  include_directories: root_inc,
+  dependencies: [common_dep, catch2_dep, cbor_dep, platform_deps],
+)
+test('protocol_compat', protocol_compat_test)

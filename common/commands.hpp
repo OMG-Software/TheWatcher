@@ -82,7 +82,7 @@ inline CborPtr to_cbor(const thewatcher::CommandMessage& cmd)
 template <>
 inline thewatcher::CommandMessage from_cbor<thewatcher::CommandMessage>(cbor_item_t* item)
 {
-    if (!cbor_isa_array(item) || cbor_array_size(item) != 3)
+    if (!cbor_isa_array(item) || cbor_array_size(item) < 3)
     {
         throw std::runtime_error("Invalid CommandMessage CBOR payload");
     }
@@ -110,7 +110,7 @@ inline CborPtr to_cbor(const thewatcher::AckMessage& ack)
 template <>
 inline thewatcher::AckMessage from_cbor<thewatcher::AckMessage>(cbor_item_t* item)
 {
-    if (!cbor_isa_array(item) || cbor_array_size(item) != 3)
+    if (!cbor_isa_array(item) || cbor_array_size(item) < 3)
     {
         throw std::runtime_error("Invalid AckMessage CBOR payload");
     }
@@ -134,7 +134,7 @@ inline CborPtr to_cbor(const thewatcher::SetIntervalArgs& a)
 template <>
 inline thewatcher::SetIntervalArgs from_cbor<thewatcher::SetIntervalArgs>(cbor_item_t* item)
 {
-    if (!cbor_isa_array(item) || cbor_array_size(item) != 1)
+    if (!cbor_isa_array(item) || cbor_array_size(item) < 1)
     {
         throw std::runtime_error("Invalid SetIntervalArgs CBOR payload");
     }
@@ -155,7 +155,7 @@ inline CborPtr to_cbor(const thewatcher::SetProcessLimitArgs& a)
 template <>
 inline thewatcher::SetProcessLimitArgs from_cbor<thewatcher::SetProcessLimitArgs>(cbor_item_t* item)
 {
-    if (!cbor_isa_array(item) || cbor_array_size(item) != 1)
+    if (!cbor_isa_array(item) || cbor_array_size(item) < 1)
     {
         throw std::runtime_error("Invalid SetProcessLimitArgs CBOR payload");
     }

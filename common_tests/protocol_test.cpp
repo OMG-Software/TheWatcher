@@ -161,12 +161,20 @@ SCENARIO("EnrollRequest decoding accepts legacy 4-element and current 5-element 
         }
     }
 
-    GIVEN("payloads with 3 and 6 elements")
+    GIVEN("a payload with only 3 elements")
     {
-        THEN("both are rejected")
+        THEN("it is rejected")
         {
             REQUIRE_THROWS_AS(unpack<EnrollRequest>(enroll_array_payload(3)), std::runtime_error);
-            REQUIRE_THROWS_AS(unpack<EnrollRequest>(enroll_array_payload(6)), std::runtime_error);
+        }
+    }
+
+    GIVEN("a payload with 6 elements from a newer agent")
+    {
+        THEN("the unknown trailing element is ignored")
+        {
+            const auto req = unpack<EnrollRequest>(enroll_array_payload(6));
+            REQUIRE(req.enrollment_token == "e");
         }
     }
 }

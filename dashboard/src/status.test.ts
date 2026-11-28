@@ -4,6 +4,7 @@ import {
   DEFAULT_NETWORK_THRESHOLDS,
   DEFAULT_PERCENT_THRESHOLDS,
   DEFAULT_THRESHOLDS,
+  NETWORK_ERROR_DELTA_THRESHOLD,
   agentStatus,
   classifyNetworkMbps,
   classifyPercent,
@@ -488,21 +489,81 @@ describe('GIVEN toDashboardAgents with metric components', () => {
     expect(dashAgent.ipAddress).toBe('192.0.2.10');
   });
 
-  it('WHEN a network interface has packet errors THEN network component is red', () => {
+  it('WHEN the only addressed interfaces are loopback by flag, BSD name or address THEN no primary IP is shown', () => {
     const snapshot = baseSnapshot('comp-agent');
-    snapshot.metrics.networks[0].errors_in = 5;
+    const template = snapshot.metrics.networks[0];
+    snapshot.metrics.networks = [
+      { ...template, interface_name: 'lo0', ip_address: '127.0.0.1' },
+      { ...template, interface_name: 'weird0', ip_address: '10.255.0.1', is_loopback: true },
+      { ...template, interface_name: 'pflog0', ip_address: '' },
+    ];
+    expect(primaryIpAddress(snapshot.metrics)).toBe('');
+  });
+
+  it('WHEN a loopback interface precedes a real one THEN the real interface address is the primary IP', () => {
+    const snapshot = baseSnapshot('comp-agent');
+    const template = snapshot.metrics.networks[0];
+    snapshot.metrics.networks = [
+      { ...template, interface_name: 'lo0', ip_address: '127.0.0.1', is_loopback: true },
+      { ...template, interface_name: 'em0', ip_address: '198.51.100.7' },
+    ];
+    expect(primaryIpAddress(snapshot.metrics)).toBe('198.51.100.7');
+  });
+
+  it('WHEN a network interface has a burst of errors in the latest interval THEN network component is red', () => {
+    const snapshot = baseSnapshot('comp-agent');
+    snapshot.metrics.networks[0].errors_in = NETWORK_ERROR_DELTA_THRESHOLD;
     const [dashAgent] = toDashboardAgents([baseAgent()], [snapshot]);
     const net = dashAgent.components.find((c) => c.key === 'network')!;
     expect(net.color).toBe('red');
     expect(net.detail).toMatch(/errors/);
   });
 
-  it('WHEN an interface is down THEN network component is red', () => {
+  it('WHEN an interface has only a few errors or drops in the latest interval THEN network component stays healthy', () => {
     const snapshot = baseSnapshot('comp-agent');
-    snapshot.metrics.networks[0].is_up = false;
+    snapshot.metrics.networks[0].errors_in = 1;
+    snapshot.metrics.networks[0].drops_out = NETWORK_ERROR_DELTA_THRESHOLD - 2;
     const [dashAgent] = toDashboardAgents([baseAgent()], [snapshot]);
     const net = dashAgent.components.find((c) => c.key === 'network')!;
+    expect(net.color).not.toBe('red');
+  });
+
+  it('WHEN an error blip is followed by a clean interval THEN network component recovers', () => {
+    const blip = baseSnapshot('comp-agent');
+    blip.metrics.networks[0].drops_in = 500;
+    const clean = baseSnapshot('comp-agent');
+    expect(toDashboardAgents([baseAgent()], [blip])[0].components.find((c) => c.key === 'network')!.color).toBe('red');
+    expect(toDashboardAgents([baseAgent()], [clean])[0].components.find((c) => c.key === 'network')!.color).not.toBe('red');
+  });
+
+  it('WHEN an interface explicitly configured for monitoring is down THEN network component is red', () => {
+    const snapshot = baseSnapshot('comp-agent');
+    snapshot.metrics.networks[0].is_up = false;
+    const agent = baseAgent({
+      collector_config: {
+        ...DEFAULT_COLLECTOR_CONFIG,
+        networks: [{ interface_name: 'eth0', enabled: true, thresholds: DEFAULT_NETWORK_THRESHOLDS }],
+      },
+    });
+    const [dashAgent] = toDashboardAgents([agent], [snapshot]);
+    const net = dashAgent.components.find((c) => c.key === 'network')!;
     expect(net.color).toBe('red');
+  });
+
+  it('WHEN the only interfaces are loopback, pseudo or down and no config is set THEN none are monitored', () => {
+    const snapshot = baseSnapshot('comp-agent');
+    const template = snapshot.metrics.networks[0];
+    snapshot.metrics.networks = [
+      { ...template, interface_name: 'lo0', is_loopback: true },
+      { ...template, interface_name: 'pflog0', is_up: false },
+      { ...template, interface_name: 'enc0' },
+      { ...template, interface_name: 'Loopback Pseudo-Interface 1' },
+      { ...template, interface_name: 'Wi-Fi', is_up: false },
+    ];
+    const [dashAgent] = toDashboardAgents([baseAgent()], [snapshot]);
+    const net = dashAgent.components.find((c) => c.key === 'network')!;
+    expect(net.color).toBe('grey');
+    expect(net.value).toBe('none');
   });
 
   it('WHEN the loopback interface is the only one and no config is set THEN it is excluded from monitoring', () => {

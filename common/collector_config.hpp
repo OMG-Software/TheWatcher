@@ -171,7 +171,7 @@ inline CborPtr to_cbor(const thewatcher::PercentThresholds& t)
 template <>
 inline thewatcher::PercentThresholds from_cbor<thewatcher::PercentThresholds>(cbor_item_t* item)
 {
-    if (!cbor_isa_array(item) || cbor_array_size(item) != 3)
+    if (!cbor_isa_array(item) || cbor_array_size(item) < 3)
     {
         throw std::runtime_error("Invalid PercentThresholds CBOR payload");
     }
@@ -199,7 +199,7 @@ inline CborPtr to_cbor(const thewatcher::NetworkThresholds& t)
 template <>
 inline thewatcher::NetworkThresholds from_cbor<thewatcher::NetworkThresholds>(cbor_item_t* item)
 {
-    if (!cbor_isa_array(item) || cbor_array_size(item) != 3)
+    if (!cbor_isa_array(item) || cbor_array_size(item) < 3)
     {
         throw std::runtime_error("Invalid NetworkThresholds CBOR payload");
     }
@@ -319,7 +319,7 @@ inline CborPtr to_cbor(const thewatcher::ProcessWatchConfig& c)
 template <>
 inline thewatcher::ProcessWatchConfig from_cbor<thewatcher::ProcessWatchConfig>(cbor_item_t* item)
 {
-    if (!cbor_isa_array(item) || cbor_array_size(item) != 3)
+    if (!cbor_isa_array(item) || cbor_array_size(item) < 3)
     {
         throw std::runtime_error("Invalid ProcessWatchConfig CBOR payload");
     }

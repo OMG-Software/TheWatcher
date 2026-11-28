@@ -186,6 +186,9 @@ Agent Management handles approved agents:
   vertically for readability;
 - network thresholds are combined receive plus transmit megabits per second per
   selected interface;
+- with no network config the Network component skips loopback, pseudo and down
+  interfaces, and goes red when an interface had 10 or more errors/drops in the
+  last sample interval (the agent reports the change per interval, not totals);
 - process watches use exact executable names plus an expected process count;
 - the Maintenance button enters maintenance with the fixed reason
   `operator request` and no expiry; for a reason or an end time use the
