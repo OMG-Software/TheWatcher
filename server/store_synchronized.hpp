@@ -97,6 +97,12 @@ public:
         return inner_->set_agent_collector_config(agent_id, config);
     }
 
+    void mark_agent_offline(const std::string& agent_id) override
+    {
+        const std::lock_guard<std::mutex> lock(mutex_);
+        return inner_->mark_agent_offline(agent_id);
+    }
+
     void touch_agent(const std::string& agent_id, int64_t last_seen_ms, bool connected) override
     {
         const std::lock_guard<std::mutex> lock(mutex_);
@@ -283,6 +289,12 @@ public:
     {
         const std::lock_guard<std::mutex> lock(mutex_);
         return inner_->insert_status_history(row);
+    }
+
+    std::vector<StatusHistoryRow> latest_status_per_indicator(const std::string& agent_id) override
+    {
+        const std::lock_guard<std::mutex> lock(mutex_);
+        return inner_->latest_status_per_indicator(agent_id);
     }
 
     std::optional<StatusHistoryRow> latest_status_for_indicator(const std::string& agent_id,
@@ -481,6 +493,36 @@ public:
     {
         const std::lock_guard<std::mutex> lock(mutex_);
         return inner_->prune_metrics_before(cutoff_ms);
+    }
+
+    void prune_status_history_before(int64_t cutoff_ms) override
+    {
+        const std::lock_guard<std::mutex> lock(mutex_);
+        return inner_->prune_status_history_before(cutoff_ms);
+    }
+
+    void prune_alerts_before(int64_t cutoff_ms) override
+    {
+        const std::lock_guard<std::mutex> lock(mutex_);
+        return inner_->prune_alerts_before(cutoff_ms);
+    }
+
+    void prune_log_matches_before(int64_t cutoff_ms) override
+    {
+        const std::lock_guard<std::mutex> lock(mutex_);
+        return inner_->prune_log_matches_before(cutoff_ms);
+    }
+
+    void prune_silences_before(int64_t cutoff_ms) override
+    {
+        const std::lock_guard<std::mutex> lock(mutex_);
+        return inner_->prune_silences_before(cutoff_ms);
+    }
+
+    void prune_maintenance_windows_before(int64_t cutoff_ms) override
+    {
+        const std::lock_guard<std::mutex> lock(mutex_);
+        return inner_->prune_maintenance_windows_before(cutoff_ms);
     }
 
     void insert_log_match(const LogMatchRecord& rec) override

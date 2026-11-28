@@ -679,6 +679,15 @@ void SqliteStore::mark_agents_offline_before(int64_t cutoff_ms)
     check(sqlite3_step(st.s), db_, "step mark_agents_offline_before");
 }
 
+void SqliteStore::mark_agent_offline(const std::string& agent_id)
+{
+    Stmt st;
+    check(sqlite3_prepare_v2(db_, "UPDATE agents SET connected=0 WHERE agent_id=?;", -1, &st.s, nullptr), db_,
+          "prepare mark_agent_offline");
+    sqlite3_bind_text(st.s, 1, agent_id.c_str(), -1, SQLITE_TRANSIENT);
+    check(sqlite3_step(st.s), db_, "step mark_agent_offline");
+}
+
 void SqliteStore::set_agent_maintenance(const std::string& agent_id, bool maintenance, const std::string& reason,
                                         int64_t until_ms)
 {
@@ -1232,6 +1241,23 @@ std::optional<StatusHistoryRow> SqliteStore::latest_status_for_indicator(const s
     return std::nullopt;
 }
 
+std::vector<StatusHistoryRow> SqliteStore::latest_status_per_indicator(const std::string& agent_id)
+{
+    Stmt st;
+    check(sqlite3_prepare_v2(db_,
+                             "SELECT id,agent_id,indicator,old_status,new_status,message,created_at FROM "
+                             "status_history WHERE agent_id=? AND id IN (SELECT MAX(id) FROM status_history "
+                             "WHERE agent_id=? GROUP BY indicator);",
+                             -1, &st.s, nullptr),
+          db_, "prepare latest_status_per_indicator");
+    sqlite3_bind_text(st.s, 1, agent_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st.s, 2, agent_id.c_str(), -1, SQLITE_TRANSIENT);
+    std::vector<StatusHistoryRow> out;
+    while (sqlite3_step(st.s) == SQLITE_ROW)
+        out.push_back(row_to_status(st.s));
+    return out;
+}
+
 std::vector<StatusHistoryRow> SqliteStore::list_status_history(const std::string& agent_id, int limit)
 {
     Stmt st;
@@ -1690,6 +1716,50 @@ void SqliteStore::prune_metrics_before(int64_t cutoff_ms)
           "prepare prune_metrics_before");
     sqlite3_bind_int64(st.s, 1, cutoff_ms);
     check(sqlite3_step(st.s), db_, "step prune_metrics_before");
+}
+
+namespace
+{
+    // Runs a DELETE that takes one integer parameter (the cutoff).
+    void delete_with_cutoff(sqlite3* db, const char* sql, int64_t cutoff_ms, const char* what)
+    {
+        Stmt st;
+        check(sqlite3_prepare_v2(db, sql, -1, &st.s, nullptr), db, what);
+        sqlite3_bind_int64(st.s, 1, cutoff_ms);
+        check(sqlite3_step(st.s), db, what);
+    }
+} // namespace
+
+void SqliteStore::prune_status_history_before(int64_t cutoff_ms)
+{
+    // The newest row per indicator is the indicator's current state: keep it.
+    delete_with_cutoff(db_,
+                       "DELETE FROM status_history WHERE created_at < ? AND id NOT IN "
+                       "(SELECT MAX(id) FROM status_history GROUP BY agent_id, indicator);",
+                       cutoff_ms, "prune_status_history_before");
+}
+
+void SqliteStore::prune_alerts_before(int64_t cutoff_ms)
+{
+    // Open alerts (not acknowledged, not soft-deleted) are never pruned.
+    delete_with_cutoff(db_, "DELETE FROM alerts WHERE created_at < ? AND (acknowledged_at > 0 OR deleted_at > 0);",
+                       cutoff_ms, "prune_alerts_before");
+}
+
+void SqliteStore::prune_log_matches_before(int64_t cutoff_ms)
+{
+    delete_with_cutoff(db_, "DELETE FROM log_matches WHERE created_at < ?;", cutoff_ms, "prune_log_matches_before");
+}
+
+void SqliteStore::prune_silences_before(int64_t cutoff_ms)
+{
+    delete_with_cutoff(db_, "DELETE FROM silences WHERE until_ms < ?;", cutoff_ms, "prune_silences_before");
+}
+
+void SqliteStore::prune_maintenance_windows_before(int64_t cutoff_ms)
+{
+    delete_with_cutoff(db_, "DELETE FROM maintenance_windows WHERE end_ms < ?;", cutoff_ms,
+                       "prune_maintenance_windows_before");
 }
 
 void SqliteStore::insert_log_match(const LogMatchRecord& rec)

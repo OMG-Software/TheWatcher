@@ -741,6 +741,14 @@ void PostgresStore::mark_agents_offline_before(int64_t cutoff_ms)
     check_res(res.r, "mark_agents_offline_before");
 }
 
+void PostgresStore::mark_agent_offline(const std::string& agent_id)
+{
+    const char* params[] = {agent_id.c_str()};
+    Res res(PQexecParams(conn_, "UPDATE agents SET connected=FALSE WHERE agent_id=$1;", 1, nullptr, params, nullptr,
+                         nullptr, 0));
+    check_res(res.r, "mark_agent_offline");
+}
+
 void PostgresStore::set_agent_maintenance(const std::string& agent_id, bool maintenance, const std::string& reason,
                                           int64_t until_ms)
 {
@@ -1283,6 +1291,54 @@ void PostgresStore::prune_metrics_before(int64_t cutoff_ms)
     check_res(res.r, "prune_metrics_before");
 }
 
+void PostgresStore::prune_status_history_before(int64_t cutoff_ms)
+{
+    // The newest row per indicator is the indicator's current state: keep it.
+    const auto p = s(cutoff_ms);
+    const char* params[] = {p.c_str()};
+    Res res(PQexecParams(conn_,
+                         "DELETE FROM status_history WHERE created_at<$1 AND id NOT IN "
+                         "(SELECT MAX(id) FROM status_history GROUP BY agent_id, indicator);",
+                         1, nullptr, params, nullptr, nullptr, 0));
+    check_res(res.r, "prune_status_history_before");
+}
+
+void PostgresStore::prune_alerts_before(int64_t cutoff_ms)
+{
+    // Open alerts (not acknowledged, not soft-deleted) are never pruned.
+    const auto p = s(cutoff_ms);
+    const char* params[] = {p.c_str()};
+    Res res(PQexecParams(conn_, "DELETE FROM alerts WHERE created_at<$1 AND (acknowledged_at>0 OR deleted_at>0);", 1,
+                         nullptr, params, nullptr, nullptr, 0));
+    check_res(res.r, "prune_alerts_before");
+}
+
+void PostgresStore::prune_log_matches_before(int64_t cutoff_ms)
+{
+    const auto p = s(cutoff_ms);
+    const char* params[] = {p.c_str()};
+    Res res(
+        PQexecParams(conn_, "DELETE FROM log_matches WHERE created_at<$1;", 1, nullptr, params, nullptr, nullptr, 0));
+    check_res(res.r, "prune_log_matches_before");
+}
+
+void PostgresStore::prune_silences_before(int64_t cutoff_ms)
+{
+    const auto p = s(cutoff_ms);
+    const char* params[] = {p.c_str()};
+    Res res(PQexecParams(conn_, "DELETE FROM silences WHERE until_ms<$1;", 1, nullptr, params, nullptr, nullptr, 0));
+    check_res(res.r, "prune_silences_before");
+}
+
+void PostgresStore::prune_maintenance_windows_before(int64_t cutoff_ms)
+{
+    const auto p = s(cutoff_ms);
+    const char* params[] = {p.c_str()};
+    Res res(PQexecParams(conn_, "DELETE FROM maintenance_windows WHERE end_ms<$1;", 1, nullptr, params, nullptr,
+                         nullptr, 0));
+    check_res(res.r, "prune_maintenance_windows_before");
+}
+
 int64_t PostgresStore::count_metrics_in_window(const std::string& agent_id, int64_t since_ms, int64_t until_ms)
 {
     const auto p_since = s(since_ms);
@@ -1322,6 +1378,22 @@ std::optional<StatusHistoryRow> PostgresStore::latest_status_for_indicator(const
         return std::nullopt;
     return StatusHistoryRow{col_int64(res.r, 0, 0), col(res.r, 0, 1), col(res.r, 0, 2),      col(res.r, 0, 3),
                             col(res.r, 0, 4),       col(res.r, 0, 5), col_int64(res.r, 0, 6)};
+}
+
+std::vector<StatusHistoryRow> PostgresStore::latest_status_per_indicator(const std::string& agent_id)
+{
+    const char* params[] = {agent_id.c_str()};
+    Res res(PQexecParams(conn_,
+                         "SELECT id,agent_id,indicator,old_status,new_status,message,created_at FROM status_history "
+                         "WHERE agent_id=$1 AND id IN (SELECT MAX(id) FROM status_history WHERE agent_id=$1 "
+                         "GROUP BY indicator);",
+                         1, nullptr, params, nullptr, nullptr, 0));
+    check_res(res.r, "latest_status_per_indicator");
+    std::vector<StatusHistoryRow> out;
+    for (int i = 0; i < PQntuples(res.r); ++i)
+        out.push_back({col_int64(res.r, i, 0), col(res.r, i, 1), col(res.r, i, 2), col(res.r, i, 3), col(res.r, i, 4),
+                       col(res.r, i, 5), col_int64(res.r, i, 6)});
+    return out;
 }
 
 std::vector<StatusHistoryRow> PostgresStore::list_status_history(const std::string& agent_id, int limit)

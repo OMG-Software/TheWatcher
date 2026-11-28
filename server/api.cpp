@@ -2772,9 +2772,12 @@ void ApiServer::setup_routes()
         }
         json out = json::object();
         out["webhook_url"] = store_.get_setting("notifications.webhook_url", "");
-        out["offline_after_seconds"] = std::stoi(store_.get_setting("offline_after_seconds", "120"));
+        out["offline_after_seconds"] = std::stoi(store_.get_setting("offline_after_seconds", "60"));
         out["escalation_timeout_seconds"] = std::stoi(store_.get_setting("escalation_timeout_seconds", "3600"));
         out["metrics_retention_days"] = std::stoi(store_.get_setting("metrics_retention_days", "30"));
+        out["status_history_retention_days"] = std::stoi(store_.get_setting("status_history_retention_days", "90"));
+        out["alerts_retention_days"] = std::stoi(store_.get_setting("alerts_retention_days", "90"));
+        out["log_matches_retention_days"] = std::stoi(store_.get_setting("log_matches_retention_days", "30"));
         out["reports_enabled"] = store_.get_setting("reports.enabled", "false") == "true";
         // Effective values: a malformed stored value reads as its default.
         const auto report_schedule = load_report_schedule(store_);
@@ -2828,6 +2831,16 @@ void ApiServer::setup_routes()
                 if (v < 1 || v > 365)
                     throw std::runtime_error("metrics_retention_days must be between 1 and 365");
                 store_.set_setting("metrics_retention_days", std::to_string(v));
+            }
+            for (const char* key :
+                 {"status_history_retention_days", "alerts_retention_days", "log_matches_retention_days"})
+            {
+                if (!body.contains(key))
+                    continue;
+                const auto v = body.at(key).get<int>();
+                if (v < 1 || v > 3650)
+                    throw std::runtime_error(std::string(key) + " must be between 1 and 3650");
+                store_.set_setting(key, std::to_string(v));
             }
             if (body.contains("reports_enabled"))
                 store_.set_setting("reports.enabled", body.at("reports_enabled").get<bool>() ? "true" : "false");

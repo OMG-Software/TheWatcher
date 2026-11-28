@@ -3233,3 +3233,77 @@ SCENARIO("upgrading clears sessions that were stored as raw tokens, exactly once
         }
     }
 }
+
+// ── Retention and per-agent offline (#76, #46) ────────────────────────────────
+
+SCENARIO("latest_status_per_indicator returns the newest row of each indicator")
+{
+    SqliteStore store(":memory:");
+
+    GIVEN("an agent with two indicators and two rows for one of them")
+    {
+        AgentRecord agent;
+        agent.agent_id = "agent-latest";
+        agent.hostname = "host";
+        agent.approved = true;
+        store.upsert_agent(agent);
+        store.insert_status_history({0, "agent-latest", "cpu", "green", "red", "", 1000});
+        store.insert_status_history({0, "agent-latest", "cpu", "red", "green", "", 2000});
+        store.insert_status_history({0, "agent-latest", "memory", "green", "yellow", "", 1500});
+
+        WHEN("the latest rows are listed")
+        {
+            const auto rows = store.latest_status_per_indicator("agent-latest");
+
+            THEN("there is one row per indicator and it is the newest")
+            {
+                REQUIRE(rows.size() == 2);
+                for (const auto& row : rows)
+                {
+                    if (row.indicator == "cpu")
+                        REQUIRE(row.new_status == "green");
+                    else
+                        REQUIRE(row.new_status == "yellow");
+                }
+            }
+        }
+
+        WHEN("another agent is queried")
+        {
+            THEN("nothing is returned")
+            {
+                REQUIRE(store.latest_status_per_indicator("nobody").empty());
+            }
+        }
+    }
+}
+
+SCENARIO("mark_agent_offline disconnects only the named agent")
+{
+    SqliteStore store(":memory:");
+
+    GIVEN("two connected agents")
+    {
+        for (const auto* id : {"agent-a", "agent-b"})
+        {
+            AgentRecord agent;
+            agent.agent_id = id;
+            agent.hostname = "host";
+            agent.approved = true;
+            agent.connected = true;
+            agent.last_seen = 1000;
+            store.upsert_agent(agent);
+        }
+
+        WHEN("one is marked offline")
+        {
+            store.mark_agent_offline("agent-a");
+
+            THEN("only that one is disconnected")
+            {
+                REQUIRE_FALSE(store.get_agent("agent-a")->connected);
+                REQUIRE(store.get_agent("agent-b")->connected);
+            }
+        }
+    }
+}

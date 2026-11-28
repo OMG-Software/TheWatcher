@@ -7,6 +7,7 @@
 #include "common/zmq_limits.hpp"
 #include "offline_alerts.hpp"
 #include "report_generator.hpp"
+#include "retention.hpp"
 #include "router_send.hpp"
 #include "status_engine.hpp"
 
@@ -133,7 +134,9 @@ Server::Server(ServerConfig config)
         return has_route(agent_id);
     });
     alerts_ = std::make_unique<AlertPipeline>(*store_, notifier_);
-    offline_alerts_ = std::make_unique<OfflineAlerts>(*store_, *alerts_);
+    offline_alerts_ = std::make_unique<OfflineAlerts>(*store_, *alerts_, config_.offline_after_seconds);
+    // #43: built once the pipeline exists; the engine routes its alerts through it.
+    status_engine_ = std::make_unique<StatusEngine>(*store_, *alerts_);
 
     // Pre-load all already-approved agents into the ZAP key set so they can
     // reconnect after a server restart without needing re-approval. SEC-04:
@@ -249,13 +252,12 @@ void Server::run(StartupSignal* startup)
         if (std::chrono::steady_clock::now() >= next_offline_scan)
         {
             const auto now = now_ms();
-            if (config_.offline_after_seconds > 0)
+            if (offline_alerts_->detection_enabled())
             {
-                const auto cutoff = now - (static_cast<int64_t>(config_.offline_after_seconds) * 1000);
-                LOGF_TRACE("Scanning for offline agents cutoff_ms=%lld", static_cast<long long>(cutoff));
-                store_->mark_agents_offline_before(cutoff);
+                // #46: the cutoff is per agent (dashboard setting, heartbeat
+                // interval). Raising marks silent agents offline first.
+                offline_alerts_->raise_for_offline_agents(now);
                 expire_routes();
-                offline_alerts_->raise_for_offline_agents(now_ms());
             }
 
             // Escalate unacknowledged alerts older than the configurable timeout.
@@ -267,35 +269,7 @@ void Server::run(StartupSignal* startup)
                 store_->escalate_old_alerts(esc_cutoff, now);
             }
 
-            // Apply scheduled maintenance windows: start or end maintenance for affected agents.
-            const auto active_windows = store_->active_maintenance_windows(now);
-            for (const auto& agent : store_->list_approved_agents())
-            {
-                bool in_window = false;
-                std::string window_reason;
-                for (const auto& win : active_windows)
-                {
-                    if (win.agent_id == "*" || win.agent_id == agent.agent_id)
-                    {
-                        in_window = true;
-                        window_reason = win.reason;
-                        break;
-                    }
-                }
-                if (in_window && !agent.maintenance)
-                {
-                    store_->set_agent_maintenance(agent.agent_id, true, "mw:" + window_reason, 0);
-                    store_->clear_active_alerts_for_agent(agent.agent_id, now);
-                    LOGF_INFO("Scheduled maintenance started agent_id=%s reason=%s", agent.agent_id.c_str(),
-                              window_reason.c_str());
-                }
-                else if (!in_window && agent.maintenance && agent.maintenance_reason.rfind("mw:", 0) == 0)
-                {
-                    // Only auto-resume agents put into maintenance by a window (prefix "mw:").
-                    store_->set_agent_maintenance(agent.agent_id, false, "", 0);
-                    LOGF_INFO("Scheduled maintenance ended agent_id=%s", agent.agent_id.c_str());
-                }
-            }
+            run_periodic_maintenance(now);
 
             // Evict dispatched commands that never received an ACK (M-8).
             constexpr int64_t command_ttl_ms = 5LL * 60LL * 1000LL;
@@ -320,6 +294,36 @@ void Server::run(StartupSignal* startup)
 
     api_->stop();
     LOG_INFO("Stopped.");
+}
+
+// Runs the traffic-independent periodic jobs (see server.hpp). Exceptions are
+// logged so a failing job cannot stop the server loop.
+void Server::run_periodic_maintenance(int64_t now_ms)
+{
+    try
+    {
+        // Timed manual maintenance and scheduled windows share one state machine.
+        status_engine_->reconcile_maintenance(now_ms);
+    }
+    catch (const std::exception& e)
+    {
+        LOGF_ERROR("Maintenance reconcile failed: %s", e.what());
+    }
+
+    constexpr int64_t retention_interval_ms = 3'600'000; // once an hour
+    if (now_ms - last_retention_run_ms_ >= retention_interval_ms)
+    {
+        // Set first: a failing prune is retried next hour, not every second.
+        last_retention_run_ms_ = now_ms;
+        try
+        {
+            run_retention(*store_, now_ms);
+        }
+        catch (const std::exception& e)
+        {
+            LOGF_ERROR("Retention run failed: %s", e.what());
+        }
+    }
 }
 
 void Server::stop()
@@ -462,8 +466,7 @@ void Server::handle_router_frame(zmq::socket_t& router)
             row.timestamp_ms = server_now;
             row.metrics_cbor = frame.payload; // already CBOR-encoded SystemMetrics; store verbatim.
             store_->insert_metrics(row);
-            StatusEngine status_engine(*store_, *alerts_);
-            status_engine.evaluate_metrics(agent_id, metrics, server_now);
+            status_engine_->evaluate_metrics(agent_id, metrics, server_now);
             LOGF_DEBUG("Stored metrics agent_id=%s timestamp_ms=%lld payload_size=%zu", agent_id.c_str(),
                        static_cast<long long>(server_now), row.metrics_cbor.size());
         }
@@ -548,19 +551,15 @@ void Server::handle_router_frame(zmq::socket_t& router)
                             {
                                 store_->touch_agent(agent_id, ack_time, command_agent->connected);
                                 if (command->second.type == CommandType::PAUSE)
-                                    store_->set_agent_maintenance(agent_id, true, "command", 0);
+                                {
+                                    // Keeps the reason and expiry the API already stored.
+                                    status_engine_->pause_agent(agent_id, ack_time);
+                                }
                                 else
-                                    store_->set_agent_maintenance(agent_id, false, "", 0);
-                            }
-                            if (command->second.type == CommandType::PAUSE)
-                            {
-                                StatusEngine status_engine(*store_, *alerts_);
-                                status_engine.enter_maintenance(agent_id, "command", 0, ack_time);
-                            }
-                            else if (command->second.type == CommandType::RESUME)
-                            {
-                                StatusEngine status_engine(*store_, *alerts_);
-                                status_engine.exit_maintenance(agent_id);
+                                {
+                                    // Clears the maintenance columns with a narrow update.
+                                    status_engine_->exit_maintenance(agent_id);
+                                }
                             }
                         }
                     }
@@ -1042,18 +1041,22 @@ bool Server::has_route(const std::string& agent_id) const
     return reachable_agents_.count(agent_id) > 0;
 }
 
-// Drops routes whose agent has sent no frame for offline_after_seconds, so a
-// closed connection's routing id cannot receive that agent's commands.
-// Does nothing when offline detection is disabled (offline_after_seconds <= 0).
+// Drops routes whose agent has sent no frame for its effective offline timeout
+// (the same per-agent timeout the offline scan uses), so a closed connection's
+// routing id cannot receive that agent's commands. Does nothing when offline
+// detection is disabled.
 void Server::expire_routes()
 {
-    if (config_.offline_after_seconds <= 0)
+    if (!offline_alerts_->detection_enabled())
         return;
-    const auto cutoff = std::chrono::steady_clock::now() - std::chrono::seconds{config_.offline_after_seconds};
+    const auto now = std::chrono::steady_clock::now();
     bool changed = false;
     for (auto it = agent_routes_.begin(); it != agent_routes_.end();)
     {
-        if (it->second.last_frame < cutoff)
+        const auto agent = store_->get_agent(it->first);
+        const int heartbeat = agent ? agent->heartbeat_interval : 0;
+        const auto timeout_s = offline_alerts_->timeout_seconds_for(heartbeat);
+        if (it->second.last_frame < now - std::chrono::seconds{timeout_s})
         {
             changed = true;
             LOGF_DEBUG("Forgetting route of agent_id=%s with no frame since the offline threshold",
