@@ -120,11 +120,13 @@ jobs:
             host=127.0.0.1 dbname=thewatcher_test
             user=thewatcher_test password=thewatcher_test
         # Sanitized binaries run several times slower; scale Meson's timeouts.
-        # login_rate_limit asserts wall-clock rate-limit windows that slow
-        # sanitized password hashing outruns; it runs in its own step below.
-        run: |
-          tests=$(meson test -C builddir-asan --list 2>/dev/null             | sed 's#^.* / ##' | grep -vx login_rate_limit)
-          meson test -C builddir-asan --no-rebuild --timeout-multiplier 5             --print-errorlogs $tests
+        # Tests in the 'timing' suite (login_rate_limit) assert wall-clock
+        # rate-limit windows that slow sanitized password hashing outruns; they
+        # run in their own step below. Select by suite, not by parsing
+        # `meson test --list`, whose name format changes between Meson versions.
+        run: >-
+          meson test -C builddir-asan --no-rebuild --timeout-multiplier 5
+          --suite thewatcher --no-suite timing --print-errorlogs
 
       - name: Test (timing-sensitive, informational)
         # TODO: remove continue-on-error once login_rate_limit is robust under
@@ -135,7 +137,7 @@ jobs:
           UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
         run: >-
           meson test -C builddir-asan --no-rebuild --timeout-multiplier 5
-          --print-errorlogs login_rate_limit
+          --suite timing --print-errorlogs
 
   # ── Dashboard ──────────────────────────────────────────────────────────────
   dashboard:

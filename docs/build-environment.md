@@ -160,7 +160,12 @@ CI has a Linux job that builds with AddressSanitizer and
 UndefinedBehaviorSanitizer in a debug configuration (assertions enabled) and
 runs the whole suite. The bundled libsodium is deliberately not instrumented
 (Argon2 under ASan makes every password hash take seconds) and Meson timeouts
-are scaled by 5. Run it locally with:
+are scaled by 5. Tests that assert wall-clock windows are also in the `timing`
+suite (today only `login_rate_limit`): the job runs
+`--suite thewatcher --no-suite timing` as the blocking step and
+`--suite timing` as a separate informational step, because the sanitizer
+slowdown can outrun those windows. Put any new wall-clock test in the
+`timing` suite too (`suite: 'timing'` on its `test()`). Run it locally with:
 
 ```bash
 meson setup builddir-asan --buildtype=debug -Db_sanitize=address,undefined -Db_lundef=false

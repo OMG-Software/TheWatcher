@@ -276,8 +276,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   bundled libsodium is not instrumented (Argon2 under ASan made password
   hashing take seconds) and Meson timeouts are scaled; no sanitizer finding
   was reported by the existing suite. `login_rate_limit` assumes real-time
-  windows and fails under the slowdown, so it runs in a separate
-  informational step (#122).
+  windows and fails under the slowdown, so it is also in a `timing` Meson
+  suite: the job runs `--suite thewatcher --no-suite timing`, then
+  `--suite timing` as a separate informational step (#122). Selecting by
+  suite replaces filtering `meson test --list` output, whose name format
+  changed in Meson 1.11 and let the test back into the blocking step.
 - Dashboard: ESLint (flat config, `typescript-eslint`, `react-hooks`) with
   `npm run lint`, and a `dashboard` CI job running
   `npm ci --ignore-scripts` (no package install scripts), lint, build, tests
