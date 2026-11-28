@@ -1,16 +1,14 @@
 #include "agent.hpp"
 
-#include "collectors/cpu_collector.hpp"
-#include "collectors/disk_collector.hpp"
 #include "collectors/log_collector.hpp"
-#include "collectors/memory_collector.hpp"
-#include "collectors/network_collector.hpp"
-#include "collectors/process_collector.hpp"
 #include "common/SingleLog.hpp"
+#include "common/agent_limits.hpp"
 #include "common/zmq_limits.hpp"
 #include "enrollment.hpp"
 
+#include <algorithm>
 #include <chrono>
+#include <cstring>
 #include <stdexcept>
 #include <thread>
 #include <utility>
@@ -80,30 +78,58 @@ namespace
         }
     }
 
-    void apply_process_watches(std::vector<std::unique_ptr<Collector>>& collectors,
-                               const std::vector<ProcessWatchConfig>& watches)
+    int64_t unix_ms()
     {
-        for (auto& c : collectors)
-        {
-            if (auto* process = dynamic_cast<ProcessCollector*>(c.get()))
-            {
-                process->set_watches(watches);
-                LOGF_DEBUG("Applied %zu process watch(es) to process collector", watches.size());
-                break;
-            }
-        }
+        return std::chrono::duration_cast<std::chrono::milliseconds>(
+                   std::chrono::system_clock::now().time_since_epoch())
+            .count();
+    }
+
+    // Idle wait of the collection and heartbeat loops while not connected.
+    constexpr auto kIdleSlice = std::chrono::milliseconds{250};
+    // IO loop poll slice: bounds how long a queued frame or stop request waits.
+    constexpr auto kIoSlice = std::chrono::milliseconds{100};
+    // How long a DISCONNECT acknowledgement may take to leave before exit.
+    constexpr auto kDisconnectFlushGrace = std::chrono::milliseconds{500};
+    // Pending frames are dropped after this long at shutdown (ZMQ_LINGER).
+    constexpr int kLingerMs = 250;
+    // ZeroMQ PING/PONG keepalive: detects half-open connections.
+    constexpr int kZmqHeartbeatIntervalMs = 5'000;
+    constexpr int kZmqHeartbeatTimeoutMs = 15'000;
+    constexpr const char* kMonitorEndpoint = "inproc://thewatcher-agent-dealer-monitor";
+
+    template <typename... Ts>
+    struct Overloaded : Ts...
+    {
+        using Ts::operator()...;
+    };
+    template <typename... Ts>
+    Overloaded(Ts...) -> Overloaded<Ts...>;
+
+    // Throws std::invalid_argument naming the offending config key.
+    void validate_settings(int collection_interval, int heartbeat_interval, int process_limit)
+    {
+        if (auto e = check_setting("COLLECTION_INTERVAL", collection_interval, kCollectionIntervalRange))
+            throw std::invalid_argument(*e);
+        if (auto e = check_setting("HEARTBEAT_INTERVAL", heartbeat_interval, kHeartbeatIntervalRange))
+            throw std::invalid_argument(*e);
+        if (auto e = check_setting("PROCESS_LIMIT", process_limit, kProcessLimitRange))
+            throw std::invalid_argument(*e);
     }
 } // namespace
 
 // ── Construction ──────────────────────────────────────────────────────────────
 
-Agent::Agent(AgentConfig config)
+Agent::Agent(AgentConfig config, AgentTimings timings)
     : config_(std::move(config))
+    , timings_(timings)
     , interval_seconds_(config_.collection_interval)
     , heartbeat_interval_seconds_(config_.heartbeat_interval)
     , process_limit_(config_.process_limit)
 {
     LOG_FUNCTION_TRACE
+
+    validate_settings(config_.collection_interval, config_.heartbeat_interval, config_.process_limit);
 
     os_name_ = get_os_name();
     os_version_ = get_os_version();
@@ -114,53 +140,47 @@ Agent::Agent(AgentConfig config)
                config_.agent_id.c_str(), hostname_.c_str(), platform_.c_str(), os_name_.c_str(), os_version_.c_str(),
                interval_seconds_.load(), heartbeat_interval_seconds_.load(), process_limit_.load());
 
-    collectors_.emplace_back(std::make_unique<CpuCollector>());
-    collectors_.emplace_back(std::make_unique<MemoryCollector>());
-    collectors_.emplace_back(std::make_unique<DiskCollector>());
-    collectors_.emplace_back(std::make_unique<ProcessCollector>(process_limit_.load()));
-    collectors_.emplace_back(std::make_unique<NetworkCollector>());
-    {
-        auto lc = std::make_unique<LogCollector>();
-        // SEC-10: the log monitor only reads files inside LOG_ALLOWED_DIRS —
-        // an agent-local list the server has no way to extend.
-        lc->set_allowed_dirs(parse_log_allowed_dirs_from_env());
-        log_collector_ = lc.get();
-        collectors_.emplace_back(std::move(lc));
-    }
-    LOGF_DEBUG("Registered %zu collectors", collectors_.size());
+    // Set before any connect so a destroyed agent never waits on pending frames.
+    dealer_.set(zmq::sockopt::linger, kLingerMs);
+    monitor_.set(zmq::sockopt::linger, 0);
 }
 
 Agent::~Agent()
 {
+    // The jthreads follow the shared stop_source_, not their own, so request
+    // the stop before the members are destroyed and joined.
     stop();
 }
 
 // ── Threading ─────────────────────────────────────────────────────────────────
 
 // Enrolls with the server, then connects the DEALER socket and starts the IO,
-// collection and heartbeat threads. Returns early if enrollment is stopped.
+// collection and heartbeat threads. Returns early if a stop was requested.
 // Throws if enrollment or the socket connect fails.
 void Agent::start()
 {
     LOG_FUNCTION_TRACE
+    // The stop state is never reset here: a signal that arrived before start()
+    // (issue #83) must still win.
+    if (stop_requested())
     {
-        enrollment_stop_.store(false);
-        LOGF_INFO("Starting enrollment with %s", config_.enrollment_address.c_str());
-        enroll(config_, ctx_, enrollment_stop_);
-        if (enrollment_stop_.load())
-        {
-            LOG_INFO("Enrollment stopped before data connection");
-            return;
-        }
-        if (!config_.config_path.empty())
-        {
-            LOGF_DEBUG("Persisting enrolled server key pin to %s", config_.config_path.c_str());
-            config_.save(config_.config_path);
-        }
-        LOGF_INFO("Enrollment approved - connecting to %s", config_.server_address.c_str());
+        LOG_INFO("Stop requested before start");
+        return;
     }
+    LOGF_INFO("Starting enrollment with %s", config_.enrollment_address.c_str());
+    enroll(config_, ctx_, enrollment_stop_);
+    if (stop_requested())
+    {
+        LOG_INFO("Enrollment stopped before data connection");
+        return;
+    }
+    if (!config_.config_path.empty())
+    {
+        LOGF_DEBUG("Persisting enrolled server key pin to %s", config_.config_path.c_str());
+        config_.save(config_.config_path);
+    }
+    LOGF_INFO("Enrollment approved - connecting to %s", config_.server_address.c_str());
 
-    dealer_.set(zmq::sockopt::linger, 0);
     // Issue #141: no explicit routing id. The server's ROUTER generates one
     // (a counter from a random start, never sent to peers, so another peer
     // would have to guess it) and learns it from this agent's authenticated
@@ -170,6 +190,13 @@ void Agent::start()
     // the connection handshake.
     dealer_.set(zmq::sockopt::maxmsgsize, proto::kDataPlaneMaxMessageBytes);
     dealer_.set(zmq::sockopt::handshake_ivl, proto::kHandshakeIvlMs);
+    // Queue only on completed connections: with no server a send reports
+    // "would block" and the bounded outbox absorbs the frames, instead of
+    // ZeroMQ buffering up to its high-water mark.
+    dealer_.set(zmq::sockopt::immediate, true);
+    // Detect half-open TCP connections.
+    dealer_.set(zmq::sockopt::heartbeat_ivl, kZmqHeartbeatIntervalMs);
+    dealer_.set(zmq::sockopt::heartbeat_timeout, kZmqHeartbeatTimeoutMs);
     if (!config_.server_public_key.empty())
     {
         LOG_DEBUG("Configuring DEALER socket with CURVE keys");
@@ -181,80 +208,152 @@ void Agent::start()
     {
         LOG_WARNING("Server public key is empty; data socket CURVE encryption is disabled");
     }
-    dealer_.connect(config_.server_address);
-    connected_.store(true);
-    LOGF_DEBUG("Dealer connected agent_id=%s", config_.agent_id.c_str());
 
-    io_thread_ = std::jthread([this](std::stop_token st) {
-        io_loop(st);
+    // Track the real connection state (issue #89) through a socket monitor.
+    try
+    {
+        if (zmq_socket_monitor(dealer_.handle(), kMonitorEndpoint,
+                               ZMQ_EVENT_HANDSHAKE_SUCCEEDED | ZMQ_EVENT_DISCONNECTED) != 0)
+            throw zmq::error_t();
+        monitor_.connect(kMonitorEndpoint);
+        monitor_active_ = true;
+    }
+    catch (const zmq::error_t& e)
+    {
+        // Without events fall back to "connected once connect() was called".
+        LOGF_WARNING("Socket monitor unavailable (%s); assuming connected", e.what());
+        connected_.store(true);
+    }
+
+    dealer_.connect(config_.server_address);
+    LOGF_DEBUG("Dealer connecting agent_id=%s", config_.agent_id.c_str());
+
+    // All threads are created before start() returns; stop() only touches
+    // stop_source_ and so cannot race with these assignments.
+    io_thread_ = std::jthread([this] {
+        io_loop(stop_source_.get_token());
     });
-    collection_thread_ = std::jthread([this](std::stop_token st) {
-        collection_loop(st);
+    collection_thread_ = std::jthread([this] {
+        collection_loop(stop_source_.get_token());
     });
-    heartbeat_thread_ = std::jthread([this](std::stop_token st) {
-        heartbeat_loop(st);
+    heartbeat_thread_ = std::jthread([this] {
+        heartbeat_loop(stop_source_.get_token());
     });
 }
 
 void Agent::stop()
 {
     LOG_FUNCTION_TRACE
-    io_thread_.request_stop();
-    collection_thread_.request_stop();
-    heartbeat_thread_.request_stop();
     enrollment_stop_.store(true);
-    connected_.store(false);
-    LOG_DEBUG("Stop requested for IO, collection, and heartbeat threads");
+    stop_source_.request_stop(); // also wakes every condition-variable wait
+    LOG_DEBUG("Stop requested");
+}
+
+bool Agent::stop_requested() const noexcept
+{
+    return stop_source_.stop_requested();
+}
+
+bool Agent::connected() const noexcept
+{
+    return connected_.load();
 }
 
 // ── IO thread ─────────────────────────────────────────────────────────────────
 
+void Agent::drain_monitor_events()
+{
+    zmq::message_t event, address;
+    while (monitor_.recv(event, zmq::recv_flags::dontwait))
+    {
+        (void)monitor_.recv(address, zmq::recv_flags::none); // endpoint frame
+        if (event.size() < sizeof(uint16_t))
+            continue;
+        uint16_t id = 0;
+        std::memcpy(&id, event.data(), sizeof(id));
+        if (id == ZMQ_EVENT_HANDSHAKE_SUCCEEDED)
+        {
+            LOG_INFO("Data connection established");
+            connected_.store(true);
+        }
+        else if (id == ZMQ_EVENT_DISCONNECTED)
+        {
+            LOG_WARNING("Data connection lost");
+            connected_.store(false);
+        }
+        else
+        {
+            continue;
+        }
+        wake_collection();
+        wake_heartbeat();
+    }
+}
+
+// Sends one frame as [empty delimiter, payload]. Never blocks: returns false
+// when the socket cannot take it now. Once the delimiter is accepted ZeroMQ
+// accepts the rest of the multipart message without blocking.
+bool Agent::send_one(const Outbox::Bytes& payload)
+{
+    try
+    {
+        if (!dealer_.send(zmq::message_t{}, zmq::send_flags::sndmore | zmq::send_flags::dontwait))
+            return false;
+        dealer_.send(zmq::message_t(payload.data(), payload.size()), zmq::send_flags::none);
+        LOGF_TRACE("Sent frame encoded_size=%zu", payload.size());
+    }
+    catch (const zmq::error_t& e)
+    {
+        // A frame the socket rejects outright is dropped, not retried forever.
+        LOGF_WARNING("Dropping unsendable frame encoded_size=%zu error=%s", payload.size(), e.what());
+    }
+    return true;
+}
+
+bool Agent::flush_outbox()
+{
+    for (;;)
+    {
+        if (!unsent_)
+        {
+            unsent_ = outbox_.pop();
+            if (!unsent_)
+                return true;
+        }
+        if (!send_one(*unsent_))
+            return false;
+        unsent_.reset();
+    }
+}
+
 void Agent::io_loop(std::stop_token st)
 {
-    zmq::pollitem_t items[] = {
-        {static_cast<void*>(dealer_), 0, ZMQ_POLLIN, 0}
-    };
-
     while (!st.stop_requested())
     {
-        {
-            std::lock_guard<std::mutex> lock(outbox_mutex_);
-            while (!outbox_.empty())
-            {
-                auto payload = std::move(outbox_.front());
-                outbox_.pop();
-                try
-                {
-                    const auto frame = proto::decode_frame(payload.data(), payload.size());
-                    LOGF_TRACE("Sending frame agent_id=%s type=%s encoded_size=%zu payload_size=%zu",
-                               frame.agent_id.c_str(), frame_type_name(frame.type), payload.size(),
-                               frame.payload.size());
-                }
-                catch (const std::exception& e)
-                {
-                    LOGF_WARNING("Sending undecodable queued frame encoded_size=%zu error=%s", payload.size(),
-                                 e.what());
-                }
-                dealer_.send(zmq::message_t{}, zmq::send_flags::sndmore);
-                dealer_.send(zmq::message_t(payload.data(), payload.size()), zmq::send_flags::none);
-            }
-        }
+        const bool blocked = !flush_outbox();
 
-        zmq::poll(items, 1, std::chrono::milliseconds{100});
+        zmq::pollitem_t items[] = {
+            {static_cast<void*>(dealer_),  0, static_cast<short>(blocked ? ZMQ_POLLIN | ZMQ_POLLOUT : ZMQ_POLLIN), 0},
+            {static_cast<void*>(monitor_), 0, ZMQ_POLLIN,                                                          0},
+        };
+        zmq::poll(items, monitor_active_ ? 2 : 1, kIoSlice);
+
+        if (monitor_active_ && (items[1].revents & ZMQ_POLLIN))
+            drain_monitor_events();
+
         if (items[0].revents & ZMQ_POLLIN)
         {
             zmq::message_t delim, payload;
-            const auto delim_size = dealer_.recv(delim, zmq::recv_flags::none);
-            const auto payload_size = dealer_.recv(payload, zmq::recv_flags::none);
-            if (!delim_size || !payload_size)
+            if (!dealer_.recv(delim, zmq::recv_flags::dontwait))
+                continue;
+            if (!dealer_.recv(payload, zmq::recv_flags::none))
             {
                 LOG_WARNING("Agent failed to receive a complete server frame");
                 continue;
             }
             try
             {
-                auto frame = proto::decode_frame(payload.data(), payload.size());
-                handle_frame(frame);
+                handle_frame(proto::decode_frame(payload.data(), payload.size()));
             }
             catch (const std::exception& e)
             {
@@ -266,121 +365,204 @@ void Agent::io_loop(std::stop_token st)
 
 // ── Collection thread ─────────────────────────────────────────────────────────
 
+void Agent::post_collector_request(CollectorRequest request)
+{
+    {
+        std::lock_guard<std::mutex> lock(collection_mutex_);
+        collector_requests_.push_back(std::move(request));
+        collection_wake_ = true;
+    }
+    collection_cv_.notify_all();
+}
+
+std::vector<Agent::CollectorRequest> Agent::take_collector_requests()
+{
+    std::lock_guard<std::mutex> lock(collection_mutex_);
+    return std::exchange(collector_requests_, {});
+}
+
+void Agent::wake_collection()
+{
+    {
+        std::lock_guard<std::mutex> lock(collection_mutex_);
+        collection_wake_ = true;
+    }
+    collection_cv_.notify_all();
+}
+
+void Agent::wake_heartbeat()
+{
+    {
+        std::lock_guard<std::mutex> lock(heartbeat_mutex_);
+        heartbeat_wake_ = true;
+    }
+    heartbeat_cv_.notify_all();
+}
+
+// Collects one snapshot, queues it, then polls the log files and queues any
+// LOG_MATCH frames. Collection thread only.
+void Agent::collect_and_send(CollectorSet& collectors)
+{
+    LOG_TRACE("Collecting system metrics snapshot");
+    SystemMetrics metrics;
+    fill_static_info(metrics);
+    collectors.for_each([&](Collector& c) {
+        LOGF_TRACE("Updating collector: %s", std::string(c.name()).c_str());
+        c.update(metrics);
+    });
+    log_metrics_summary("Collected metrics", config_.agent_id, metrics);
+    enqueue(proto::FrameType::METRICS, proto::pack(metrics), FramePriority::Bulk);
+
+    collectors.log().tick();
+    for (const auto& m : collectors.log().take_matches())
+    {
+        enqueue(proto::FrameType::LOG_MATCH, proto::pack(m), FramePriority::Bulk);
+        LOGF_DEBUG("Queued LOG_MATCH frame indicator=%s path=%s", m.indicator_name.c_str(), m.path.c_str());
+    }
+}
+
 void Agent::collection_loop(std::stop_token st)
 {
+    auto collectors = std::make_unique<CollectorSet>(process_limit_.load(), parse_log_allowed_dirs_from_env());
+    CollectorConfig active_config; // last config pushed by the server
+    std::chrono::steady_clock::time_point last_collect{};
+    bool has_collected = false;
+
     while (!st.stop_requested())
     {
-        if (connected_ && !paused_)
+        // Apply work posted by the IO thread: this thread is the only one that
+        // ever touches the collectors (issue #87).
+        for (auto& request : take_collector_requests())
+        {
+            std::visit(Overloaded{
+                           [&](ApplyCollectorConfig& r) {
+                               active_config = std::move(r.config);
+                               collectors->process().set_limit(r.process_limit);
+                               collectors->apply(active_config);
+                           },
+                           [&](SetProcessLimit& r) {
+                               collectors->process().set_limit(r.limit);
+                           },
+                           [&](RestartCollectors& r) {
+                               LOG_INFO("Restarting collectors");
+                               collectors = std::make_unique<CollectorSet>(process_limit_.load(),
+                                                                           parse_log_allowed_dirs_from_env());
+                               collectors->apply(active_config);
+                               queue_ack(r.command_id, true, "collectors restarted");
+                           },
+                           [&](CollectNow& r) {
+                               LOG_INFO("Immediate status requested");
+                               try
+                               {
+                                   collect_and_send(*collectors);
+                                   queue_ack(r.command_id, true, "status sent");
+                               }
+                               catch (const std::exception& e)
+                               {
+                                   LOGF_WARNING("Status collection error: %s", e.what());
+                                   queue_ack(r.command_id, false, "status collection failed");
+                               }
+                           },
+                       },
+                       request);
+        }
+
+        const auto now = std::chrono::steady_clock::now();
+        const bool active = connected_.load() && !paused_.load();
+        // The interval is re-read every slice, so a change applies at once.
+        const auto interval = std::chrono::seconds{interval_seconds_.load()};
+        if (active && (!has_collected || now >= last_collect + interval))
         {
             try
             {
-                auto metrics = collect_metrics();
-                log_metrics_summary("Collected metrics", config_.agent_id, metrics);
-
-                proto::Frame f;
-                f.type = static_cast<uint8_t>(proto::FrameType::METRICS);
-                f.agent_id = config_.agent_id;
-                f.timestamp_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                                     std::chrono::system_clock::now().time_since_epoch())
-                                     .count();
-                f.payload = proto::pack(metrics);
-                auto encoded_metrics = proto::encode_frame(f);
-                LOGF_DEBUG("Queueing metrics frame agent_id=%s timestamp=%lld payload_size=%zu encoded_size=%zu",
-                           f.agent_id.c_str(), static_cast<long long>(f.timestamp_ms), f.payload.size(),
-                           encoded_metrics.size());
-                enqueue(std::move(encoded_metrics));
-
-                // Poll log files and forward any matches.
-                if (log_collector_ != nullptr)
-                {
-                    log_collector_->tick();
-                    auto matches = log_collector_->take_matches();
-                    for (const auto& m : matches)
-                    {
-                        proto::Frame lf;
-                        lf.type = static_cast<uint8_t>(proto::FrameType::LOG_MATCH);
-                        lf.agent_id = config_.agent_id;
-                        lf.timestamp_ms = f.timestamp_ms;
-                        lf.payload = proto::pack(m);
-                        enqueue(proto::encode_frame(lf));
-                        LOGF_DEBUG("Queued LOG_MATCH frame agent_id=%s indicator=%s path=%s", lf.agent_id.c_str(),
-                                   m.indicator_name.c_str(), m.path.c_str());
-                    }
-                }
-
-                proto::Frame cfg_request;
-                cfg_request.type = static_cast<uint8_t>(proto::FrameType::CONFIG_REQUEST);
-                cfg_request.agent_id = config_.agent_id;
-                cfg_request.timestamp_ms = f.timestamp_ms;
-                auto encoded_config_request = proto::encode_frame(cfg_request);
-                LOGF_TRACE("Queued config request agent_id=%s timestamp=%lld encoded_size=%zu",
-                           cfg_request.agent_id.c_str(), static_cast<long long>(cfg_request.timestamp_ms),
-                           encoded_config_request.size());
-                enqueue(std::move(encoded_config_request));
+                collect_and_send(*collectors);
             }
             catch (const std::exception& e)
             {
                 LOGF_WARNING("Collection error: %s", e.what());
             }
+            last_collect = now;
+            has_collected = true;
         }
 
-        auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{interval_seconds_.load()};
-        while (!st.stop_requested() && std::chrono::steady_clock::now() < deadline)
-            std::this_thread::sleep_for(std::chrono::milliseconds{500});
+        const auto deadline = active ? last_collect + interval : now + kIdleSlice;
+        std::unique_lock<std::mutex> lock(collection_mutex_);
+        collection_cv_.wait_until(lock, st, deadline, [&] {
+            return collection_wake_ || !collector_requests_.empty();
+        });
+        collection_wake_ = false;
     }
 }
 
 // ── Heartbeat thread ──────────────────────────────────────────────────────────
 
+// Sends heartbeats and config requests on their own timers, independent of the
+// collection interval, pause state and the metrics backlog (issue #89).
 void Agent::heartbeat_loop(std::stop_token st)
 {
+    using Clock = std::chrono::steady_clock;
+    std::optional<Clock::time_point> last_heartbeat;
+    std::optional<Clock::time_point> last_config_request;
+    bool was_connected = false;
+
     while (!st.stop_requested())
     {
-        if (connected_)
+        const bool is_connected = connected_.load();
+        if (is_connected != was_connected)
         {
-            proto::Frame f;
-            f.type = static_cast<uint8_t>(proto::FrameType::HEARTBEAT);
-            f.agent_id = config_.agent_id;
-            f.timestamp_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                                 std::chrono::system_clock::now().time_since_epoch())
-                                 .count();
-            auto encoded_heartbeat = proto::encode_frame(f);
-            LOGF_TRACE("Queued heartbeat frame agent_id=%s timestamp=%lld encoded_size=%zu", f.agent_id.c_str(),
-                       static_cast<long long>(f.timestamp_ms), encoded_heartbeat.size());
-            enqueue(std::move(encoded_heartbeat));
+            // A fresh connection greets the server and asks for config at once.
+            last_heartbeat.reset();
+            last_config_request.reset();
+            was_connected = is_connected;
         }
 
-        auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds{heartbeat_interval_seconds_.load()};
-        while (!st.stop_requested() && std::chrono::steady_clock::now() < deadline)
-            std::this_thread::sleep_for(std::chrono::milliseconds{500});
+        auto deadline = Clock::now() + kIdleSlice;
+        if (is_connected)
+        {
+            const auto now = Clock::now();
+            const auto heartbeat_every = std::chrono::seconds{heartbeat_interval_seconds_.load()};
+            if (!last_heartbeat || now >= *last_heartbeat + heartbeat_every)
+            {
+                enqueue(proto::FrameType::HEARTBEAT, {}, FramePriority::Urgent);
+                last_heartbeat = now;
+            }
+            if (!last_config_request || now >= *last_config_request + timings_.config_poll_interval)
+            {
+                enqueue(proto::FrameType::CONFIG_REQUEST, {}, FramePriority::Urgent);
+                last_config_request = now;
+            }
+            // Deadlines come from the current settings, so a lowered interval
+            // takes effect on the next wake, not after the old one expires.
+            deadline =
+                std::min(*last_heartbeat + heartbeat_every, *last_config_request + timings_.config_poll_interval);
+        }
+
+        std::unique_lock<std::mutex> lock(heartbeat_mutex_);
+        heartbeat_cv_.wait_until(lock, st, deadline, [&] {
+            return heartbeat_wake_;
+        });
+        heartbeat_wake_ = false;
     }
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-void Agent::enqueue(std::vector<uint8_t> frame)
+void Agent::enqueue(proto::FrameType type, std::vector<uint8_t> payload, FramePriority priority)
 {
-    std::lock_guard<std::mutex> lock(outbox_mutex_);
-    const auto pending_before = outbox_.size();
-    LOGF_TRACE("Outbox enqueue encoded_size=%zu pending_before=%zu pending_after=%zu", frame.size(), pending_before,
-               pending_before + 1);
-    outbox_.push(std::move(frame));
+    proto::Frame f;
+    f.type = static_cast<uint8_t>(type);
+    f.agent_id = config_.agent_id;
+    f.timestamp_ms = unix_ms();
+    f.payload = std::move(payload);
+    auto encoded = proto::encode_frame(f);
+    LOGF_TRACE("Outbox enqueue type=%s encoded_size=%zu", frame_type_name(f.type), encoded.size());
+    outbox_.push(std::move(encoded), priority);
 }
 
-SystemMetrics Agent::collect_metrics()
+void Agent::queue_ack(const std::string& command_id, bool ok, const std::string& message)
 {
-    LOG_TRACE("Collecting system metrics snapshot");
-    SystemMetrics m;
-    fill_static_info(m);
-    for (auto& c : collectors_)
-    {
-        LOGF_TRACE("Updating collector: %s", std::string(c->name()).c_str());
-        c->update(m);
-        LOGF_TRACE("Collector %s snapshot cpu=%.2f memory=%.2f disks=%zu networks=%zu processes=%zu",
-                   std::string(c->name()).c_str(), m.cpu.usage_percent, m.memory.usage_percent, m.disks.size(),
-                   m.networks.size(), m.top_processes.size());
-    }
-    return m;
+    enqueue(proto::FrameType::COMMAND_ACK, proto::pack(AckMessage{command_id, ok, message}), FramePriority::Urgent);
+    LOGF_DEBUG("Queued ACK command_id=%s ok=%d message=%s", command_id.c_str(), ok ? 1 : 0, message.c_str());
 }
 
 void Agent::fill_static_info(SystemMetrics& m) const
@@ -392,7 +574,7 @@ void Agent::fill_static_info(SystemMetrics& m) const
     m.uptime_seconds = get_uptime_seconds();
 }
 
-// ── Command handling ──────────────────────────────────────────────────────────
+// ── Command handling (IO thread) ──────────────────────────────────────────────
 
 void Agent::handle_frame(const proto::Frame& f)
 {
@@ -400,158 +582,130 @@ void Agent::handle_frame(const proto::Frame& f)
     if (type == proto::FrameType::COMMAND)
     {
         LOGF_DEBUG("Received COMMAND frame payload_size=%zu", f.payload.size());
-        auto cmd = proto::unpack<CommandMessage>(f.payload);
-        handle_command(cmd);
+        handle_command(proto::unpack<CommandMessage>(f.payload));
     }
     else if (type == proto::FrameType::CONFIG_UPDATE)
     {
         LOGF_DEBUG("Received CONFIG_UPDATE payload_size=%zu", f.payload.size());
-        auto cfg = proto::unpack<ConfigUpdate>(f.payload);
-        interval_seconds_.store(cfg.interval_seconds);
-        heartbeat_interval_seconds_.store(cfg.heartbeat_interval_seconds);
-        process_limit_.store(cfg.process_limit);
-        collector_config_ = cfg.collector_config;
-        LOGF_INFO("Applied config update interval_seconds=%d heartbeat_interval_seconds=%d process_limit=%d "
-                  "disk_configs=%zu network_configs=%zu "
-                  "process_watches=%zu",
-                  cfg.interval_seconds, cfg.heartbeat_interval_seconds, cfg.process_limit,
-                  collector_config_.disks.size(), collector_config_.networks.size(),
-                  collector_config_.processes.size());
-        for (auto& c : collectors_)
-        {
-            if (auto* process = dynamic_cast<ProcessCollector*>(c.get()))
-            {
-                process->set_limit(cfg.process_limit);
-                process->set_watches(collector_config_.processes);
-            }
-        }
-        if (log_collector_ != nullptr)
-            log_collector_->set_configs(collector_config_.logs);
+        handle_config_update(proto::unpack<ConfigUpdate>(f.payload));
     }
 }
 
-// Runs one server command (interval, process limit, restart, pause, resume,
-// status, disconnect) and sends a COMMAND_ACK. An unknown command type is acked
-// with ok=false. Malformed arguments make proto::unpack throw. Restarting
-// collectors re-applies the LOG_ALLOWED_DIRS allowlist to the new LogCollector.
+// Applies a server-pushed config. An out-of-range value rejects the whole
+// update and keeps the previous settings (issue #88).
+void Agent::handle_config_update(const ConfigUpdate& cfg)
+{
+    if (auto e = check_setting("collection interval", cfg.interval_seconds, kCollectionIntervalRange))
+    {
+        LOGF_WARNING("Rejected config update: %s", e->c_str());
+        return;
+    }
+    if (auto e = check_setting("heartbeat interval", cfg.heartbeat_interval_seconds, kHeartbeatIntervalRange))
+    {
+        LOGF_WARNING("Rejected config update: %s", e->c_str());
+        return;
+    }
+    if (auto e = check_setting("process limit", cfg.process_limit, kProcessLimitRange))
+    {
+        LOGF_WARNING("Rejected config update: %s", e->c_str());
+        return;
+    }
+
+    interval_seconds_.store(cfg.interval_seconds);
+    heartbeat_interval_seconds_.store(cfg.heartbeat_interval_seconds);
+    process_limit_.store(cfg.process_limit);
+    LOGF_INFO("Applied config update interval_seconds=%d heartbeat_interval_seconds=%d process_limit=%d "
+              "disk_configs=%zu network_configs=%zu process_watches=%zu",
+              cfg.interval_seconds, cfg.heartbeat_interval_seconds, cfg.process_limit,
+              cfg.collector_config.disks.size(), cfg.collector_config.networks.size(),
+              cfg.collector_config.processes.size());
+    post_collector_request(ApplyCollectorConfig{cfg.process_limit, cfg.collector_config});
+    wake_heartbeat();
+}
+
+// Waits up to `grace` for queued frames to leave the socket.
+void Agent::flush_for(std::chrono::milliseconds grace)
+{
+    const auto deadline = std::chrono::steady_clock::now() + grace;
+    while (!flush_outbox() && std::chrono::steady_clock::now() < deadline)
+    {
+        zmq::pollitem_t item{static_cast<void*>(dealer_), 0, ZMQ_POLLOUT, 0};
+        zmq::poll(&item, 1, std::chrono::milliseconds{20});
+    }
+}
+
+// Runs one server command and queues a COMMAND_ACK. Out-of-range values and
+// unknown command types are acked with ok=false; collector work is posted to
+// the collection thread, which acks restart and status itself once done.
 void Agent::handle_command(const CommandMessage& cmd)
 {
     LOGF_DEBUG("Handling command type=%u command_id=%s args_size=%zu", static_cast<unsigned>(cmd.command_type),
                cmd.command_id.c_str(), cmd.args.size());
-    auto send_ack_now = [&](bool ok, const std::string& msg) {
-        AckMessage ack_msg{cmd.command_id, ok, msg};
-        proto::Frame f;
-        f.type = static_cast<uint8_t>(proto::FrameType::COMMAND_ACK);
-        f.agent_id = config_.agent_id;
-        f.timestamp_ms =
-            std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch())
-                .count();
-        f.payload = proto::pack(ack_msg);
-        auto encoded = proto::encode_frame(f);
-        dealer_.send(zmq::message_t{}, zmq::send_flags::sndmore);
-        dealer_.send(zmq::message_t(encoded.data(), encoded.size()), zmq::send_flags::none);
-        LOGF_DEBUG("Sent immediate ACK command_id=%s ok=%d message=%s", cmd.command_id.c_str(), ok ? 1 : 0,
-                   msg.c_str());
-    };
-
-    auto ack = [&](bool ok, const std::string& msg) {
-        AckMessage ack_msg{cmd.command_id, ok, msg};
-        proto::Frame f;
-        f.type = static_cast<uint8_t>(proto::FrameType::COMMAND_ACK);
-        f.agent_id = config_.agent_id;
-        f.timestamp_ms =
-            std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch())
-                .count();
-        f.payload = proto::pack(ack_msg);
-        enqueue(proto::encode_frame(f));
-        LOGF_DEBUG("Queued ACK command_id=%s ok=%d message=%s", cmd.command_id.c_str(), ok ? 1 : 0, msg.c_str());
-    };
-
-    switch (static_cast<CommandType>(cmd.command_type))
+    try
     {
-    case CommandType::SET_INTERVAL: {
-        auto args = proto::unpack<SetIntervalArgs>(cmd.args);
-        interval_seconds_.store(args.interval_seconds);
-        LOGF_INFO("Set collection interval to %d seconds", args.interval_seconds);
-        ack(true, "interval set to " + std::to_string(args.interval_seconds));
-        break;
-    }
-    case CommandType::SET_PROCESS_LIMIT: {
-        auto args = proto::unpack<SetProcessLimitArgs>(cmd.args);
-        process_limit_.store(args.limit);
-        LOGF_INFO("Set process limit to %d", args.limit);
-        for (auto& c : collectors_)
+        switch (static_cast<CommandType>(cmd.command_type))
         {
-            if (auto* process = dynamic_cast<ProcessCollector*>(c.get()))
+        case CommandType::SET_INTERVAL: {
+            const auto args = proto::unpack<SetIntervalArgs>(cmd.args);
+            if (auto e = check_setting("collection interval", args.interval_seconds, kCollectionIntervalRange))
             {
-                process->set_limit(args.limit);
+                queue_ack(cmd.command_id, false, *e);
                 break;
             }
+            interval_seconds_.store(args.interval_seconds);
+            wake_collection();
+            LOGF_INFO("Set collection interval to %d seconds", args.interval_seconds);
+            queue_ack(cmd.command_id, true, "interval set to " + std::to_string(args.interval_seconds));
+            break;
         }
-        ack(true, "process limit set to " + std::to_string(args.limit));
-        break;
-    }
-    case CommandType::RESTART_COLLECTORS:
-        LOG_INFO("Restarting collectors");
-        collectors_.clear();
-        log_collector_ = nullptr;
-        collectors_.emplace_back(std::make_unique<CpuCollector>());
-        collectors_.emplace_back(std::make_unique<MemoryCollector>());
-        collectors_.emplace_back(std::make_unique<DiskCollector>());
-        collectors_.emplace_back(std::make_unique<ProcessCollector>(process_limit_.load()));
-        collectors_.emplace_back(std::make_unique<NetworkCollector>());
-        {
-            auto lc = std::make_unique<LogCollector>();
-            // SEC-10: without the allowlist the new collector would stay
-            // fail-closed and log monitoring would silently stop.
-            lc->set_allowed_dirs(parse_log_allowed_dirs_from_env());
-            log_collector_ = lc.get();
-            collectors_.emplace_back(std::move(lc));
+        case CommandType::SET_PROCESS_LIMIT: {
+            const auto args = proto::unpack<SetProcessLimitArgs>(cmd.args);
+            if (auto e = check_setting("process limit", args.limit, kProcessLimitRange))
+            {
+                queue_ack(cmd.command_id, false, *e);
+                break;
+            }
+            process_limit_.store(args.limit);
+            post_collector_request(SetProcessLimit{args.limit});
+            LOGF_INFO("Set process limit to %d", args.limit);
+            queue_ack(cmd.command_id, true, "process limit set to " + std::to_string(args.limit));
+            break;
         }
-        apply_process_watches(collectors_, collector_config_.processes);
-        if (log_collector_ != nullptr)
-            log_collector_->set_configs(collector_config_.logs);
-        ack(true, "collectors restarted");
-        break;
-    case CommandType::PAUSE:
-        LOG_INFO("Pausing metric collection");
-        paused_.store(true);
-        ack(true, "paused");
-        break;
-    case CommandType::RESUME:
-        LOG_INFO("Resuming metric collection");
-        paused_.store(false);
-        ack(true, "resumed");
-        break;
-    case CommandType::GET_STATUS: {
-        LOG_INFO("Immediate status requested");
-        auto metrics = collect_metrics();
-        proto::Frame f;
-        f.type = static_cast<uint8_t>(proto::FrameType::METRICS);
-        f.agent_id = config_.agent_id;
-        f.timestamp_ms =
-            std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::system_clock::now().time_since_epoch())
-                .count();
-        f.payload = proto::pack(metrics);
-        enqueue(proto::encode_frame(f));
-        proto::Frame cfg_request;
-        cfg_request.type = static_cast<uint8_t>(proto::FrameType::CONFIG_REQUEST);
-        cfg_request.agent_id = config_.agent_id;
-        cfg_request.timestamp_ms = f.timestamp_ms;
-        enqueue(proto::encode_frame(cfg_request));
-        ack(true, "status sent");
-        break;
+        case CommandType::RESTART_COLLECTORS:
+            post_collector_request(RestartCollectors{cmd.command_id});
+            break;
+        case CommandType::PAUSE:
+            LOG_INFO("Pausing metric collection");
+            paused_.store(true);
+            queue_ack(cmd.command_id, true, "paused");
+            break;
+        case CommandType::RESUME:
+            LOG_INFO("Resuming metric collection");
+            paused_.store(false);
+            wake_collection();
+            queue_ack(cmd.command_id, true, "resumed");
+            break;
+        case CommandType::GET_STATUS:
+            post_collector_request(CollectNow{cmd.command_id});
+            break;
+        case CommandType::DISCONNECT:
+            LOG_INFO("Disconnect command received");
+            queue_ack(cmd.command_id, true, "disconnecting");
+            flush_for(kDisconnectFlushGrace); // let the ack out before exiting
+            stop();                           // the process owner sees stop_requested() and exits
+            break;
+        default:
+            LOGF_WARNING("Unknown command type=%u command_id=%s", static_cast<unsigned>(cmd.command_type),
+                         cmd.command_id.c_str());
+            queue_ack(cmd.command_id, false, "unknown command");
+            break;
+        }
     }
-    case CommandType::DISCONNECT:
-        LOG_INFO("Disconnect command received");
-        send_ack_now(true, "disconnecting");
-        stop();
-        break;
-    default:
-        LOGF_WARNING("Unknown command type=%u command_id=%s", static_cast<unsigned>(cmd.command_type),
-                     cmd.command_id.c_str());
-        ack(false, "unknown command");
-        break;
+    catch (const std::exception& e)
+    {
+        // Malformed or out-of-range arguments (checked narrowing in commands.hpp).
+        LOGF_WARNING("Command %s rejected: %s", cmd.command_id.c_str(), e.what());
+        queue_ack(cmd.command_id, false, "invalid command arguments");
     }
 }
 

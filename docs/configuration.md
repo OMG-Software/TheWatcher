@@ -260,9 +260,17 @@ Options:
 | `AGENT_ID` | generated UUID | Stable agent identity used for enrollment, data-plane frames, and dashboard rows. Valid characters are letters, digits, `.`, `_`, and `-` (max 64). |
 | `AGENT_PUBLIC_KEY` | generated | Agent CURVE public key sent during enrollment and approved by the server. |
 | `AGENT_SECRET_KEY` | generated | Agent CURVE secret key. Keep this private. |
-| `COLLECTION_INTERVAL` | `30` | Seconds between periodic metrics submissions. The server can update this through the dashboard. |
+| `COLLECTION_INTERVAL` | `30` | Seconds between periodic metrics submissions; valid values are 1 through 3600. The server can update this through the dashboard. |
 | `HEARTBEAT_INTERVAL` | `5` | Seconds between heartbeat frames. The server can update this through the dashboard; valid values are 1 through 60. |
-| `PROCESS_LIMIT` | `25` | Number of top processes collected by the process collector. The server can update this through the dashboard. |
+| `PROCESS_LIMIT` | `25` | Number of top processes collected by the process collector; valid values are 1 through 1000. The server can update this through the dashboard. |
+
+The agent refuses to start when `COLLECTION_INTERVAL`, `HEARTBEAT_INTERVAL` or
+`PROCESS_LIMIT` is not an integer or is outside its range, with a message such
+as `HEARTBEAT_INTERVAL must be between 1 and 60`. The same ranges apply to
+`CONFIG_UPDATE` and to the `SET_INTERVAL` and `SET_PROCESS_LIMIT` commands: an
+out-of-range `CONFIG_UPDATE` is rejected as a whole and the previous settings
+stay in force, and an out-of-range command is acknowledged as failed. The
+server REST API enforces the same ranges (`400` otherwise).
 
 The log monitor additionally respects the `LOG_ALLOWED_DIRS` environment
 variable: a list of directories (separated by `;` on Windows, `:` elsewhere)

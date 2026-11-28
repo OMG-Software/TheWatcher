@@ -58,13 +58,36 @@ Responsibilities:
   reject later approvals from a different server key.
 - Establish a ZeroMQ DEALER connection to the server data endpoint.
 - Collect metrics periodically and submit `METRICS` frames.
-- Send `HEARTBEAT` frames.
-- Send `CONFIG_REQUEST` after each metrics submission.
+- Send `HEARTBEAT` frames on their own timer, independent of the collection
+  interval, pause state and the metrics backlog.
+- Send `CONFIG_REQUEST` on connect and every 10 seconds, also while paused, so
+  dashboard changes reach the agent promptly.
 - Apply `CONFIG_UPDATE` responses.
 - Execute server commands such as pause, resume, restart collectors, status, and
   disconnect.
 
 The agent is always the side that establishes connections.
+
+### Agent threading and shutdown
+
+- The IO thread owns the DEALER socket. It never blocks: sends are
+  non-blocking, the socket only queues on completed connections
+  (`ZMQ_IMMEDIATE`), and the outbox lock is never held across a ZeroMQ call.
+- The outbox is bounded. Heartbeats, acks and config requests are sent before
+  metrics, and when the server is unreachable the oldest metrics are dropped.
+  ZeroMQ PING/PONG keepalive detects half-open connections.
+- The connection state follows the real handshake (socket monitor), not the
+  `connect()` call. The agent greets the server and requests its config as soon
+  as the handshake completes.
+- The collection thread is the only owner of the collectors. The IO thread
+  posts config changes, process-limit changes, restart and status requests to
+  it, and it applies them between collection passes. Restart and status
+  commands are acknowledged once the work is done.
+- One stop request, made at any time (signal, service stop, `DISCONNECT`),
+  stops enrollment and every thread; enrollment waits are interruptible, so
+  Ctrl-C returns within about a second even while awaiting approval.
+- A `DISCONNECT` command acknowledges, then makes the agent stop and the
+  process exit (the Windows service reports STOPPED).
 
 ## Common Protocol
 

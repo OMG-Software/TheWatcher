@@ -129,6 +129,34 @@ double get_uptime_seconds()
 
 namespace
 {
+    // Longest uninterrupted wait: bounds how late a stop request is noticed.
+    constexpr auto kStopCheckSlice = std::chrono::milliseconds{50};
+
+    // Sleeps for `seconds`, returning early once `stop_flag` is set (issue #83).
+    void sleep_unless_stopped(const std::atomic<bool>& stop_flag, int seconds)
+    {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(seconds);
+        while (!stop_flag.load() && std::chrono::steady_clock::now() < deadline)
+            std::this_thread::sleep_for(kStopCheckSlice);
+    }
+
+    // Receives one message, waiting at most `timeout_ms` and giving up early once
+    // `stop_flag` is set. Returns an empty result on timeout or stop.
+    zmq::recv_result_t recv_unless_stopped(zmq::socket_t& socket, zmq::message_t& message,
+                                           const std::atomic<bool>& stop_flag, int timeout_ms)
+    {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+        while (!stop_flag.load())
+        {
+            zmq::pollitem_t item{static_cast<void*>(socket), 0, ZMQ_POLLIN, 0};
+            zmq::poll(&item, 1, kStopCheckSlice);
+            if (item.revents & ZMQ_POLLIN)
+                return socket.recv(message, zmq::recv_flags::dontwait);
+            if (std::chrono::steady_clock::now() >= deadline)
+                break;
+        }
+        return std::nullopt;
+    }
 
     // True if key is exactly 40 Z85 characters that decode to a 32-byte CURVE key.
     // The enrollment reply is untrusted text that ends up in the config file, so
@@ -154,6 +182,7 @@ namespace
     // Returns the decoded reply, or nullopt after logging why there is none
     // (send failure, timeout or a reply that does not decode).
     std::optional<EnrollResponse> request_enrollment(const AgentConfig& config, zmq::context_t& ctx,
+                                                     const std::atomic<bool>& stop_flag,
                                                      const std::vector<uint8_t>& encoded, int recv_timeout_ms)
     {
         try
@@ -172,7 +201,8 @@ namespace
             req.send(zmq::message_t(encoded.data(), encoded.size()), zmq::send_flags::none);
 
             zmq::message_t resp;
-            if (!req.recv(resp, zmq::recv_flags::none))
+            // Interruptible: a stop request ends the wait within one slice.
+            if (!recv_unless_stopped(req, resp, stop_flag, recv_timeout_ms))
             {
                 LOG_DEBUG("Enrollment response timed out");
                 return std::nullopt;
@@ -227,11 +257,11 @@ void enroll(AgentConfig& config, zmq::context_t& ctx, const std::atomic<bool>& s
 
     while (!stop_flag.load())
     {
-        const auto reply = request_enrollment(config, ctx, encoded, recv_timeout_ms);
+        const auto reply = request_enrollment(config, ctx, stop_flag, encoded, recv_timeout_ms);
         if (!reply)
         {
             LOGF_DEBUG("No usable enrollment reply; retrying in %d seconds", poll_interval_seconds);
-            std::this_thread::sleep_for(std::chrono::seconds(poll_interval_seconds));
+            sleep_unless_stopped(stop_flag, poll_interval_seconds);
             continue;
         }
         const auto& er_resp = *reply;
@@ -304,7 +334,7 @@ void enroll(AgentConfig& config, zmq::context_t& ctx, const std::atomic<bool>& s
         }
 
         LOGF_INFO("Enrollment pending; retrying in %d seconds", poll_interval_seconds);
-        std::this_thread::sleep_for(std::chrono::seconds(poll_interval_seconds));
+        sleep_unless_stopped(stop_flag, poll_interval_seconds);
     }
 
     LOG_WARNING("Enrollment stopped before approval");

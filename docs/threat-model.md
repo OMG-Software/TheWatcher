@@ -114,6 +114,12 @@ working document for audit, design review, and regression testing.
   enrollment, 4 MiB data plane) and bounds the connection handshake
   (`ZMQ_HANDSHAKE_IVL`); enrollment replies use a send timeout so a stalled
   client cannot block the data-plane thread.
+- The agent's outbound queue is bounded and its sends never block, so a
+  stalled or unreachable server cannot exhaust agent memory or hang its
+  shutdown. Config-driven intervals and the process limit are range-checked
+  (1-3600 s, 1-60 s, 1-1000), so a malicious or buggy `CONFIG_UPDATE` or
+  command cannot put the agent into a busy loop. Residual risk: metrics are
+  dropped oldest-first while the server is unreachable.
 - CBOR payloads are structurally pre-validated (nesting depth cap, declared
   container counts must fit the remaining bytes) before the decoder can
   allocate from them; a malformed multipart enrollment request is drained and

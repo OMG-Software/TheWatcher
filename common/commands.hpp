@@ -4,6 +4,7 @@
 #include "protocol.hpp"
 
 #include <cstdint>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -66,6 +67,15 @@ struct ConfigUpdate
 
 namespace thewatcher::proto::detail
 {
+
+// Narrows a wire int64 to int, throwing instead of silently wrapping
+// (2^32 + 5 must not become 5).
+inline int narrow_to_int(int64_t value)
+{
+    if (value < std::numeric_limits<int>::min() || value > std::numeric_limits<int>::max())
+        throw std::runtime_error("Integer out of range in command payload");
+    return static_cast<int>(value);
+}
 
 template <>
 inline CborPtr to_cbor(const thewatcher::CommandMessage& cmd)
@@ -140,7 +150,7 @@ inline thewatcher::SetIntervalArgs from_cbor<thewatcher::SetIntervalArgs>(cbor_i
     }
 
     thewatcher::SetIntervalArgs a;
-    a.interval_seconds = static_cast<int>(read_int64(array_get(item, 0)));
+    a.interval_seconds = narrow_to_int(read_int64(array_get(item, 0)));
     return a;
 }
 
@@ -161,7 +171,7 @@ inline thewatcher::SetProcessLimitArgs from_cbor<thewatcher::SetProcessLimitArgs
     }
 
     thewatcher::SetProcessLimitArgs a;
-    a.limit = static_cast<int>(read_int64(array_get(item, 0)));
+    a.limit = narrow_to_int(read_int64(array_get(item, 0)));
     return a;
 }
 
@@ -189,11 +199,11 @@ inline thewatcher::ConfigUpdate from_cbor<thewatcher::ConfigUpdate>(cbor_item_t*
     }
 
     thewatcher::ConfigUpdate u;
-    u.interval_seconds = static_cast<int>(read_int64(array_get(item, 0)));
-    u.process_limit = static_cast<int>(read_int64(array_get(item, 1)));
+    u.interval_seconds = narrow_to_int(read_int64(array_get(item, 0)));
+    u.process_limit = narrow_to_int(read_int64(array_get(item, 1)));
     u.collector_config = from_cbor<thewatcher::CollectorConfig>(array_get(item, 2));
     if (cbor_array_size(item) >= 4)
-        u.heartbeat_interval_seconds = static_cast<int>(read_int64(array_get(item, 3)));
+        u.heartbeat_interval_seconds = narrow_to_int(read_int64(array_get(item, 3)));
 
     return u;
 }
