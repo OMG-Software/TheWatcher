@@ -128,8 +128,9 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   The form's fields are locked while it saves, and an answer that arrives after
   the form was closed (or replaced by a new one) is discarded instead of
   reopening or overwriting it. The rolled-back-reset test now holds the reset
-  inside its store call with a SQLite write lock, and fails unless a login
-  attempts its call during the reset and its session survives the rollback.
+  inside its store call with a SQLite write lock. It fails unless a login
+  attempted during the reset waits for it (the store runs one call at a time)
+  and then creates a session that survives the rollback.
   The PostgreSQL lock tests check that the fixture connection blocks the exact
   backend under test (new `PostgresStore::backend_pid`), so an unrelated lock
   wait no longer counts. The `auth_sessions` suite gets a 120-second test

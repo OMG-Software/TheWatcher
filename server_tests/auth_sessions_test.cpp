@@ -964,7 +964,15 @@ private:
 
 } // namespace
 
-SCENARIO("A rolled-back password reset never takes other threads' sessions with it")
+// The invariant here is serialisation. make_store wraps the store in
+// SynchronizedStore, which runs one call at a time on the one connection, so a
+// login attempted during a reset cannot run inside the reset's transaction: it
+// waits until the reset has rolled back and returned. Without that wrapper the
+// login's insert lands inside the reset's open transaction and the rollback
+// discards it (this test fails against a bare SqliteStore). Rollback while
+// other store work is in flight on the same connection cannot happen, so it is
+// not what this test exercises.
+SCENARIO("A login attempted during a failing password reset waits for it and keeps its session")
 {
     GIVEN("a file-backed store where revoking one user's sessions is forced to fail")
     {
@@ -986,7 +994,7 @@ SCENARIO("A rolled-back password reset never takes other threads' sessions with 
         }
         const auto new_hash = hash_for("new-victim-password");
 
-        WHEN("another user's login attempts its store call while the failing reset is still inside its own")
+        WHEN("another user's login is attempted while the failing reset is still inside its store call")
         {
             std::atomic<bool> reset_entered{false};
             std::atomic<bool> reset_returned{false};
@@ -1049,8 +1057,9 @@ SCENARIO("A rolled-back password reset never takes other threads' sessions with 
                 5s, 1ms);
             std::this_thread::sleep_for(200ms);
             // The barrier: the login has attempted its call while the reset is
-            // still inside its own, and neither has returned.
-            const bool overlapped = login_started && !reset_returned.load() && !login_returned.load();
+            // held, and is waiting for it (the store runs one call at a time);
+            // neither has returned.
+            const bool login_waited = login_started && !reset_returned.load() && !login_returned.load();
 
             writer.exec("ROLLBACK;");
             const bool both_returned = thewatcher::test::eventually(
@@ -1061,12 +1070,12 @@ SCENARIO("A rolled-back password reset never takes other threads' sessions with 
             reset.join();
             login.join();
 
-            THEN("the reset fails and rolls back, and the login's session survives it")
+            THEN("the login waits for the reset to roll back, then creates a session that survives")
             {
                 // Each barrier fails the test on timeout instead of letting it
-                // pass without the overlap it is meant to prove.
+                // pass without the wait it is meant to prove.
                 REQUIRE(reset_held);
-                REQUIRE(overlapped);
+                REQUIRE(login_waited);
                 REQUIRE(both_returned);
                 REQUIRE(reset_threw.load());
                 REQUIRE_FALSE(login_threw.load());
