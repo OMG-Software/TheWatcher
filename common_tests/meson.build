@@ -22,6 +22,14 @@ protocol_security_test = executable(
 )
 test('protocol_security', protocol_security_test)
 
+private_directory_test = executable(
+  'private_directory_test',
+  ['private_directory_test.cpp'],
+  include_directories: root_inc,
+  dependencies: [common_dep, catch2_dep, platform_deps],
+)
+test('private_directory', private_directory_test)
+
 singlelog_test = executable(
   'singlelog_test',
   ['singlelog_test.cpp'],

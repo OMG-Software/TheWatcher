@@ -123,6 +123,13 @@ working document for audit, design review, and regression testing.
 - Approval and revocation are enforced per frame: rejected or deleted agents
   stop contributing data on their live session without waiting for a
   reconnect.
+- The server refuses to start when the directory holding its config (CURVE
+  secret key, database path) can be changed by other local users, and creates a
+  missing one private (SYSTEM, Administrators and owner on Windows, `0700` on
+  POSIX). Without this, a standard user could pre-create
+  `C:\ProgramData\TheWatcher` and plant or swap `TheWatcherServer.conf`. The
+  directory is checked, not repaired. Residual risk: the agent config under its
+  own data directory is not checked yet.
 - Config parser file and line sizes are bounded to avoid unbounded local input,
   and values are range-checked at load (ports, offline interval, database type,
   CURVE keypair), so a typo cannot silently disable offline detection or

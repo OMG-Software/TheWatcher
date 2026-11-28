@@ -19,6 +19,29 @@ On Windows the common application data folder comes from the system; if it
 cannot be determined the server stops with an error asking for `--config`
 instead of guessing a folder that other users might be able to write to.
 
+### Config directory permissions
+
+The config file holds the CURVE secret key and the database path, so the server
+checks the directory that contains it, for the default path and for `--config`,
+before it reads or writes anything. If the directory does not exist it is
+created private (Windows: a protected ACL for SYSTEM, Administrators and the
+owner; POSIX: mode `0700`). An existing directory is only checked, never
+changed. The server refuses to start (exit code 1) when:
+
+- Windows: the owner is not SYSTEM, Administrators or the user running the
+  server, or any other account (Users, Authenticated Users, Everyone, ...) is
+  allowed to add files, write, delete or change permissions.
+- POSIX: the owner is not root or the user running the server, or the group or
+  other users can write to it.
+
+The error names the directory and the reason. To fix it, run the installer
+(it sets the right ACL), or on Windows run
+`icacls "<dir>" /inheritance:r /grant:r *S-1-5-32-544:(OI)(CI)F *S-1-5-18:(OI)(CI)F`,
+or on POSIX `chmod 700 <dir>`, or pass `--config` with a path in a private
+directory (a home directory is fine). A server started by hand against a
+directory with loose permissions, which worked before, now stops until it is
+fixed.
+
 On the BSDs an existing `/etc/thewatcher/TheWatcherServer.conf` is still used
 when no file exists under `/usr/local/etc/thewatcher/`, so upgrades keep their
 settings.

@@ -9,6 +9,15 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Security
 
+- **Behaviour change:** the server refuses to start when the directory that
+  holds its config can be changed by other local users (Windows: an owner other
+  than SYSTEM, Administrators or the current user, or a write-type allow entry
+  for any other account such as Users; POSIX: not owned by root or the current
+  user, or group/other writable). A missing directory is created private. Before,
+  a standard user could pre-create `C:\ProgramData\TheWatcher` and plant a
+  `TheWatcherServer.conf` the server then trusted. Hand-made installs with loose
+  permissions must fix them (the installer already does) or pass `--config` with
+  a private path; see `docs/configuration.md` (#58).
 - The agent no longer trusts the server key in an enrollment reply: it must
   be 40 Z85 characters decoding to a 32-byte key, and the config writer
   refuses any value containing CR or LF. Before, a crafted key could inject
