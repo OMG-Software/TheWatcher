@@ -148,7 +148,14 @@ working document for audit, design review, and regression testing.
   only group-scoped users in their own groups, can set only group roles, and
   can only assign their own groups (`PUT /api/users/:id`, #64). An account
   change reaches every group of the user, so it needs all of them to be the
-  admin's own; a group edit touches only the admin's own memberships.
+  admin's own; a group edit touches only the admin's own memberships. The scope
+  check is not done by the API: the actor's group ids are passed to the store,
+  which re-reads the target's role and groups inside the write transaction
+  (`BEGIN IMMEDIATE` on SQLite; row locks plus the user-admin advisory lock on
+  PostgreSQL) and answers out-of-scope with 403. A target moved to another group
+  between the request and the write is therefore refused, and a membership merge
+  never overwrites a group added concurrently. The actor's own group list is
+  still read when the request starts.
 - The last enabled global admin cannot be disabled, deleted or demoted. The
   check runs inside the same SQL statement (SQLite) or a transaction holding an
   advisory lock (PostgreSQL) as the write, so two concurrent requests cannot

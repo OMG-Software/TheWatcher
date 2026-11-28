@@ -749,3 +749,131 @@ SCENARIO("The last global admin is protected through the API")
         }
     }
 }
+
+// ── Store: a group admin's scope is enforced inside the write ───────────────
+
+SCENARIO("A group admin's scope is re-checked by the store at write time")
+{
+    GIVEN("groups A and B, a scope limited to A, and users in and outside A")
+    {
+        auto store = make_store("sqlite", ":memory:");
+        const auto group_a = store->create_group("A");
+        const auto group_b = store->create_group("B");
+        const auto group_c = store->create_group("C");
+        const UserScope scope{true, {group_a}};
+        const auto inside = store->create_user("inside", "hash", "group_viewer");
+        store->set_user_groups(inside, {group_a});
+        const auto shared = store->create_user("shared", "hash", "group_viewer");
+        store->set_user_groups(shared, {group_a, group_b});
+        const auto outside = store->create_user("outside", "hash", "group_viewer");
+        store->set_user_groups(outside, {group_b});
+        const auto global = store->create_user("global", "hash", "global_operator");
+        store->set_user_groups(global, {group_a});
+        const auto nobody = store->create_user("nobody", "hash", "group_viewer");
+
+        WHEN("the account actions target a user wholly inside the scope")
+        {
+            THEN("disable, enable and delete succeed")
+            {
+                REQUIRE(store->disable_user(inside, scope) == 1);
+                REQUIRE(find_user(*store, "inside")->disabled);
+                REQUIRE(store->enable_user(inside, scope) == 1);
+                REQUIRE_FALSE(find_user(*store, "inside")->disabled);
+                REQUIRE(store->delete_user(inside, scope) == 1);
+            }
+        }
+
+        WHEN("the account actions target users beyond the scope")
+        {
+            THEN("each is refused as out of scope and nothing changes")
+            {
+                for (const auto target : {shared, outside, global, nobody})
+                {
+                    REQUIRE(store->disable_user(target, scope) == kOutOfScope);
+                    REQUIRE(store->enable_user(target, scope) == kOutOfScope);
+                    REQUIRE(store->delete_user(target, scope) == kOutOfScope);
+                }
+                REQUIRE_FALSE(find_user(*store, "shared")->disabled);
+                REQUIRE(find_user(*store, "global"));
+            }
+        }
+
+        WHEN("an unknown user is targeted")
+        {
+            THEN("the result is 0, not out of scope")
+            {
+                REQUIRE(store->disable_user(424242, scope) == 0);
+                REQUIRE(store->update_user_access(424242, std::nullopt, std::vector<int64_t>{}, scope) == 0);
+            }
+        }
+
+        WHEN("a role is changed")
+        {
+            THEN("a group role is allowed inside the scope and a global role is not")
+            {
+                REQUIRE(store->update_user_access(inside, std::string("global_admin"), std::nullopt, scope) ==
+                        kOutOfScope);
+                REQUIRE(store->update_user_access(inside, std::string("admin"), std::nullopt, scope) == kOutOfScope);
+                REQUIRE(store->update_user_access(inside, std::string("group_operator"), std::nullopt, scope) == 1);
+                REQUIRE(find_user(*store, "inside")->role == "group_operator");
+            }
+
+            THEN("a user who is also in another group, or holds a global role, is out of scope")
+            {
+                REQUIRE(store->update_user_access(shared, std::string("group_operator"), std::nullopt, scope) ==
+                        kOutOfScope);
+                REQUIRE(store->update_user_access(global, std::string("group_viewer"), std::nullopt, scope) ==
+                        kOutOfScope);
+                REQUIRE(find_user(*store, "shared")->role == "group_viewer");
+            }
+        }
+
+        WHEN("memberships are changed")
+        {
+            THEN("only the scope's own groups are replaced and the others are kept")
+            {
+                REQUIRE(store->update_user_access(shared, std::nullopt, std::vector<int64_t>{}, scope) == 1);
+                REQUIRE(groups_of(*store, shared) == std::vector<int64_t>{group_b});
+            }
+
+            THEN("assigning a group outside the scope, or editing a foreign user, is refused")
+            {
+                REQUIRE(store->update_user_access(inside, std::nullopt, std::vector<int64_t>{group_a, group_b},
+                                                  scope) == kOutOfScope);
+                REQUIRE(store->update_user_access(outside, std::nullopt, std::vector<int64_t>{group_a}, scope) ==
+                        kOutOfScope);
+                REQUIRE(store->update_user_access(global, std::nullopt, std::vector<int64_t>{}, scope) == kOutOfScope);
+                REQUIRE(groups_of(*store, inside) == std::vector<int64_t>{group_a});
+                REQUIRE(groups_of(*store, outside) == std::vector<int64_t>{group_b});
+            }
+        }
+
+        WHEN("the target is moved out of the scope after the caller computed it")
+        {
+            store->set_user_groups(inside, {group_b});
+
+            THEN("every scoped write is refused against the fresh state")
+            {
+                REQUIRE(store->update_user_access(inside, std::string("group_operator"), std::nullopt, scope) ==
+                        kOutOfScope);
+                REQUIRE(store->update_user_access(inside, std::nullopt, std::vector<int64_t>{group_a}, scope) ==
+                        kOutOfScope);
+                REQUIRE(store->disable_user(inside, scope) == kOutOfScope);
+                REQUIRE(store->delete_user(inside, scope) == kOutOfScope);
+                REQUIRE(find_user(*store, "inside")->role == "group_viewer");
+                REQUIRE(groups_of(*store, inside) == std::vector<int64_t>{group_b});
+            }
+        }
+
+        WHEN("the target gains another group after the caller read it")
+        {
+            store->set_user_groups(shared, {group_a, group_b, group_c});
+
+            THEN("the merge is computed from the fresh memberships, so the new group survives")
+            {
+                REQUIRE(store->update_user_access(shared, std::nullopt, std::vector<int64_t>{}, scope) == 1);
+                REQUIRE(groups_of(*store, shared) == std::vector<int64_t>{group_b, group_c});
+            }
+        }
+    }
+}

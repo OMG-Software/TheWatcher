@@ -779,59 +779,37 @@ namespace
         return std::nullopt;
     }
 
-    bool shares_group(const std::vector<int64_t>& a, const std::vector<int64_t>& b)
+    // What the store must enforce for this session: nothing for a global admin,
+    // the session's own groups for a group admin. The store re-reads the target
+    // inside the write transaction, so the API does no scope check of its own.
+    UserScope scope_for(Store& store, const SessionRecord& session)
     {
-        return std::any_of(a.begin(), a.end(), [&](int64_t id) {
-            return std::find(b.begin(), b.end(), id) != b.end();
-        });
-    }
-
-    // May the session change this user's membership of the session's own
-    // groups? True for a global admin, and for a group admin when the target
-    // is group-scoped and shares one of their groups.
-    bool may_edit_membership(Store& store, const SessionRecord& session, const UserRecord& target)
-    {
-        if (normalize_role(session.role) == "global_admin")
-            return true;
-        if (normalize_role(session.role) != "group_admin" || is_global_role(target.role))
-            return false;
-        return shares_group(store.get_user_groups(session.user_id), store.get_user_groups(target.user_id));
-    }
-
-    // May the session act on the whole account (role, disable, enable,
-    // delete)? Those reach every group the user is in, so a group admin needs
-    // all of the target's groups to be their own.
-    bool may_manage_account(Store& store, const SessionRecord& session, const UserRecord& target)
-    {
-        if (normalize_role(session.role) == "global_admin")
-            return true;
-        if (!may_edit_membership(store, session, target))
-            return false;
-        const auto own = store.get_user_groups(session.user_id);
-        const auto theirs = store.get_user_groups(target.user_id);
-        return std::all_of(theirs.begin(), theirs.end(), [&](int64_t id) {
-            return std::find(own.begin(), own.end(), id) != own.end();
-        });
-    }
-
-    // Common checks for disable, enable and delete. Writes the error response
-    // and returns false when the session may not act on user_id.
-    bool authorize_account_change(Store& store, const SessionRecord& session, int64_t user_id, httplib::Response& res)
-    {
-        const auto target = find_user_by_id(store, user_id);
-        if (!target)
+        UserScope scope;
+        if (normalize_role(session.role) != "global_admin")
         {
-            res.status = 404;
-            res.set_content(R"({"error":"user not found"})", "application/json");
-            return false;
+            scope.restricted = true;
+            scope.group_ids = store.get_user_groups(session.user_id);
         }
-        if (!may_manage_account(store, session, *target))
+        return scope;
+    }
+
+    // The answer for a store result that means "refused": writes the response
+    // and returns true for kOutOfScope and kLastGlobalAdmin.
+    bool write_refusal(int result, httplib::Response& res)
+    {
+        if (result == kOutOfScope)
         {
             res.status = 403;
             res.set_content(R"({"error":"user is outside the user's groups"})", "application/json");
-            return false;
+            return true;
         }
-        return true;
+        if (result == kLastGlobalAdmin)
+        {
+            res.status = 409;
+            res.set_content(R"({"error":"cannot remove or demote the last global admin"})", "application/json");
+            return true;
+        }
+        return false;
     }
 
     bool group_visible_to_session(Store& store, const SessionRecord& session, int64_t group_id)
@@ -2661,19 +2639,16 @@ void ApiServer::setup_routes()
             std::optional<std::string> role;
             if (body.contains("role"))
             {
-                const auto requested = normalize_role(body.at("role").get<std::string>());
-                if (!is_valid_role(requested))
+                role = normalize_role(body.at("role").get<std::string>());
+                if (!is_valid_role(*role))
                     throw std::runtime_error("invalid role");
-                // Re-sending the current role is not a role change.
-                if (requested != normalize_role(target->role))
-                    role = requested;
             }
-            std::optional<std::vector<int64_t>> requested_groups;
+            std::optional<std::vector<int64_t>> group_ids;
             if (body.contains("group_ids"))
             {
-                requested_groups = body.at("group_ids").get<std::vector<int64_t>>();
+                group_ids = body.at("group_ids").get<std::vector<int64_t>>();
                 const auto known = store_.list_groups();
-                for (const auto group_id : *requested_groups)
+                for (const auto group_id : *group_ids)
                 {
                     if (std::none_of(known.begin(), known.end(), [&](const GroupRecord& g) {
                             return g.group_id == group_id;
@@ -2684,53 +2659,11 @@ void ApiServer::setup_routes()
             if (!body.contains("role") && !body.contains("group_ids"))
                 throw std::runtime_error("role or group_ids is required");
 
-            std::optional<std::vector<int64_t>> new_groups = requested_groups;
-            if (normalize_role(session->role) != "global_admin")
-            {
-                const auto own = store_.get_user_groups(session->user_id);
-                const bool allowed =
-                    may_edit_membership(store_, *session, *target) &&
-                    (!role || (!is_global_role(*role) && may_manage_account(store_, *session, *target)));
-                if (!allowed)
-                {
-                    res.status = 403;
-                    set_json(res, json{
-                                      {"error", "user or role is outside the user's groups"}
-                    });
-                    return;
-                }
-                if (requested_groups)
-                {
-                    for (const auto group_id : *requested_groups)
-                    {
-                        if (std::find(own.begin(), own.end(), group_id) == own.end())
-                        {
-                            res.status = 403;
-                            set_json(res, json{
-                                              {"error", "group admins can only assign users to their own groups"}
-                            });
-                            return;
-                        }
-                    }
-                    // Keep the target's membership of groups this admin does not manage.
-                    new_groups = requested_groups;
-                    for (const auto group_id : store_.get_user_groups(target->user_id))
-                    {
-                        if (std::find(own.begin(), own.end(), group_id) == own.end())
-                            new_groups->push_back(group_id);
-                    }
-                }
-            }
-
-            const auto changed = store_.update_user_access(user_id, role, new_groups);
-            if (changed == kLastGlobalAdmin)
-            {
-                res.status = 409;
-                set_json(res, json{
-                                  {"error", "cannot remove or demote the last global admin"}
-                });
+            // The scope check, the merge of a group admin's memberships and the
+            // write all happen in one store transaction.
+            const auto changed = store_.update_user_access(user_id, role, group_ids, scope_for(store_, *session));
+            if (write_refusal(changed, res))
                 return;
-            }
             if (changed == 0)
             {
                 res.status = 404;
@@ -2740,7 +2673,7 @@ void ApiServer::setup_routes()
                 return;
             }
             LOGF_INFO("Updated user access user_id=%lld by=%s role_changed=%d groups_changed=%d",
-                      static_cast<long long>(user_id), session->username.c_str(), role ? 1 : 0, new_groups ? 1 : 0);
+                      static_cast<long long>(user_id), session->username.c_str(), role ? 1 : 0, group_ids ? 1 : 0);
             set_json(res, json{
                               {"ok", true}
             });
@@ -2771,17 +2704,10 @@ void ApiServer::setup_routes()
         try
         {
             const auto user_id = std::stoll(req.path_params.at("id"));
-            if (!authorize_account_change(store_, *session, user_id, res))
+            // The scope check runs inside the store write.
+            const auto affected = store_.disable_user(user_id, scope_for(store_, *session));
+            if (write_refusal(affected, res))
                 return;
-            const auto affected = store_.disable_user(user_id);
-            if (affected == kLastGlobalAdmin)
-            {
-                res.status = 409;
-                set_json(res, json{
-                                  {"error", "cannot remove or demote the last global admin"}
-                });
-                return;
-            }
             if (affected == 0)
             {
                 // SEC-14: unknown id or the built_in guard refused the change;
@@ -2822,9 +2748,17 @@ void ApiServer::setup_routes()
         try
         {
             const auto user_id = std::stoll(req.path_params.at("id"));
-            if (!authorize_account_change(store_, *session, user_id, res))
+            const auto affected = store_.enable_user(user_id, scope_for(store_, *session));
+            if (write_refusal(affected, res))
                 return;
-            store_.enable_user(user_id);
+            if (affected == 0)
+            {
+                res.status = 404;
+                set_json(res, json{
+                                  {"error", "user not found"}
+                });
+                return;
+            }
             LOGF_INFO("Enabled user user_id=%lld", static_cast<long long>(user_id));
             set_json(res, json{
                               {"ok", true}
@@ -2855,17 +2789,10 @@ void ApiServer::setup_routes()
         try
         {
             const auto user_id = std::stoll(req.path_params.at("id"));
-            if (!authorize_account_change(store_, *session, user_id, res))
+            // The scope check runs inside the store write.
+            const auto affected = store_.delete_user(user_id, scope_for(store_, *session));
+            if (write_refusal(affected, res))
                 return;
-            const auto affected = store_.delete_user(user_id);
-            if (affected == kLastGlobalAdmin)
-            {
-                res.status = 409;
-                set_json(res, json{
-                                  {"error", "cannot remove or demote the last global admin"}
-                });
-                return;
-            }
             if (affected == 0)
             {
                 // SEC-14: unknown id or the built_in guard refused the change.

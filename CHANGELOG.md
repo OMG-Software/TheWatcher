@@ -9,6 +9,13 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Security
 
+- A group admin's scope over a user (role change, disable, enable, delete,
+  membership edit) is now checked inside the store's write transaction instead
+  of by a separate read in the API, so a user moved out of the admin's groups
+  during the request cannot be changed and concurrent memberships are not
+  overwritten (#64). The PostgreSQL user-admin transaction now rolls back when
+  `COMMIT` fails instead of leaving the shared connection in an aborted
+  transaction.
 - The last enabled global admin can no longer be disabled, deleted or demoted;
   the API answers 409. The check is part of the store write (one statement on
   SQLite, an advisory-locked transaction on PostgreSQL), so concurrent requests

@@ -922,8 +922,98 @@ std::vector<int64_t> SqliteStore::get_user_groups(int64_t user_id)
     return out;
 }
 
-int SqliteStore::disable_user(int64_t user_id)
+namespace
 {
+    // BEGIN IMMEDIATE ... COMMIT with rollback on any exit that did not commit.
+    class ImmediateTransaction
+    {
+    public:
+        explicit ImmediateTransaction(sqlite3* db)
+            : db_(db)
+        {
+            exec("BEGIN IMMEDIATE;", "begin immediate");
+            open_ = true;
+        }
+        ~ImmediateTransaction()
+        {
+            if (open_)
+                sqlite3_exec(db_, "ROLLBACK;", nullptr, nullptr, nullptr);
+        }
+        ImmediateTransaction(const ImmediateTransaction&) = delete;
+        ImmediateTransaction& operator=(const ImmediateTransaction&) = delete;
+
+        void commit()
+        {
+            exec("COMMIT;", "commit");
+            open_ = false;
+        }
+
+    private:
+        void exec(const char* sql, const char* ctx)
+        {
+            char* error = nullptr;
+            if (sqlite3_exec(db_, sql, nullptr, nullptr, &error) != SQLITE_OK)
+            {
+                const std::string message = error ? error : "unknown error";
+                sqlite3_free(error);
+                throw std::runtime_error(std::string(ctx) + ": " + message);
+            }
+        }
+
+        sqlite3* db_;
+        bool open_ = false;
+    };
+
+    struct TargetState
+    {
+        std::string role;
+        std::vector<int64_t> groups;
+    };
+
+    // The role and groups of a non-built-in user, or nullopt when the id is
+    // unknown or built-in. Called inside the write transaction.
+    std::optional<TargetState> read_target(sqlite3* db, int64_t user_id)
+    {
+        Stmt st;
+        check(sqlite3_prepare_v2(db, "SELECT role FROM users WHERE user_id=? AND built_in=0;", -1, &st.s, nullptr), db,
+              "prepare read_target");
+        sqlite3_bind_int64(st.s, 1, user_id);
+        if (sqlite3_step(st.s) != SQLITE_ROW)
+            return std::nullopt;
+        TargetState target;
+        target.role = text_col(st.s, 0);
+        Stmt groups;
+        check(sqlite3_prepare_v2(db, "SELECT group_id FROM user_groups WHERE user_id=? ORDER BY group_id;", -1,
+                                 &groups.s, nullptr),
+              db, "prepare read_target groups");
+        sqlite3_bind_int64(groups.s, 1, user_id);
+        while (sqlite3_step(groups.s) == SQLITE_ROW)
+            target.groups.push_back(sqlite3_column_int64(groups.s, 0));
+        return target;
+    }
+
+    // 1 when the scope may act on the user, 0 for an unknown or built-in user,
+    // kOutOfScope otherwise. The transaction is already open.
+    int account_scope_verdict(sqlite3* db, int64_t user_id, const UserScope& scope)
+    {
+        const auto target = read_target(db, user_id);
+        if (!target)
+            return 0;
+        return within_scope(scope, target->role, target->groups, ScopeKind::Account) ? 1 : kOutOfScope;
+    }
+} // namespace
+
+int SqliteStore::disable_user(int64_t user_id, const UserScope& scope)
+{
+    // A restricted actor's scope is checked inside the transaction that does the
+    // write. Others keep the single guarded statement.
+    std::optional<ImmediateTransaction> tx;
+    if (scope.restricted)
+    {
+        tx.emplace(db_);
+        if (const auto verdict = account_scope_verdict(db_, user_id, scope); verdict != 1)
+            return verdict;
+    }
     // The last-admin guard is part of the UPDATE, so it is atomic with the write.
     const auto sql = std::string("UPDATE users SET disabled=1 WHERE user_id=? AND built_in=0 AND NOT ") +
                      WOULD_REMOVE_LAST_ADMIN + ";";
@@ -933,20 +1023,41 @@ int SqliteStore::disable_user(int64_t user_id)
     check(sqlite3_step(st.s), db_, "step disable_user");
     // SEC-13/14: report affected rows so the API can reject no-ops.
     const auto changed = sqlite3_changes(db_);
-    return changed == 0 && is_last_global_admin(db_, user_id) ? kLastGlobalAdmin : changed;
+    const auto result = changed == 0 && is_last_global_admin(db_, user_id) ? kLastGlobalAdmin : changed;
+    if (tx)
+        tx->commit();
+    return result;
 }
 
-void SqliteStore::enable_user(int64_t user_id)
+int SqliteStore::enable_user(int64_t user_id, const UserScope& scope)
 {
+    std::optional<ImmediateTransaction> tx;
+    if (scope.restricted)
+    {
+        tx.emplace(db_);
+        if (const auto verdict = account_scope_verdict(db_, user_id, scope); verdict != 1)
+            return verdict;
+    }
     Stmt st;
     check(sqlite3_prepare_v2(db_, "UPDATE users SET disabled=0 WHERE user_id=?;", -1, &st.s, nullptr), db_,
           "prepare enable_user");
     sqlite3_bind_int64(st.s, 1, user_id);
     check(sqlite3_step(st.s), db_, "step enable_user");
+    const auto changed = sqlite3_changes(db_);
+    if (tx)
+        tx->commit();
+    return changed;
 }
 
-int SqliteStore::delete_user(int64_t user_id)
+int SqliteStore::delete_user(int64_t user_id, const UserScope& scope)
 {
+    std::optional<ImmediateTransaction> tx;
+    if (scope.restricted)
+    {
+        tx.emplace(db_);
+        if (const auto verdict = account_scope_verdict(db_, user_id, scope); verdict != 1)
+            return verdict;
+    }
     const auto sql =
         std::string("DELETE FROM users WHERE user_id=? AND built_in=0 AND NOT ") + WOULD_REMOVE_LAST_ADMIN + ";";
     Stmt st;
@@ -954,58 +1065,59 @@ int SqliteStore::delete_user(int64_t user_id)
     sqlite3_bind_int64(st.s, 1, user_id);
     check(sqlite3_step(st.s), db_, "step delete_user");
     const auto changed = sqlite3_changes(db_);
-    return changed == 0 && is_last_global_admin(db_, user_id) ? kLastGlobalAdmin : changed;
+    const auto result = changed == 0 && is_last_global_admin(db_, user_id) ? kLastGlobalAdmin : changed;
+    if (tx)
+        tx->commit();
+    return result;
 }
 
 int SqliteStore::update_user_access(int64_t user_id, const std::optional<std::string>& role,
-                                    const std::optional<std::vector<int64_t>>& group_ids)
+                                    const std::optional<std::vector<int64_t>>& group_ids, const UserScope& scope)
 {
-    exec("BEGIN IMMEDIATE;");
-    try
+    ImmediateTransaction tx(db_);
+    // Everything below works on the target as it is now, inside the transaction.
+    const auto target = read_target(db_, user_id);
+    if (!target)
+        return 0;
+
+    // Re-sending the current role is not a role change.
+    std::optional<std::string> new_role = role;
+    if (new_role && normalized_role_name(*new_role) == normalized_role_name(target->role))
+        new_role.reset();
+
+    if (scope.restricted)
     {
-        if (role)
-        {
-            // Demoting is a removal as far as the guard is concerned: the
-            // condition is true only for an enabled global admin who is the
-            // last one, so it is checked only when the new role is not global admin.
-            const bool keeps_admin = *role == "global_admin" || *role == "admin";
-            const auto sql = std::string("UPDATE users SET role=? WHERE user_id=? AND built_in=0") +
-                             (keeps_admin ? ";" : std::string(" AND NOT ") + WOULD_REMOVE_LAST_ADMIN + ";");
-            Stmt st;
-            check(sqlite3_prepare_v2(db_, sql.c_str(), -1, &st.s, nullptr), db_, "prepare update_user_access");
-            sqlite3_bind_text(st.s, 1, role->c_str(), -1, SQLITE_TRANSIENT);
-            sqlite3_bind_int64(st.s, 2, user_id);
-            check(sqlite3_step(st.s), db_, "step update_user_access");
-            if (sqlite3_changes(db_) == 0)
-            {
-                const auto refused = is_last_global_admin(db_, user_id) ? kLastGlobalAdmin : 0;
-                exec("ROLLBACK;");
-                return refused;
-            }
-        }
-        else
-        {
-            // Groups only: still refuse unknown and built-in users.
-            Stmt st;
-            check(sqlite3_prepare_v2(db_, "SELECT 1 FROM users WHERE user_id=? AND built_in=0;", -1, &st.s, nullptr),
-                  db_, "prepare update_user_access lookup");
-            sqlite3_bind_int64(st.s, 1, user_id);
-            if (sqlite3_step(st.s) != SQLITE_ROW)
-            {
-                exec("ROLLBACK;");
-                return 0;
-            }
-        }
-        if (group_ids)
-            replace_user_groups(db_, user_id, *group_ids);
-        exec("COMMIT;");
-        return 1;
+        // A role change reaches every group of the user and may only pick a
+        // group role; a membership change only needs the target to share a group.
+        const bool allowed = new_role ? !is_global_role_name(*new_role) &&
+                                            within_scope(scope, target->role, target->groups, ScopeKind::Account)
+                                      : within_scope(scope, target->role, target->groups, ScopeKind::Membership);
+        if (!allowed || (group_ids && !all_in_scope(scope, *group_ids)))
+            return kOutOfScope;
     }
-    catch (...)
+
+    if (new_role)
     {
-        exec("ROLLBACK;");
-        throw;
+        // Demoting is a removal as far as the guard is concerned; keeping an
+        // admin role cannot remove the last admin, so only demotions are guarded.
+        const bool keeps_admin = *new_role == "global_admin" || *new_role == "admin";
+        const auto sql = std::string("UPDATE users SET role=? WHERE user_id=? AND built_in=0") +
+                         (keeps_admin ? ";" : std::string(" AND NOT ") + WOULD_REMOVE_LAST_ADMIN + ";");
+        Stmt st;
+        check(sqlite3_prepare_v2(db_, sql.c_str(), -1, &st.s, nullptr), db_, "prepare update_user_access");
+        sqlite3_bind_text(st.s, 1, new_role->c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(st.s, 2, user_id);
+        check(sqlite3_step(st.s), db_, "step update_user_access");
+        if (sqlite3_changes(db_) == 0)
+            return is_last_global_admin(db_, user_id) ? kLastGlobalAdmin : 0;
     }
+    if (group_ids)
+    {
+        replace_user_groups(
+            db_, user_id, scope.restricted ? merge_scoped_memberships(scope, target->groups, *group_ids) : *group_ids);
+    }
+    tx.commit();
+    return 1;
 }
 
 void SqliteStore::update_user_password(int64_t user_id, const std::string& password_hash)

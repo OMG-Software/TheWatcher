@@ -44,7 +44,7 @@ function Dashboard({ session, onSignOut }: { session: SessionInfo; onSignOut: ()
   const [overviewGroupFilter, setOverviewGroupFilter] = React.useState<OverviewGroupFilter>('all');
 
   const { agents, pending, groups, alerts, allAlerts, users, maintenanceWindows, silences, customViews, sectionErrors, loadedAt, error, loading, refresh } = useDashboardData();
-  const { busyAction, runAction, failure, clearFailure } = useRunAction(refresh);
+  const { busyAction, isBusy, runAction, failure, clearFailure } = useRunAction(refresh);
 
   const counts = summaryCounts(agents);
   const displayAlerts = toDisplayAlerts(alerts, agents);
@@ -213,7 +213,7 @@ function Dashboard({ session, onSignOut }: { session: SessionInfo; onSignOut: ()
         <>
           {sectionErrors.users ? <LoadFailed what="users" message={sectionErrors.users} onRetry={retry} /> : null}
           {sectionErrors.groups ? <LoadFailed what="groups" message={sectionErrors.groups} onRetry={retry} /> : null}
-          <UsersPage busyAction={busyAction} groups={groups} runAction={runAction} session={session} users={users} />
+          <UsersPage isBusy={isBusy} groups={groups} runAction={runAction} session={session} users={users} />
         </>
       ) : null}
       {view === 'settings' ? <SettingsPage runAction={runAction} /> : null}

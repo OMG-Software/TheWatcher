@@ -5,7 +5,10 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cstdlib>
+#include <string>
 
 using namespace thewatcher;
 using namespace thewatcher::server;
@@ -22,6 +25,15 @@ const char* test_dsn()
     if (env && *env)
         return env;
     return "host=localhost dbname=thewatcher_test user=thewatcher_test password=thewatcher_test";
+}
+
+// A name that is unique across runs: a per-process counter plus the clock.
+// Uniqueness is all the tests need, so there is no random source.
+std::string unique_name(const std::string& prefix)
+{
+    static std::atomic<unsigned> counter{0};
+    const auto ticks = std::chrono::steady_clock::now().time_since_epoch().count();
+    return prefix + std::to_string(ticks) + "-" + std::to_string(counter++);
 }
 
 // Returns true if a PostgreSQL server is reachable at the test DSN.
@@ -653,8 +665,8 @@ SCENARIO("[postgres] A user's role and groups are edited in one step and the bui
     GIVEN("a PostgresStore, a fresh group and a fresh group viewer")
     {
         PostgresStore store(test_dsn());
-        const auto group = store.create_group("pg-access-group-" + std::to_string(std::rand()));
-        const auto username = "pg-access-user-" + std::to_string(std::rand());
+        const auto group = store.create_group(unique_name("pg-access-group-"));
+        const auto username = unique_name("pg-access-user-");
         const auto id = store.create_user(username, "hash", "group_viewer");
 
         WHEN("role and groups are updated together")
