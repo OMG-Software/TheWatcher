@@ -18,6 +18,7 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 #include <httplib.h>
 #include <zmq.hpp>
@@ -292,6 +293,162 @@ SCENARIO("Only real loopback addresses get the loopback origin exception (issue 
             {
                 REQUIRE(res);
                 REQUIRE(res->status == 200);
+            }
+        }
+    }
+}
+
+SCENARIO("Commands for agents that are not connected are refused (issue #54)")
+{
+    GIVEN("an approved agent that is offline and one that is connected")
+    {
+        ApiFixture fx;
+        auto offline = agent("agent-offline", "", true);
+        offline.connected = false;
+        fx.store->upsert_agent(offline);
+        auto online = agent("agent-online", "", true);
+        online.connected = true;
+        fx.store->upsert_agent(online);
+        REQUIRE(login_as_default_admin(fx.client));
+
+        WHEN("an operator sends a command to the offline agent")
+        {
+            auto res = fx.client.Post("/api/agents/agent-offline/restart_collectors", "", "application/json");
+
+            THEN("the API answers 409 and queues nothing")
+            {
+                REQUIRE(res);
+                REQUIRE(res->status == 409);
+                std::vector<thewatcher::server::PendingCommand> queued;
+                fx.api.drain_commands(queued);
+                REQUIRE(queued.empty());
+            }
+        }
+
+        WHEN("an operator pauses the offline agent")
+        {
+            auto res = fx.client.Post("/api/agents/agent-offline/pause", "", "application/json");
+
+            THEN("it is refused and the agent is not put into maintenance")
+            {
+                REQUIRE(res);
+                REQUIRE(res->status == 409);
+                REQUIRE_FALSE(fx.store->get_agent("agent-offline")->maintenance);
+            }
+        }
+
+        WHEN("an operator sends a command to the connected agent")
+        {
+            auto res = fx.client.Post("/api/agents/agent-online/restart_collectors", "", "application/json");
+
+            THEN("the command is queued for it")
+            {
+                REQUIRE(res);
+                REQUIRE(res->status == 200);
+                std::vector<thewatcher::server::PendingCommand> queued;
+                fx.api.drain_commands(queued);
+                REQUIRE(queued.size() == 1);
+                REQUIRE(queued[0].agent_id == "agent-online");
+            }
+        }
+    }
+}
+
+SCENARIO("Every command route refuses an agent that is not reachable (issue #54)")
+{
+    GIVEN("an agent stored as connected but with no live route")
+    {
+        ApiFixture fx;
+        auto stale = agent("agent-stale", "", true);
+        stale.connected = true;
+        stale.collection_interval = 30;
+        stale.process_limit = 25;
+        fx.store->upsert_agent(stale);
+        fx.api.set_connectivity_check([](const std::string&) {
+            return false; // the server has no learned route for anyone
+        });
+        REQUIRE(login_as_default_admin(fx.client));
+
+        WHEN("an operator uses the command, set_interval, set_process_limit and pause routes")
+        {
+            const auto command =
+                fx.client.Post("/api/agents/agent-stale/command", R"({"command_type":6})", "application/json");
+            const auto interval = fx.client.Post("/api/agents/agent-stale/set_interval", R"({"interval_seconds":10})",
+                                                 "application/json");
+            const auto limit =
+                fx.client.Post("/api/agents/agent-stale/set_process_limit", R"({"limit":5})", "application/json");
+            const auto pause = fx.client.Post("/api/agents/agent-stale/pause", "", "application/json");
+
+            THEN("all are refused with 409, nothing is queued and the store is unchanged")
+            {
+                REQUIRE(command);
+                REQUIRE(command->status == 409);
+                REQUIRE(interval);
+                REQUIRE(interval->status == 409);
+                REQUIRE(limit);
+                REQUIRE(limit->status == 409);
+                REQUIRE(pause);
+                REQUIRE(pause->status == 409);
+                std::vector<thewatcher::server::PendingCommand> queued;
+                fx.api.drain_commands(queued);
+                REQUIRE(queued.empty());
+                const auto after = fx.store->get_agent("agent-stale");
+                REQUIRE(after->collection_interval == 30);
+                REQUIRE(after->process_limit == 25);
+                REQUIRE_FALSE(after->maintenance);
+            }
+        }
+    }
+
+    GIVEN("an agent the server can reach")
+    {
+        ApiFixture fx;
+        auto live = agent("agent-live", "", true);
+        live.connected = true;
+        fx.store->upsert_agent(live);
+        fx.api.set_connectivity_check([](const std::string& id) {
+            return id == "agent-live";
+        });
+        REQUIRE(login_as_default_admin(fx.client));
+
+        WHEN("an operator sets its interval")
+        {
+            const auto res =
+                fx.client.Post("/api/agents/agent-live/set_interval", R"({"interval_seconds":10})", "application/json");
+
+            THEN("the change is stored and the command is queued")
+            {
+                REQUIRE(res);
+                REQUIRE(res->status == 200);
+                REQUIRE(fx.store->get_agent("agent-live")->collection_interval == 10);
+                std::vector<thewatcher::server::PendingCommand> queued;
+                fx.api.drain_commands(queued);
+                REQUIRE(queued.size() == 1);
+            }
+        }
+    }
+}
+
+SCENARIO("GET /api/settings survives malformed report settings (issue #49)")
+{
+    GIVEN("stored reports.hour and reports.day_of_week values that are not valid")
+    {
+        ApiFixture fx;
+        fx.store->set_setting("reports.hour", "banana");
+        fx.store->set_setting("reports.day_of_week", "99");
+        REQUIRE(login_as_default_admin(fx.client));
+
+        WHEN("an admin reads the settings")
+        {
+            const auto res = fx.client.Get("/api/settings");
+
+            THEN("the effective defaults are returned")
+            {
+                REQUIRE(res);
+                REQUIRE(res->status == 200);
+                const auto body = nlohmann::json::parse(res->body);
+                REQUIRE(body["reports_hour"] == 8);
+                REQUIRE(body["reports_day_of_week"] == 1);
             }
         }
     }

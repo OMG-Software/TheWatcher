@@ -514,6 +514,9 @@ SCENARIO("Agent-supplied strings cannot forge log lines or break JSON (issues #1
                 const auto log = read_file(log_path);
                 REQUIRE(log.find("\n2026-11-04 12:00:00 [CRITICAL]") == std::string::npos);
                 REQUIRE(log.find("path=x?2026-11-04") != std::string::npos);
+                // The alert pipeline logs the indicator name too (#157).
+                REQUIRE(log.find("indicator=forge\ntest") == std::string::npos);
+                REQUIRE(log.find("indicator=forge?test") != std::string::npos);
             }
 
             AND_THEN("the match is stored and the APIs still answer")
