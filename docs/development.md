@@ -87,6 +87,12 @@ npm.cmd test
 - Keep persistence/status tests on the lighter `server_store_lib` target when
   they do not need ZeroMQ. Use `server_lib` only for tests that exercise the
   full server runtime.
+- Get test ports from `test_support/net_helpers.hpp` (`free_zmq_endpoint()`,
+  `free_http_port()`), never from `tcp://127.0.0.1:*`. A fixture picks all of
+  its ports before the server binds them, so the helpers walk 20000-32767
+  from a random start per process: no port repeats within one test process,
+  and processes running side by side start far apart. The `net_helpers` test
+  checks this.
 - Keep `httplib` route callbacks self-contained. Shared authorization,
   session, and command helpers should live on `ApiServer` and callbacks should
   capture `this` or values, not references to stack-local helper lambdas from

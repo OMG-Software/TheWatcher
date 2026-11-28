@@ -53,6 +53,13 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 
+- Tests: the free-port helpers in `test_support/net_helpers.hpp` no longer
+  hand out the same port twice in one test process. A fixture picks its
+  ROUTER, enrollment and REST ports before the server binds any of them, so
+  two independent random draws could match and the server then failed with
+  "Failed to listen" (seen on FreeBSD CI in `server_enrollment_security`).
+  Each process now starts at a random port and walks the range; the new
+  `net_helpers` test checks 200 draws are all distinct.
 - Log tailing (#90): each indicator keeps its own read offset, so two
   indicators on one file both match; a monitor starts at the end of an
   existing file instead of replaying its history as new alerts (a file that

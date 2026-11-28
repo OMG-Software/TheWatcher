@@ -80,6 +80,14 @@ login_rate_limit_test = executable(
 )
 test('login_rate_limit', login_rate_limit_test, is_parallel: false)
 
+net_helpers_test = executable(
+  'net_helpers_test',
+  ['net_helpers_test.cpp'],
+  include_directories: root_inc,
+  dependencies: [catch2_dep, cppzmq_dep, platform_deps],
+)
+test('net_helpers', net_helpers_test)
+
 api_server_test = executable(
   'api_server_test',
   ['api_server_test.cpp'],
