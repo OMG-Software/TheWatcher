@@ -1,11 +1,11 @@
 import React from 'react';
-import { Plus, Trash2, X } from 'lucide-react';
+import { Plus, Trash2 } from 'lucide-react';
 import { setAgentCollectorConfig } from '../api';
 import { buildCollectorDraft } from '../collectorDraft';
 import { ActionError } from './ActionError';
 import { ActionButton } from './ActionButton';
 import { AgentIdentity } from './AgentIdentity';
-import { useDialog } from './Modal';
+import { Modal } from './Modal';
 import { AnomalyInputs, NetworkThresholdInputs, NumberField, ThresholdInputs, ThresholdRow } from './ThresholdInputs';
 import { ActionFailureContext, type RunAction } from '../hooks/useRunAction';
 import type { AgentCollectorConfigUpdate, CollectorConfig, DashboardAgent, DiskMonitorConfig, GroupRecord, LogMonitorConfig, NetworkInterfaceConfig, ProcessWatchConfig } from '../models';
@@ -83,18 +83,19 @@ export function AgentConfigModal({
     onClose();
   };
 
-  const dialogRef = React.useRef<HTMLFormElement>(null);
-  const onKeyDown = useDialog(dialogRef, !busy, dismiss);
-
   return (
-    <div className="modal-backdrop" role="presentation">
+    // A stray click on the backdrop must not throw away unsaved edits, so only Escape and the buttons close it.
+    <Modal
+      className="config-modal"
+      closeLabel="Close configuration"
+      closeOnBackdrop={false}
+      dismissible={!busy}
+      onClose={dismiss}
+      title={`Configure ${agent.name}`}
+      titleContent={<AgentIdentity id={agent.id} name={agent.name} />}
+    >
       <form
-        aria-label={`Configure ${agent.name}`}
-        aria-modal="true"
-        className="config-modal"
-        onKeyDown={onKeyDown}
-        ref={dialogRef}
-        role="dialog"
+        className="config-form"
         onSubmit={(event) => {
           event.preventDefault();
           void runAction(`${agent.id}:collector_config`, () => setAgentCollectorConfig(agent.id, draft), { inline: true }).then((saved) => {
@@ -102,13 +103,6 @@ export function AgentConfigModal({
           });
         }}
       >
-        <div className="modal-header">
-          <AgentIdentity id={agent.id} name={agent.name} />
-          <button className="icon-button" type="button" disabled={busy} onClick={dismiss} aria-label="Close configuration">
-            <X size={14} />
-          </button>
-        </div>
-
         <div className="config-grid">
           <section>
             <h2>Access</h2>
@@ -296,7 +290,7 @@ export function AgentConfigModal({
           <button className="text-button" type="submit" disabled={!operator || busy}>{busy ? 'Saving…' : 'Save'}</button>
         </div>
       </form>
-    </div>
+    </Modal>
   );
 }
 

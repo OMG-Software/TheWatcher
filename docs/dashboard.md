@@ -36,10 +36,10 @@ dashboard/src/main.tsx          entry point: mounts <App/>
 dashboard/src/App.tsx           app shell: session gate, top bar, summary cards, page routing
 dashboard/src/pages/            one file per page (Monitoring, Views, Agents, Alerts,
                                 Silences, Maintenance, Users, Runbooks, Settings, Login)
-dashboard/src/components/       shared components and modals (ActionButton, StatusDot,
+dashboard/src/components/       shared components and modals (Modal, ActionButton, StatusDot,
                                 AgentConfigModal, AcknowledgeModal, RunbookModal, ...)
 dashboard/src/hooks/            usePolling, useDashboardData, useRunAction, useSession, useActiveView
-dashboard/src/testing/          fake REST server for UI tests
+dashboard/src/testing/          fake REST server and native-dialog model for UI tests
 dashboard/src/permissions.ts    role helpers: isGlobal, canOperate, canManageUsers, canManageGroups
 dashboard/src/api.ts            REST client
 dashboard/src/models.ts         API row types
@@ -218,6 +218,14 @@ role gating, action and load errors, 401 to login, the polling guard and
 hidden-tab pause (fake timers), Settings after a failed load and forms after a
 failed save. These dev dependencies install without install scripts
 (`npm ci --ignore-scripts`, as CI does).
+
+jsdom has no `showModal()`, `close()` or close requests, so `src/test-setup.ts`
+installs a small model of them from `src/testing/dialog.ts`. It treats an Escape
+keydown that nothing cancelled as a close request for the topmost modal dialog,
+checked after the keydown has been dispatched, as a browser does.
+`clickBackdrop()` and `dragOntoBackdrop()` press on the backdrop the way a
+browser reports it: on the dialog element, outside its box. The model does not
+make the page inert, so Tab behaviour is not tested in jsdom.
 
 ## Views
 
@@ -549,10 +557,22 @@ When server API fields change:
 
 ## Accessibility
 
-- Dialogs use the shared `Modal` (`components/Modal.tsx`): `role="dialog"`,
-  `aria-modal`, a name, focus moved in and returned, Tab kept inside, Escape and
-  backdrop click to close. While a request runs they cannot be closed. The
-  Configure modal uses the same `useDialog` behaviour.
+- Every dialog, the Configure modal included, is the shared `Modal`
+  (`components/Modal.tsx`): a native `<dialog>` opened with `showModal()` and
+  named by its title. The browser puts it in the top layer, draws the
+  `::backdrop` and makes the rest of the page inert, so Tab cannot reach the page
+  behind it (it can reach the browser's own controls, which is intended). No
+  `div` backdrop with a click handler and no `role="dialog"` remain (Sonar
+  S6848). Escape, a backdrop click and the close button close it. The Configure
+  modal ignores backdrop clicks (`closeOnBackdrop={false}`), so a stray click
+  keeps unsaved edits. While a request runs (`dismissible={false}`) none of
+  them work.
+- `Modal` is controlled: the page renders it to open it and stops rendering it
+  to close it. Each way of closing only calls `onClose`, and the dialog stays
+  open until the page removes it. If the browser closes it anyway (a second
+  Escape with no click in between cannot be cancelled), it opens again. A
+  backdrop click counts only when both the press and the release land outside
+  the dialog's box, so dragging a text selection out of it does not close it.
 - `ConfirmDialog` is the shared confirmation; use it for any destructive action.
   It names the target, closes only when the action succeeded and shows the
   failure otherwise. With `reasonLabel` it also collects an optional reason.
@@ -566,5 +586,14 @@ When server API fields change:
   dashboard poll, so an expiry shows within one poll), never during render.
 - A dialog remembers the element that had focus before it opened (read in its
   first render) and returns focus there. It focuses the control marked
-  `data-autofocus`, else the first control after the header. Escape closes an
+  `data-autofocus`, else the first control after the header. Use
+  `data-autofocus`, not React's `autoFocus` (Sonar S9379). Escape closes an
   open info tip before it closes the dialog around it.
+- A control inside a dialog that handles Escape itself must call
+  `preventDefault()` on the keydown, not only `stopPropagation()`. The browser
+  turns any Escape keydown that was not cancelled into a close request for the
+  dialog.
+- The dialog styles are `.modal-panel` (the box, plus `::backdrop`) and
+  variants such as `.runbook-modal` and `.config-modal`. `.modal-panel` undoes
+  the browser's own dialog box (padding, colour, max size) and keeps 24px clear
+  around the dialog.
