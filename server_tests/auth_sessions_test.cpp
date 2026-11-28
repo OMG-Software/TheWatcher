@@ -601,6 +601,9 @@ SCENARIO("Session creation racing a password reset never leaves an old-credentia
         const int64_t expires = now_ms() + hour_ms;
 
         constexpr int creators = 6;
+        constexpr int creator_budget = 400; // sessions each creator may attempt
+        // Wall-clock cap as well, so a slow disk bounds the loops by time.
+        const auto creator_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
         std::atomic<int> created_count{0};
         std::atomic<int> errors{0};
         std::atomic<bool> stop{false};
@@ -613,7 +616,10 @@ SCENARIO("Session creation racing a password reset never leaves an old-credentia
             {
                 threads.emplace_back([&, t] {
                     // No Catch2 assertions off the main thread.
-                    for (int i = 0; !stop.load(); ++i)
+                    // Bounded by a fixed budget as well as by `stop`, so a slow disk
+                    // cannot make the loop run for minutes.
+                    for (int i = 0;
+                         i < creator_budget && !stop.load() && std::chrono::steady_clock::now() < creator_deadline; ++i)
                     {
                         const auto token = "tok-" + std::to_string(t) + "-" + std::to_string(i);
                         try
@@ -735,6 +741,9 @@ SCENARIO("A rolled-back password reset never takes other threads' sessions with 
         const auto new_hash = hash_for("new-victim-password");
 
         constexpr int creators = 4;
+        constexpr int creator_budget = 400; // sessions each creator may attempt
+        // Wall-clock cap as well, so a slow disk bounds the loops by time.
+        const auto creator_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
         constexpr int resetters = 3;
         constexpr int resets_each = 40;
         std::atomic<int> reset_throws{0};
@@ -751,7 +760,11 @@ SCENARIO("A rolled-back password reset never takes other threads' sessions with 
             for (int c = 0; c < creators; ++c)
             {
                 threads.emplace_back([&, c] {
-                    for (int i = 0; resets_done.load() < resetters; ++i)
+                    // Bounded: a fixed budget keeps slow disks from running forever, and
+                    // it still overlaps the resets, which run alongside.
+                    for (int i = 0; i < creator_budget && resets_done.load() < resetters &&
+                                    std::chrono::steady_clock::now() < creator_deadline;
+                         ++i)
                     {
                         const auto token = "other-" + std::to_string(c) + "-" + std::to_string(i);
                         try

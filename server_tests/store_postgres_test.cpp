@@ -9,8 +9,10 @@
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
+#include <functional>
 #include <future>
 #include <memory>
+#include <optional>
 #include <thread>
 #include <vector>
 
@@ -944,6 +946,58 @@ struct PgSideConnection
     PGconn* conn;
 };
 
+// Runs one call on its own thread and always joins it on scope exit. Unlike
+// std::async, destroying a call that is still blocked does not hang in a
+// future destructor, so a hung call under test fails the checks instead.
+// Declare it before any connection holding the lock it waits on, so that
+// connection is closed first and the call can finish.
+template <typename T>
+class BackgroundCall
+{
+public:
+    BackgroundCall() = default;
+    BackgroundCall(const BackgroundCall&) = delete;
+    BackgroundCall& operator=(const BackgroundCall&) = delete;
+    ~BackgroundCall()
+    {
+        if (thread_.joinable())
+            thread_.join();
+    }
+
+    template <typename Fn>
+    void start(Fn fn)
+    {
+        promise_ = std::promise<T>();
+        future_ = promise_.get_future();
+        thread_ = std::thread([this, fn = std::move(fn)]() mutable {
+            try
+            {
+                promise_.set_value(fn());
+            }
+            catch (...)
+            {
+                promise_.set_exception(std::current_exception());
+            }
+        });
+    }
+    // True while the call has not returned yet.
+    bool running() const
+    {
+        return future_.wait_for(std::chrono::seconds(0)) == std::future_status::timeout;
+    }
+    T get()
+    {
+        T value = future_.get();
+        thread_.join();
+        return value;
+    }
+
+private:
+    std::promise<T> promise_;
+    std::future<T> future_;
+    std::thread thread_;
+};
+
 } // namespace
 
 SCENARIO("[postgres] A login waits for a concurrent credential change instead of creating a session")
@@ -964,7 +1018,7 @@ SCENARIO("[postgres] A login waits for a concurrent credential change instead of
 
         // Declared before the side connection so that connection closes (and
         // releases its lock) first if an assertion fails.
-        std::future<bool> login;
+        BackgroundCall<bool> login;
         PgSideConnection side;
         REQUIRE(PQstatus(side.conn) == CONNECTION_OK);
         side.run("BEGIN");
@@ -973,11 +1027,11 @@ SCENARIO("[postgres] A login waits for a concurrent credential change instead of
         {
             side.run("UPDATE users SET password_hash='new-hash-" + suffix +
                      "' WHERE user_id=" + std::to_string(user_id));
-            login = std::async(std::launch::async, [&] {
+            login.start([&] {
                 return store.create_session_if_credentials_current(session, old_hash);
             });
             std::this_thread::sleep_for(std::chrono::milliseconds(500));
-            const bool blocked = login.wait_for(std::chrono::seconds(0)) == std::future_status::timeout;
+            const bool blocked = login.running();
             side.run("COMMIT");
             const bool created = login.get();
 
@@ -992,11 +1046,11 @@ SCENARIO("[postgres] A login waits for a concurrent credential change instead of
         WHEN("the user is disabled and not yet committed")
         {
             side.run("UPDATE users SET disabled=TRUE WHERE user_id=" + std::to_string(user_id));
-            login = std::async(std::launch::async, [&] {
+            login.start([&] {
                 return store.create_session_if_credentials_current(session, old_hash);
             });
             std::this_thread::sleep_for(std::chrono::milliseconds(500));
-            const bool blocked = login.wait_for(std::chrono::seconds(0)) == std::future_status::timeout;
+            const bool blocked = login.running();
             side.run("COMMIT");
             const bool created = login.get();
 
@@ -1060,6 +1114,109 @@ SCENARIO("[postgres] Password change and disable report a missing user and revok
             }
         }
         store.delete_user(user_id);
+    }
+}
+
+SCENARIO("[postgres] A password reset or disable revokes a session a login committed first")
+{
+    if (!postgres_is_available())
+        SKIP("PostgreSQL not available");
+    GIVEN("a user, one connection for logins and another for credential changes")
+    {
+        PostgresStore login_store(test_dsn());
+        PostgresStore change_store(test_dsn());
+        const auto suffix = std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
+        const auto old_hash = "old-hash-" + suffix;
+        const auto user_id = change_store.create_user("order-" + suffix, old_hash, "global_viewer");
+        const auto uid = std::to_string(user_id);
+        SessionRecord session;
+        session.token = "order-token-" + suffix;
+        session.user_id = user_id;
+        session.created_at = 1;
+        session.expires_at = 4'000'000'000'000LL;
+
+        // Declared before the side connection so that connection closes (and
+        // releases its locks) first if an assertion fails.
+        BackgroundCall<std::optional<int>> reset;
+        BackgroundCall<int> disable;
+        PgSideConnection login_tx;
+        REQUIRE(PQstatus(login_tx.conn) == CONNECTION_OK);
+        // The same lock-then-insert a login performs, but left open so the
+        // change can start while the login is still in flight.
+        const std::string held_login = "WITH u AS (SELECT user_id FROM users WHERE user_id=" + uid +
+                                       " AND password_hash='" + old_hash +
+                                       "' AND disabled=FALSE FOR SHARE) "
+                                       "INSERT INTO sessions(token,user_id,created_at,expires_at) SELECT '" +
+                                       session.token + "',user_id,1,4000000000000 FROM u";
+
+        WHEN("the login commits and the password is reset afterwards")
+        {
+            REQUIRE(login_store.create_session_if_credentials_current(session, old_hash));
+            const auto revoked = change_store.update_user_password_and_revoke_sessions(user_id, "new-" + suffix);
+
+            THEN("the session is revoked")
+            {
+                REQUIRE(revoked.has_value());
+                CHECK(*revoked == 1);
+                CHECK(change_store.delete_sessions_for_user(user_id) == 0);
+            }
+        }
+
+        WHEN("the login commits and the user is disabled afterwards")
+        {
+            REQUIRE(login_store.create_session_if_credentials_current(session, old_hash));
+            const auto affected = change_store.disable_user_and_revoke_sessions(user_id);
+
+            THEN("the session is revoked")
+            {
+                CHECK(affected == 1);
+                CHECK(change_store.delete_sessions_for_user(user_id) == 0);
+            }
+        }
+
+        WHEN("the password reset starts while the login still holds the row lock and commits later")
+        {
+            login_tx.run("BEGIN");
+            login_tx.run(held_login);
+            reset.start([&] {
+                return change_store.update_user_password_and_revoke_sessions(user_id, "new-" + suffix);
+            });
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            const bool blocked = reset.running();
+            login_tx.run("COMMIT");
+            const auto revoked = reset.get();
+
+            THEN("the reset waited for the login and still deletes the session it committed")
+            {
+                CHECK(blocked);
+                REQUIRE(revoked.has_value());
+                CHECK(*revoked == 1);
+                CHECK(change_store.delete_sessions_for_user(user_id) == 0);
+                CHECK(change_store.get_user_by_username("order-" + suffix)->password_hash == "new-" + suffix);
+            }
+        }
+
+        WHEN("the disable starts while the login still holds the row lock and commits later")
+        {
+            login_tx.run("BEGIN");
+            login_tx.run(held_login);
+            disable.start([&] {
+                return change_store.disable_user_and_revoke_sessions(user_id);
+            });
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+            const bool blocked = disable.running();
+            login_tx.run("COMMIT");
+            const auto affected = disable.get();
+
+            THEN("the disable waited for the login and still deletes the session it committed")
+            {
+                CHECK(blocked);
+                CHECK(affected == 1);
+                CHECK(change_store.delete_sessions_for_user(user_id) == 0);
+            }
+        }
+        login_tx.run("ROLLBACK");
+        change_store.delete_user(user_id);
     }
 }
 #endif // HAVE_LIBPQ
