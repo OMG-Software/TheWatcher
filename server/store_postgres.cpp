@@ -1317,6 +1317,18 @@ std::vector<std::string> PostgresStore::get_offline_unalerted_agent_ids()
     return out;
 }
 
+bool PostgresStore::has_open_alert(const std::string& agent_id, const std::string& indicator,
+                                   const std::string& new_status)
+{
+    const char* params[] = {agent_id.c_str(), indicator.c_str(), new_status.c_str()};
+    Res res(PQexecParams(conn_,
+                         "SELECT 1 FROM alerts WHERE agent_id=$1 AND indicator=$2 AND new_status=$3 "
+                         "AND deleted_at=0 AND acknowledged_at=0 LIMIT 1;",
+                         3, nullptr, params, nullptr, nullptr, 0));
+    check_res(res.r, "has_open_alert");
+    return PQntuples(res.r) > 0;
+}
+
 void PostgresStore::archive_heartbeat_alerts_for_agent(const std::string& agent_id, int64_t deleted_at)
 {
     const auto p_dat = s(deleted_at);

@@ -58,6 +58,32 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   UTF-8. They are UTF-8 again, and a new test fails whenever any file under
   `dashboard/src` is not valid UTF-8, since vitest decodes such files without
   complaint.
+- All alerts now go through one pipeline that applies maintenance, silences,
+  severity validation, de-duplication, the runbook link and the webhook.
+  Log-match alerts no longer fire during maintenance, offline and log-match
+  alerts now send the webhook and offline alerts honour silences, and 100
+  matching log lines leave one open alert (#52).
+- Alert webhooks and scheduled reports are delivered by a worker thread with a
+  bounded queue and timeouts, so a slow webhook no longer stalls the data
+  plane (#48).
+- The scheduled report reads its last-sent time at startup, so a restart in
+  the scheduled hour does not send it twice. A non-2xx response is a failure
+  and is retried with backoff; invalid `reports.*` values no longer throw
+  (#49). The `reports.*` settings are documented.
+- Commands for an agent that is not connected now get `409` from the API
+  instead of being dropped after a success reply, and the ROUTER reports
+  undeliverable commands (#54). The check uses the server's live routes, so
+  an agent stored as connected before a restart is also refused until it
+  sends a frame, and every command route (`command`, `set_interval`,
+  `set_process_limit` too) checks it before changing or queuing anything.
+  Commands are sent without blocking on a full send queue.
+- `GET /api/settings` no longer fails on a malformed `reports.hour` or
+  `reports.day_of_week`, and `reports.last_sent_ms` with trailing junk reads
+  as never sent (#49).
+- An operator DISCONNECT no longer raises a red "Agent has gone offline"
+  alert that escalates; the agent is marked operator-disconnected until it
+  sends a frame again (#156).
+- Added behavioural tests for `ReportGenerator` (part of #137).
 - Log tailing (#90): each indicator keeps its own read offset, so two
   indicators on one file both match; a monitor starts at the end of an
   existing file instead of replaying its history as new alerts (a file that
@@ -79,8 +105,10 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   twice (8 files / 172 tests became 4 / 86) (#103).
 - Agent enrollment recovers after a reply timeout: each attempt uses a new
   REQ socket, so a late server is reached without restarting the agent (#86).
-- A malformed enrollment reply is logged and retried instead of terminating
-  the agent (#160).
+- An enrollment reply that cannot be decoded is logged and retried instead
+  of terminating the agent (#160). An approved reply with an invalid server
+  key or a fingerprint that does not match still stops enrollment with an
+  error.
 - IPv6 server addresses such as `[2001:db8::1]:5555` are parsed correctly in
   the agent config; an unbracketed IPv6 address is rejected with a clear
   error (#98).
