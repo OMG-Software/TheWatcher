@@ -1,10 +1,12 @@
 #pragma once
 
+#include "alert_pipeline.hpp"
 #include "common/collector_config.hpp"
 #include "common/metrics.hpp"
 #include "store.hpp"
 
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <unordered_map>
 
@@ -28,7 +30,10 @@ bool is_worse_status(IndicatorStatus previous, IndicatorStatus current);
 class StatusEngine
 {
 public:
+    // Alerts are stored but send no webhook.
     explicit StatusEngine(Store& store);
+    // Alerts go through `pipeline`, which applies maintenance, silences and webhooks.
+    StatusEngine(Store& store, AlertPipeline& pipeline);
 
     void evaluate_metrics(const std::string& agent_id, const SystemMetrics& metrics, int64_t timestamp_ms);
     void enter_maintenance(const std::string& agent_id, const std::string& reason, int64_t until_ms, int64_t now_ms);
@@ -64,6 +69,8 @@ private:
                                        int64_t now_ms);
 
     Store& store_;
+    std::unique_ptr<AlertPipeline> owned_pipeline_; // set only by the Store-only constructor
+    AlertPipeline& pipeline_;
     int64_t last_prune_ms_ = 0;
     std::unordered_map<std::string, BaselineCacheEntry> baseline_cache_;
     std::unordered_map<std::string, StalenessEntry> staleness_cache_;

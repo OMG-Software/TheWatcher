@@ -144,7 +144,8 @@ dedicated dashboard controls exist.
 
 | Key | Default | Description |
 | --- | --- | --- |
-| `notifications.webhook_url` | empty | Optional HTTP webhook URL. The server posts alert JSON when an alert is generated. `http://` URLs are supported by the current build. Localhost, private, link-local, multicast, documentation, benchmark, malformed authority, userinfo, and invalid-port targets are rejected before sending. |
+| `notifications.webhook_url` | empty | Optional HTTP webhook URL. The server posts alert JSON when an alert is generated. `http://` URLs are supported by the current build. Localhost, private, link-local, multicast, documentation, benchmark, malformed authority, userinfo, and invalid-port targets are rejected before sending. Delivery runs on a background worker with a 2 second timeout and up to 3 attempts; only a 2xx response counts as delivered. |
+| `reports.enabled`, `reports.webhook_url`, `reports.schedule`, `reports.hour`, `reports.day_of_week`, `reports.last_sent_ms` | disabled | Scheduled fleet digest. See [Scheduled reports](architecture.md#scheduled-reports). |
 
 ## Per-Agent Collector Configuration
 
