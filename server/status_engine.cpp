@@ -3,7 +3,6 @@
 #include "common/SingleLog.hpp"
 #include "common/metrics.hpp"
 #include "common/protocol.hpp"
-#include "webhook_security.hpp"
 
 #include <nlohmann/json.hpp>
 
@@ -11,8 +10,6 @@
 #include <cmath>
 #include <stdexcept>
 #include <vector>
-
-#include <httplib.h>
 
 namespace thewatcher::server
 {
@@ -66,46 +63,6 @@ namespace
     {
         return network.interface_name != "lo";
     }
-
-    void send_webhook(Store& store, const AlertRecord& alert, int64_t alert_id)
-    {
-        const auto webhook_url = store.get_setting("notifications.webhook_url", "");
-        if (webhook_url.empty())
-            return;
-
-        const auto target = parse_webhook_url(webhook_url);
-        if (!target)
-        {
-            LOGF_WARNING("Skipping unsupported webhook URL: %s", webhook_url.c_str());
-            return;
-        }
-
-        json payload = {
-            {"alert_id",    alert_id         },
-            {"agent_id",    alert.agent_id   },
-            {"indicator",   alert.indicator  },
-            {"old_status",  alert.old_status },
-            {"new_status",  alert.new_status },
-            {"message",     alert.message    },
-            {"created_at",  alert.created_at },
-            {"runbook_url", alert.runbook_url},
-        };
-
-        httplib::Client client(target->host, target->port);
-        client.set_connection_timeout(2, 0);
-        client.set_read_timeout(2, 0);
-        // Invalid UTF-8 from an agent (#56) must not throw out of evaluation.
-        auto response =
-            client.Post(target->path, payload.dump(-1, ' ', false, json::error_handler_t::replace), "application/json");
-        if (!response)
-        {
-            LOGF_WARNING("Webhook notification failed alert_id=%lld url=%s", static_cast<long long>(alert_id),
-                         webhook_url.c_str());
-            return;
-        }
-        LOGF_DEBUG("Webhook notification sent alert_id=%lld status=%d", static_cast<long long>(alert_id),
-                   response->status);
-    }
 } // namespace
 
 std::string status_to_string(IndicatorStatus status)
@@ -155,13 +112,16 @@ bool is_worse_status(IndicatorStatus previous, IndicatorStatus current)
     return static_cast<int>(current) > static_cast<int>(previous);
 }
 
-int effective_offline_timeout_seconds(int offline_after_seconds, int heartbeat_interval_seconds)
-{
-    return std::max(offline_after_seconds, kOfflineHeartbeatMultiple * std::max(0, heartbeat_interval_seconds));
-}
-
 StatusEngine::StatusEngine(Store& store)
     : store_(store)
+    , owned_pipeline_(std::make_unique<AlertPipeline>(store))
+    , pipeline_(*owned_pipeline_)
+{
+}
+
+StatusEngine::StatusEngine(Store& store, AlertPipeline& pipeline)
+    : store_(store)
+    , pipeline_(pipeline)
 {
 }
 
@@ -422,48 +382,6 @@ void StatusEngine::reconcile_maintenance(int64_t now_ms)
     }
 }
 
-int StatusEngine::offline_timeout_seconds_for(int heartbeat_interval_seconds, int default_offline_after_seconds)
-{
-    int base_seconds = default_offline_after_seconds;
-    const auto setting = store_.get_setting("offline_after_seconds", "");
-    if (!setting.empty())
-    {
-        try
-        {
-            base_seconds = std::stoi(setting);
-        }
-        catch (const std::exception&)
-        {
-            LOGF_WARNING("Ignoring invalid offline_after_seconds setting '%s'", setting.c_str());
-        }
-    }
-    // The saved setting overrides the config in both directions; detection is
-    // off only when the resulting base is not positive.
-    if (base_seconds <= 0)
-        return 0;
-    return effective_offline_timeout_seconds(base_seconds, heartbeat_interval_seconds);
-}
-
-std::vector<std::string> StatusEngine::mark_offline_agents(int64_t now_ms, int default_offline_after_seconds)
-{
-    std::vector<std::string> gone;
-    if (offline_timeout_seconds_for(0, default_offline_after_seconds) <= 0)
-        return gone; // disabled
-
-    for (const auto& agent : store_.list_approved_agents())
-    {
-        if (!agent.connected || agent.maintenance || agent.last_seen <= 0)
-            continue;
-        const auto timeout_s = offline_timeout_seconds_for(agent.heartbeat_interval, default_offline_after_seconds);
-        if (agent.last_seen < now_ms - static_cast<int64_t>(timeout_s) * 1000)
-        {
-            store_.mark_agent_offline(agent.agent_id);
-            gone.push_back(agent.agent_id);
-        }
-    }
-    return gone;
-}
-
 IndicatorStatus StatusEngine::classify_percent(double value, const PercentThresholds& thresholds) const
 {
     if (!std::isfinite(value))
@@ -668,29 +586,9 @@ void StatusEngine::record_transition(const std::string& agent_id, const std::str
 
     if (previous_row && is_worse_status(previous, next))
     {
-        if (store_.is_silenced(agent_id, indicator, timestamp_ms))
-        {
-            LOGF_DEBUG("Alert suppressed by silence rule agent_id=%s indicator=%s", agent_id.c_str(),
-                       indicator.c_str());
-        }
-        else
-        {
-            AlertRecord alert;
-            alert.agent_id = agent_id;
-            alert.indicator = indicator;
-            alert.old_status = status_to_string(previous);
-            alert.new_status = status_to_string(next);
-            alert.message = final_message;
-            alert.created_at = timestamp_ms;
-            const auto runbook = store_.get_runbook(agent_id, indicator, alert.new_status);
-            if (runbook)
-                alert.runbook_url = runbook->url;
-            const auto alert_id = store_.insert_alert(alert);
-            LOGF_WARNING("Generated alert id=%lld agent_id=%s indicator=%s old=%s new=%s",
-                         static_cast<long long>(alert_id), agent_id.c_str(), indicator.c_str(),
-                         alert.old_status.c_str(), alert.new_status.c_str());
-            send_webhook(store_, alert, alert_id);
-        }
+        // Maintenance, silences, runbook and webhook are applied by the pipeline.
+        pipeline_.raise({agent_id, indicator, status_to_string(previous), status_to_string(next), final_message,
+                         timestamp_ms, false});
     }
 }
 

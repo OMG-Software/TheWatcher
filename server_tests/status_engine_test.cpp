@@ -1131,21 +1131,6 @@ SCENARIO("record_transition leaves runbook_url empty when no matching runbook ex
 
 namespace
 {
-void put_agent(SqliteStore& store, const std::string& agent_id, int64_t last_seen, int heartbeat_interval,
-               bool connected = true)
-{
-    AgentRecord agent;
-    agent.agent_id = agent_id;
-    agent.hostname = "status-host";
-    agent.platform = "linux";
-    agent.approved = true;
-    agent.connected = connected;
-    agent.first_seen = 1;
-    agent.last_seen = last_seen;
-    agent.heartbeat_interval = heartbeat_interval;
-    store.upsert_agent(agent);
-}
-
 bool has_alert(SqliteStore& store, const std::string& indicator, const std::string& new_status)
 {
     for (const auto& alert : store.list_alerts(false))
@@ -1475,115 +1460,6 @@ SCENARIO("Stale detection works across separate evaluate_metrics calls on one en
     }
 }
 
-// ── Offline detection (#46) ──────────────────────────────────────────────────
-
-SCENARIO("The effective offline timeout is the larger of the setting and three heartbeat intervals")
-{
-    GIVEN("the dashboard setting and an agent heartbeat interval")
-    {
-        THEN("the setting wins for short heartbeats")
-        {
-            REQUIRE(effective_offline_timeout_seconds(60, 5) == 60);
-            REQUIRE(effective_offline_timeout_seconds(300, 60) == 300);
-        }
-        AND_THEN("three heartbeat intervals win for long heartbeats")
-        {
-            REQUIRE(effective_offline_timeout_seconds(60, 60) == 180);
-            REQUIRE(effective_offline_timeout_seconds(10, 30) == 90);
-        }
-    }
-}
-
-SCENARIO("Offline detection honours the offline_after_seconds setting and each agent's heartbeat")
-{
-    constexpr int64_t now = 1'000'000;
-
-    GIVEN("offline_after_seconds=300 set in the store and an agent silent for 120 s")
-    {
-        SqliteStore store(":memory:");
-        store.set_setting("offline_after_seconds", "300");
-        put_agent(store, "agent-quiet", now - 120'000, 5);
-        StatusEngine engine(store);
-
-        WHEN("the offline check runs with a configured default of 60 s")
-        {
-            const auto gone = engine.mark_offline_agents(now, 60);
-
-            THEN("the agent is still online")
-            {
-                REQUIRE(gone.empty());
-                REQUIRE(store.get_agent("agent-quiet")->connected);
-            }
-        }
-
-        WHEN("the agent has been silent for 301 s")
-        {
-            put_agent(store, "agent-quiet", now - 301'000, 5);
-            const auto gone = engine.mark_offline_agents(now, 60);
-
-            THEN("it goes offline")
-            {
-                REQUIRE(gone == std::vector<std::string>{"agent-quiet"});
-                REQUIRE_FALSE(store.get_agent("agent-quiet")->connected);
-            }
-        }
-    }
-
-    GIVEN("no setting in the store and agents with different heartbeat intervals")
-    {
-        SqliteStore store(":memory:");
-        put_agent(store, "agent-fast", now - 100'000, 5);
-        put_agent(store, "agent-slow", now - 100'000, 60);
-        StatusEngine engine(store);
-
-        WHEN("both have been silent for 100 s and the default is 60 s")
-        {
-            const auto gone = engine.mark_offline_agents(now, 60);
-
-            THEN("only the fast agent goes offline; the 60 s heartbeat agent has 180 s")
-            {
-                REQUIRE(gone == std::vector<std::string>{"agent-fast"});
-                REQUIRE(store.get_agent("agent-slow")->connected);
-            }
-        }
-    }
-
-    GIVEN("an agent in maintenance that has been silent for a long time")
-    {
-        SqliteStore store(":memory:");
-        put_agent(store, "agent-maint-quiet", now - 900'000, 5);
-        store.set_agent_maintenance("agent-maint-quiet", true, "patching", 0);
-        StatusEngine engine(store);
-
-        WHEN("the offline check runs")
-        {
-            const auto gone = engine.mark_offline_agents(now, 60);
-
-            THEN("it is not marked offline")
-            {
-                REQUIRE(gone.empty());
-            }
-        }
-    }
-
-    GIVEN("a non-positive default and no setting")
-    {
-        SqliteStore store(":memory:");
-        put_agent(store, "agent-disabled", 1, 5);
-        StatusEngine engine(store);
-
-        WHEN("the offline check runs")
-        {
-            const auto gone = engine.mark_offline_agents(now, 0);
-
-            THEN("offline detection is disabled")
-            {
-                REQUIRE(gone.empty());
-            }
-        }
-    }
-}
-
 // ── Retention (#76) ──────────────────────────────────────────────────────────
 
 SCENARIO("The retention task prunes every growing table without any metrics arriving")
@@ -1764,63 +1640,6 @@ SCENARIO("Consecutive-reading confirmation counts the first reading after mainte
     }
 }
 
-SCENARIO("A persisted non-positive offline_after_seconds disables offline detection")
-{
-    GIVEN("an agent silent for a long time and offline_after_seconds=0 saved in the store")
-    {
-        SqliteStore store(":memory:");
-        store.set_setting("offline_after_seconds", "0");
-        put_agent(store, "agent-never-off", 1, 5);
-        StatusEngine engine(store);
-
-        WHEN("the offline check runs with a positive configured default")
-        {
-            const auto gone = engine.mark_offline_agents(10'000'000, 60);
-
-            THEN("the agent stays online")
-            {
-                REQUIRE(gone.empty());
-                REQUIRE(store.get_agent("agent-never-off")->connected);
-            }
-        }
-    }
-}
-
-SCENARIO("offline_timeout_seconds_for combines the setting, the default and the heartbeat")
-{
-    GIVEN("a store with and without the setting")
-    {
-        SqliteStore store(":memory:");
-        StatusEngine engine(store);
-
-        THEN("the configured default is used when no setting is saved")
-        {
-            REQUIRE(engine.offline_timeout_seconds_for(5, 60) == 60);
-            REQUIRE(engine.offline_timeout_seconds_for(60, 60) == 180);
-        }
-
-        AND_WHEN("the setting is saved")
-        {
-            store.set_setting("offline_after_seconds", "300");
-
-            THEN("it replaces the default")
-            {
-                REQUIRE(engine.offline_timeout_seconds_for(5, 60) == 300);
-            }
-        }
-
-        AND_WHEN("detection is disabled by the setting or by the default")
-        {
-            THEN("the timeout is 0")
-            {
-                REQUIRE(engine.offline_timeout_seconds_for(5, 0) == 0);
-                store.set_setting("offline_after_seconds", "-1");
-                REQUIRE(engine.offline_timeout_seconds_for(5, 60) == 0);
-            }
-        }
-    }
-}
-
 SCENARIO("A pause acknowledgement keeps the maintenance reason and expiry already set")
 {
     GIVEN("an agent put into timed maintenance through the API")
@@ -1920,33 +1739,6 @@ SCENARIO("Expired timed maintenance inside an active window re-enters for the wi
                 const auto agent = store.get_agent("agent-overlap");
                 REQUIRE(agent->maintenance);
                 REQUIRE(agent->maintenance_reason == "mw:nightly");
-            }
-        }
-    }
-}
-
-SCENARIO("A saved positive offline_after_seconds enables offline detection that the config disabled")
-{
-    GIVEN("a config with offline detection disabled and offline_after_seconds=120 saved in the store")
-    {
-        SqliteStore store(":memory:");
-        store.set_setting("offline_after_seconds", "120");
-        put_agent(store, "agent-runtime-on", 1'000'000 - 200'000, 5);
-        StatusEngine engine(store);
-
-        THEN("the timeout is the saved setting, which also decides route expiry")
-        {
-            REQUIRE(engine.offline_timeout_seconds_for(5, 0) == 120);
-        }
-
-        WHEN("the agent has been silent past the saved setting")
-        {
-            const auto gone = engine.mark_offline_agents(1'000'000, 0);
-
-            THEN("it is marked offline")
-            {
-                REQUIRE(gone == std::vector<std::string>{"agent-runtime-on"});
-                REQUIRE_FALSE(store.get_agent("agent-runtime-on")->connected);
             }
         }
     }

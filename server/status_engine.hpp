@@ -1,10 +1,12 @@
 #pragma once
 
+#include "alert_pipeline.hpp"
 #include "common/collector_config.hpp"
 #include "common/metrics.hpp"
 #include "store.hpp"
 
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -32,18 +34,13 @@ IndicatorStatus status_from_string(const std::string& value);
 // Grey->Green does not.
 bool is_worse_status(IndicatorStatus previous, IndicatorStatus current);
 
-// Number of heartbeat intervals an agent may stay silent before it counts as
-// offline, however small the configured offline_after_seconds is (#46).
-constexpr int kOfflineHeartbeatMultiple = 3;
-
-// The silence allowed before an agent is marked offline:
-// max(offline_after_seconds, kOfflineHeartbeatMultiple * heartbeat_interval).
-int effective_offline_timeout_seconds(int offline_after_seconds, int heartbeat_interval_seconds);
-
 class StatusEngine
 {
 public:
+    // Alerts are stored but send no webhook.
     explicit StatusEngine(Store& store);
+    // Alerts go through `pipeline`, which applies maintenance, silences and webhooks.
+    StatusEngine(Store& store, AlertPipeline& pipeline);
 
     void evaluate_metrics(const std::string& agent_id, const SystemMetrics& metrics, int64_t timestamp_ms);
     void enter_maintenance(const std::string& agent_id, const std::string& reason, int64_t until_ms, int64_t now_ms);
@@ -63,20 +60,6 @@ public:
     //    indicators marked Blue.
     // Manual and scheduled maintenance both go through enter/exit_maintenance.
     void reconcile_maintenance(int64_t now_ms);
-
-    // Marks approved, connected agents that have been silent for longer than
-    // effective_offline_timeout_seconds() as offline and returns their ids.
-    // The base timeout is the "offline_after_seconds" server setting, falling
-    // back to default_offline_after_seconds (the config value). A non-positive
-    // default disables offline detection. Agents in maintenance are skipped.
-    std::vector<std::string> mark_offline_agents(int64_t now_ms, int default_offline_after_seconds);
-
-    // The effective offline timeout for an agent with this heartbeat interval:
-    // max(base, 3 x heartbeat) where base is the saved "offline_after_seconds"
-    // setting, else default_offline_after_seconds. The saved setting wins over
-    // the config either way. Returns 0 when offline detection is disabled (the
-    // resulting base is not positive).
-    int offline_timeout_seconds_for(int heartbeat_interval_seconds, int default_offline_after_seconds);
 
     // Number of agents with cached state (for tests and diagnostics).
     size_t tracked_agent_count() const;
@@ -114,6 +97,10 @@ private:
     void mark_indicators_blue(const std::string& agent_id, int64_t now_ms);
 
     Store& store_;
+    // Declared before the pipeline reference so a Store-only engine owns the
+    // pipeline it points at.
+    std::unique_ptr<AlertPipeline> owned_pipeline_; // set only by the Store-only constructor
+    AlertPipeline& pipeline_;
     // Agents whose indicators were already marked Blue for the current maintenance.
     std::unordered_set<std::string> maintenance_marked_;
     // Drops the stale-value clocks and baselines of one agent.

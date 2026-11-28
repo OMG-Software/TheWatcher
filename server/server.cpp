@@ -5,8 +5,10 @@
 #include "common/crypto.hpp"
 #include "common/metrics.hpp"
 #include "common/zmq_limits.hpp"
+#include "offline_alerts.hpp"
 #include "report_generator.hpp"
 #include "retention.hpp"
+#include "router_send.hpp"
 #include "status_engine.hpp"
 
 #include <chrono>
@@ -122,11 +124,19 @@ Server::Server(ServerConfig config)
                config_.api_port, config_.db_type.c_str(), config_.db_path.c_str(), config_.offline_after_seconds);
     const auto& db_target = (config_.db_type == "postgres") ? config_.postgres_dsn : config_.db_path;
     store_ = make_store(config_.db_type, db_target);
-    status_engine_ = std::make_unique<StatusEngine>(*store_);
     zap_ = std::make_unique<ZapHandler>(ctx_);
     api_ = std::make_unique<ApiServer>(*store_, *zap_, config_.api_host, config_.api_port);
     // SEC-12: login throttling honours X-Forwarded-For / X-Real-IP only from these peers.
     api_->set_trusted_proxies(config_.trusted_proxies);
+    // #54: the API refuses commands for an agent with no live route, not just
+    // one stored as disconnected (the stored flag survives a restart).
+    api_->set_connectivity_check([this](const std::string& agent_id) {
+        return has_route(agent_id);
+    });
+    alerts_ = std::make_unique<AlertPipeline>(*store_, notifier_);
+    offline_alerts_ = std::make_unique<OfflineAlerts>(*store_, *alerts_, config_.offline_after_seconds);
+    // #43: built once the pipeline exists; the engine routes its alerts through it.
+    status_engine_ = std::make_unique<StatusEngine>(*store_, *alerts_);
 
     // Pre-load all already-approved agents into the ZAP key set so they can
     // reconnect after a server restart without needing re-approval. SEC-04:
@@ -159,8 +169,10 @@ void Server::run(StartupSignal* startup)
     // ROUTER: encrypted data plane for metric/heartbeat/ack traffic
     zmq::socket_t router(ctx_, ZMQ_ROUTER);
     router.set(zmq::sockopt::linger, 0);
-    // Silently drop frames addressed to an unknown identity rather than erroring.
-    router.set(zmq::sockopt::router_mandatory, 0);
+    // Sending to an identity with no live connection fails with EHOSTUNREACH
+    // instead of silently dropping the frame, so dispatch_commands can tell
+    // that a command was not delivered (#54).
+    router.set(zmq::sockopt::router_mandatory, 1);
     // SEC-02: reject oversize messages at the socket layer and bound the
     // connection handshake so hostile peers cannot exhaust server memory.
     router.set(zmq::sockopt::maxmsgsize, kDataPlaneMaxMessageBytes);
@@ -240,24 +252,12 @@ void Server::run(StartupSignal* startup)
         if (std::chrono::steady_clock::now() >= next_offline_scan)
         {
             const auto now = now_ms();
-            if (status_engine_->offline_timeout_seconds_for(0, config_.offline_after_seconds) > 0)
+            if (offline_alerts_->detection_enabled())
             {
-                // #46: the cutoff is per agent (dashboard setting, heartbeat interval).
-                status_engine_->mark_offline_agents(now, config_.offline_after_seconds);
+                // #46: the cutoff is per agent (dashboard setting, heartbeat
+                // interval). Raising marks silent agents offline first.
+                offline_alerts_->raise_for_offline_agents(now);
                 expire_routes();
-                const auto ts = now_ms();
-                for (const auto& agent_id : store_->get_offline_unalerted_agent_ids())
-                {
-                    AlertRecord alert;
-                    alert.agent_id = agent_id;
-                    alert.indicator = "Heartbeat";
-                    alert.old_status = "green";
-                    alert.new_status = "red";
-                    alert.message = "Agent has gone offline (no heartbeat received)";
-                    alert.created_at = ts;
-                    store_->insert_alert(alert);
-                    LOGF_INFO("Created dead-agent alert for agent_id=%s", agent_id.c_str());
-                }
             }
 
             // Escalate unacknowledged alerts older than the configurable timeout.
@@ -442,6 +442,7 @@ void Server::handle_router_frame(zmq::socket_t& router)
     store_->upsert_agent(*rec);
     if (was_offline)
     {
+        offline_alerts_->agent_seen(agent_id); // #156: an operator disconnect ends here
         store_->archive_heartbeat_alerts_for_agent(agent_id, now_ms());
         LOGF_INFO("Agent reconnected, archived heartbeat alerts for agent_id=%s", agent_id.c_str());
     }
@@ -538,7 +539,11 @@ void Server::handle_router_frame(zmq::socket_t& router)
                         if (command_agent)
                         {
                             if (command->second.type == CommandType::DISCONNECT)
+                            {
                                 command_agent->connected = false;
+                                // #156: deliberate, so the offline scan must not alert.
+                                offline_alerts_->mark_operator_disconnect(agent_id);
+                            }
                             else if (command->second.type == CommandType::RESUME)
                             {
                                 command_agent->maintenance = false;
@@ -587,20 +592,11 @@ void Server::handle_router_frame(zmq::socket_t& router)
             log_match_record.created_at = server_now;
             store_->insert_log_match(log_match_record);
 
-            // Raise an alert on the named indicator so it shows up on the dashboard.
-            if (!store_->is_silenced(agent_id, match.indicator_name, server_now))
-            {
-                AlertRecord alert;
-                alert.agent_id = agent_id;
-                alert.indicator = match.indicator_name;
-                alert.old_status = "green";
-                alert.new_status = match.severity;
-                alert.message = "Log match in " + match.path + ": " + match.matched_line.substr(0, 200);
-                alert.created_at = server_now;
-                store_->insert_alert(alert);
-                LOGF_INFO("Log match alert agent_id=%s indicator=%s severity=%s path=%s", agent_id.c_str(),
-                          match.indicator_name.c_str(), match.severity.c_str(), match.path.c_str());
-            }
+            // Raise an alert on the named indicator so it shows up on the
+            // dashboard. The pipeline applies maintenance, silences, severity
+            // validation, de-duplication and the webhook (#52).
+            alerts_->raise({agent_id, match.indicator_name, "green", match.severity,
+                            "Log match in " + match.path + ": " + match.matched_line.substr(0, 200), server_now, true});
         }
         catch (const std::exception& e)
         {
@@ -930,7 +926,7 @@ void Server::handle_enrollment(zmq::socket_t& enroll)
 
 // Takes pending commands from the API queue and sends each to its agent through
 // the ROUTER. Records each sent command to match its ACK. A send failure is
-// logged and that command is dropped.
+// logged, not recorded as dispatched, and that command is dropped (#54).
 void Server::dispatch_commands(zmq::socket_t& router)
 {
     std::vector<PendingCommand> cmds;
@@ -964,13 +960,28 @@ void Server::dispatch_commands(zmq::socket_t& router)
         try
         {
             const auto& routing_id = route->second.routing_id;
-            router.send(zmq::message_t(routing_id.data(), routing_id.size()), zmq::send_flags::sndmore);
-            router.send(zmq::message_t{}, zmq::send_flags::sndmore);
-            router.send(zmq::message_t(encoded.data(), encoded.size()), zmq::send_flags::none);
+            // ROUTER_MANDATORY makes this throw EHOSTUNREACH when the peer is
+            // gone; every part uses dontwait so a full queue cannot block.
+            if (!send_to_peer(router, routing_id, encoded.data(), encoded.size()))
+            {
+                LOGF_WARNING("Command not delivered (send queue full) agent_id=%s command_id=%s",
+                             sanitize_log_text(pc.agent_id).c_str(), pc.cmd.command_id.c_str());
+                continue;
+            }
             dispatched_commands_[pc.cmd.command_id] = {static_cast<CommandType>(pc.cmd.command_type), now_ms(),
                                                        pc.agent_id};
             LOGF_DEBUG("Dispatched command agent_id=%s command_id=%s type=%u", pc.agent_id.c_str(),
                        pc.cmd.command_id.c_str(), static_cast<unsigned>(pc.cmd.command_type));
+        }
+        catch (const zmq::error_t& e)
+        {
+            // #54: not delivered, so it is not recorded as dispatched and no
+            // ACK is awaited. The API refuses commands for agents it knows to
+            // be offline; this covers the window before the offline scan.
+            if (e.num() == EHOSTUNREACH)
+                forget_route(pc.agent_id);
+            LOGF_WARNING("Command not delivered agent_id=%s command_id=%s: %s", sanitize_log_text(pc.agent_id).c_str(),
+                         pc.cmd.command_id.c_str(), e.what());
         }
         catch (const std::exception& e)
         {
@@ -998,6 +1009,7 @@ void Server::learn_route(const std::string& agent_id, const std::string& routing
     forget_route(agent_id);
     agent_routes_[agent_id] = AgentRoute{routing_id, now};
     route_owners_[routing_id] = agent_id;
+    publish_reachable_agents();
 }
 
 // Removes agent_id's route and its reverse-index entry, if present.
@@ -1008,6 +1020,25 @@ void Server::forget_route(const std::string& agent_id)
         return;
     route_owners_.erase(route->second.routing_id);
     agent_routes_.erase(route);
+    publish_reachable_agents();
+}
+
+// Copies the set of agents with a learned route where the API threads can read
+// it. Called after every route change, which is rare (the per-frame fast path
+// in learn_route changes nothing).
+void Server::publish_reachable_agents()
+{
+    std::unordered_set<std::string> reachable;
+    for (const auto& [agent_id, route] : agent_routes_)
+        reachable.insert(agent_id);
+    std::lock_guard lock(reachable_mutex_);
+    reachable_agents_ = std::move(reachable);
+}
+
+bool Server::has_route(const std::string& agent_id) const
+{
+    std::lock_guard lock(reachable_mutex_);
+    return reachable_agents_.count(agent_id) > 0;
 }
 
 // Drops routes whose agent has sent no frame for its effective offline timeout
@@ -1016,16 +1047,18 @@ void Server::forget_route(const std::string& agent_id)
 // detection is disabled.
 void Server::expire_routes()
 {
-    if (status_engine_->offline_timeout_seconds_for(0, config_.offline_after_seconds) <= 0)
+    if (!offline_alerts_->detection_enabled())
         return;
     const auto now = std::chrono::steady_clock::now();
+    bool changed = false;
     for (auto it = agent_routes_.begin(); it != agent_routes_.end();)
     {
         const auto agent = store_->get_agent(it->first);
         const int heartbeat = agent ? agent->heartbeat_interval : 0;
-        const auto timeout_s = status_engine_->offline_timeout_seconds_for(heartbeat, config_.offline_after_seconds);
+        const auto timeout_s = offline_alerts_->timeout_seconds_for(heartbeat);
         if (it->second.last_frame < now - std::chrono::seconds{timeout_s})
         {
+            changed = true;
             LOGF_DEBUG("Forgetting route of agent_id=%s with no frame since the offline threshold",
                        sanitize_log_text(it->first).c_str());
             route_owners_.erase(it->second.routing_id);
@@ -1036,41 +1069,64 @@ void Server::expire_routes()
             ++it;
         }
     }
+    if (changed)
+        publish_reachable_agents();
 }
 
+// Sends the scheduled digest when one is due (#48, #49). Building the payload
+// is quick and happens here; the HTTP POST runs on the notification worker.
+// The last-sent time lives in the reports.last_sent_ms setting, so a restart
+// inside the scheduled hour does not send it again. A failed delivery (no
+// response or a non-2xx status) is retried with backoff while the scheduled
+// hour lasts.
 void Server::maybe_send_report(int64_t now_ms)
 {
+    // Record the outcome of digests the worker finished since the last tick.
+    for (const auto& result : notifier_.drain_results())
+    {
+        if (result.kind != NotificationKind::ReportDigest)
+            continue;
+        report_in_flight_ = false;
+        if (result.success)
+        {
+            report_failures_ = 0;
+            store_->set_setting("reports.last_sent_ms", std::to_string(now_ms));
+            LOGF_INFO("Reports: digest delivered status=%d", result.http_status);
+        }
+        else
+        {
+            ++report_failures_;
+            next_report_attempt_ms_ = now_ms + report_retry_delay_ms(report_failures_);
+            LOGF_WARNING("Reports: digest delivery failed status=%d, retry in %lld s", result.http_status,
+                         static_cast<long long>(report_retry_delay_ms(report_failures_) / 1000));
+        }
+    }
+
+    if (report_in_flight_ || now_ms < next_report_attempt_ms_)
+        return;
     if (store_->get_setting("reports.enabled", "false") != "true")
         return;
 
-    const auto schedule = store_->get_setting("reports.schedule", "daily"); // "daily" or "weekly"
-    const int target_hour = std::stoi(store_->get_setting("reports.hour", "8"));
-    const int target_dow = std::stoi(store_->get_setting("reports.day_of_week", "1")); // 0=Sun
-
-    // Minimum gap: 23 h for daily, 6 days 23 h for weekly.
-    const int64_t min_gap_ms = (schedule == "weekly") ? 6LL * 86'400'000LL + 23LL * 3'600'000LL : 23LL * 3'600'000LL;
-    if (last_report_ms_ > 0 && now_ms - last_report_ms_ < min_gap_ms)
-        return;
-
-    // Convert now_ms to UTC calendar fields.
-    const time_t now_t = static_cast<time_t>(now_ms / 1000);
-    struct tm utc{};
-#ifdef _WIN32
-    gmtime_s(&utc, &now_t);
-#else
-    gmtime_r(&now_t, &utc);
-#endif
-    if (utc.tm_hour != target_hour)
-        return;
-    if (schedule == "weekly" && utc.tm_wday != target_dow)
-        return;
-
-    LOG_INFO("Sending scheduled fleet digest report");
-    if (generate_and_send_report(*store_, now_ms))
+    const auto schedule = load_report_schedule(*store_);
+    const auto last_sent_ms = load_report_last_sent_ms(*store_);
+    if (!report_due(schedule, last_sent_ms, now_ms))
     {
-        last_report_ms_ = now_ms;
-        store_->set_setting("reports.last_sent_ms", std::to_string(now_ms));
+        report_failures_ = 0; // outside the slot: start the next one fresh
+        return;
     }
+
+    auto notification = build_report_notification(*store_, now_ms);
+    if (!notification)
+    {
+        // No usable URL: check again in a minute rather than every second.
+        next_report_attempt_ms_ = now_ms + report_retry_delay_ms(1);
+        return;
+    }
+    LOG_INFO("Sending scheduled fleet digest report");
+    if (notifier_.submit(std::move(*notification)))
+        report_in_flight_ = true;
+    else
+        next_report_attempt_ms_ = now_ms + report_retry_delay_ms(1);
 }
 
 } // namespace thewatcher::server

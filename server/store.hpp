@@ -249,6 +249,10 @@ public:
     virtual void set_agent_description(const std::string& agent_id, const std::string& description) = 0;
     virtual void set_agent_runbook(const std::string& agent_id, const std::string& markdown) = 0;
     virtual std::vector<std::string> get_offline_unalerted_agent_ids() = 0;
+    // True when an alert for agent_id/indicator with this new_status is still
+    // open: neither acknowledged nor deleted. Used to de-duplicate alerts.
+    virtual bool has_open_alert(const std::string& agent_id, const std::string& indicator,
+                                const std::string& new_status) = 0;
     virtual void archive_heartbeat_alerts_for_agent(const std::string& agent_id, int64_t deleted_at) = 0;
     virtual void escalate_old_alerts(int64_t cutoff_ms, int64_t now_ms) = 0;
     virtual int64_t count_metrics_in_window(const std::string& agent_id, int64_t since_ms, int64_t until_ms) = 0;

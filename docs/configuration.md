@@ -78,7 +78,8 @@ dedicated dashboard controls exist.
 | `status_history_retention_days` | `90` | Status history older than this is deleted, except the newest row per indicator (1-3650). |
 | `alerts_retention_days` | `90` | Acknowledged or deleted alerts older than this are deleted; open alerts are kept. Also applies to expired silences and ended maintenance windows (1-3650). |
 | `log_matches_retention_days` | `30` | Log matches older than this are deleted (1-3650). |
-| `notifications.webhook_url` | empty | Optional HTTP webhook URL. The server posts alert JSON when an alert is generated. `http://` URLs are supported by the current build. Localhost, private, link-local, multicast, documentation, benchmark, malformed authority, userinfo, and invalid-port targets are rejected before sending. |
+| `notifications.webhook_url` | empty | Optional HTTP webhook URL. The server posts alert JSON when an alert is generated. `http://` URLs are supported by the current build. Localhost, private, link-local, multicast, documentation, benchmark, malformed authority, userinfo, and invalid-port targets are rejected before sending. Delivery runs on a background worker with a 2 second timeout and up to 3 attempts; only a 2xx response counts as delivered. |
+| `reports.enabled`, `reports.webhook_url`, `reports.schedule`, `reports.hour`, `reports.day_of_week`, `reports.last_sent_ms` | disabled | Scheduled fleet digest. See [Scheduled reports](architecture.md#scheduled-reports). |
 
 ## Per-Agent Collector Configuration
 
@@ -294,7 +295,8 @@ Ordinary patterns such as `ERROR.*disk.*full`, `(ERROR|WARN) disk` and
 Each indicator tails its file independently. A monitor starts at the end of an
 existing file, so enabling it does not report old lines; a file that is created
 later is read from its first byte. A line is matched once it ends with a
-newline (a trailing `` is dropped, so CRLF logs work with `$`). If the file
+newline (a trailing `
+` is dropped, so CRLF logs work with `$`). If the file
 is replaced, deleted and recreated, or becomes shorter than the read position,
 it is read again from the start (#90).
 
