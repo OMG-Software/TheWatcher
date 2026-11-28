@@ -5,6 +5,9 @@
 
 #include <algorithm>
 #include <filesystem>
+#include <fstream>
+
+#include <sqlite3.h>
 
 using namespace thewatcher;
 using namespace thewatcher::server;
@@ -2989,6 +2992,398 @@ SCENARIO("get_runbook never returns another agent's runbook")
         THEN("an alert on agent-b gets no runbook")
         {
             REQUIRE_FALSE(store.get_runbook("agent-b", "cpu", "red").has_value());
+        }
+    }
+}
+
+// ── Agent delete cascade (#146) ───────────────────────────────────────────────
+
+namespace
+{
+AgentRecord make_agent(const std::string& id, const std::string& key = "")
+{
+    AgentRecord agent;
+    agent.agent_id = id;
+    agent.hostname = id + "-host";
+    agent.platform = "linux";
+    agent.curve_public_key_z85 = key.empty() ? id + "-key" : key;
+    agent.approved = true;
+    return agent;
+}
+} // namespace
+
+SCENARIO("Deleting an agent removes its silences, maintenance windows, runbooks and view references")
+{
+    GIVEN("two agents that each have a silence, a maintenance window, a runbook and a shared view")
+    {
+        SqliteStore store(":memory:");
+        store.upsert_agent(make_agent("gone"));
+        store.upsert_agent(make_agent("stays"));
+
+        for (const auto* id : {"gone", "stays"})
+        {
+            SilenceRecord silence;
+            silence.agent_id = id;
+            silence.indicator = "*";
+            silence.until_ms = 9'000'000'000'000;
+            silence.created_at = 1;
+            store.create_silence(silence);
+
+            MaintenanceWindowRecord window;
+            window.agent_id = id;
+            window.start_ms = 1;
+            window.end_ms = 9'000'000'000'000;
+            window.created_at = 1;
+            store.create_maintenance_window(window);
+
+            RunbookRecord runbook;
+            runbook.agent_id = id;
+            runbook.indicator = "cpu";
+            runbook.status = "red";
+            runbook.url = "https://wiki.example.com/cpu";
+            runbook.created_at = 1;
+            store.create_runbook(runbook);
+        }
+
+        // Rows that are not tied to one agent must survive.
+        SilenceRecord global_silence;
+        global_silence.agent_id = "*";
+        global_silence.indicator = "*";
+        global_silence.until_ms = 9'000'000'000'000;
+        global_silence.created_at = 1;
+        store.create_silence(global_silence);
+        RunbookRecord generic_runbook;
+        generic_runbook.indicator = "*";
+        generic_runbook.status = "red";
+        generic_runbook.url = "https://wiki.example.com/generic";
+        generic_runbook.created_at = 1;
+        store.create_runbook(generic_runbook);
+
+        ViewRecord view;
+        view.name = "both";
+        view.owner_user_id = 1;
+        view.created_at = 1;
+        view.agent_ids = {"gone", "stays"};
+        const auto view_id = store.create_view(view);
+
+        WHEN("one agent is deleted")
+        {
+            store.delete_agent("gone");
+
+            THEN("its agent-scoped silence, window and runbook are gone")
+            {
+                for (const auto& s : store.list_silences())
+                    REQUIRE(s.agent_id != "gone");
+                for (const auto& w : store.list_maintenance_windows())
+                    REQUIRE(w.agent_id != "gone");
+                for (const auto& r : store.list_runbooks())
+                    REQUIRE(r.agent_id != "gone");
+            }
+
+            AND_THEN("a re-enrolled agent with the same id inherits nothing")
+            {
+                store.upsert_agent(make_agent("gone"));
+                // Only the generic runbook may match; the old agent runbook is gone.
+                const auto runbook = store.get_runbook("gone", "cpu", "red");
+                REQUIRE((!runbook || runbook->agent_id.empty()));
+                REQUIRE(store.active_maintenance_windows(2).size() == 1);
+            }
+
+            AND_THEN("the other agent's rows and the generic rows are untouched")
+            {
+                REQUIRE(store.is_silenced("stays", "cpu", 2));
+                REQUIRE(store.list_silences().size() == 2);
+                REQUIRE(store.list_maintenance_windows().size() == 1);
+                REQUIRE(store.list_runbooks().size() == 2);
+            }
+
+            AND_THEN("the deleted id is removed from views but the others stay")
+            {
+                const auto updated = store.get_view(view_id);
+                REQUIRE(updated.has_value());
+                REQUIRE(updated->agent_ids == std::vector<std::string>{"stays"});
+            }
+        }
+    }
+}
+
+// ── Filtered alert queries (#68) ──────────────────────────────────────────────
+
+namespace
+{
+int64_t add_alert(SqliteStore& store, const std::string& agent, int64_t created_at, int64_t acknowledged_at = 0,
+                  int64_t deleted_at = 0)
+{
+    AlertRecord alert;
+    alert.agent_id = agent;
+    alert.indicator = "cpu";
+    alert.old_status = "green";
+    alert.new_status = "red";
+    alert.message = "m";
+    alert.created_at = created_at;
+    alert.acknowledged_at = acknowledged_at;
+    alert.deleted_at = deleted_at;
+    return store.insert_alert(alert);
+}
+} // namespace
+
+SCENARIO("query_alerts filters, joins group access and paginates in the store")
+{
+    GIVEN("alerts on agents in two groups and a user who belongs to one group")
+    {
+        SqliteStore store(":memory:");
+        auto mine = make_agent("mine");
+        mine.runbook_markdown = "# mine runbook";
+        store.upsert_agent(mine);
+        store.upsert_agent(make_agent("theirs"));
+        const auto group_a = store.create_group("A");
+        const auto group_b = store.create_group("B");
+        store.set_agent_groups("mine", {group_a});
+        store.set_agent_groups("theirs", {group_b});
+        const auto user_id = store.create_user("alice", "hash", "group_viewer");
+        store.set_user_groups(user_id, {group_a});
+
+        const auto a1 = add_alert(store, "mine", 100);
+        const auto a2 = add_alert(store, "mine", 200, 250);    // acknowledged
+        const auto a3 = add_alert(store, "mine", 300, 0, 350); // archived
+        const auto b1 = add_alert(store, "theirs", 400);
+        const auto a4 = add_alert(store, "mine", 500);
+
+        WHEN("the user's visible, non-archived alerts are queried")
+        {
+            AlertQuery query;
+            query.visible_to_user_id = user_id;
+            const auto rows = store.query_alerts(query);
+
+            THEN("only alerts of the user's groups come back, newest first, with the agent runbook")
+            {
+                REQUIRE(rows.size() == 3);
+                REQUIRE(rows[0].alert_id == a4);
+                REQUIRE(rows[1].alert_id == a2);
+                REQUIRE(rows[2].alert_id == a1);
+                REQUIRE(rows[0].runbook_markdown == "# mine runbook");
+            }
+        }
+
+        WHEN("archived alerts are included")
+        {
+            AlertQuery query;
+            query.visible_to_user_id = user_id;
+            query.include_deleted = true;
+
+            THEN("the archived alert is returned too")
+            {
+                REQUIRE(store.query_alerts(query).size() == 4);
+            }
+        }
+
+        WHEN("only unacknowledged alerts are requested for everyone")
+        {
+            AlertQuery query;
+            query.unacknowledged_only = true;
+            const auto rows = store.query_alerts(query);
+
+            THEN("acknowledged and archived alerts are left out")
+            {
+                REQUIRE(rows.size() == 3);
+                for (const auto& row : rows)
+                    REQUIRE(row.acknowledged_at == 0);
+            }
+        }
+
+        WHEN("a page is requested")
+        {
+            AlertQuery query;
+            query.limit = 2;
+            query.offset = 1;
+            const auto rows = store.query_alerts(query);
+
+            THEN("limit and offset apply after ordering")
+            {
+                REQUIRE(rows.size() == 2);
+                REQUIRE(rows[0].alert_id == b1);
+                REQUIRE(rows[1].alert_id == a2);
+            }
+        }
+
+        WHEN("specific ids are requested")
+        {
+            AlertQuery query;
+            query.visible_to_user_id = user_id;
+            query.alert_ids = {a1, b1, 99999};
+            const auto rows = store.query_alerts(query);
+
+            THEN("unknown ids and ids outside the user's groups are not returned")
+            {
+                REQUIRE(rows.size() == 1);
+                REQUIRE(rows[0].alert_id == a1);
+            }
+        }
+
+        THEN("get_alert returns one alert, including archived ones, or nothing")
+        {
+            REQUIRE(store.get_alert(a3).has_value());
+            REQUIRE(store.get_alert(a3)->deleted_at == 350);
+            REQUIRE_FALSE(store.get_alert(99999).has_value());
+        }
+    }
+}
+
+// ── Review follow-ups ─────────────────────────────────────────────────────────
+
+SCENARIO("A duplicate username raises UniqueViolation")
+{
+    GIVEN("a store with a user")
+    {
+        SqliteStore store(":memory:");
+        store.create_user("alice", "hash", "group_viewer");
+
+        THEN("creating the same name again throws the typed uniqueness error")
+        {
+            REQUIRE_THROWS_AS(store.create_user("alice", "hash", "group_viewer"), UniqueViolation);
+        }
+
+        THEN("create_group is idempotent by name and returns the existing id")
+        {
+            const auto first = store.create_group("ops");
+            REQUIRE(store.create_group("ops") == first);
+        }
+    }
+}
+
+SCENARIO("Deleting an agent never leaves its id in a view with an undecodable config")
+{
+    GIVEN("a file store with a view whose stored config is corrupt and mentions the agent")
+    {
+        const auto path = unique_store_path("corrupt-view.db").string();
+        SqliteStore store(path);
+        store.upsert_agent(make_agent("gone"));
+        ViewRecord view;
+        view.name = "v";
+        view.owner_user_id = 1;
+        view.created_at = 1;
+        view.agent_ids = {"gone"};
+        const auto view_id = store.create_view(view);
+        {
+            sqlite3* raw = nullptr;
+            REQUIRE(sqlite3_open(path.c_str(), &raw) == SQLITE_OK);
+            const auto sql =
+                "UPDATE views SET config_json='{\"agent_ids\":[\"gone\"' WHERE view_id=" + std::to_string(view_id) +
+                ";";
+            REQUIRE(sqlite3_exec(raw, sql.c_str(), nullptr, nullptr, nullptr) == SQLITE_OK);
+            sqlite3_close(raw);
+        }
+
+        WHEN("the agent is deleted")
+        {
+            THEN("the delete fails and rolls back, so the agent still exists")
+            {
+                REQUIRE_THROWS(store.delete_agent("gone"));
+                REQUIRE(store.get_agent("gone").has_value());
+            }
+        }
+    }
+
+    GIVEN("a corrupt view that does not mention the agent")
+    {
+        const auto path = unique_store_path("corrupt-view-other.db").string();
+        SqliteStore store(path);
+        store.upsert_agent(make_agent("gone"));
+        ViewRecord view;
+        view.name = "v";
+        view.owner_user_id = 1;
+        view.created_at = 1;
+        const auto view_id = store.create_view(view);
+        {
+            sqlite3* raw = nullptr;
+            REQUIRE(sqlite3_open(path.c_str(), &raw) == SQLITE_OK);
+            const auto sql = "UPDATE views SET config_json='not json' WHERE view_id=" + std::to_string(view_id) + ";";
+            REQUIRE(sqlite3_exec(raw, sql.c_str(), nullptr, nullptr, nullptr) == SQLITE_OK);
+            sqlite3_close(raw);
+        }
+
+        THEN("the agent is deleted normally")
+        {
+            store.delete_agent("gone");
+            REQUIRE_FALSE(store.get_agent("gone").has_value());
+        }
+    }
+
+    GIVEN("a view whose config keeps other keys next to agent_ids")
+    {
+        SqliteStore store(":memory:");
+        store.upsert_agent(make_agent("gone"));
+        ViewRecord view;
+        view.name = "v";
+        view.owner_user_id = 1;
+        view.group_id = 0;
+        view.created_at = 1;
+        view.agent_ids = {"gone", "stays"};
+        const auto view_id = store.create_view(view);
+
+        WHEN("the agent is deleted")
+        {
+            store.delete_agent("gone");
+
+            THEN("only that id is removed")
+            {
+                REQUIRE(store.get_view(view_id)->agent_ids == std::vector<std::string>{"stays"});
+            }
+        }
+    }
+}
+
+SCENARIO("A read error while scanning views rolls the agent delete back")
+{
+    GIVEN("a file store whose views relation fails when it is read")
+    {
+        const auto path = unique_store_path("failing-views.db").string();
+        // One store stays open for the whole scenario, so its schema set-up never
+        // runs against the replaced relation (a later migration that alters or
+        // indexes views would otherwise break this fixture).
+        SqliteStore store(path);
+        store.upsert_agent(make_agent("gone"));
+        SilenceRecord silence;
+        silence.agent_id = "gone";
+        silence.indicator = "*";
+        silence.until_ms = 9'000'000'000'000;
+        silence.created_at = 1;
+        store.create_silence(silence);
+
+        // Through a second connection (the store holds no transaction here),
+        // replace the views table by a SQL view whose config_json raises
+        // "integer overflow" (SQLITE_ERROR) when a row is stepped. Unlike a
+        // corrupt page, this error does not make SQLite roll the transaction
+        // back by itself, so only the store's own error handling can.
+        sqlite3* raw = nullptr;
+        REQUIRE(sqlite3_open(path.c_str(), &raw) == SQLITE_OK);
+        REQUIRE(
+            sqlite3_exec(raw,
+                         "DROP TABLE views;"
+                         "CREATE VIEW views AS SELECT 1 AS view_id, 'v' AS name, 1 AS owner_user_id, 0 AS is_public,"
+                         " 0 AS group_id, abs(-9223372036854775807-1) AS config_json, 1 AS created_at;",
+                         nullptr, nullptr, nullptr) == SQLITE_OK);
+        sqlite3_close(raw);
+
+        WHEN("the agent is deleted")
+        {
+            THEN("the delete fails instead of committing with the id left in the views")
+            {
+                REQUIRE_THROWS(store.delete_agent("gone"));
+            }
+
+            AND_THEN("nothing was deleted: the agent and its silence are still there")
+            {
+                try
+                {
+                    store.delete_agent("gone");
+                }
+                catch (const std::exception&)
+                {
+                }
+                REQUIRE(store.get_agent("gone").has_value());
+                REQUIRE(store.list_silences().size() == 1);
+            }
         }
     }
 }

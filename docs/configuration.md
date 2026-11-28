@@ -11,8 +11,80 @@ Default paths:
 
 ```text
 Windows: C:\ProgramData\TheWatcher\TheWatcherServer.conf
-Linux/BSD: /etc/thewatcher/TheWatcherServer.conf
+Linux: /etc/thewatcher/TheWatcherServer.conf
+FreeBSD/OpenBSD/NetBSD/DragonFly: /usr/local/etc/thewatcher/TheWatcherServer.conf
 ```
+
+On Windows the common application data folder comes from the system; if it
+cannot be determined the server stops with an error asking for `--config`
+instead of guessing a folder that other users might be able to write to.
+
+### Config directory permissions
+
+The config file holds the CURVE secret key and the database path, so the server
+checks the directory that contains it, for the default path and for `--config`,
+before it reads or writes anything. If the directory does not exist it is
+created private (Windows: a protected ACL for SYSTEM, Administrators and the
+owner; POSIX: mode `0700`). An existing directory is only checked, never
+changed. The server refuses to start (exit code 1) when:
+
+- Windows: the owner is not SYSTEM, Administrators or the user running the
+  server, or any other account (Users, Authenticated Users, Everyone, ...) is
+  allowed to add files, write, delete or change permissions.
+- POSIX: the owner is not root or the user running the server, or the group or
+  other users can write to it.
+
+Every existing directory above it, up to the filesystem root, is checked too,
+because whoever can rename or replace an ancestor can swap the checked
+directory for their own between the check and the open. The server also
+refuses (naming the ancestor) when:
+
+- Windows: an ancestor's owner is not SYSTEM, Administrators, TrustedInstaller
+  or the user running the server, or any other account is allowed `DELETE`,
+  `FILE_DELETE_CHILD`, `WRITE_DAC`, `WRITE_OWNER` or `GENERIC_ALL` on it.
+  Entries that only apply to children (inherit-only) are ignored, and so is
+  the right to add files and subfolders that Users have on `C:\` and
+  `C:\ProgramData`, which cannot replace an existing directory.
+- POSIX: an ancestor is not owned by root or the user running the server, or
+  it is group or other writable without the sticky bit (like OpenSSH
+  `StrictModes`). A sticky directory such as `/tmp` is accepted.
+
+A config path that goes through a symbolic link (POSIX) or a junction (Windows)
+is judged where the link lives, not only where it leads: the path is walked as
+given, one component at a time (`..` is the parent of the directory reached so
+far). The directory that holds each link, and every directory above it, must
+pass the ancestor rules, and the link itself must not be replaceable by other
+users: on POSIX a link in a sticky directory must be owned by root or the
+user running the server; on Windows the link's own owner and ACL are judged
+like an ancestor's (read without following it). Links to links are followed.
+The error names the link. For example `--config /tmp/link/TheWatcherServer.conf`
+is refused when `/tmp/link` belongs to another user, even if its target is
+clean.
+Nothing is created until the deepest existing level of the path has passed
+these checks, so a link planted by another user cannot make the server create
+directories inside its target before refusing. A level is created without
+following links, and only a directory the server just created has its mode set
+(POSIX: through a descriptor opened with `O_NOFOLLOW`); a link that appears at a
+level being created is refused.
+
+On Windows the check fails closed: an allow entry of a kind it cannot read
+(for example an object-specific allow entry) makes the directory unsafe, and
+deny entries are skipped because they can only remove access. `/etc`,
+`/usr/local/etc` and `C:\ProgramData` pass as ancestors on a stock install.
+`--uninstall-service` is handled before any of this, so it works with a loose
+or missing config directory.
+
+The error names the directory and the reason. To fix it, run the installer
+(it sets the right ACL), or on Windows run
+`icacls "<dir>" /inheritance:r /grant:r *S-1-5-32-544:(OI)(CI)F *S-1-5-18:(OI)(CI)F`,
+or on POSIX `chmod 700 <dir>`, or pass `--config` with a path in a private
+directory (a home directory is fine). A server started by hand against a
+directory with loose permissions, which worked before, now stops until it is
+fixed.
+
+On the BSDs an existing `/etc/thewatcher/TheWatcherServer.conf` is still used
+when no file exists under `/usr/local/etc/thewatcher/`, so upgrades keep their
+settings.
 
 The server uses `--config <path>` when provided. Otherwise it uses the platform
 default path. If the file does not exist, the server creates it and generates a
@@ -41,11 +113,11 @@ Options:
 | `BIND_ADDRESS` | `tcp://*:5555` | ZeroMQ ROUTER endpoint for approved agents. Agents connect to this endpoint and submit metrics, heartbeats, command ACKs, and config requests. |
 | `ENROLLMENT_ADDRESS` | `tcp://*:5556` | ZeroMQ REP endpoint for plaintext enrollment requests. |
 | `API_HOST` | `0.0.0.0` | HTTP REST API bind host. |
-| `API_PORT` | `8080` | HTTP REST API port consumed by the dashboard. |
+| `API_PORT` | `8080` | HTTP REST API port consumed by the dashboard. Must be a number from 1 to 65535. |
 | `DB_PATH` | `thewatcher.db` | SQLite database path when `DB_TYPE` is `sqlite`. Relative paths resolve beside the active server config file so server restarts from different working directories keep using the same database. |
-| `DB_TYPE` | `sqlite` | Storage backend: `sqlite` or `postgres`. `postgres` needs a server binary built with PostgreSQL support (see [Build Environment](build-environment.md)); a binary built without it stops at startup with `Unsupported db_type: postgres`. Any other value stops the server the same way. |
+| `DB_TYPE` | `sqlite` | Storage backend: `sqlite` or `postgres`. `postgres` needs a server binary built with PostgreSQL support (see [Build Environment](build-environment.md)); a binary built without it stops at startup with `Unsupported db_type: postgres`. Any other value is a config error at startup (`must be 'sqlite' or 'postgres'`), and `postgres` with an empty `POSTGRES_DSN` is too. |
 | `POSTGRES_DSN` | empty | libpq connection string used when `DB_TYPE` is `postgres`, for example `host=db.example.com port=5432 dbname=thewatcher user=thewatcher password=... sslmode=require`. It usually holds a password, so keep the config file owner-only like `SERVER_SECRET_KEY`. Known issue: at debug log level the server currently writes the raw DSN, password included, to `TheWatcherServer.log` (`make_store`); do not enable debug logging against a production database, and restrict the log file like the config until this is fixed. Ignored when `DB_TYPE` is `sqlite`. |
-| `OFFLINE_AFTER_SECONDS` | `60` | Approved connected agents are marked disconnected when `last_seen` is older than this number of seconds. Set `0` or a negative value to disable automatic offline marking. |
+| `OFFLINE_AFTER_SECONDS` | `60` | Approved connected agents are marked disconnected when `last_seen` is older than this number of seconds. Must be a number from 0 to 604800. `0` disables automatic offline marking (a warning is logged at startup); negative values are rejected. |
 | `SERVER_PUBLIC_KEY` | generated | Server CURVE public key. Approved enrollment responses include this key and its fingerprint so agents can learn and pin it. |
 | `SERVER_SECRET_KEY` | generated | Server CURVE secret key. Keep this private. |
 | `ENROLLMENT_TOKEN` | empty | Optional pre-shared token. When set, every enrollment request must carry a matching token (`ENROLLMENT_TOKEN` in the agent config), so arbitrary hosts cannot create pending-agent records. Leave empty for tokenless first-run enrollment. |
@@ -53,6 +125,23 @@ Options:
 
 If `server_public_key` is empty, the server does not enable CURVE on the data
 socket. The default generated config enables CURVE.
+
+`SERVER_PUBLIC_KEY` and `SERVER_SECRET_KEY` must be set together, each a
+40-character z85 key, and the public key must belong to the secret key; a
+half-set or mismatched pair fails startup instead of silently running without
+encryption.
+
+### Validation
+
+The config is checked when it loads. A bad value stops startup with an error
+that names the key and the line, for example `API_PORT: not a number (line 4)`
+or `API_PORT: must be between 1 and 65535 (line 4)`. Cross-key problems name
+the keys involved (`POSTGRES_DSN: required when DB_TYPE=postgres`).
+
+A key the server does not know (usually a typo such as `OFFLNE_AFTER_SECONDS`)
+is ignored with a warning in the log that names the key and line. It does not
+stop startup, so a config written for a newer release still loads after a
+downgrade; check the log after editing the file.
 
 When the server writes its config (first run, or after a change), it writes to
 a uniquely named temporary file in the same directory that is created

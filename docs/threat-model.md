@@ -123,7 +123,45 @@ working document for audit, design review, and regression testing.
 - Approval and revocation are enforced per frame: rejected or deleted agents
   stop contributing data on their live session without waiting for a
   reconnect.
-- Config parser file and line sizes are bounded to avoid unbounded local input.
+- The server refuses to start when the directory holding its config (CURVE
+  secret key, database path) can be changed by other local users, and creates a
+  missing one private (SYSTEM, Administrators and owner on Windows, `0700` on
+  POSIX). Without this, a standard user could pre-create
+  `C:\ProgramData\TheWatcher` and plant or swap `TheWatcherServer.conf`. The
+  directory is checked, not repaired. Every existing ancestor up to the root is
+  checked as well (owner trusted; no group/other write without the sticky bit on
+  POSIX; no delete, delete-child, change-permissions, take-ownership or
+  generic-all right for other accounts on Windows), so a user who can write to
+  `/shared` cannot rename the checked directory away after the check. On
+  Windows an ACL entry the check cannot interpret (object-specific allow) is
+  treated as unsafe rather than skipped. A config path through a symlink or junction is walked
+  component by component and each link is judged where it lives (its
+  directory, the link's own owner or ACL), so another user cannot retarget a
+  link on the path after the check, and missing levels are created only after the
+  deepest existing level passed, so a planted link cannot be used to create
+  directories in its target; a level is created without following links and only
+  a directory just created is chmodded, so a link that appears in the race
+  window cannot redirect the mode change. `--uninstall-service` runs before the
+  check. Residual risk: the agent config under its
+  own data directory is not checked yet.
+- Config parser file and line sizes are bounded to avoid unbounded local input,
+  and values are range-checked at load (ports, offline interval, database type,
+  CURVE keypair), so a typo cannot silently disable offline detection or
+  encryption. Unknown keys only warn, so a config from a newer release still
+  loads after a downgrade; the residual risk is a typo in an optional key being
+  noticed only in the log.
+- REST API inputs are bounded by one set of limits (`server/api_validation.hpp`,
+  listed in [api.md](api.md)): string lengths, list sizes, numeric ranges and
+  timestamps, so oversized records cannot bloat the database or the dashboard
+  poll. Ids are parsed strictly (400 for malformed, 404 for unknown; a group user gets
+  403 for an agent outside their groups, including one that does not exist, so
+  they cannot tell the two apart) and errors
+  never carry exception text. Alert lists are filtered, scoped to the caller's
+  groups and paged inside the database, so one request cannot load the whole
+  alerts table.
+- Deleting an agent also deletes its silences, maintenance windows, runbooks and
+  view references in one transaction, so a re-enrolled agent with the same id
+  cannot inherit a silence that suppresses its alerts.
 - The API still needs a global request-body size limit in httplib or a fronting
   reverse proxy; this is a residual risk.
 - Metrics and alert retention settings should be configured to limit database

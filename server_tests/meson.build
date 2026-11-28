@@ -120,6 +120,14 @@ api_server_test = executable(
 )
 test('api_server', api_server_test, is_parallel: false)
 
+api_validation_test = executable(
+  'api_validation_test',
+  ['api_validation_test.cpp'],
+  include_directories: root_inc,
+  dependencies: [server_dep, common_dep, catch2_dep, http_dep, cppzmq_dep, sqlite_dep, platform_deps],
+)
+test('api_validation', api_validation_test, is_parallel: false)
+
 store_user_guard_test = executable(
   'store_user_guard_test',
   ['store_user_guard_test.cpp'],
@@ -150,3 +158,24 @@ if libpq_dep.found()
     env: ['THEWATCHER_POSTGRES_TEST_DSN=host=localhost dbname=thewatcher_test user=thewatcher_test password=thewatcher_test'],
   )
 endif
+
+server_uninstall_order_test = executable(
+  'server_uninstall_order_test',
+  ['server_uninstall_order_test.cpp'],
+  include_directories: root_inc,
+  dependencies: [catch2_dep, platform_deps],
+)
+test(
+  'server_uninstall_order',
+  server_uninstall_order_test,
+  env: {'THEWATCHER_SERVER_EXE': server_exe.full_path()},
+  depends: server_exe,
+)
+
+view_config_test = executable(
+  'view_config_test',
+  ['view_config_test.cpp'],
+  include_directories: root_inc,
+  dependencies: [catch2_dep, json_dep, platform_deps],
+)
+test('view_config', view_config_test)

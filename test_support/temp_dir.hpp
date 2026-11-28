@@ -29,10 +29,17 @@ class ScopedTempDir
 {
 public:
     // `prefix` becomes the leading part of the directory name; the rest is random.
-    explicit ScopedTempDir(const std::string& prefix = "thewatcher-test")
+    // `base_dir` is where the directory is made; empty means ".tmp/" under the
+    // current working directory. Only a test that needs every ancestor of the
+    // scratch path to pass ensure_private_directory passes another base
+    // (private_directory_test: %ProgramData% on Windows, the system temp
+    // directory elsewhere), because the build tree may sit under a directory
+    // that other users can write to.
+    explicit ScopedTempDir(const std::string& prefix = "thewatcher-test",
+                           const std::filesystem::path& base_dir = std::filesystem::path())
     {
         namespace fs = std::filesystem;
-        const fs::path base = fs::current_path() / ".tmp";
+        const fs::path base = base_dir.empty() ? fs::current_path() / ".tmp" : base_dir;
         fs::create_directories(base);
 #ifdef _WIN32
         // No mkdtemp: pick a random 64-bit suffix and let create_directory

@@ -60,11 +60,24 @@ npm.cmd test
   directories and `*.test.ts(x)` files are excluded from duplication
   detection only (BDD scenarios repeat setup deliberately); keep shared
   setup in helpers when it carries logic.
+- Release builds on Ubuntu turn on glibc's `_FORTIFY_SOURCE`, which marks
+  functions such as `system()` and `write()` `warn_unused_result`; with
+  `werror=true` an ignored result fails the build. Debug builds do not, so
+  use the result (assert on it, or attach it with Catch2's `UNSCOPED_INFO`)
+  and check warnings with a `--buildtype=release` build before pushing.
 - Keep top-level C++ namespace as `thewatcher`.
 - Prefer structured types in `common/metrics.hpp`, `common/protocol.hpp`, and
   `common/commands.hpp` over ad hoc strings.
 - Use BDD-style tests with `GIVEN`, `WHEN`, and `THEN`.
 - Add tests before behavior changes.
+- Make test scratch directories with `ScopedTempDir`
+  (`test_support/temp_dir.hpp`). It creates a randomly named, owner-only
+  directory under `.tmp/` in the build directory and removes it afterwards.
+  Do not use the system temp directory: it is publicly writable, and
+  SonarCloud flags it (rule S5443). The one exception is
+  `private_directory_test`, which needs every ancestor of its scratch path
+  to pass the private-directory check, so it uses `%ProgramData%` on Windows
+  and the system temp directory elsewhere.
 - Update docs for every behavior or workflow change.
 - For security-sensitive changes, update [Threat Model](threat-model.md) with
   the affected asset, trust boundary, mitigation, and residual risk.

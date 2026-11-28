@@ -9,6 +9,68 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Security
 
+- Every route that parses a JSON body now answers `415` for a non-JSON
+  `Content-Type` (acknowledge and bulk acknowledge did not). Integer fields
+  (`interval_seconds`, `limit`, collector intervals, settings, `until_ms`,
+  `start_ms`, `end_ms`) reject `2.5`, strings and booleans with 400 instead of
+  truncating them, so `until_ms: 0.5` can no longer start indefinite
+  maintenance. Command `args` must be an array of at most 4096 integers from 0
+  to 255, checked before conversion.
+- Deleting an agent reads view agent lists as decoded strings: an escaped id is
+  found, `node-ab` no longer blocks `node-a`, a malformed list that contains the
+  id aborts the delete, and text that is not JSON is refused when it mentions
+  the id or could hide it behind an escape. The agent's ZAP key is removed only
+  after the delete commits.
+- A login whose session cannot be stored is a logged generic 500, not a 400
+  carrying the database error.
+- Creating a missing config-directory level no longer follows a link: it is
+  opened with `O_NOFOLLOW` and only a directory the server just created is
+  chmodded (a link or non-directory at that level is refused; on Windows a
+  junction is refused). Before, `chmod` followed a link that appeared after the
+  existence check.
+- `command_type` of `POST /api/agents/:id/command` must be an integer from 0 to
+  255; before, 262 wrapped to a valid type and 6.5 was accepted as 6.
+- The config-directory check now runs on the deepest existing level before
+  any missing level is created, so a symlink planted by another user (for
+  example `/tmp/link/new/...`) no longer makes the server create directories
+  inside the link target before refusing.
+- A config path that goes through a symbolic link or junction is now judged
+  where the link lives: the path is walked as given, and each link needs a
+  directory that passes the ancestor check and its own owner/ACL (POSIX: a
+  link in a sticky directory must be owned by root or the current user;
+  Windows: the link's owner and DACL are read without following it). Before,
+  only the resolved target chain was checked, so another user who owned
+  `/tmp/link` could retarget it after the check.
+- Command routes (`/command`, `/set_interval`, `/set_process_limit`) validate
+  the body before checking whether the agent is online, so an invalid body is
+  `400` for an offline agent instead of `409`.
+- The config-directory check now covers every existing ancestor up to the
+  filesystem root, not only the directory itself: another user who can write
+  to an ancestor (for example `/shared` for `/shared/thewatcher/...`) could
+  rename or replace the checked directory between the check and the open.
+  POSIX: an ancestor must be owned by root or the current user and must not be
+  group/other writable unless it has the sticky bit (like `/tmp`). Windows: the
+  owner must be SYSTEM, Administrators, TrustedInstaller or the current user,
+  and no other account may hold `DELETE`, `FILE_DELETE_CHILD`, `WRITE_DAC`,
+  `WRITE_OWNER` or `GENERIC_ALL` on it (inherit-only entries and the add-file
+  right Users have on `C:\ProgramData` are ignored). Default locations still
+  pass.
+- The Windows ACL check no longer skips entries it cannot read: an
+  object-specific allow entry (or any type other than allow/deny) now makes the
+  directory unsafe, and the error names the entry type. Deny entries are
+  skipped.
+- `--uninstall-service` is handled before the config directory is validated, so
+  a machine with a loose or missing config directory can still remove the
+  service. `--install-service` and a normal start keep the check.
+- **Behaviour change:** the server refuses to start when the directory that
+  holds its config can be changed by other local users (Windows: an owner other
+  than SYSTEM, Administrators or the current user, or a write-type allow entry
+  for any other account such as Users; POSIX: not owned by root or the current
+  user, or group/other writable). A missing directory is created private. Before,
+  a standard user could pre-create `C:\ProgramData\TheWatcher` and plant a
+  `TheWatcherServer.conf` the server then trusted. Hand-made installs with loose
+  permissions must fix them (the installer already does) or pass `--config` with
+  a private path; see `docs/configuration.md` (#58).
 - The agent no longer trusts the server key in an enrollment reply: it must
   be 40 Z85 characters decoding to a 32-byte key, and the config writer
   refuses any value containing CR or LF. Before, a crafted key could inject
@@ -53,6 +115,67 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 
+- A query `limit` larger than the route maximum now clamps however large it is
+  (`limit=2147483648` was 400); zero and malformed values stay 400.
+- `POST /api/groups` decides its `409` with one atomic insert instead of a list
+  followed by an insert, in both stores (`Store::create_group_if_absent`).
+- `PUT /api/views/:id` checks agent existence only for agents it adds and
+  validates only the fields it supplies, so a stale or legacy view can be
+  renamed or re-saved. Collector `group_ids` are checked only for callers whose
+  `group_ids` are applied (global roles).
+- A repeated config key is validated only at its last occurrence, and an error
+  names that line. On the BSDs the legacy `/etc/thewatcher` config is used only
+  once the preferred file is known to be absent; an unreadable preferred path
+  is reported.
+- The dashboard reads every page of `/api/alerts` and `/api/alerts/unacknowledged`
+  (`limit`/`offset` until a short page), so more than 1000 alerts are all shown.
+- The store delete cascade and view rewrite check their SQLite bind results.
+- REST API errors are consistent: a malformed numeric id in a path or
+  query (`/api/alerts/abc/ack`, `?limit=x`) is a 400 and an unknown id (alert,
+  agent, user, window, silence, runbook, view, or an agent or group named in a
+  body) is a 404, where before they were an empty 500, a 400 carrying exception
+  text, or a silent success. A duplicate user or group name is a 409. Every
+  error is `{"error": "<message>"}` and a server fault is a generic
+  `internal error` (#67).
+- Input limits are now one shared set (`server/api_validation.hpp`) applied on
+  every endpoint: maintenance, silence and window reasons, silence agent and
+  indicator, timestamps, collection interval, readings, list sizes, view name
+  and agents, runbook url and notes, settings webhook URL (#69).
+- Approving an agent with an invalid body no longer leaves it approved without
+  groups; the body is validated first (#67).
+- `/api/alerts` and `/api/alerts/unacknowledged` filter by the caller's groups
+  and page (`limit`, `offset`, default and maximum 1000) in one SQL query,
+  and ack, archive and the bulk routes look alerts up by id instead of loading
+  the whole table. One undecodable metrics row is skipped and logged instead
+  of failing `/api/metrics` (#68).
+- Deleting an agent also deletes its silences, maintenance windows and
+  agent runbooks and removes its id from views, in one transaction, so an
+  agent that re-enrolls with the same id starts clean (#146).
+- `GET /api/settings` no longer fails with a 500 when a stored numeric setting
+  is corrupt, and `/api/uptime` no longer divides by zero for an agent with a
+  stored interval of 0 (#67).
+- Error statuses now separate the client's mistakes from server faults:
+  validation errors stay 400, a database failure in a mutation handler is a
+  logged generic 500 instead of a 400 carrying the SQL error, and a duplicate
+  username that loses a race is 409 (the store raises a typed
+  `UniqueViolation`) (#67).
+- Views reject an `agent_ids` that is not an array and answer 404 for an
+  agent or group that does not exist, `bulk-ack` rejects a non-string `note`,
+  and approve rejects a body that is not a JSON object (#67, #69).
+- Deleting an agent no longer silently skips a view whose stored config is
+  malformed: a config that mentions the agent fails the delete and rolls it
+  back (#146).
+- The SQLite store checks the result of the view scan, alert query and
+  single-alert lookup: an error is raised instead of being read as "no more
+  rows", so a failed scan during agent delete rolls the delete back (#146).
+- On Windows the default server config path is no longer guessed from the
+  `ProgramData` environment variable or a fixed `C:\ProgramData` when the
+  shell call fails; the server stops and asks for `--config` (#58).
+- Server config values are validated at load with errors that name the key
+  and line (`API_PORT: not a number (line 3)`): port range, offline interval
+  range, `DB_TYPE`, a Postgres DSN, and a complete, matching CURVE keypair.
+  Unknown keys log a warning. The Windows default path no longer reads an
+  uninitialised buffer if the shell call fails (#58).
 - All alerts now go through one pipeline that applies maintenance, silences,
   severity validation, de-duplication, the runbook link and the webhook.
   Log-match alerts no longer fire during maintenance, offline and log-match
@@ -200,6 +323,16 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Changed
 
+- **Behaviour change:** `/api/alerts` returns at most 1000 alerts per request
+  (newest first); use `limit` and `offset` to page. `limit` values above a
+  route's maximum are clamped and non-numeric or non-positive values are
+  rejected with 400 (#68, #67).
+- **Behaviour change:** a negative `OFFLINE_AFTER_SECONDS` and a half-set or
+  mismatched `SERVER_PUBLIC_KEY`/`SERVER_SECRET_KEY` now stop startup. `0`
+  still disables offline detection, with a warning (#58).
+- The default server config path on FreeBSD, OpenBSD, NetBSD and DragonFly is
+  `/usr/local/etc/thewatcher/TheWatcherServer.conf`; an existing
+  `/etc/thewatcher` config is still used when the new file is absent (#58).
 - Documentation: PostgreSQL is documented as an implemented backend selected
   with `DB_TYPE=postgres` / `POSTGRES_DSN` (build-time support required), the
   HA guide uses the real `TheWatcherServer.conf` KEY=VALUE format with its
@@ -243,6 +376,10 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   Silences, Maintenance and Settings pages, the fixed maintenance reason and
   the first-group approval, and that the server does not serve the bundle
   (#135).
+- Tests: `server_uninstall_order_test` keeps its scratch tree in the build
+  directory instead of the system temp directory. Only
+  `private_directory_test` still needs another base, because every ancestor
+  of its scratch path must pass the private-directory check.
 
 ### Added
 
@@ -252,6 +389,12 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   and `npm audit --omit=dev` (#120).
 - Dashboard: the footer shows the dashboard version from `package.json`
   (#127).
+
+- `docs/api.md`: a reference for every REST route (role, request and response
+  shapes, error codes, limits, paging). The README index now lists it, the
+  threat model and the HA topology guide (#134).
+- Store methods `query_alerts` (filter, group visibility, paging) and
+  `get_alert` for SQLite and PostgreSQL (#68).
 
 ## [0.8.0] - 2026-11-02
 

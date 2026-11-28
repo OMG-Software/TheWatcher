@@ -33,6 +33,7 @@ public:
 
     std::vector<GroupRecord> list_groups() override;
     int64_t create_group(const std::string& name) override;
+    std::optional<int64_t> create_group_if_absent(const std::string& name) override;
     std::vector<int64_t> get_agent_groups(const std::string& agent_id) override;
     void set_agent_groups(const std::string& agent_id, const std::vector<int64_t>& group_ids) override;
     std::optional<UserRecord> get_user_by_username(const std::string& username) override;
@@ -73,6 +74,8 @@ public:
     int64_t insert_alert(const AlertRecord& alert) override;
     std::vector<AlertRecord> list_alerts(bool include_deleted) override;
     std::vector<AlertRecord> list_unacknowledged_alerts() override;
+    std::vector<AlertRecord> query_alerts(const AlertQuery& query) override;
+    std::optional<AlertRecord> get_alert(int64_t alert_id) override;
     void acknowledge_alert(int64_t alert_id, const std::string& username, int64_t acknowledged_at,
                            const std::string& note = "") override;
     void bulk_acknowledge_alerts(const std::vector<int64_t>& alert_ids, const std::string& username,

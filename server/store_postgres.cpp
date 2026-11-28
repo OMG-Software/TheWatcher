@@ -3,11 +3,15 @@
 #include "store_postgres.hpp"
 
 #include "common/SingleLog.hpp"
+#include "view_config.hpp"
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <stdexcept>
 #include <string>
+#include <string_view>
+#include <utility>
 
 #include <sodium.h>
 
@@ -47,7 +51,12 @@ namespace
             // Do NOT call PQclear here — the caller wraps res in a Res RAII
             // guard whose destructor will free it during stack unwinding.
             // Calling PQclear here would cause a double-free.
-            throw std::runtime_error(std::string(ctx) + ": " + PQresultErrorMessage(res));
+            const auto message = std::string(ctx) + ": " + PQresultErrorMessage(res);
+            // SQLSTATE 23505 is unique_violation.
+            const char* sqlstate = PQresultErrorField(res, PG_DIAG_SQLSTATE);
+            if (sqlstate != nullptr && std::string_view(sqlstate) == "23505")
+                throw UniqueViolation(message);
+            throw std::runtime_error(message);
         }
     }
 
@@ -212,20 +221,20 @@ namespace
     AlertRecord row_to_alert(PGresult* r, int row)
     {
         return {
-            col_int64(r, row, 0),  // alert_id
-            col(r, row, 1),        // agent_id
-            col(r, row, 2),        // indicator
-            col(r, row, 3),        // old_status
-            col(r, row, 4),        // new_status
-            col(r, row, 5),        // message
-            col_int64(r, row, 6),  // created_at
-            col(r, row, 7),        // acknowledged_by
-            col_int64(r, row, 8),  // acknowledged_at
-            col_int64(r, row, 9),  // deleted_at
-            col(r, row, 10),       // note
-            col_int64(r, row, 11), // escalated_at
-            col(r, row, 12),       // runbook_url
-            {},                    // runbook_markdown
+            col_int64(r, row, 0),                                // alert_id
+            col(r, row, 1),                                      // agent_id
+            col(r, row, 2),                                      // indicator
+            col(r, row, 3),                                      // old_status
+            col(r, row, 4),                                      // new_status
+            col(r, row, 5),                                      // message
+            col_int64(r, row, 6),                                // created_at
+            col(r, row, 7),                                      // acknowledged_by
+            col_int64(r, row, 8),                                // acknowledged_at
+            col_int64(r, row, 9),                                // deleted_at
+            col(r, row, 10),                                     // note
+            col_int64(r, row, 11),                               // escalated_at
+            col(r, row, 12),                                     // runbook_url
+            PQnfields(r) > 13 ? col(r, row, 13) : std::string{}, // runbook_markdown (joined from agents)
         };
     }
 
@@ -709,9 +718,65 @@ void PostgresStore::reject_agent(const std::string& agent_id)
 
 void PostgresStore::delete_agent(const std::string& agent_id)
 {
+    // Rolls back unless commit() ran, so a failure part-way leaves the agent
+    // and its silences, windows, runbooks and views all in place.
+    struct Transaction
+    {
+        explicit Transaction(PostgresStore& store)
+            : store_(store)
+        {
+            store_.exec("BEGIN;");
+        }
+        ~Transaction()
+        {
+            if (!committed_)
+            {
+                Res res(PQexec(store_.conn_, "ROLLBACK;"));
+            }
+        }
+        Transaction(const Transaction&) = delete;
+        Transaction& operator=(const Transaction&) = delete;
+        void commit()
+        {
+            store_.exec("COMMIT;");
+            committed_ = true;
+        }
+        PostgresStore& store_;
+        bool committed_ = false;
+    } tx(*this);
+
     const char* params[] = {agent_id.c_str()};
-    Res res(PQexecParams(conn_, "DELETE FROM agents WHERE agent_id=$1;", 1, nullptr, params, nullptr, nullptr, 0));
-    check_res(res.r, "delete_agent");
+    // silences, maintenance_windows and runbooks have no foreign key to agents.
+    for (const char* sql :
+         {"DELETE FROM silences WHERE agent_id=$1;", "DELETE FROM maintenance_windows WHERE agent_id=$1;",
+          "DELETE FROM runbooks WHERE agent_id=$1;", "DELETE FROM agents WHERE agent_id=$1;"})
+    {
+        Res res(PQexecParams(conn_, sql, 1, nullptr, params, nullptr, nullptr, 0));
+        check_res(res.r, "delete_agent");
+    }
+
+    // Views keep their agent ids inside config_json: drop the deleted id and
+    // rewrite the row. A config that cannot be decoded and mentions the id
+    // throws, which rolls the whole delete back (see remove_agent_from_view_config).
+    std::vector<std::pair<std::string, std::string>> rewritten;
+    {
+        Res res(PQexec(conn_, "SELECT view_id,config_json FROM views;"));
+        check_res(res.r, "delete_agent views");
+        for (int i = 0; i < PQntuples(res.r); ++i)
+        {
+            if (auto updated = remove_agent_from_view_config(col(res.r, i, 1), agent_id))
+                rewritten.emplace_back(col(res.r, i, 0), std::move(*updated));
+        }
+    }
+    for (const auto& [view_id, config_json] : rewritten)
+    {
+        const char* view_params[] = {config_json.c_str(), view_id.c_str()};
+        Res res(PQexecParams(conn_, "UPDATE views SET config_json=$1 WHERE view_id=$2::bigint;", 2, nullptr,
+                             view_params, nullptr, nullptr, 0));
+        check_res(res.r, "delete_agent view update");
+    }
+
+    tx.commit();
 }
 
 void PostgresStore::mark_agents_offline_before(int64_t cutoff_ms)
@@ -812,6 +877,18 @@ int64_t PostgresStore::create_group(const std::string& name)
         "INSERT INTO groups(name) VALUES($1) ON CONFLICT(name) DO UPDATE SET name=EXCLUDED.name RETURNING group_id;", 1,
         nullptr, params, nullptr, nullptr, 0));
     check_res(res.r, "create_group");
+    return col_int64(res.r, 0, 0);
+}
+
+std::optional<int64_t> PostgresStore::create_group_if_absent(const std::string& name)
+{
+    const char* params[] = {name.c_str()};
+    // DO NOTHING returns no row when the name exists, so one statement decides who inserted.
+    Res res(PQexecParams(conn_, "INSERT INTO groups(name) VALUES($1) ON CONFLICT(name) DO NOTHING RETURNING group_id;",
+                         1, nullptr, params, nullptr, nullptr, 0));
+    check_res(res.r, "create_group_if_absent");
+    if (PQntuples(res.r) == 0)
+        return std::nullopt;
     return col_int64(res.r, 0, 0);
 }
 
@@ -1239,6 +1316,73 @@ std::vector<AlertRecord> PostgresStore::list_unacknowledged_alerts()
     for (int i = 0; i < PQntuples(res.r); ++i)
         out.push_back(row_to_alert(res.r, i));
     return out;
+}
+
+namespace
+{
+    // Alert columns plus the agent's runbook, read by row_to_alert.
+    constexpr const char* ALERT_JOIN_SELECT =
+        "SELECT a.alert_id,a.agent_id,a.indicator,a.old_status,a.new_status,a.message,a.created_at,"
+        "a.acknowledged_by,a.acknowledged_at,a.deleted_at,a.note,a.escalated_at,a.runbook_url,"
+        "COALESCE(g.runbook_markdown,'') FROM alerts a LEFT JOIN agents g ON g.agent_id=a.agent_id";
+} // namespace
+
+std::vector<AlertRecord> PostgresStore::query_alerts(const AlertQuery& query)
+{
+    std::string sql = ALERT_JOIN_SELECT;
+    sql += " WHERE TRUE";
+    // Parameters are collected in order; each placeholder gets the next number.
+    std::vector<std::string> values;
+    const auto placeholder = [&values](std::string value) {
+        values.push_back(std::move(value));
+        return "$" + std::to_string(values.size());
+    };
+    if (!query.include_deleted)
+        sql += " AND a.deleted_at=0";
+    if (query.unacknowledged_only)
+        sql += " AND a.acknowledged_at=0";
+    if (query.visible_to_user_id > 0)
+        sql += " AND a.agent_id IN (SELECT ag.agent_id FROM agent_groups ag JOIN user_groups ug ON "
+               "ug.group_id=ag.group_id WHERE ug.user_id=" +
+               placeholder(s(query.visible_to_user_id)) + "::bigint)";
+    if (!query.alert_ids.empty())
+    {
+        // A PostgreSQL array literal such as {1,2,3}.
+        std::string ids = "{";
+        for (std::size_t i = 0; i < query.alert_ids.size(); ++i)
+            ids += (i ? "," : "") + std::to_string(query.alert_ids[i]);
+        ids += "}";
+        sql += " AND a.alert_id = ANY(" + placeholder(ids) + "::bigint[])";
+    }
+    sql += " ORDER BY a.created_at DESC,a.alert_id DESC";
+    if (query.limit > 0)
+        sql += " LIMIT " + placeholder(s(query.limit)) + "::bigint";
+    if (query.offset > 0)
+        sql += " OFFSET " + placeholder(s(query.offset)) + "::bigint";
+    sql += ";";
+
+    std::vector<const char*> params;
+    for (const auto& v : values)
+        params.push_back(v.c_str());
+    Res res(
+        PQexecParams(conn_, sql.c_str(), static_cast<int>(params.size()), nullptr, params.data(), nullptr, nullptr, 0));
+    check_res(res.r, "query_alerts");
+    std::vector<AlertRecord> out;
+    for (int i = 0; i < PQntuples(res.r); ++i)
+        out.push_back(row_to_alert(res.r, i));
+    return out;
+}
+
+std::optional<AlertRecord> PostgresStore::get_alert(int64_t alert_id)
+{
+    const std::string sql = std::string(ALERT_JOIN_SELECT) + " WHERE a.alert_id=$1;";
+    const auto p = s(alert_id);
+    const char* params[] = {p.c_str()};
+    Res res(PQexecParams(conn_, sql.c_str(), 1, nullptr, params, nullptr, nullptr, 0));
+    check_res(res.r, "get_alert");
+    if (PQntuples(res.r) == 0)
+        return std::nullopt;
+    return row_to_alert(res.r, 0);
 }
 
 void PostgresStore::acknowledge_alert(int64_t alert_id, const std::string& username, int64_t acknowledged_at,

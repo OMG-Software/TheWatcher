@@ -114,7 +114,7 @@ server_dep = declare_dependency(
   ],
 )
 
-executable(
+server_exe = executable(
   'TheWatcherServer',
   'main.cpp',
   dependencies: server_dep,

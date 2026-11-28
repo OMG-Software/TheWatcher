@@ -1,5 +1,6 @@
 #include "common/SingleLog.hpp"
 #include "common/crypto.hpp"
+#include "common/secure_file.hpp"
 #include "common/windows_service.hpp"
 #include "config.hpp"
 #include "server.hpp"
@@ -104,7 +105,39 @@ int main(int argc, char* argv[])
         return 0;
     }
 
-    fs::path cfg_path = config_path.empty() ? ServerConfig::default_path() : fs::path(config_path);
+    // Removing the service needs no config: handle it before the config path is
+    // resolved or its directory validated, so a machine with a loose or missing
+    // config directory can still uninstall. Logs to the console only.
+    if (uninstall_service)
+    {
+        thewatcher::logging::SingleLog::GetInstance().SetConsoleLogLevel(thewatcher::logging::LogLevel::L_INFO);
+        return thewatcher::service::uninstall_windows_service(service_name);
+    }
+
+    fs::path cfg_path;
+    try
+    {
+        cfg_path = config_path.empty() ? ServerConfig::default_path() : fs::path(config_path);
+    }
+    catch (const std::exception& e)
+    {
+        std::cerr << "Cannot choose a config path: " << e.what() << "\n";
+        return 1;
+    }
+    // The config holds the CURVE secret key and DB_PATH: refuse to start when
+    // another user could replace it (or create the directory first). A missing
+    // directory is created private. Runs before the log file is opened because
+    // the log lives in the same directory.
+    try
+    {
+        thewatcher::common::ensure_private_directory(cfg_path.has_parent_path() ? cfg_path.parent_path()
+                                                                                : fs::current_path());
+    }
+    catch (const std::exception& e)
+    {
+        std::cerr << e.what() << "\n";
+        return 1;
+    }
     auto log_path = log_path_for_config(cfg_path, "TheWatcherServer.log");
     auto& logger = thewatcher::logging::SingleLog::GetInstance();
     logger.SetConsoleLogLevel(thewatcher::logging::LogLevel::L_INFO);
@@ -133,10 +166,6 @@ int main(int argc, char* argv[])
         });
     }
 
-    if (uninstall_service)
-    {
-        return thewatcher::service::uninstall_windows_service(service_name);
-    }
     LOG_FUNCTION_TRACE
     LOG_INFO("Starting TheWatcher Server");
     LOGF_INFO("Config: %s", cfg_path.string().c_str());

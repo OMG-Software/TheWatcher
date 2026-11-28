@@ -6,11 +6,21 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
 namespace thewatcher::server
 {
+
+// Thrown when a write violates a UNIQUE or PRIMARY KEY constraint (for example
+// a second user with the same name), so the API can answer 409 instead of
+// treating it as a server fault.
+class UniqueViolation : public std::runtime_error
+{
+public:
+    using std::runtime_error::runtime_error;
+};
 
 struct AgentRecord
 {
@@ -109,6 +119,18 @@ struct AlertRecord
     std::string runbook_markdown;
 };
 
+// Filter for Store::query_alerts. Filtering, group visibility and paging are
+// done in the database so a request costs one query however many alerts exist.
+struct AlertQuery
+{
+    bool include_deleted = false;     // also return archived (soft-deleted) alerts
+    bool unacknowledged_only = false; // only alerts that nobody has acknowledged
+    int64_t visible_to_user_id = 0;   // > 0: only alerts of agents in this user's groups
+    std::vector<int64_t> alert_ids;   // non-empty: only these ids (unknown ids simply do not match)
+    int limit = 0;                    // <= 0: no limit
+    int64_t offset = 0;
+};
+
 struct MaintenanceWindowRecord
 {
     int64_t window_id = 0;
@@ -187,6 +209,10 @@ public:
     virtual std::vector<AgentRecord> list_pending_agents() = 0;
     virtual void approve_agent(const std::string& agent_id) = 0;
     virtual void reject_agent(const std::string& agent_id) = 0;
+    // Removes the agent and, in one transaction, everything keyed to its id
+    // without a foreign key: its silences, maintenance windows and agent-scoped
+    // runbooks, and its id in views. A re-enrolled agent with the same id then
+    // starts clean.
     virtual void delete_agent(const std::string& agent_id) = 0;
     virtual void mark_agents_offline_before(int64_t cutoff_ms) = 0;
     virtual void set_agent_maintenance(const std::string& agent_id, bool maintenance, const std::string& reason,
@@ -196,6 +222,11 @@ public:
 
     virtual std::vector<GroupRecord> list_groups() = 0;
     virtual int64_t create_group(const std::string& name) = 0;
+    // Inserts the group and returns its id, or returns nothing when a group with
+    // this name already exists. One atomic statement, so two concurrent creators
+    // of the same name cannot both be told they inserted it. create_group stays
+    // idempotent for bootstrap.
+    virtual std::optional<int64_t> create_group_if_absent(const std::string& name) = 0;
     virtual std::vector<int64_t> get_agent_groups(const std::string& agent_id) = 0;
     virtual void set_agent_groups(const std::string& agent_id, const std::vector<int64_t>& group_ids) = 0;
     virtual std::optional<UserRecord> get_user_by_username(const std::string& username) = 0;
@@ -235,6 +266,10 @@ public:
     virtual int64_t insert_alert(const AlertRecord& alert) = 0;
     virtual std::vector<AlertRecord> list_alerts(bool include_deleted = false) = 0;
     virtual std::vector<AlertRecord> list_unacknowledged_alerts() = 0;
+    // Newest first. runbook_markdown is filled from the alert's agent.
+    virtual std::vector<AlertRecord> query_alerts(const AlertQuery& query) = 0;
+    // Returns the alert with this id, archived or not, or nullopt.
+    virtual std::optional<AlertRecord> get_alert(int64_t alert_id) = 0;
     virtual void acknowledge_alert(int64_t alert_id, const std::string& username, int64_t acknowledged_at,
                                    const std::string& note = "") = 0;
     virtual void bulk_acknowledge_alerts(const std::vector<int64_t>& alert_ids, const std::string& username,

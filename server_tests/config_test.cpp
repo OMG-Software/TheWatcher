@@ -320,3 +320,287 @@ SCENARIO("Server config rejects oversized KEY=VALUE config input")
         }
     }
 }
+
+namespace
+{
+// Writes a config file made of the given lines and returns its path.
+std::filesystem::path write_config(const char* dir_name, const std::vector<std::string>& lines)
+{
+    auto dir = unique_temp_dir(dir_name);
+    auto path = dir / "server.conf";
+    std::ofstream f(path);
+    for (const auto& line : lines)
+        f << line << '\n';
+    return path;
+}
+
+// Returns the message of the exception thrown by loading path, or "" if none.
+std::string load_error(const std::filesystem::path& path)
+{
+    try
+    {
+        (void)ServerConfig::load_or_create(path);
+    }
+    catch (const std::exception& e)
+    {
+        return e.what();
+    }
+    return {};
+}
+} // namespace
+
+SCENARIO("Server config reports a non-numeric number with its key and line")
+{
+    GIVEN("a config whose API_PORT is not a number on line 2")
+    {
+        const auto path = write_config("server-config-bad-port", {"# comment", "API_PORT=abc"});
+
+        WHEN("the config is loaded")
+        {
+            THEN("startup fails with an error naming the key and the line")
+            {
+                REQUIRE(load_error(path) == "API_PORT: not a number (line 2)");
+            }
+        }
+    }
+
+    GIVEN("a config whose OFFLINE_AFTER_SECONDS has trailing garbage")
+    {
+        const auto path = write_config("server-config-bad-offline", {"OFFLINE_AFTER_SECONDS=60s"});
+
+        THEN("the value is rejected rather than read as 60")
+        {
+            REQUIRE(load_error(path) == "OFFLINE_AFTER_SECONDS: not a number (line 1)");
+        }
+    }
+}
+
+SCENARIO("Server config range-checks API_PORT and OFFLINE_AFTER_SECONDS")
+{
+    GIVEN("API_PORT values outside 1-65535")
+    {
+        THEN("zero, negative and oversized ports are rejected with the key and line")
+        {
+            REQUIRE(load_error(write_config("server-config-port-0", {"API_PORT=0"})) ==
+                    "API_PORT: must be between 1 and 65535 (line 1)");
+            REQUIRE(load_error(write_config("server-config-port-neg", {"API_PORT=-1"})) ==
+                    "API_PORT: must be between 1 and 65535 (line 1)");
+            REQUIRE(load_error(write_config("server-config-port-big", {"API_PORT=70000"})) ==
+                    "API_PORT: must be between 1 and 65535 (line 1)");
+            REQUIRE(load_error(write_config("server-config-port-huge", {"API_PORT=99999999999999999999"})) ==
+                    "API_PORT: must be between 1 and 65535 (line 1)");
+        }
+    }
+
+    GIVEN("API_PORT=65535")
+    {
+        THEN("the boundary value is accepted")
+        {
+            REQUIRE(ServerConfig::load_or_create(write_config("server-config-port-max", {"API_PORT=65535"})).api_port ==
+                    65535);
+        }
+    }
+
+    GIVEN("a negative OFFLINE_AFTER_SECONDS")
+    {
+        THEN("it is rejected")
+        {
+            REQUIRE(load_error(write_config("server-config-offline-neg", {"OFFLINE_AFTER_SECONDS=-5"})) ==
+                    "OFFLINE_AFTER_SECONDS: must be between 0 and 604800 (line 1)");
+        }
+    }
+
+    GIVEN("OFFLINE_AFTER_SECONDS=0, the documented way to disable offline detection")
+    {
+        THEN("it is accepted")
+        {
+            REQUIRE(ServerConfig::load_or_create(write_config("server-config-offline-0", {"OFFLINE_AFTER_SECONDS=0"}))
+                        .offline_after_seconds == 0);
+        }
+    }
+}
+
+SCENARIO("Server config warns about unknown keys without refusing to start")
+{
+    GIVEN("a config with a mistyped OFFLINE_AFTER_SECONDS key")
+    {
+        const auto path = write_config("server-config-unknown-key", {"OFFLNE_AFTER_SECONDS=30", "API_PORT=9090"});
+
+        WHEN("the config is loaded")
+        {
+            const auto cfg = ServerConfig::load_or_create(path);
+
+            THEN("the server still starts and the unknown key is reported")
+            {
+                REQUIRE(cfg.unknown_keys == std::vector<std::string>{"OFFLNE_AFTER_SECONDS"});
+            }
+
+            AND_THEN("known keys are applied and the mistyped one is not")
+            {
+                REQUIRE(cfg.api_port == 9090);
+                REQUIRE(cfg.offline_after_seconds == 60);
+            }
+        }
+    }
+
+    GIVEN("a config with only known keys")
+    {
+        THEN("no unknown keys are reported")
+        {
+            REQUIRE(ServerConfig::load_or_create(write_config("server-config-known-keys", {"API_PORT=9090"}))
+                        .unknown_keys.empty());
+        }
+    }
+}
+
+SCENARIO("Server config validates DB_TYPE and the CURVE keypair")
+{
+    GIVEN("an unsupported DB_TYPE")
+    {
+        THEN("startup fails naming the key and line")
+        {
+            REQUIRE(load_error(write_config("server-config-db-type", {"DB_TYPE=mysql"})) ==
+                    "DB_TYPE: must be 'sqlite' or 'postgres' (line 1)");
+        }
+    }
+
+    GIVEN("DB_TYPE=postgres without a POSTGRES_DSN")
+    {
+        THEN("startup fails because there is nothing to connect to")
+        {
+            REQUIRE(load_error(write_config("server-config-pg-no-dsn", {"DB_TYPE=postgres"})) ==
+                    "POSTGRES_DSN: required when DB_TYPE=postgres");
+        }
+    }
+
+    GIVEN("a generated keypair")
+    {
+        auto dir = unique_temp_dir("server-config-keys");
+        const auto good = ServerConfig::load_or_create(dir / "good.conf");
+        const auto other = ServerConfig::load_or_create(dir / "other.conf");
+
+        THEN("only the public key set is rejected")
+        {
+            const auto path =
+                write_config("server-config-only-public", {"SERVER_PUBLIC_KEY=" + good.server_public_key});
+            REQUIRE(load_error(path) == "SERVER_PUBLIC_KEY and SERVER_SECRET_KEY must be set together");
+        }
+
+        THEN("only the secret key set is rejected")
+        {
+            const auto path =
+                write_config("server-config-only-secret", {"SERVER_SECRET_KEY=" + good.server_secret_key});
+            REQUIRE(load_error(path) == "SERVER_PUBLIC_KEY and SERVER_SECRET_KEY must be set together");
+        }
+
+        THEN("a public key that does not belong to the secret key is rejected")
+        {
+            const auto path = write_config("server-config-mismatch", {"SERVER_PUBLIC_KEY=" + other.server_public_key,
+                                                                      "SERVER_SECRET_KEY=" + good.server_secret_key});
+            REQUIRE(load_error(path) == "SERVER_PUBLIC_KEY does not match SERVER_SECRET_KEY");
+        }
+
+        THEN("a key that is not 40 z85 characters is rejected")
+        {
+            const auto path = write_config("server-config-short-key",
+                                           {"SERVER_PUBLIC_KEY=short", "SERVER_SECRET_KEY=" + good.server_secret_key});
+            REQUIRE(load_error(path) == "SERVER_PUBLIC_KEY: must be a 40 character z85 key (line 1)");
+        }
+
+        THEN("a matching pair is accepted")
+        {
+            const auto path = write_config("server-config-match", {"SERVER_PUBLIC_KEY=" + good.server_public_key,
+                                                                   "SERVER_SECRET_KEY=" + good.server_secret_key});
+            REQUIRE(load_error(path).empty());
+        }
+    }
+}
+
+SCENARIO("Only the last occurrence of a repeated key is validated")
+{
+    GIVEN("a config where an invalid value is overridden later in the file")
+    {
+        const auto dir = unique_temp_dir("server-config-repeated-keys");
+        const auto path = dir / "TheWatcherServer.conf";
+        {
+            std::ofstream f(path);
+            f << "API_PORT=abc\nAPI_PORT=9090\nDB_TYPE=bogus\nDB_TYPE=sqlite\n"
+                 "OFFLINE_AFTER_SECONDS=-5\nOFFLINE_AFTER_SECONDS=60\n";
+        }
+
+        THEN("the shadowed values are ignored and the final ones win")
+        {
+            ServerConfig cfg;
+            REQUIRE_NOTHROW(cfg = ServerConfig::load_or_create(path));
+            REQUIRE(cfg.api_port == 9090);
+            REQUIRE(cfg.db_type == "sqlite");
+            REQUIRE(cfg.offline_after_seconds == 60);
+        }
+    }
+
+    GIVEN("a config where the last occurrence of a key is the invalid one")
+    {
+        const auto dir = unique_temp_dir("server-config-repeated-bad-last");
+        const auto path = dir / "TheWatcherServer.conf";
+        {
+            std::ofstream f(path);
+            f << "API_PORT=9090\nDB_TYPE=sqlite\nAPI_PORT=abc\n";
+        }
+
+        THEN("it is rejected and the error names the line of that last occurrence")
+        {
+            try
+            {
+                ServerConfig::load_or_create(path);
+                FAIL("an invalid final value was accepted");
+            }
+            catch (const std::invalid_argument& e)
+            {
+                const std::string message = e.what();
+                REQUIRE(message.find("API_PORT") != std::string::npos);
+                REQUIRE(message.find("line 3") != std::string::npos);
+            }
+        }
+    }
+}
+
+SCENARIO("A preferred config path wins over the legacy one, which is used only when the preferred file is absent")
+{
+    GIVEN("a preferred and a legacy config file")
+    {
+        const auto dir = unique_temp_dir("server-config-preferred-path");
+        const auto preferred = dir / "new" / "TheWatcherServer.conf";
+        const auto legacy = dir / "old" / "TheWatcherServer.conf";
+        std::filesystem::create_directories(preferred.parent_path());
+        std::filesystem::create_directories(legacy.parent_path());
+        std::ofstream(legacy) << "API_PORT=1\n";
+
+        WHEN("only the legacy file exists")
+        {
+            THEN("the legacy path is chosen")
+            {
+                REQUIRE(ServerConfig::existing_path_or_legacy(preferred, legacy) == legacy);
+            }
+        }
+
+        WHEN("both exist")
+        {
+            std::ofstream(preferred) << "API_PORT=2\n";
+
+            THEN("the preferred path is chosen")
+            {
+                REQUIRE(ServerConfig::existing_path_or_legacy(preferred, legacy) == preferred);
+            }
+        }
+
+        WHEN("neither exists")
+        {
+            std::filesystem::remove(legacy);
+
+            THEN("the preferred path is chosen so it gets created there")
+            {
+                REQUIRE(ServerConfig::existing_path_or_legacy(preferred, legacy) == preferred);
+            }
+        }
+    }
+}

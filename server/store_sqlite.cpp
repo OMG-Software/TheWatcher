@@ -5,12 +5,15 @@
 #endif
 
 #include "common/SingleLog.hpp"
+#include "view_config.hpp"
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <cctype>
 #include <stdexcept>
 #include <string>
+#include <utility>
 
 #include <sodium.h>
 
@@ -45,7 +48,27 @@ namespace
     void check(int rc, sqlite3* db, const char* ctx)
     {
         if (rc != SQLITE_OK && rc != SQLITE_ROW && rc != SQLITE_DONE)
-            throw std::runtime_error(std::string(ctx) + ": " + sqlite3_errmsg(db));
+        {
+            const auto message = std::string(ctx) + ": " + sqlite3_errmsg(db);
+            const auto extended = sqlite3_extended_errcode(db);
+            if (extended == SQLITE_CONSTRAINT_UNIQUE || extended == SQLITE_CONSTRAINT_PRIMARYKEY)
+                throw UniqueViolation(message);
+            throw std::runtime_error(message);
+        }
+    }
+
+    // Advances a SELECT. Returns true for a row and false at SQLITE_DONE; any
+    // other result (SQLITE_ERROR, SQLITE_BUSY, ...) throws, so a failed scan can
+    // never be read as "no more rows" and let a caller commit partial work.
+    bool next_row(sqlite3_stmt* stmt, sqlite3* db, const char* ctx)
+    {
+        const int rc = sqlite3_step(stmt);
+        if (rc == SQLITE_ROW)
+            return true;
+        if (rc == SQLITE_DONE)
+            return false;
+        check(rc == SQLITE_OK ? SQLITE_ERROR : rc, db, ctx);
+        return false;
     }
 
     std::string text_col(sqlite3_stmt* s, int col)
@@ -162,7 +185,7 @@ namespace
                 text_col(s, 10),
                 sqlite3_column_int64(s, 11),
                 text_col(s, 12),
-                {}};
+                sqlite3_column_count(s) > 13 ? text_col(s, 13) : std::string{}};
     }
 
     MaintenanceWindowRecord row_to_maintenance_window(sqlite3_stmt* s)
@@ -650,11 +673,68 @@ void SqliteStore::reject_agent(const std::string& agent_id)
 
 void SqliteStore::delete_agent(const std::string& agent_id)
 {
-    Stmt st;
-    check(sqlite3_prepare_v2(db_, "DELETE FROM agents WHERE agent_id=?;", -1, &st.s, nullptr), db_,
-          "prepare delete_agent");
-    sqlite3_bind_text(st.s, 1, agent_id.c_str(), -1, SQLITE_TRANSIENT);
-    check(sqlite3_step(st.s), db_, "step delete_agent");
+    // Rolls back unless commit() ran, so a failure part-way leaves the agent
+    // and its silences, windows, runbooks and views all in place.
+    struct Transaction
+    {
+        explicit Transaction(SqliteStore& store)
+            : store_(store)
+        {
+            store_.exec("BEGIN IMMEDIATE;");
+        }
+        ~Transaction()
+        {
+            if (!committed_)
+                sqlite3_exec(store_.db_, "ROLLBACK;", nullptr, nullptr, nullptr);
+        }
+        Transaction(const Transaction&) = delete;
+        Transaction& operator=(const Transaction&) = delete;
+        void commit()
+        {
+            store_.exec("COMMIT;");
+            committed_ = true;
+        }
+        SqliteStore& store_;
+        bool committed_ = false;
+    } tx(*this);
+
+    // silences, maintenance_windows and runbooks have no foreign key to agents.
+    for (const char* sql :
+         {"DELETE FROM silences WHERE agent_id=?;", "DELETE FROM maintenance_windows WHERE agent_id=?;",
+          "DELETE FROM runbooks WHERE agent_id=?;", "DELETE FROM agents WHERE agent_id=?;"})
+    {
+        Stmt st;
+        check(sqlite3_prepare_v2(db_, sql, -1, &st.s, nullptr), db_, "prepare delete_agent");
+        check(sqlite3_bind_text(st.s, 1, agent_id.c_str(), -1, SQLITE_TRANSIENT), db_, "bind delete_agent");
+        check(sqlite3_step(st.s), db_, "step delete_agent");
+    }
+
+    // Views keep their agent ids inside config_json: drop the deleted id and
+    // rewrite the row. A config that cannot be decoded and mentions the id
+    // throws, which rolls the whole delete back (see remove_agent_from_view_config).
+    std::vector<std::pair<int64_t, std::string>> rewritten;
+    {
+        Stmt st;
+        check(sqlite3_prepare_v2(db_, "SELECT view_id,config_json FROM views;", -1, &st.s, nullptr), db_,
+              "prepare delete_agent views");
+        while (next_row(st.s, db_, "step delete_agent views"))
+        {
+            if (auto updated = remove_agent_from_view_config(text_col(st.s, 1), agent_id))
+                rewritten.emplace_back(sqlite3_column_int64(st.s, 0), std::move(*updated));
+        }
+    }
+    for (const auto& [view_id, config_json] : rewritten)
+    {
+        Stmt st;
+        check(sqlite3_prepare_v2(db_, "UPDATE views SET config_json=? WHERE view_id=?;", -1, &st.s, nullptr), db_,
+              "prepare delete_agent view update");
+        check(sqlite3_bind_text(st.s, 1, config_json.c_str(), -1, SQLITE_TRANSIENT), db_,
+              "bind delete_agent view update");
+        check(sqlite3_bind_int64(st.s, 2, view_id), db_, "bind delete_agent view id");
+        check(sqlite3_step(st.s), db_, "step delete_agent view update");
+    }
+
+    tx.commit();
 }
 
 void SqliteStore::mark_agents_offline_before(int64_t cutoff_ms)
@@ -760,6 +840,19 @@ int64_t SqliteStore::create_group(const std::string& name)
     if (sqlite3_step(lookup.s) == SQLITE_ROW)
         return sqlite3_column_int64(lookup.s, 0);
     throw std::runtime_error("group lookup failed after insert");
+}
+
+std::optional<int64_t> SqliteStore::create_group_if_absent(const std::string& name)
+{
+    Stmt st;
+    check(sqlite3_prepare_v2(db_, "INSERT OR IGNORE INTO groups(name) VALUES(?);", -1, &st.s, nullptr), db_,
+          "prepare create_group_if_absent");
+    check(sqlite3_bind_text(st.s, 1, name.c_str(), -1, SQLITE_TRANSIENT), db_, "bind create_group_if_absent");
+    check(sqlite3_step(st.s), db_, "step create_group_if_absent");
+    // OR IGNORE changes no row when the name exists: that is the "already there" answer.
+    if (sqlite3_changes(db_) == 0)
+        return std::nullopt;
+    return sqlite3_last_insert_rowid(db_);
 }
 
 std::vector<int64_t> SqliteStore::get_agent_groups(const std::string& agent_id)
@@ -1181,6 +1274,68 @@ std::vector<AlertRecord> SqliteStore::list_unacknowledged_alerts()
     while (sqlite3_step(st.s) == SQLITE_ROW)
         out.push_back(row_to_alert(st.s));
     return out;
+}
+
+namespace
+{
+    // Alert columns plus the agent's runbook, read by row_to_alert.
+    constexpr const char* ALERT_JOIN_SELECT =
+        "SELECT a.alert_id,a.agent_id,a.indicator,a.old_status,a.new_status,a.message,a.created_at,"
+        "a.acknowledged_by,a.acknowledged_at,a.deleted_at,a.note,a.escalated_at,a.runbook_url,"
+        "COALESCE(g.runbook_markdown,'') FROM alerts a LEFT JOIN agents g ON g.agent_id=a.agent_id";
+} // namespace
+
+std::vector<AlertRecord> SqliteStore::query_alerts(const AlertQuery& query)
+{
+    std::string sql = ALERT_JOIN_SELECT;
+    sql += " WHERE 1=1";
+    if (!query.include_deleted)
+        sql += " AND a.deleted_at=0";
+    if (query.unacknowledged_only)
+        sql += " AND a.acknowledged_at=0";
+    if (query.visible_to_user_id > 0)
+        sql += " AND a.agent_id IN (SELECT ag.agent_id FROM agent_groups ag JOIN user_groups ug ON "
+               "ug.group_id=ag.group_id WHERE ug.user_id=?)";
+    if (!query.alert_ids.empty())
+    {
+        sql += " AND a.alert_id IN (?";
+        for (std::size_t i = 1; i < query.alert_ids.size(); ++i)
+            sql += ",?";
+        sql += ")";
+    }
+    sql += " ORDER BY a.created_at DESC,a.alert_id DESC";
+    // SQLite needs a LIMIT before OFFSET; -1 means unlimited.
+    if (query.limit > 0 || query.offset > 0)
+        sql += " LIMIT ? OFFSET ?";
+    sql += ";";
+
+    Stmt st;
+    check(sqlite3_prepare_v2(db_, sql.c_str(), -1, &st.s, nullptr), db_, "prepare query_alerts");
+    int bind = 1;
+    if (query.visible_to_user_id > 0)
+        sqlite3_bind_int64(st.s, bind++, query.visible_to_user_id);
+    for (const auto id : query.alert_ids)
+        sqlite3_bind_int64(st.s, bind++, id);
+    if (query.limit > 0 || query.offset > 0)
+    {
+        sqlite3_bind_int64(st.s, bind++, query.limit > 0 ? query.limit : -1);
+        sqlite3_bind_int64(st.s, bind++, query.offset);
+    }
+    std::vector<AlertRecord> out;
+    while (next_row(st.s, db_, "step query_alerts"))
+        out.push_back(row_to_alert(st.s));
+    return out;
+}
+
+std::optional<AlertRecord> SqliteStore::get_alert(int64_t alert_id)
+{
+    const std::string sql = std::string(ALERT_JOIN_SELECT) + " WHERE a.alert_id=?;";
+    Stmt st;
+    check(sqlite3_prepare_v2(db_, sql.c_str(), -1, &st.s, nullptr), db_, "prepare get_alert");
+    sqlite3_bind_int64(st.s, 1, alert_id);
+    if (next_row(st.s, db_, "step get_alert"))
+        return row_to_alert(st.s);
+    return std::nullopt;
 }
 
 void SqliteStore::acknowledge_alert(int64_t alert_id, const std::string& username, int64_t acknowledged_at,

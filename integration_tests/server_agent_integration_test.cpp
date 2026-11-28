@@ -539,6 +539,8 @@ SCENARIO("Alert silence rules can be created, listed, and deleted via the HTTP A
 
         WHEN("a silence scoped to a specific agent and indicator is created")
         {
+            // A silence may only name an agent that exists.
+            REQUIRE(fx.enroll_and_approve("my-agent"));
             const int64_t until_ms = now_ms() + 7'200'000;
             const auto result = post_json(fx.client, "/api/silences",
                                           {
@@ -972,6 +974,12 @@ SCENARIO("Views API supports full CRUD and enforces public/private visibility be
 
         WHEN("the admin creates a private view with two agent IDs")
         {
+            // A view may only name agents that exist (404 otherwise); agent-c is used by the update below.
+            for (const auto* agent_id : {"agent-a", "agent-b", "agent-c"})
+            {
+                REQUIRE(fx.enroll_and_approve(agent_id));
+                std::this_thread::sleep_for(std::chrono::milliseconds(1100)); // per-source enrollment rate limit
+            }
             const auto created = post_json_created(fx.client, "/api/views",
                                                    {
                                                        {"name",      "Production"                       },
