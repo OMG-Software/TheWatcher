@@ -65,6 +65,14 @@ npm.cmd test
   `common/commands.hpp` over ad hoc strings.
 - Use BDD-style tests with `GIVEN`, `WHEN`, and `THEN`.
 - Add tests before behavior changes.
+- Make test scratch directories with `ScopedTempDir`
+  (`test_support/temp_dir.hpp`). It creates a randomly named, owner-only
+  directory under `.tmp/` in the build directory and removes it afterwards.
+  Do not use the system temp directory: it is publicly writable, and
+  SonarCloud flags it (rule S5443). The one exception is
+  `private_directory_test`, which needs every ancestor of its scratch path
+  to pass the private-directory check, so it uses `%ProgramData%` on Windows
+  and the system temp directory elsewhere.
 - Update docs for every behavior or workflow change.
 - For security-sensitive changes, update [Threat Model](threat-model.md) with
   the affected asset, trust boundary, mitigation, and residual risk.

@@ -326,6 +326,10 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   Silences, Maintenance and Settings pages, the fixed maintenance reason and
   the first-group approval, and that the server does not serve the bundle
   (#135).
+- Tests: `server_uninstall_order_test` keeps its scratch tree in the build
+  directory instead of the system temp directory. Only
+  `private_directory_test` still needs another base, because every ancestor
+  of its scratch path must pass the private-directory check.
 
 ### Added
 

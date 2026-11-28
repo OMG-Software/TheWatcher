@@ -76,8 +76,11 @@ SCENARIO("--uninstall-service works when the config directory is not private")
 {
     GIVEN("a config path inside a directory that other users can write to")
     {
-        // The system temp directory keeps this scratch tree's ancestors out of the picture.
-        const thewatcher::test::ScopedTempDir scratch("thewatcher-uninstall-order", fs::temp_directory_path());
+        // The default scratch base (the build tree) is enough here: every refusal
+        // of the private-directory check, for the directory itself or for one of
+        // its ancestors, says "is not private", and these scenarios only ask
+        // whether the check ran.
+        const thewatcher::test::ScopedTempDir scratch("thewatcher-uninstall-order");
         const auto loose = make_loose_directory(scratch.path() / "loose");
         const auto config = loose / "TheWatcherServer.conf";
         const auto output = scratch.path() / "output.txt";

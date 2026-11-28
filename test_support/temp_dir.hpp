@@ -30,9 +30,11 @@ class ScopedTempDir
 public:
     // `prefix` becomes the leading part of the directory name; the rest is random.
     // `base_dir` is where the directory is made; empty means ".tmp/" under the
-    // current working directory. Tests that check the ancestors of the scratch
-    // path pass the system temp directory, because the build tree may sit
-    // under a directory that other users can write to.
+    // current working directory. Only a test that needs every ancestor of the
+    // scratch path to pass ensure_private_directory passes another base
+    // (private_directory_test: %ProgramData% on Windows, the system temp
+    // directory elsewhere), because the build tree may sit under a directory
+    // that other users can write to.
     explicit ScopedTempDir(const std::string& prefix = "thewatcher-test",
                            const std::filesystem::path& base_dir = std::filesystem::path())
     {
