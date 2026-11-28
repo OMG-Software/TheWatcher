@@ -111,8 +111,6 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   twice (8 files / 172 tests became 4 / 86) (#103).
 - Agent enrollment recovers after a reply timeout: each attempt uses a new
   REQ socket, so a late server is reached without restarting the agent (#86).
-- A malformed enrollment reply is logged and retried instead of terminating
-  the agent (#160).
 - An enrollment reply that cannot be decoded is logged and retried instead
   of terminating the agent (#160). An approved reply with an invalid server
   key or a fingerprint that does not match still stops enrollment with an
