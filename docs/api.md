@@ -10,8 +10,9 @@ can answer with.
 ### Authentication
 
 `POST /api/login` sets an `HttpOnly` cookie named `tw_session` (8 hour
-lifetime). Every other route except login needs that cookie and answers `401`
-without it. Unsafe methods (`POST`, `PUT`, `DELETE`) are rejected with `403`
+lifetime). Every route except these needs that cookie and answers `401` without
+it: `POST /api/login`, `POST /api/logout` (it succeeds without a cookie, subject
+to the origin check, and clears it) and `OPTIONS` preflight requests. Unsafe methods (`POST`, `PUT`, `DELETE`) are rejected with `403`
 when an `Origin` or `Referer` header names a different origin than the API
 (loopback dashboards on another port are allowed).
 
@@ -32,8 +33,15 @@ the agent's groups gets `403`. The legacy role names `admin`, `operator` and
 
 ### Requests and responses
 
-- Request bodies are JSON. Routes that write data answer `415` when a
-  `Content-Type` header is present but is not `application/json`.
+- Request bodies are JSON. Every route that parses a JSON body answers `415` when
+  a `Content-Type` header is present but is not `application/json` (a missing
+  header is tolerated). A route that takes no body, such as acknowledging an
+  alert, also accepts an empty one.
+- A number that must be an integer (`interval_seconds`, `limit`, the collector
+  config intervals, the `settings` fields, `until_ms`, `start_ms`, `end_ms`, each
+  `args` byte) must be a JSON integer. `2.5`, a string, `true` or `null` is `400`;
+  nothing is truncated, so `until_ms: 0.5` cannot become the `0` "until resumed"
+  value.
 - Success responses are JSON: `{"ok": true}`, the created id, or the resource.
 - Ids in a path (`:id` for alerts, windows, silences, runbooks, views, users)
   are positive decimal integers. Agent ids are opaque strings.
@@ -79,12 +87,15 @@ another group, so ids cannot be probed; global users get `404`.
 
 ### Paging and query values
 
-Query integers must be plain numbers. A malformed or non-positive value is
-`400`; a value above the route's maximum is clamped to the maximum.
+Query integers must be plain decimal numbers. A malformed value, zero or a
+negative `limit` is `400`; a `limit` above the route's maximum, however large, is
+clamped to the maximum. `offset` is separate: `0` is valid and is the first page,
+and it has no upper bound other than the integer range.
 
 | Route | Parameter | Default | Maximum |
 | --- | --- | --- | --- |
-| `GET /api/alerts`, `GET /api/alerts/unacknowledged` | `limit`, `offset` | 1000, 0 | 1000 |
+| `GET /api/alerts`, `GET /api/alerts/unacknowledged` | `limit` | 1000 | 1000 |
+| `GET /api/alerts`, `GET /api/alerts/unacknowledged` | `offset` | 0 | none (0 or more) |
 | `GET /api/metrics/:id` | `limit` | 100 | 1000 |
 | `GET /api/agents/:id/history` | `limit` | 100 | 200 |
 | `GET /api/agents/:id/log-matches` | `limit` | 200 | 1000 |
@@ -106,7 +117,7 @@ run inside the database, so a request costs one query however many alerts exist.
 | Route | Role | Request | Response and errors |
 | --- | --- | --- | --- |
 | `GET /api/groups` | viewer | none | Array of `{group_id, name, built_in}`; group users see their own groups. |
-| `POST /api/groups` | global admin | `{name}` | `200 {group_id}`. `409` name exists. |
+| `POST /api/groups` | global admin | `{name}` | `200 {group_id}`. `409` name exists; one atomic insert decides, so two simultaneous requests for a new name cannot both succeed. |
 | `GET /api/users` | viewer | none | Array of `{user_id, username, role, built_in, disabled, group_ids}`; group users see users that share a group. |
 | `POST /api/users` | admin | `{username, password, role?, group_ids?}` (`role` defaults to `group_viewer`) | `200 {user_id}`. `400` invalid role or over a limit or group admin creating a global user, `404` unknown group, `409` username exists. Group admins can only assign their own groups. |
 | `PUT /api/users/:id/disable` | global admin | none | `{ok}`. `404` unknown or built-in user. |
@@ -127,7 +138,7 @@ under Roles. `404` is returned when the agent does not exist.
 | `POST /api/agents/:id/reject` | operator and global | none | `{ok}`; removes the key from ZAP. `404`. |
 | `POST /api/agents/:id/groups` | operator and global | `{group_ids}` | `{ok}`. `404` unknown agent or group. |
 | `DELETE /api/agents/:id` | operator, agent access | none | `{ok}`. Removes the agent, its metrics, alerts and group links, and in one transaction its silences, maintenance windows, agent runbooks and its id in views, so a re-enrolled agent starts clean. A view whose stored config cannot be decoded and mentions the agent makes the delete fail with `500` (nothing is deleted) rather than keeping the id. |
-| `POST /api/agents/:id/command` | operator, agent access | `{command_type, args?}` (`args` is a byte array, at most 4096) | `{ok, command_id}`. `400` malformed body, `command_type` that is not an integer from 0 to 255 (it is never wrapped), or unknown `command_type`, `409` the agent is offline. The body is validated first, so an invalid body is `400` for an offline agent too; `409` is only for a valid request. |
+| `POST /api/agents/:id/command` | operator, agent access | `{command_type, args?}` (`args` is an array of at most 4096 integers from 0 to 255, checked before it becomes bytes; omitted and empty are valid) | `{ok, command_id}`. `400` malformed body, `command_type` that is not an integer from 0 to 255 (it is never wrapped), or unknown `command_type`, `409` the agent is offline. The body is validated first, so an invalid body is `400` for an offline agent too; `409` is only for a valid request. |
 | `POST /api/agents/:id/set_interval` | operator, agent access | `{interval_seconds}` | `{ok}`; saved and sent to the agent. `400` invalid body (checked before the agent state), `409` the agent is offline. |
 | `POST /api/agents/:id/set_process_limit` | operator, agent access | `{limit}` | `{ok}`; saved and sent to the agent. `400` invalid body (checked before the agent state), `409` the agent is offline. |
 | `POST /api/agents/:id/thresholds` | operator, agent access | `{thresholds: {cpu, memory, disk, network: {warning_pct_of_avg, degraded_pct_of_avg, critical_pct_of_avg}}}`, values finite, above zero and increasing | `{ok}`. |
@@ -186,7 +197,7 @@ belong to.
 | `GET /api/views` | viewer | none | Array of `{view_id, name, owner_user_id, owner_username, is_public, group_id, agent_ids, created_at}`. |
 | `GET /api/views/:id` | viewer | none | One view. `403` outside the caller's groups, `404`. |
 | `POST /api/views` | operator | `{name, is_public?, group_id?, agent_ids?}` | `201` with the view. `400` over a limit or `agent_ids` that is not an array, `404` an agent in `agent_ids` or the `group_id` does not exist. |
-| `PUT /api/views/:id` | operator; owner or global role | any of `name`, `is_public`, `group_id`, `agent_ids` | The updated view. `400` as for create, `403`, `404` the view, or an agent or group the request names does not exist. Only references in the request are checked, so a view holding an old stale id can still be renamed. |
+| `PUT /api/views/:id` | operator; owner or global role | any of `name`, `is_public`, `group_id`, `agent_ids` | The updated view. `400` as for create, `403`, `404` the view, or an agent or group the request names does not exist. Only what the request supplies is validated, and `404` applies only to agents the request adds (and to a supplied `group_id`): agents already stored in the view are not checked, so a view holding an old stale id can be renamed or re-saved, and a legacy over-long agent list can be renamed. Create (`POST`) checks every agent and group. |
 | `DELETE /api/views/:id` | operator; owner or global role | none | `{ok}`. `403`, `404`. |
 
 ## Runbooks

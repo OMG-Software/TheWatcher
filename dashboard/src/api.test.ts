@@ -182,9 +182,49 @@ describe('GIVEN agent management API actions', () => {
     await fetchAlerts(false);
     await fetchAlerts(true);
 
-    expect(fetchMock).toHaveBeenNthCalledWith(1, '/api/alerts', { credentials: 'include' });
-    expect(fetchMock).toHaveBeenNthCalledWith(2, '/api/alerts', { credentials: 'include' });
-    expect(fetchMock).toHaveBeenNthCalledWith(3, '/api/alerts?include_archived=1', { credentials: 'include' });
+    expect(fetchMock).toHaveBeenNthCalledWith(1, '/api/alerts?limit=1000&offset=0', { credentials: 'include' });
+    expect(fetchMock).toHaveBeenNthCalledWith(2, '/api/alerts?limit=1000&offset=0', { credentials: 'include' });
+    expect(fetchMock).toHaveBeenNthCalledWith(3, '/api/alerts?include_archived=1&limit=1000&offset=0', {
+      credentials: 'include',
+    });
+  });
+
+  it('WHEN more alerts exist than one page holds THEN every page is fetched until a short page', async () => {
+    const page = (first: number, count: number) =>
+      Array.from({ length: count }, (_, index) => ({ alert_id: first + index }));
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce({ ok: true, json: async () => page(1, 1000) })
+      .mockResolvedValueOnce({ ok: true, json: async () => page(1001, 1000) })
+      .mockResolvedValueOnce({ ok: true, json: async () => page(2001, 5) });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const alerts = await fetchAlerts();
+
+    expect(alerts).toHaveLength(2005);
+    expect(alerts[2004]).toEqual({ alert_id: 2005 });
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect(fetchMock).toHaveBeenNthCalledWith(2, '/api/alerts?limit=1000&offset=1000', { credentials: 'include' });
+    expect(fetchMock).toHaveBeenNthCalledWith(3, '/api/alerts?limit=1000&offset=2000', { credentials: 'include' });
+  });
+
+  it('WHEN unacknowledged alerts exceed one page THEN the next page is requested too', async () => {
+    const full = Array.from({ length: 1000 }, (_, index) => ({ alert_id: index + 1 }));
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce({ ok: true, json: async () => full })
+      .mockResolvedValueOnce({ ok: true, json: async () => [] });
+    vi.stubGlobal('fetch', fetchMock);
+
+    const alerts = await fetchUnacknowledgedAlerts();
+
+    expect(alerts).toHaveLength(1000);
+    expect(fetchMock).toHaveBeenNthCalledWith(1, '/api/alerts/unacknowledged?limit=1000&offset=0', {
+      credentials: 'include',
+    });
+    expect(fetchMock).toHaveBeenNthCalledWith(2, '/api/alerts/unacknowledged?limit=1000&offset=1000', {
+      credentials: 'include',
+    });
   });
 
   it('WHEN users and groups are created THEN admin payloads are sent to the backend', async () => {
@@ -395,7 +435,9 @@ describe('GIVEN read-only fetch endpoints', () => {
     expect(fetchMock).toHaveBeenNthCalledWith(3, '/api/metrics', { credentials: 'include' });
     expect(fetchMock).toHaveBeenNthCalledWith(4, '/api/groups', { credentials: 'include' });
     expect(fetchMock).toHaveBeenNthCalledWith(5, '/api/users', { credentials: 'include' });
-    expect(fetchMock).toHaveBeenNthCalledWith(6, '/api/alerts/unacknowledged', { credentials: 'include' });
+    expect(fetchMock).toHaveBeenNthCalledWith(6, '/api/alerts/unacknowledged?limit=1000&offset=0', {
+      credentials: 'include',
+    });
   });
 });
 

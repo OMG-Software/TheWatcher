@@ -27,8 +27,8 @@ namespace
 // is checked too, so it must sit under directories with clean permissions, not
 // under the build tree or a per-user temp directory whose ACLs the machine
 // controls. Windows: %ProgramData% (Users can create folders there, and it passes
-// the ancestor check on a stock install). POSIX: the system temp directory
-// (sticky, root-owned).
+// the ancestor check on a stock install). POSIX: the build directory, whose
+// ancestors are the developer's or CI runner's own (never a shared temp directory).
 fs::path scratch_base()
 {
 #ifdef _WIN32
@@ -40,7 +40,7 @@ fs::path scratch_base()
     std::free(program_data);
     return base;
 #else
-    return fs::temp_directory_path();
+    return {}; // the default: ".tmp" under the build directory, not a shared temp directory
 #endif
 }
 
@@ -663,12 +663,9 @@ SCENARIO("A link that appears where a level was missing is never followed when c
 
         WHEN("the level is created")
         {
-            THEN("it is refused")
-            {
-                REQUIRE_THROWS(thewatcher::common::detail::create_private_directory_level(link));
-            }
+            REQUIRE_THROWS(thewatcher::common::detail::create_private_directory_level(link));
 
-            AND_THEN("the target was not changed")
+            THEN("the target was not changed")
             {
 #ifdef _WIN32
                 // Still open to Users: its ACL was not replaced with the private one.

@@ -9,6 +9,20 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Security
 
+- Every route that parses a JSON body now answers `415` for a non-JSON
+  `Content-Type` (acknowledge and bulk acknowledge did not). Integer fields
+  (`interval_seconds`, `limit`, collector intervals, settings, `until_ms`,
+  `start_ms`, `end_ms`) reject `2.5`, strings and booleans with 400 instead of
+  truncating them, so `until_ms: 0.5` can no longer start indefinite
+  maintenance. Command `args` must be an array of at most 4096 integers from 0
+  to 255, checked before conversion.
+- Deleting an agent reads view agent lists as decoded strings: an escaped id is
+  found, `node-ab` no longer blocks `node-a`, a malformed list that contains the
+  id aborts the delete, and text that is not JSON is refused when it mentions
+  the id or could hide it behind an escape. The agent's ZAP key is removed only
+  after the delete commits.
+- A login whose session cannot be stored is a logged generic 500, not a 400
+  carrying the database error.
 - Creating a missing config-directory level no longer follows a link: it is
   opened with `O_NOFOLLOW` and only a directory the server just created is
   chmodded (a link or non-directory at that level is refused; on Windows a
@@ -101,6 +115,21 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 
+- A query `limit` larger than the route maximum now clamps however large it is
+  (`limit=2147483648` was 400); zero and malformed values stay 400.
+- `POST /api/groups` decides its `409` with one atomic insert instead of a list
+  followed by an insert, in both stores (`Store::create_group_if_absent`).
+- `PUT /api/views/:id` checks agent existence only for agents it adds and
+  validates only the fields it supplies, so a stale or legacy view can be
+  renamed or re-saved. Collector `group_ids` are checked only for callers whose
+  `group_ids` are applied (global roles).
+- A repeated config key is validated only at its last occurrence, and an error
+  names that line. On the BSDs the legacy `/etc/thewatcher` config is used only
+  once the preferred file is known to be absent; an unreadable preferred path
+  is reported.
+- The dashboard reads every page of `/api/alerts` and `/api/alerts/unacknowledged`
+  (`limit`/`offset` until a short page), so more than 1000 alerts are all shown.
+- The store delete cascade and view rewrite check their SQLite bind results.
 - REST API errors are consistent: a malformed numeric id in a path or
   query (`/api/alerts/abc/ack`, `?limit=x`) is a 400 and an unknown id (alert,
   agent, user, window, silence, runbook, view, or an agent or group named in a

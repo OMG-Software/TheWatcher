@@ -515,3 +515,92 @@ SCENARIO("Server config validates DB_TYPE and the CURVE keypair")
         }
     }
 }
+
+SCENARIO("Only the last occurrence of a repeated key is validated")
+{
+    GIVEN("a config where an invalid value is overridden later in the file")
+    {
+        const auto dir = unique_temp_dir("server-config-repeated-keys");
+        const auto path = dir / "TheWatcherServer.conf";
+        {
+            std::ofstream f(path);
+            f << "API_PORT=abc\nAPI_PORT=9090\nDB_TYPE=bogus\nDB_TYPE=sqlite\n"
+                 "OFFLINE_AFTER_SECONDS=-5\nOFFLINE_AFTER_SECONDS=60\n";
+        }
+
+        THEN("the shadowed values are ignored and the final ones win")
+        {
+            ServerConfig cfg;
+            REQUIRE_NOTHROW(cfg = ServerConfig::load_or_create(path));
+            REQUIRE(cfg.api_port == 9090);
+            REQUIRE(cfg.db_type == "sqlite");
+            REQUIRE(cfg.offline_after_seconds == 60);
+        }
+    }
+
+    GIVEN("a config where the last occurrence of a key is the invalid one")
+    {
+        const auto dir = unique_temp_dir("server-config-repeated-bad-last");
+        const auto path = dir / "TheWatcherServer.conf";
+        {
+            std::ofstream f(path);
+            f << "API_PORT=9090\nDB_TYPE=sqlite\nAPI_PORT=abc\n";
+        }
+
+        THEN("it is rejected and the error names the line of that last occurrence")
+        {
+            try
+            {
+                ServerConfig::load_or_create(path);
+                FAIL("an invalid final value was accepted");
+            }
+            catch (const std::invalid_argument& e)
+            {
+                const std::string message = e.what();
+                REQUIRE(message.find("API_PORT") != std::string::npos);
+                REQUIRE(message.find("line 3") != std::string::npos);
+            }
+        }
+    }
+}
+
+SCENARIO("A preferred config path wins over the legacy one, which is used only when the preferred file is absent")
+{
+    GIVEN("a preferred and a legacy config file")
+    {
+        const auto dir = unique_temp_dir("server-config-preferred-path");
+        const auto preferred = dir / "new" / "TheWatcherServer.conf";
+        const auto legacy = dir / "old" / "TheWatcherServer.conf";
+        std::filesystem::create_directories(preferred.parent_path());
+        std::filesystem::create_directories(legacy.parent_path());
+        std::ofstream(legacy) << "API_PORT=1\n";
+
+        WHEN("only the legacy file exists")
+        {
+            THEN("the legacy path is chosen")
+            {
+                REQUIRE(ServerConfig::existing_path_or_legacy(preferred, legacy) == legacy);
+            }
+        }
+
+        WHEN("both exist")
+        {
+            std::ofstream(preferred) << "API_PORT=2\n";
+
+            THEN("the preferred path is chosen")
+            {
+                REQUIRE(ServerConfig::existing_path_or_legacy(preferred, legacy) == preferred);
+            }
+        }
+
+        WHEN("neither exists")
+        {
+            std::filesystem::remove(legacy);
+
+            THEN("the preferred path is chosen so it gets created there")
+            {
+                REQUIRE(ServerConfig::existing_path_or_legacy(preferred, legacy) == preferred);
+            }
+        }
+    }
+}

@@ -705,7 +705,7 @@ void SqliteStore::delete_agent(const std::string& agent_id)
     {
         Stmt st;
         check(sqlite3_prepare_v2(db_, sql, -1, &st.s, nullptr), db_, "prepare delete_agent");
-        sqlite3_bind_text(st.s, 1, agent_id.c_str(), -1, SQLITE_TRANSIENT);
+        check(sqlite3_bind_text(st.s, 1, agent_id.c_str(), -1, SQLITE_TRANSIENT), db_, "bind delete_agent");
         check(sqlite3_step(st.s), db_, "step delete_agent");
     }
 
@@ -728,8 +728,9 @@ void SqliteStore::delete_agent(const std::string& agent_id)
         Stmt st;
         check(sqlite3_prepare_v2(db_, "UPDATE views SET config_json=? WHERE view_id=?;", -1, &st.s, nullptr), db_,
               "prepare delete_agent view update");
-        sqlite3_bind_text(st.s, 1, config_json.c_str(), -1, SQLITE_TRANSIENT);
-        sqlite3_bind_int64(st.s, 2, view_id);
+        check(sqlite3_bind_text(st.s, 1, config_json.c_str(), -1, SQLITE_TRANSIENT), db_,
+              "bind delete_agent view update");
+        check(sqlite3_bind_int64(st.s, 2, view_id), db_, "bind delete_agent view id");
         check(sqlite3_step(st.s), db_, "step delete_agent view update");
     }
 
@@ -839,6 +840,19 @@ int64_t SqliteStore::create_group(const std::string& name)
     if (sqlite3_step(lookup.s) == SQLITE_ROW)
         return sqlite3_column_int64(lookup.s, 0);
     throw std::runtime_error("group lookup failed after insert");
+}
+
+std::optional<int64_t> SqliteStore::create_group_if_absent(const std::string& name)
+{
+    Stmt st;
+    check(sqlite3_prepare_v2(db_, "INSERT OR IGNORE INTO groups(name) VALUES(?);", -1, &st.s, nullptr), db_,
+          "prepare create_group_if_absent");
+    check(sqlite3_bind_text(st.s, 1, name.c_str(), -1, SQLITE_TRANSIENT), db_, "bind create_group_if_absent");
+    check(sqlite3_step(st.s), db_, "step create_group_if_absent");
+    // OR IGNORE changes no row when the name exists: that is the "already there" answer.
+    if (sqlite3_changes(db_) == 0)
+        return std::nullopt;
+    return sqlite3_last_insert_rowid(db_);
 }
 
 std::vector<int64_t> SqliteStore::get_agent_groups(const std::string& agent_id)

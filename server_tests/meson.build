@@ -171,3 +171,11 @@ test(
   env: {'THEWATCHER_SERVER_EXE': server_exe.full_path()},
   depends: server_exe,
 )
+
+view_config_test = executable(
+  'view_config_test',
+  ['view_config_test.cpp'],
+  include_directories: root_inc,
+  dependencies: [catch2_dep, json_dep, platform_deps],
+)
+test('view_config', view_config_test)

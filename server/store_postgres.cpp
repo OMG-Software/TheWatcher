@@ -880,6 +880,18 @@ int64_t PostgresStore::create_group(const std::string& name)
     return col_int64(res.r, 0, 0);
 }
 
+std::optional<int64_t> PostgresStore::create_group_if_absent(const std::string& name)
+{
+    const char* params[] = {name.c_str()};
+    // DO NOTHING returns no row when the name exists, so one statement decides who inserted.
+    Res res(PQexecParams(conn_, "INSERT INTO groups(name) VALUES($1) ON CONFLICT(name) DO NOTHING RETURNING group_id;",
+                         1, nullptr, params, nullptr, nullptr, 0));
+    check_res(res.r, "create_group_if_absent");
+    if (PQntuples(res.r) == 0)
+        return std::nullopt;
+    return col_int64(res.r, 0, 0);
+}
+
 std::vector<int64_t> PostgresStore::get_agent_groups(const std::string& agent_id)
 {
     const char* params[] = {agent_id.c_str()};

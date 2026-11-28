@@ -14,6 +14,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <map>
 #include <sstream>
 #include <stdexcept>
 #include <string_view>
@@ -174,9 +175,18 @@ namespace
         ConfigEntry public_key_entry{"SERVER_PUBLIC_KEY", "", 0};
         ConfigEntry secret_key_entry{"SERVER_SECRET_KEY", "", 0};
 
-        for (const auto& entry : entries)
+        // The last occurrence of a key wins, so only that one is validated: an invalid
+        // value that a later line overrides is ignored, and errors name the final line.
+        std::map<std::string, std::size_t> last_index;
+        for (std::size_t i = 0; i < entries.size(); ++i)
+            last_index[entries[i].key] = i;
+
+        for (std::size_t i = 0; i < entries.size(); ++i)
         {
+            const auto& entry = entries[i];
             const auto& key = entry.key;
+            if (last_index[key] != i)
+                continue;
             if (key == "BIND_ADDRESS")
                 cfg.bind_address = entry.value;
             else if (key == "ENROLLMENT_ADDRESS")
@@ -262,6 +272,22 @@ namespace
     }
 } // namespace
 
+fs::path ServerConfig::existing_path_or_legacy(const fs::path& preferred, const fs::path& legacy)
+{
+    std::error_code ec;
+    const bool preferred_exists = fs::exists(preferred, ec);
+    if (ec)
+        throw std::runtime_error("Cannot inspect " + preferred.string() + ": " + ec.message() +
+                                 "; pass --config <path>");
+    if (preferred_exists)
+        return preferred;
+    // A legacy file that cannot be inspected is treated as absent.
+    std::error_code legacy_ec;
+    if (fs::exists(legacy, legacy_ec) && !legacy_ec)
+        return legacy;
+    return preferred;
+}
+
 fs::path ServerConfig::default_path()
 {
     LOG_FUNCTION_TRACE
@@ -279,10 +305,7 @@ fs::path ServerConfig::default_path()
     // not lose their settings.
     const fs::path bsd_path("/usr/local/etc/thewatcher/TheWatcherServer.conf");
     const fs::path legacy_path("/etc/thewatcher/TheWatcherServer.conf");
-    std::error_code ec;
-    if (!fs::exists(bsd_path, ec) && fs::exists(legacy_path, ec))
-        return legacy_path;
-    return bsd_path;
+    return existing_path_or_legacy(bsd_path, legacy_path);
 #else
     return fs::path("/etc/thewatcher/TheWatcherServer.conf");
 #endif

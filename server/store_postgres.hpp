@@ -33,6 +33,7 @@ public:
 
     std::vector<GroupRecord> list_groups() override;
     int64_t create_group(const std::string& name) override;
+    std::optional<int64_t> create_group_if_absent(const std::string& name) override;
     std::vector<int64_t> get_agent_groups(const std::string& agent_id) override;
     void set_agent_groups(const std::string& agent_id, const std::vector<int64_t>& group_ids) override;
     std::optional<UserRecord> get_user_by_username(const std::string& username) override;

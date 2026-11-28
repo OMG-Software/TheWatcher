@@ -41,6 +41,11 @@ struct ServerConfig
     // Throws std::runtime_error on Windows when the common application data
     // folder cannot be determined (it never guesses a location).
     static std::filesystem::path default_path();
+    // `preferred` when that file exists, else `legacy` when only it exists, else
+    // `preferred`. Throws std::runtime_error when `preferred` cannot be inspected:
+    // the legacy file is used only once the preferred one is known to be absent.
+    static std::filesystem::path existing_path_or_legacy(const std::filesystem::path& preferred,
+                                                         const std::filesystem::path& legacy);
     // Loads the KEY=VALUE config at path, or creates it with a new CURVE keypair
     // when missing. A relative sqlite DB_PATH resolves against the config
     // directory. Throws std::runtime_error if the file is over 1 MiB, a line is

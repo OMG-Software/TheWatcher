@@ -153,7 +153,9 @@ working document for audit, design review, and regression testing.
 - REST API inputs are bounded by one set of limits (`server/api_validation.hpp`,
   listed in [api.md](api.md)): string lengths, list sizes, numeric ranges and
   timestamps, so oversized records cannot bloat the database or the dashboard
-  poll. Ids are parsed strictly (400 for malformed, 404 for unknown) and errors
+  poll. Ids are parsed strictly (400 for malformed, 404 for unknown; a group user gets
+  403 for an agent outside their groups, including one that does not exist, so
+  they cannot tell the two apart) and errors
   never carry exception text. Alert lists are filtered, scoped to the caller's
   groups and paged inside the database, so one request cannot load the whole
   alerts table.

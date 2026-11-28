@@ -822,10 +822,21 @@ namespace
     // body (JSON error) or a failed validation is the client's fault: 400 with
     // the message. A uniqueness violation from the store is a conflict: 409.
     // Anything else is a storage or runtime fault: logged, generic 500.
+    // A JSON body arrived with another Content-Type (answered 415).
+    class UnsupportedMediaType : public validation::ValidationError
+    {
+    public:
+        using validation::ValidationError::ValidationError;
+    };
+
     void respond_to_exception(const httplib::Request& req, httplib::Response& res, const std::exception& e)
     {
-        if (dynamic_cast<const validation::ValidationError*>(&e) != nullptr ||
-            dynamic_cast<const json::exception*>(&e) != nullptr)
+        if (dynamic_cast<const UnsupportedMediaType*>(&e) != nullptr)
+        {
+            send_error(res, 415, e.what());
+        }
+        else if (dynamic_cast<const validation::ValidationError*>(&e) != nullptr ||
+                 dynamic_cast<const json::exception*>(&e) != nullptr)
         {
             send_error(res, 400, e.what());
         }
@@ -848,6 +859,47 @@ namespace
             throw validation::ValidationError(*error);
     }
 
+    // Parses a JSON request body. Content-Type, when present, must be JSON (415);
+    // malformed JSON throws json::exception (400).
+    json parse_json_body(const httplib::Request& req)
+    {
+        if (!is_json_content_type(req))
+            throw UnsupportedMediaType("Content-Type must be application/json");
+        return json::parse(req.body);
+    }
+
+    // As parse_json_body, for routes whose body is optional: an empty body is {}.
+    json parse_optional_json_body(const httplib::Request& req)
+    {
+        if (req.body.empty())
+            return json::object();
+        return parse_json_body(req);
+    }
+
+    // Reads a JSON value as an integer. A float (30.5), string, bool or null is a
+    // 400, never truncated or converted, so 0.5 cannot become a 0 sentinel.
+    int64_t json_integer(const json& value, const std::string& field)
+    {
+        if (value.is_number_unsigned())
+        {
+            const auto number = value.get<uint64_t>();
+            if (number > static_cast<uint64_t>(std::numeric_limits<int64_t>::max()))
+                throw validation::ValidationError(field + " is out of range");
+            return static_cast<int64_t>(number);
+        }
+        if (!value.is_number_integer())
+            throw validation::ValidationError(field + " must be an integer");
+        return value.get<int64_t>();
+    }
+
+    // json_integer plus an inclusive range check, narrowed to int only after it.
+    int json_int_in_range(const json& value, const std::string& field, int64_t min, int64_t max)
+    {
+        const auto number = json_integer(value, field);
+        require_valid(validation::check_range(field, number, min, max));
+        return static_cast<int>(number);
+    }
+
     // Parses the numeric :id path parameter. Answers 400 itself and returns
     // nullopt when it is not a positive integer.
     std::optional<int64_t> path_id(const httplib::Request& req, httplib::Response& res)
@@ -867,13 +919,13 @@ namespace
         out = fallback;
         if (!req.has_param(name))
             return true;
-        const auto parsed = validation::parse_int(req.get_param_value(name), 1, std::numeric_limits<int>::max());
+        const auto parsed = validation::parse_positive_saturating(req.get_param_value(name), max);
         if (!parsed)
         {
             send_error(res, 400, std::string(name) + " must be a positive integer");
             return false;
         }
-        out = std::min(*parsed, max);
+        out = *parsed;
         return true;
     }
 
@@ -1093,7 +1145,7 @@ void ApiServer::setup_routes()
                 });
                 return;
             }
-            auto body = json::parse(req.body);
+            auto body = parse_json_body(req);
             const auto username = body.at("username").get<std::string>();
             const auto password = body.at("password").get<std::string>();
 
@@ -1226,10 +1278,9 @@ void ApiServer::setup_routes()
         }
         catch (const std::exception& e)
         {
-            res.status = 400;
-            set_json(res, json{
-                              {"error", e.what()}
-            });
+            // Malformed JSON is 400; a store fault such as create_session failing is a
+            // logged generic 500, not a 400 carrying the database error.
+            respond_to_exception(req, res, e);
         }
     });
 
@@ -1342,21 +1393,19 @@ void ApiServer::setup_routes()
                 });
                 return;
             }
-            auto body = json::parse(req.body);
+            auto body = parse_json_body(req);
             const auto name = body.at("name").get<std::string>();
             if (name.empty() || name.size() > validation::limits::name_bytes)
                 throw validation::ValidationError("group name must be between 1 and 64 characters");
-            for (const auto& existing : store_.list_groups())
+            // One atomic insert decides: two requests for a new name cannot both succeed.
+            const auto group_id = store_.create_group_if_absent(name);
+            if (!group_id)
             {
-                if (existing.name == name)
-                {
-                    send_error(res, 409, "a group with this name already exists");
-                    return;
-                }
+                send_error(res, 409, "a group with this name already exists");
+                return;
             }
-            auto group_id = store_.create_group(name);
             set_json(res, json{
-                              {"group_id", group_id}
+                              {"group_id", *group_id}
             });
         }
         catch (const std::exception& e)
@@ -1409,7 +1458,7 @@ void ApiServer::setup_routes()
                 });
                 return;
             }
-            auto body = json::parse(req.body);
+            auto body = parse_json_body(req);
             const auto username = body.at("username").get<std::string>();
             const auto password = body.at("password").get<std::string>();
             const auto role = body.value("role", "group_viewer");
@@ -1522,6 +1571,11 @@ void ApiServer::setup_routes()
             send_error(res, 400, "body required");
             return std::nullopt;
         }
+        if (!is_json_content_type(req))
+        {
+            send_error(res, 415, "Content-Type must be application/json");
+            return std::nullopt;
+        }
         body = json::parse(req.body, nullptr, false);
         if (!body.is_object())
         {
@@ -1571,6 +1625,11 @@ void ApiServer::setup_routes()
                     std::string note;
                     if (!req.body.empty())
                     {
+                        if (!is_json_content_type(req))
+                        {
+                            send_error(res, 415, "Content-Type must be application/json");
+                            return;
+                        }
                         const auto body = json::parse(req.body, nullptr, false);
                         if (!body.is_object())
                         {
@@ -1728,7 +1787,7 @@ void ApiServer::setup_routes()
                 {
                     try
                     {
-                        auto body = json::parse(req.body);
+                        auto body = parse_json_body(req);
                         if (!body.is_object())
                             throw validation::ValidationError("body must be a JSON object");
                         if (body.contains("group_ids"))
@@ -1869,7 +1928,7 @@ void ApiServer::setup_routes()
                 send_error(res, 404, "agent not found");
                 return;
             }
-            auto body = json::parse(req.body);
+            auto body = parse_json_body(req);
             auto group_ids = body.at("group_ids").get<std::vector<int64_t>>();
             require_valid(validation::check_count("group_ids", group_ids.size(), validation::limits::max_group_ids));
             if (const auto missing = first_missing_group(group_ids))
@@ -1899,13 +1958,16 @@ void ApiServer::setup_routes()
             if (!session)
                 return;
             LOGF_INFO("Deleting agent id=%s", id.c_str());
-            auto rec = store_.get_agent(id);
+            const auto rec = store_.get_agent(id);
+            // The store removes the agent in one transaction; only once that has
+            // committed is its key taken out of ZAP. A failed delete (rolled back)
+            // leaves the agent and its key as they were.
+            store_.delete_agent(id);
             if (rec)
             {
                 zap_.remove_key(rec->curve_public_key_z85);
                 LOGF_DEBUG("Deleted agent key removed from ZAP id=%s", id.c_str());
             }
-            store_.delete_agent(id);
             set_json(res, json{
                               {"ok", true}
             });
@@ -1984,7 +2046,7 @@ void ApiServer::setup_routes()
             auto id = req.path_params.at("id");
             if (!require_agent_access(req, res, "operator", id))
                 return;
-            auto body = json::parse(req.body);
+            auto body = parse_json_body(req);
 
             CommandMessage cmd;
             cmd.command_id = random_command_id();
@@ -2011,9 +2073,14 @@ void ApiServer::setup_routes()
             // args is optional raw bytes packed by caller; default empty
             if (body.contains("args"))
             {
-                cmd.args = body["args"].get<std::vector<uint8_t>>();
-                if (cmd.args.size() > 4096)
+                // Checked before converting to bytes: 1.5 would become 1, 257 would wrap.
+                const auto& args = body["args"];
+                if (!args.is_array())
+                    throw validation::ValidationError("args must be an array of bytes");
+                if (args.size() > 4096)
                     throw validation::ValidationError("args payload too large (max 4096 bytes)");
+                for (const auto& element : args)
+                    cmd.args.push_back(static_cast<uint8_t>(json_int_in_range(element, "args entry", 0, 255)));
             }
 
             // Body first: a malformed or out-of-range request is a 400 whether or
@@ -2048,10 +2115,10 @@ void ApiServer::setup_routes()
             auto id = req.path_params.at("id");
             if (!require_agent_access(req, res, "operator", id))
                 return;
-            auto body = json::parse(req.body);
-            int secs = body.at("interval_seconds").get<int>();
-            require_valid(validation::check_range("interval_seconds", secs, validation::limits::min_interval_seconds,
-                                                  validation::limits::max_interval_seconds));
+            auto body = parse_json_body(req);
+            const int secs =
+                json_int_in_range(body.at("interval_seconds"), "interval_seconds",
+                                  validation::limits::min_interval_seconds, validation::limits::max_interval_seconds);
             // Body first: a malformed or out-of-range request is a 400 whether or
             // not the agent is online. Nothing is changed or queued before this.
             if (!admit_command(id, res))
@@ -2098,10 +2165,9 @@ void ApiServer::setup_routes()
             auto id = req.path_params.at("id");
             if (!require_agent_access(req, res, "operator", id))
                 return;
-            auto body = json::parse(req.body);
-            int limit = body.at("limit").get<int>();
-            require_valid(validation::check_range("limit", limit, validation::limits::min_process_limit,
-                                                  validation::limits::max_process_limit));
+            auto body = parse_json_body(req);
+            const int limit = json_int_in_range(body.at("limit"), "limit", validation::limits::min_process_limit,
+                                                validation::limits::max_process_limit);
             // Body first: a malformed or out-of-range request is a 400 whether or
             // not the agent is online. Nothing is changed or queued before this.
             if (!admit_command(id, res))
@@ -2158,7 +2224,7 @@ void ApiServer::setup_routes()
                 return;
             }
 
-            auto body = json::parse(req.body);
+            auto body = parse_json_body(req);
             auto updated = apply_threshold_payload(*rec, body);
             store_.set_agent_thresholds(updated);
             LOGF_INFO("Updated per-agent thresholds id=%s", id.c_str());
@@ -2191,18 +2257,21 @@ void ApiServer::setup_routes()
                 return;
             }
 
-            auto body = json::parse(req.body);
-            const auto interval = body.at("collection_interval").get<int>();
-            const auto heartbeat_interval = body.value("heartbeat_interval", rec->heartbeat_interval);
-            const auto process_limit = body.at("process_limit").get<int>();
-            require_valid(validation::check_range("collection_interval", interval,
-                                                  validation::limits::min_interval_seconds,
-                                                  validation::limits::max_interval_seconds));
+            auto body = parse_json_body(req);
+            const int interval =
+                json_int_in_range(body.at("collection_interval"), "collection_interval",
+                                  validation::limits::min_interval_seconds, validation::limits::max_interval_seconds);
+            const int heartbeat_interval = body.contains("heartbeat_interval")
+                                               ? json_int_in_range(body.at("heartbeat_interval"), "heartbeat_interval",
+                                                                   validation::limits::min_heartbeat_seconds,
+                                                                   validation::limits::max_heartbeat_seconds)
+                                               : rec->heartbeat_interval;
             require_valid(validation::check_range("heartbeat_interval", heartbeat_interval,
                                                   validation::limits::min_heartbeat_seconds,
                                                   validation::limits::max_heartbeat_seconds));
-            require_valid(validation::check_range("process_limit", process_limit, validation::limits::min_process_limit,
-                                                  validation::limits::max_process_limit));
+            const int process_limit =
+                json_int_in_range(body.at("process_limit"), "process_limit", validation::limits::min_process_limit,
+                                  validation::limits::max_process_limit);
 
             auto config = body.at("collector_config").get<CollectorConfig>();
             validate_collector_config(config);
@@ -2230,7 +2299,9 @@ void ApiServer::setup_routes()
                 group_ids = body.at("group_ids").get<std::vector<int64_t>>();
                 require_valid(
                     validation::check_count("group_ids", group_ids.size(), validation::limits::max_group_ids));
-                if (const auto missing = first_missing_group(group_ids))
+                // The write below applies group_ids only for global roles, so only they are checked.
+                if (const auto missing =
+                        is_global_role(session->role) ? first_missing_group(group_ids) : std::optional<int64_t>{})
                 {
                     send_error(res, 404, "group " + std::to_string(*missing) + " not found");
                     return;
@@ -2275,9 +2346,9 @@ void ApiServer::setup_routes()
             auto id = req.path_params.at("id");
             if (!require_agent_access(req, res, "operator", id))
                 return;
-            auto body = req.body.empty() ? json::object() : json::parse(req.body);
+            auto body = parse_optional_json_body(req);
             const auto reason = body.value("reason", std::string());
-            const auto until = body.value("until_ms", static_cast<int64_t>(0));
+            const int64_t until = body.contains("until_ms") ? json_integer(body.at("until_ms"), "until_ms") : 0;
             require_valid(validation::check_text("reason", reason, validation::limits::reason_bytes));
             // 0 means "until resumed"; anything else must be a plausible timestamp.
             if (until != 0)
@@ -2451,11 +2522,11 @@ void ApiServer::setup_routes()
                             });
                             return;
                         }
-                        auto body = json::parse(req.body);
+                        auto body = parse_json_body(req);
                         MaintenanceWindowRecord rec;
                         rec.agent_id = body.value("agent_id", std::string("*"));
-                        rec.start_ms = body.at("start_ms").get<int64_t>();
-                        rec.end_ms = body.at("end_ms").get<int64_t>();
+                        rec.start_ms = json_integer(body.at("start_ms"), "start_ms");
+                        rec.end_ms = json_integer(body.at("end_ms"), "end_ms");
                         rec.reason = body.value("reason", std::string(""));
                         if (!is_global_role(session->role))
                         {
@@ -2546,7 +2617,7 @@ void ApiServer::setup_routes()
                 });
                 return;
             }
-            const auto body = json::parse(req.body);
+            const auto body = parse_json_body(req);
             const auto description = body.value("description", std::string(""));
             require_valid(validation::check_text("description", description, validation::limits::note_bytes));
             store_.set_agent_description(id, description);
@@ -2579,7 +2650,7 @@ void ApiServer::setup_routes()
                 });
                 return;
             }
-            const auto body = json::parse(req.body);
+            const auto body = parse_json_body(req);
             const auto markdown = body.value("markdown", std::string(""));
             require_valid(validation::check_text("markdown", markdown, validation::limits::markdown_bytes));
             store_.set_agent_runbook(id, markdown);
@@ -2637,7 +2708,7 @@ void ApiServer::setup_routes()
         }
         try
         {
-            const auto body = json::parse(req.body);
+            const auto body = parse_json_body(req);
             // Issue #147: a truncated URL is a different URL, so an oversize one
             // is rejected. Checked before any setting is written, so this
             // rejection does not leave earlier fields of the request applied.
@@ -2651,21 +2722,21 @@ void ApiServer::setup_routes()
                 store_.set_setting("notifications.webhook_url", body.at("webhook_url").get<std::string>());
             if (body.contains("offline_after_seconds"))
             {
-                const auto v = body.at("offline_after_seconds").get<int>();
+                const auto v = json_integer(body.at("offline_after_seconds"), "offline_after_seconds");
                 if (v < 10 || v > 86400)
                     throw validation::ValidationError("offline_after_seconds must be between 10 and 86400");
                 store_.set_setting("offline_after_seconds", std::to_string(v));
             }
             if (body.contains("escalation_timeout_seconds"))
             {
-                const auto v = body.at("escalation_timeout_seconds").get<int>();
+                const auto v = json_integer(body.at("escalation_timeout_seconds"), "escalation_timeout_seconds");
                 if (v < 60 || v > 604800)
                     throw validation::ValidationError("escalation_timeout_seconds must be between 60 and 604800");
                 store_.set_setting("escalation_timeout_seconds", std::to_string(v));
             }
             if (body.contains("metrics_retention_days"))
             {
-                const auto v = body.at("metrics_retention_days").get<int>();
+                const auto v = json_integer(body.at("metrics_retention_days"), "metrics_retention_days");
                 if (v < 1 || v > 365)
                     throw validation::ValidationError("metrics_retention_days must be between 1 and 365");
                 store_.set_setting("metrics_retention_days", std::to_string(v));
@@ -2681,14 +2752,14 @@ void ApiServer::setup_routes()
             }
             if (body.contains("reports_hour"))
             {
-                const auto v = body.at("reports_hour").get<int>();
+                const auto v = json_integer(body.at("reports_hour"), "reports_hour");
                 if (v < 0 || v > 23)
                     throw validation::ValidationError("reports_hour must be between 0 and 23");
                 store_.set_setting("reports.hour", std::to_string(v));
             }
             if (body.contains("reports_day_of_week"))
             {
-                const auto v = body.at("reports_day_of_week").get<int>();
+                const auto v = json_integer(body.at("reports_day_of_week"), "reports_day_of_week");
                 if (v < 0 || v > 6)
                     throw validation::ValidationError("reports_day_of_week must be between 0 and 6");
                 store_.set_setting("reports.day_of_week", std::to_string(v));
@@ -2889,7 +2960,7 @@ void ApiServer::setup_routes()
                 });
                 return;
             }
-            const auto body = json::parse(req.body);
+            const auto body = parse_json_body(req);
             const auto password = body.at("password").get<std::string>();
             require_valid(validation::check_text("password", password, validation::limits::password_bytes, true));
             store_.update_user_password(user_id, hash_password(password));
@@ -2935,7 +3006,7 @@ void ApiServer::setup_routes()
                 });
                 return;
             }
-            const auto body = json::parse(req.body);
+            const auto body = parse_json_body(req);
             SilenceRecord rec;
             rec.agent_id = body.value("agent_id", std::string("*"));
             rec.indicator = body.value("indicator", std::string("*"));
@@ -2955,7 +3026,7 @@ void ApiServer::setup_routes()
                 return;
             require_valid(validation::check_text("reason", rec.reason, validation::limits::reason_bytes));
             require_valid(validation::check_text("indicator", rec.indicator, validation::limits::name_bytes, true));
-            rec.until_ms = body.at("until_ms").get<int64_t>();
+            rec.until_ms = json_integer(body.at("until_ms"), "until_ms");
             require_valid(check_timestamp("until_ms", rec.until_ms));
             rec.created_by = session->username;
             rec.created_at = now_ms();
@@ -3058,33 +3129,32 @@ void ApiServer::setup_routes()
 
     // 404 when the view names an agent or group that does not exist. Answers on
     // res and returns false in that case.
-    auto view_references_exist = [this, first_missing_group](httplib::Response& res, const ViewRecord& view,
-                                                             bool check_agents, bool check_group) {
-        if (check_agents)
+    auto view_references_exist = [this, first_missing_group](httplib::Response& res,
+                                                             const std::vector<std::string>& agent_ids,
+                                                             int64_t group_id) {
+        for (const auto& agent_id : agent_ids)
         {
-            for (const auto& agent_id : view.agent_ids)
+            if (!store_.get_agent(agent_id))
             {
-                if (!store_.get_agent(agent_id))
-                {
-                    send_error(res, 404, "agent " + agent_id + " not found");
-                    return false;
-                }
+                send_error(res, 404, "agent " + agent_id + " not found");
+                return false;
             }
         }
-        if (check_group && view.group_id > 0 && first_missing_group({view.group_id}))
+        if (group_id > 0 && first_missing_group({group_id}))
         {
-            send_error(res, 404, "group " + std::to_string(view.group_id) + " not found");
+            send_error(res, 404, "group " + std::to_string(group_id) + " not found");
             return false;
         }
         return true;
     };
 
     // Size limits for a view's name and agent list (400 when exceeded).
-    auto validate_view = [](const ViewRecord& view) {
-        require_valid(validation::check_text("name", view.name, validation::limits::name_bytes, true));
-        require_valid(
-            validation::check_count("agent_ids", view.agent_ids.size(), validation::limits::max_ids_per_request));
-        for (const auto& agent_id : view.agent_ids)
+    auto validate_view_name = [](const std::string& name) {
+        require_valid(validation::check_text("name", name, validation::limits::name_bytes, true));
+    };
+    auto validate_view_agents = [](const std::vector<std::string>& agent_ids) {
+        require_valid(validation::check_count("agent_ids", agent_ids.size(), validation::limits::max_ids_per_request));
+        for (const auto& agent_id : agent_ids)
             require_valid(
                 validation::check_text("agent_ids entry", agent_id, validation::limits::agent_id_bytes, true));
     };
@@ -3116,14 +3186,14 @@ void ApiServer::setup_routes()
     });
 
     // POST /api/views — create a view (operator+)
-    http_->Post("/api/views", [this, view_to_json, validate_view, view_references_exist](const httplib::Request& req,
-                                                                                         httplib::Response& res) {
+    http_->Post("/api/views", [this, view_to_json, validate_view_name, validate_view_agents,
+                               view_references_exist](const httplib::Request& req, httplib::Response& res) {
         try
         {
             auto session = require_role(req, res, "operator");
             if (!session)
                 return;
-            auto body = json::parse(req.body);
+            auto body = parse_json_body(req);
             ViewRecord rec;
             rec.name = body.at("name").get<std::string>();
             rec.owner_user_id = session->user_id;
@@ -3141,7 +3211,8 @@ void ApiServer::setup_routes()
                     throw validation::ValidationError("agent_ids must be an array of agent ids");
                 rec.agent_ids = body["agent_ids"].get<std::vector<std::string>>();
             }
-            validate_view(rec);
+            validate_view_name(rec.name);
+            validate_view_agents(rec.agent_ids);
             // SEC-11: a view may only reference agents its creator can see.
             if (!is_global_role(session->role))
             {
@@ -3151,7 +3222,7 @@ void ApiServer::setup_routes()
                         throw validation::ValidationError("view references an agent outside your access");
                 }
             }
-            if (!view_references_exist(res, rec, true, true))
+            if (!view_references_exist(res, rec.agent_ids, rec.group_id))
                 return;
             rec.created_at = now_ms();
             const auto id = store_.create_view(rec);
@@ -3202,8 +3273,8 @@ void ApiServer::setup_routes()
     });
 
     // PUT /api/views/:id — update (owner or admin)
-    http_->Put("/api/views/:id", [this, view_to_json, validate_view, view_references_exist](const httplib::Request& req,
-                                                                                            httplib::Response& res) {
+    http_->Put("/api/views/:id", [this, view_to_json, validate_view_name, validate_view_agents,
+                                  view_references_exist](const httplib::Request& req, httplib::Response& res) {
         try
         {
             auto session = require_role(req, res, "operator");
@@ -3230,7 +3301,8 @@ void ApiServer::setup_routes()
                 });
                 return;
             }
-            auto body = json::parse(req.body);
+            auto body = parse_json_body(req);
+            const auto stored_agent_ids = existing->agent_ids;
             existing->name = body.value("name", existing->name);
             existing->is_public = body.value("is_public", existing->is_public);
             existing->group_id = body.value("group_id", existing->group_id);
@@ -3246,7 +3318,12 @@ void ApiServer::setup_routes()
                     throw validation::ValidationError("agent_ids must be an array of agent ids");
                 existing->agent_ids = body["agent_ids"].get<std::vector<std::string>>();
             }
-            validate_view(*existing);
+            // Only what the request supplies is validated: a rename must not fail on a
+            // legacy agent list it did not touch.
+            if (body.contains("name"))
+                validate_view_name(existing->name);
+            if (body.contains("agent_ids"))
+                validate_view_agents(existing->agent_ids);
             // SEC-11: a view may only reference agents its editor can see.
             if (!is_global_role(session->role))
             {
@@ -3256,9 +3333,18 @@ void ApiServer::setup_routes()
                         throw validation::ValidationError("view references an agent outside your access");
                 }
             }
-            // Only references the request changed are checked, so a view
-            // that still holds an old stale id can be renamed.
-            if (!view_references_exist(res, *existing, body.contains("agent_ids"), body.contains("group_id")))
+            // Only references the request adds are checked, so a view that still holds
+            // an old stale id can be renamed or re-saved with it.
+            std::vector<std::string> added_agent_ids;
+            if (body.contains("agent_ids"))
+            {
+                for (const auto& agent_id : existing->agent_ids)
+                {
+                    if (std::find(stored_agent_ids.begin(), stored_agent_ids.end(), agent_id) == stored_agent_ids.end())
+                        added_agent_ids.push_back(agent_id);
+                }
+            }
+            if (!view_references_exist(res, added_agent_ids, body.contains("group_id") ? existing->group_id : 0))
                 return;
             store_.update_view(*existing);
             set_json(res, view_to_json(*existing));
@@ -3359,7 +3445,7 @@ void ApiServer::setup_routes()
                 });
                 return;
             }
-            const auto body = json::parse(req.body);
+            const auto body = parse_json_body(req);
             RunbookRecord rec;
             // SEC-11: an optional agent_id scopes the runbook to one agent;
             // it is only shown to sessions that can see that agent.

@@ -1068,7 +1068,397 @@ SCENARIO("command_type must be an integer from 0 to 255 and is never wrapped")
                 std::vector<PendingCommand> queued;
                 fx.api.drain_commands(queued);
                 REQUIRE(queued.size() == 1);
+                REQUIRE(queued[0].agent_id == "on1");
+                REQUIRE(queued[0].cmd.command_type == 6); // GET_STATUS
             }
+        }
+    }
+}
+
+// ── Review batch: limits, integers, args, views, ordering ────────────────────
+
+SCENARIO("A query limit above the route maximum saturates instead of failing")
+{
+    GIVEN("an admin session")
+    {
+        ApiFixture fx;
+        REQUIRE(login_as_default_admin(fx.client));
+
+        THEN("huge positive limits clamp, while zero, negative and malformed ones stay 400")
+        {
+            REQUIRE(fx.client.Get("/api/alerts?limit=2147483648")->status == 200);
+            REQUIRE(fx.client.Get("/api/alerts?limit=99999999999999999999999")->status == 200);
+            REQUIRE(fx.client.Get("/api/alerts?limit=0")->status == 400);
+            REQUIRE(fx.client.Get("/api/alerts?limit=00")->status == 400);
+            REQUIRE(fx.client.Get("/api/alerts?limit=-1")->status == 400);
+            REQUIRE(fx.client.Get("/api/alerts?limit=abc")->status == 400);
+            REQUIRE(fx.client.Get("/api/alerts?limit=")->status == 400);
+        }
+    }
+}
+
+SCENARIO("Group creation reports whether it inserted")
+{
+    GIVEN("a store")
+    {
+        ApiFixture fx;
+
+        THEN("the first create returns the id and the second reports it already exists")
+        {
+            const auto first = fx.store->create_group_if_absent("Ops");
+            REQUIRE(first.has_value());
+            REQUIRE_FALSE(fx.store->create_group_if_absent("Ops").has_value());
+            REQUIRE(fx.store->create_group("Ops") == *first);
+        }
+    }
+}
+
+SCENARIO("Command args must be an array of at most 4096 bytes")
+{
+    GIVEN("an online and an offline agent")
+    {
+        ApiFixture fx;
+        fx.store->upsert_agent(approved_agent("on1"));
+        auto offline = approved_agent("off1");
+        offline.connected = false;
+        fx.store->upsert_agent(offline);
+        REQUIRE(login_as_default_admin(fx.client));
+        const auto post_args = [&](const char* agent, const json& args) {
+            return fx
+                .post(std::string("/api/agents/") + agent + "/command",
+                      json{
+                          {"command_type", 6   },
+                          {"args",         args}
+            })
+                ->status;
+        };
+
+        THEN("a fractional, out of range, non numeric or oversized element is 400 for both agents")
+        {
+            for (const char* agent : {"on1", "off1"})
+            {
+                REQUIRE(post_args(agent, json::array({1.5})) == 400);
+                REQUIRE(post_args(agent, json::array({256})) == 400);
+                REQUIRE(post_args(agent, json::array({-1})) == 400);
+                REQUIRE(post_args(agent, json::array({"1"})) == 400);
+                REQUIRE(post_args(agent, json::array({true})) == 400);
+                REQUIRE(post_args(agent, json("abc")) == 400);
+                REQUIRE(post_args(agent, json(std::vector<int>(4097, 1))) == 400);
+            }
+        }
+
+        THEN("omitted, empty and maximum size args are valid")
+        {
+            REQUIRE(post_args("on1", json::array()) == 200);
+            REQUIRE(post_args("on1", json(std::vector<int>(4096, 255))) == 200);
+            REQUIRE(fx.post("/api/agents/on1/command",
+                            json{
+                                {"command_type", 6}
+            })
+                        ->status == 200);
+            REQUIRE(post_args("off1", json::array()) == 409);
+        }
+    }
+}
+
+SCENARIO("Integer fields reject non-integer JSON numbers instead of truncating them")
+{
+    GIVEN("an admin session and an online agent")
+    {
+        ApiFixture fx;
+        fx.store->upsert_agent(approved_agent("a1"));
+        REQUIRE(login_as_default_admin(fx.client));
+        const auto until = now_ms() + 3'600'000;
+
+        THEN("interval, process limit, collector config and settings fields are 400")
+        {
+            REQUIRE(fx.post("/api/agents/a1/set_interval",
+                            json{
+                                {"interval_seconds", 30.5}
+            })
+                        ->status == 400);
+            REQUIRE(fx.post("/api/agents/a1/set_process_limit",
+                            json{
+                                {"limit", 50.5}
+            })
+                        ->status == 400);
+            const auto rec = fx.store->get_agent("a1");
+            REQUIRE(fx.post("/api/agents/a1/collector_config",
+                            json{
+                                {"collection_interval", 30.5                       },
+                                {"process_limit",       50                         },
+                                {"collector_config",    json(rec->collector_config)}
+            })
+                        ->status == 400);
+            REQUIRE(fx.post("/api/agents/a1/collector_config",
+                            json{
+                                {"collection_interval", 30                         },
+                                {"heartbeat_interval",  10.5                       },
+                                {"process_limit",       50                         },
+                                {"collector_config",    json(rec->collector_config)}
+            })
+                        ->status == 400);
+            for (const char* field : {"offline_after_seconds", "escalation_timeout_seconds", "metrics_retention_days",
+                                      "reports_hour", "reports_day_of_week"})
+                REQUIRE(fx.put("/api/settings",
+                               json{
+                                   {field, 3.5}
+                })
+                            ->status == 400);
+        }
+
+        THEN("a fractional until_ms never becomes the 'until resumed' sentinel")
+        {
+            REQUIRE(fx.post("/api/agents/a1/maintenance",
+                            json{
+                                {"until_ms", 0.5}
+            })
+                        ->status == 400);
+            REQUIRE_FALSE(fx.store->get_agent("a1")->maintenance);
+            REQUIRE(fx.post("/api/agents/a1/maintenance",
+                            json{
+                                {"until_ms", 0}
+            })
+                        ->status == 200);
+        }
+
+        THEN("silence and maintenance window times must be integers too")
+        {
+            REQUIRE(fx.post("/api/silences",
+                            json{
+                                {"agent_id", "a1"                            },
+                                {"until_ms", static_cast<double>(until) + 0.5}
+            })
+                        ->status == 400);
+            REQUIRE(
+                fx.post("/api/maintenance-windows",
+                        json{
+                            {"agent_id", "a1"                               },
+                            {"start_ms", static_cast<double>(now_ms()) + 0.5},
+                            {"end_ms",   until                              }
+            })
+                    ->status == 400);
+        }
+    }
+}
+
+SCENARIO("Collector group_ids are only checked for callers whose group_ids are applied")
+{
+    GIVEN("a group operator with access to an agent, and a global admin")
+    {
+        ApiFixture fx;
+        REQUIRE(login_as_default_admin(fx.client));
+        const auto group_a = json::parse(fx.post("/api/groups",
+                                                 json{
+                                                     {"name", "A"}
+        })
+                                             ->body)["group_id"]
+                                 .get<int64_t>();
+        fx.store->upsert_agent(approved_agent("agent-a"));
+        fx.store->set_agent_groups("agent-a", {group_a});
+        REQUIRE(fx.post("/api/users",
+                        json{
+                            {"username",  "op"            },
+                            {"password",  "pw12345!"      },
+                            {"role",      "group_operator"},
+                            {"group_ids", {group_a}       }
+        })
+                    ->status == 200);
+        httplib::Client user("http://127.0.0.1:" + std::to_string(fx.port));
+        REQUIRE(login_as(user, "op", "pw12345!"));
+        const auto rec = fx.store->get_agent("agent-a");
+        const auto body_with = [&](const json& group_ids) {
+            return json{
+                {"collection_interval", rec->collection_interval   },
+                {"process_limit",       rec->process_limit         },
+                {"collector_config",    json(rec->collector_config)},
+                {"group_ids",           group_ids                  }
+            };
+        };
+
+        THEN("the operator's removed group id is ignored, the admin's is 404")
+        {
+            REQUIRE(user.Post("/api/agents/agent-a/collector_config", body_with(json::array({98765})).dump(),
+                              "application/json")
+                        ->status == 200);
+            REQUIRE(fx.post("/api/agents/agent-a/collector_config", body_with(json::array({98765})))->status == 404);
+            REQUIRE(fx.store->get_agent_groups("agent-a") == std::vector<int64_t>{group_a});
+        }
+    }
+}
+
+SCENARIO("A view update checks only what it adds and validates only what it supplies")
+{
+    GIVEN("an admin and a view that holds a deleted agent and a very long legacy agent list")
+    {
+        ApiFixture fx;
+        fx.store->upsert_agent(approved_agent("a1"));
+        REQUIRE(login_as_default_admin(fx.client));
+        ViewRecord stale;
+        stale.name = "stale";
+        stale.owner_user_id = 1;
+        stale.created_at = 1;
+        stale.agent_ids = {"long-gone", "a1"};
+        const auto stale_id = fx.store->create_view(stale);
+        ViewRecord legacy;
+        legacy.name = "legacy";
+        legacy.owner_user_id = 1;
+        legacy.created_at = 1;
+        for (int i = 0; i < 1001; ++i)
+            legacy.agent_ids.push_back("legacy-" + std::to_string(i));
+        const auto legacy_id = fx.store->create_view(legacy);
+
+        THEN("re-sending the stored list is accepted")
+        {
+            REQUIRE(fx.put("/api/views/" + std::to_string(stale_id),
+                           json{
+                               {"agent_ids", {"long-gone", "a1"}}
+            })
+                        ->status == 200);
+        }
+
+        THEN("adding an unknown agent is 404, adding a real one is accepted")
+        {
+            REQUIRE(fx.put("/api/views/" + std::to_string(stale_id),
+                           json{
+                               {"agent_ids", {"long-gone", "a1", "ghost"}}
+            })
+                        ->status == 404);
+            fx.store->upsert_agent(approved_agent("a2"));
+            REQUIRE(fx.put("/api/views/" + std::to_string(stale_id),
+                           json{
+                               {"agent_ids", {"long-gone", "a1", "a2"}}
+            })
+                        ->status == 200);
+        }
+
+        THEN("renaming the legacy view works, replacing its list with an over-long one does not")
+        {
+            REQUIRE(fx.put("/api/views/" + std::to_string(legacy_id),
+                           json{
+                               {"name", "renamed"}
+            })
+                        ->status == 200);
+            REQUIRE(fx.put("/api/views/" + std::to_string(legacy_id),
+                           json{
+                               {"agent_ids", legacy.agent_ids}
+            })
+                        ->status == 400);
+        }
+
+        THEN("a bad name is still 400 when it is supplied")
+        {
+            REQUIRE(fx.put("/api/views/" + std::to_string(stale_id),
+                           json{
+                               {"name", std::string(65, 'n')}
+            })
+                        ->status == 400);
+        }
+    }
+}
+
+SCENARIO("A JSON body needs a JSON content type on every route that parses one")
+{
+    GIVEN("an admin session, an online agent and an alert")
+    {
+        ApiFixture fx;
+        fx.store->upsert_agent(approved_agent("a1"));
+        REQUIRE(login_as_default_admin(fx.client));
+        const auto alert = add_alert(*fx.store, "a1", 100);
+        const auto as_text = [&](const std::string& path, const json& body) {
+            return fx.client.Post(path, body.dump(), "text/plain")->status;
+        };
+
+        THEN("text/plain is 415 for acknowledge, commands, maintenance and bulk acknowledge")
+        {
+            REQUIRE(as_text("/api/alerts/" + std::to_string(alert) + "/ack", json{
+                                                                                 {"note", "x"}
+            }) == 415);
+            REQUIRE(as_text("/api/agents/a1/set_interval", json{
+                                                               {"interval_seconds", 30}
+            }) == 415);
+            REQUIRE(as_text("/api/agents/a1/set_process_limit", json{
+                                                                    {"limit", 50}
+            }) == 415);
+            REQUIRE(as_text("/api/agents/a1/command", json{
+                                                          {"command_type", 6}
+            }) == 415);
+            REQUIRE(as_text("/api/agents/a1/maintenance", json{
+                                                              {"reason", "x"}
+            }) == 415);
+            REQUIRE(as_text("/api/alerts/bulk-ack", json{
+                                                        {"alert_ids", {alert}}
+            }) == 415);
+            REQUIRE(fx.store->get_alert(alert)->acknowledged_at == 0);
+        }
+
+        THEN("a route that takes no body still accepts an empty one")
+        {
+            REQUIRE(fx.client.Post("/api/alerts/" + std::to_string(alert) + "/ack", "", "application/json")->status ==
+                    200);
+            REQUIRE(fx.client.Post("/api/agents/a1/maintenance", "", "application/json")->status == 200);
+        }
+    }
+}
+
+SCENARIO("A failing delete keeps the agent's ZAP key, and a failing login is a generic 500")
+{
+    GIVEN("an API on a file database with an enrolled agent whose key is registered")
+    {
+        const auto dir = thewatcher::test::process_temp_dir().path() / "api-validation";
+        std::filesystem::create_directories(dir);
+        const auto db = (dir / "fault2.db").string();
+        std::filesystem::remove(db);
+        ApiFixture fx(db);
+        auto agent = approved_agent("keyed");
+        agent.curve_public_key_z85 = std::string(40, 'a');
+        fx.store->upsert_agent(agent);
+        fx.zap.add_key(agent.curve_public_key_z85, "keyed");
+        REQUIRE(login_as_default_admin(fx.client));
+        {
+            sqlite3* raw = nullptr;
+            REQUIRE(sqlite3_open(db.c_str(), &raw) == SQLITE_OK);
+            REQUIRE(sqlite3_exec(raw, "DROP TABLE silences;", nullptr, nullptr, nullptr) == SQLITE_OK);
+            sqlite3_close(raw);
+        }
+
+        WHEN("deleting the agent fails in the store")
+        {
+            const auto res = fx.client.Delete("/api/agents/keyed");
+
+            THEN("the answer is 500 and the key is still registered")
+            {
+                REQUIRE(res->status == 500);
+                REQUIRE(fx.zap.has_key(agent.curve_public_key_z85));
+            }
+        }
+    }
+
+    GIVEN("an API whose sessions table is gone")
+    {
+        const auto dir = thewatcher::test::process_temp_dir().path() / "api-validation";
+        std::filesystem::create_directories(dir);
+        const auto db = (dir / "fault3.db").string();
+        std::filesystem::remove(db);
+        ApiFixture fx(db);
+        {
+            sqlite3* raw = nullptr;
+            REQUIRE(sqlite3_open(db.c_str(), &raw) == SQLITE_OK);
+            REQUIRE(sqlite3_exec(raw, "DROP TABLE sessions;", nullptr, nullptr, nullptr) == SQLITE_OK);
+            sqlite3_close(raw);
+        }
+
+        THEN("a correct login is a generic 500 and malformed JSON is still 400")
+        {
+            const auto res = fx.post("/api/login", json{
+                                                       {"username", "thewatcher"},
+                                                       {"password", "look_at_me"}
+            });
+            REQUIRE(res->status == 500);
+            REQUIRE(json::parse(res->body) == json{
+                                                  {"error", "internal error"}
+            });
+            REQUIRE(fx.client.Post("/api/login", "{not json", "application/json")->status == 400);
         }
     }
 }

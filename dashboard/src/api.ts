@@ -77,12 +77,26 @@ export async function createUser(username: string, password: string, role: UserR
   await jsonPost<{ user_id: number }>('/api/users', { username, password, role, group_ids: groupIds });
 }
 
+// The server returns at most this many alerts per request, so a longer list
+// is read page by page (limit/offset) until a short page ends it.
+const ALERT_PAGE_SIZE = 1000;
+
+async function fetchAllAlertPages(path: string, params: string[] = []): Promise<AlertRecord[]> {
+  const alerts: AlertRecord[] = [];
+  for (let offset = 0; ; offset += ALERT_PAGE_SIZE) {
+    const query = [...params, `limit=${ALERT_PAGE_SIZE}`, `offset=${offset}`].join('&');
+    const page = await fetchJson<AlertRecord[]>(`${path}?${query}`);
+    alerts.push(...page);
+    if (page.length < ALERT_PAGE_SIZE) return alerts;
+  }
+}
+
 export async function fetchAlerts(includeArchived = false): Promise<AlertRecord[]> {
-  return fetchJson<AlertRecord[]>(includeArchived ? '/api/alerts?include_archived=1' : '/api/alerts');
+  return fetchAllAlertPages('/api/alerts', includeArchived ? ['include_archived=1'] : []);
 }
 
 export async function fetchUnacknowledgedAlerts(): Promise<AlertRecord[]> {
-  return fetchJson<AlertRecord[]>('/api/alerts/unacknowledged');
+  return fetchAllAlertPages('/api/alerts/unacknowledged');
 }
 
 export async function loadDashboardData(): Promise<{

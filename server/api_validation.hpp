@@ -98,6 +98,25 @@ inline std::optional<int> parse_int(std::string_view text, int min, int max)
     return value;
 }
 
+// Parses a positive decimal integer for a query limit and saturates it at `max`:
+// a value too large for any integer type is `max`, not an error. Returns nullopt
+// for empty text, zero, signs, leading zeros or any non-digit (callers answer 400).
+inline std::optional<int> parse_positive_saturating(std::string_view text, int max)
+{
+    if (text.empty() || text[0] == '0')
+        return std::nullopt;
+    int64_t value = 0;
+    for (const char ch : text)
+    {
+        if (ch < '0' || ch > '9')
+            return std::nullopt;
+        // Stop growing once past max; the rest of the digits are still validated.
+        if (value <= max)
+            value = value * 10 + (ch - '0');
+    }
+    return static_cast<int>(value > max ? max : value);
+}
+
 // Returns an error message when value is longer than max_bytes (or empty while
 // required), otherwise nullopt. field names the JSON field in the message.
 inline std::optional<std::string> check_text(std::string_view field, std::string_view value, std::size_t max_bytes,

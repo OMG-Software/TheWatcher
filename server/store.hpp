@@ -222,6 +222,11 @@ public:
 
     virtual std::vector<GroupRecord> list_groups() = 0;
     virtual int64_t create_group(const std::string& name) = 0;
+    // Inserts the group and returns its id, or returns nothing when a group with
+    // this name already exists. One atomic statement, so two concurrent creators
+    // of the same name cannot both be told they inserted it. create_group stays
+    // idempotent for bootstrap.
+    virtual std::optional<int64_t> create_group_if_absent(const std::string& name) = 0;
     virtual std::vector<int64_t> get_agent_groups(const std::string& agent_id) = 0;
     virtual void set_agent_groups(const std::string& agent_id, const std::vector<int64_t>& group_ids) = 0;
     virtual std::optional<UserRecord> get_user_by_username(const std::string& username) = 0;
