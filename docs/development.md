@@ -95,9 +95,10 @@ npm.cmd test
   read `runner.config.*` / `fx.config.*` as before. Do not probe a port, release
   it and bind it later: another process, or on FreeBSD/OpenBSD an outgoing
   connection, can take it in between. `free_zmq_endpoint()` / `free_http_port()`
-  in `test_support/net_helpers.hpp` still do that: they are unique within one
-  process only, 20000-32767 is inside FreeBSD's default ephemeral range, and the
-  race window exists, so new tests should not use them. A test that restarts a
+  in `test_support/net_helpers.hpp` still do that: the OS picks the port (no
+  fixed range, so BSD ephemeral ranges do not matter), but the port is released
+  before the caller binds it and is unique within one process only, so new
+  tests should not use them. A test that restarts a
   server on the same port may rebind the explicit port it read back.
 - Keep `httplib` route callbacks self-contained. Shared authorization,
   session, and command helpers should live on `ApiServer` and callbacks should

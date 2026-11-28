@@ -68,8 +68,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   `enrollment_endpoint()` and `api_port()`, `ApiServer` gained `port()` and
   accepts port 0, and the server logs the endpoints it actually bound. The
   config file loader is unchanged. `free_zmq_endpoint()` / `free_http_port()`
-  remain, with corrected comments, but nothing in the tree calls them besides
-  the `net_helpers` test (per-process uniqueness only).
+  remain for code that still calls them, but now take an OS-assigned port
+  instead of walking the fixed 20000-32767 range (which overlaps the FreeBSD
+  and OpenBSD ephemeral ranges), and remember what they handed out so a
+  process never gets the same port twice. Nothing in the tree calls them
+  besides the `net_helpers` test.
 - All alerts now go through one pipeline that applies maintenance, silences,
   severity validation, de-duplication, the runbook link and the webhook.
   Log-match alerts no longer fire during maintenance, offline and log-match

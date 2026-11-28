@@ -12,8 +12,9 @@
 
 #include "test_support/timing.hpp"
 
-#include <atomic>
-#include <random>
+#include <mutex>
+#include <set>
+#include <stdexcept>
 #include <string>
 
 #include <zmq.hpp>
@@ -21,54 +22,43 @@
 namespace thewatcher::test
 {
 
-// The next candidate port in 20000-32767 for this process.
-//
-// Unique per process only: each process starts at a random offset and walks
-// the range, so no port repeats within one process until all 12768 are used.
-// Two processes can still pick the same port. The range is below the Linux,
-// Windows and macOS ephemeral ranges but inside FreeBSD's default one (from
-// 10000) and overlaps OpenBSD's, so an outgoing connection can be given a
-// candidate port too.
-inline int next_candidate_port()
-{
-    static std::atomic<unsigned> next{std::random_device{}()};
-    return 20000 + static_cast<int>(next.fetch_add(1) % 12768U);
-}
-
 // A free "tcp://127.0.0.1:<port>" endpoint for a server under test to bind.
 //
-// The port comes from next_candidate_port() and is checked by binding it, then
-// released before returning. It is therefore only a hint: between the release
-// and the code under test binding it (the race window) another process may
-// pick the same port, and on FreeBSD/OpenBSD an outgoing connection may take
-// it. Falls back to an OS-assigned port if no candidate can be bound.
+// The OS picks the port: a probe binds "tcp://127.0.0.1:*", so the port comes
+// from the platform's own ephemeral range and nothing had it bound at that
+// moment. There is no fixed port range, so nothing here assumes where a
+// platform's ephemeral range starts (FreeBSD's starts at 10000, OpenBSD's
+// default covers 1024-49151).
+//
+// The probe is released before returning, so the port is only a hint: between
+// the release and the code under test binding it (the race window) another
+// process or an outgoing connection may take it. The OS may also hand the same
+// port back to a later probe, so the ports handed out are remembered and none
+// is handed out twice in one process; a caller may ask for several before it
+// binds any. Two processes can still be handed the same port.
 inline std::string free_zmq_endpoint()
 {
-    // A context per call: destroying it waits until the probe socket is fully
+    static std::mutex mutex;
+    static std::set<std::string> handed_out;
+
+    // A context per call: destroying it waits until the probe sockets are fully
     // closed, so the port is free again when this returns.
     zmq::context_t ctx{1};
     for (int attempt = 0; attempt < 64; ++attempt)
     {
-        const int port = next_candidate_port();
-        const std::string endpoint = "tcp://127.0.0.1:" + std::to_string(port);
-        try
+        std::string endpoint;
         {
             zmq::socket_t probe{ctx, ZMQ_REP};
             probe.set(zmq::sockopt::linger, 0);
-            probe.bind(endpoint);
-            probe.close();
+            probe.bind("tcp://127.0.0.1:*");
+            endpoint = probe.get(zmq::sockopt::last_endpoint);
+        }
+        const std::lock_guard<std::mutex> lock(mutex);
+        if (handed_out.insert(endpoint).second)
             return endpoint;
-        }
-        catch (const zmq::error_t&)
-        {
-            // In use: try another candidate.
-        }
+        // Already handed out in this process: ask the OS again.
     }
-    zmq::socket_t socket{ctx, ZMQ_REP};
-    socket.bind("tcp://127.0.0.1:*");
-    auto endpoint = socket.get(zmq::sockopt::last_endpoint);
-    socket.close();
-    return endpoint;
+    throw std::runtime_error("free_zmq_endpoint: the OS kept returning ports already handed out");
 }
 
 // A free TCP port on 127.0.0.1 (see free_zmq_endpoint).
