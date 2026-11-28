@@ -43,4 +43,12 @@ void write_private_file_atomic(const std::filesystem::path& target, const std::s
 // installer, or choose a private --config path).
 void ensure_private_directory(const std::filesystem::path& dir);
 
+namespace detail
+{
+    // Creates one private directory level (POSIX mode 0700; Windows protected ACL).
+    // Never follows a link: a symlink or junction already at `dir` is refused, and
+    // an existing real directory is left as it is. Exposed for tests.
+    void create_private_directory_level(const std::filesystem::path& dir);
+} // namespace detail
+
 } // namespace thewatcher::common

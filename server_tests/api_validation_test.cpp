@@ -1022,3 +1022,53 @@ SCENARIO("A command body is validated before the agent's connection state is che
         }
     }
 }
+
+SCENARIO("command_type must be an integer from 0 to 255 and is never wrapped")
+{
+    GIVEN("an online agent")
+    {
+        ApiFixture fx;
+        fx.store->upsert_agent(approved_agent("on1"));
+        REQUIRE(login_as_default_admin(fx.client));
+
+        WHEN("command_type is 256 plus a valid type, negative, or not an integer")
+        {
+            const auto status_of = [&](const json& value) {
+                return fx
+                    .post("/api/agents/on1/command",
+                          json{
+                              {"command_type", value}
+                })
+                    ->status;
+            };
+
+            THEN("each is 400 and nothing is queued")
+            {
+                REQUIRE(status_of(262) == 400);  // 256 + 6 would wrap to GET_STATUS
+                REQUIRE(status_of(-255) == 400); // would wrap to 1
+                REQUIRE(status_of(6.5) == 400);
+                REQUIRE(status_of("6") == 400);
+                REQUIRE(status_of(true) == 400);
+                REQUIRE(status_of(nullptr) == 400);
+                std::vector<PendingCommand> queued;
+                fx.api.drain_commands(queued);
+                REQUIRE(queued.empty());
+            }
+        }
+
+        WHEN("command_type is a valid type")
+        {
+            THEN("it is queued")
+            {
+                REQUIRE(fx.post("/api/agents/on1/command",
+                                json{
+                                    {"command_type", 6}
+                })
+                            ->status == 200);
+                std::vector<PendingCommand> queued;
+                fx.api.drain_commands(queued);
+                REQUIRE(queued.size() == 1);
+            }
+        }
+    }
+}

@@ -9,6 +9,13 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Security
 
+- Creating a missing config-directory level no longer follows a link: it is
+  opened with `O_NOFOLLOW` and only a directory the server just created is
+  chmodded (a link or non-directory at that level is refused; on Windows a
+  junction is refused). Before, `chmod` followed a link that appeared after the
+  existence check.
+- `command_type` of `POST /api/agents/:id/command` must be an integer from 0 to
+  255; before, 262 wrapped to a valid type and 6.5 was accepted as 6.
 - The config-directory check now runs on the deepest existing level before
   any missing level is created, so a symlink planted by another user (for
   example `/tmp/link/new/...`) no longer makes the server create directories

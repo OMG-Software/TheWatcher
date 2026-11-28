@@ -258,6 +258,34 @@ namespace
         }
     };
 
+    // Owns a handle returned by CreateFileW (INVALID_HANDLE_VALUE when it failed).
+    class FileHandle
+    {
+    public:
+        explicit FileHandle(HANDLE handle)
+            : handle_(handle)
+        {
+        }
+        ~FileHandle()
+        {
+            if (handle_ != INVALID_HANDLE_VALUE)
+                CloseHandle(handle_);
+        }
+        FileHandle(const FileHandle&) = delete;
+        FileHandle& operator=(const FileHandle&) = delete;
+        HANDLE get() const
+        {
+            return handle_;
+        }
+        bool valid() const
+        {
+            return handle_ != INVALID_HANDLE_VALUE;
+        }
+
+    private:
+        HANDLE handle_;
+    };
+
     // Rights that let an account rename, replace or re-permission a directory or
     // one of its children, which is what an ancestor must not allow. Adding a file
     // or subdirectory is not among them: C:\ and C:\ProgramData grant it to Users.
@@ -382,18 +410,17 @@ namespace
     // FILE_FLAG_OPEN_REPARSE_POINT so the link is read, not its target.
     std::optional<std::string> unsafe_link_reason(const fs::path& link, const fs::path& /*container*/)
     {
-        HANDLE raw =
+        const FileHandle handle(
             CreateFileW(link.c_str(), READ_CONTROL, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
-                        OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
-        if (raw == INVALID_HANDLE_VALUE)
+                        OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
+        if (!handle.valid())
             return "its permissions cannot be read (error " + std::to_string(GetLastError()) + ")";
-        std::unique_ptr<void, HandleCloser> handle(raw);
         PSID owner = nullptr;
         PACL dacl = nullptr;
         PSECURITY_DESCRIPTOR raw_descriptor = nullptr;
         const DWORD status =
-            GetSecurityInfo(raw, SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION, &owner,
-                            nullptr, &dacl, nullptr, &raw_descriptor);
+            GetSecurityInfo(handle.get(), SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+                            &owner, nullptr, &dacl, nullptr, &raw_descriptor);
         if (status != ERROR_SUCCESS)
             return "its permissions cannot be read (error " + std::to_string(status) + ")";
         LocalMemory descriptor(raw_descriptor);
@@ -417,7 +444,7 @@ namespace
 
     // Creates one directory with a protected DACL: SYSTEM, Administrators and the
     // owner get full control, inherited by files and subfolders; nobody else.
-    void create_private_directory_level(const fs::path& dir)
+    void create_level(const fs::path& dir)
     {
         SECURITY_ATTRIBUTES attributes{};
         attributes.nLength = sizeof(attributes);
@@ -427,9 +454,15 @@ namespace
                 &attributes.lpSecurityDescriptor, nullptr))
             throw std::runtime_error("Cannot build the security descriptor for " + dir.string());
         LocalMemory descriptor(attributes.lpSecurityDescriptor);
-        if (!CreateDirectoryW(dir.c_str(), &attributes) && GetLastError() != ERROR_ALREADY_EXISTS)
-            throw std::runtime_error("Cannot create " + dir.string() + " (error " + std::to_string(GetLastError()) +
-                                     ")");
+        if (!CreateDirectoryW(dir.c_str(), &attributes))
+        {
+            const DWORD error = GetLastError();
+            if (error != ERROR_ALREADY_EXISTS)
+                throw std::runtime_error("Cannot create " + dir.string() + " (error " + std::to_string(error) + ")");
+            // An existing level is judged by the checks that follow; a link there is never accepted.
+            if (is_link(dir))
+                throw std::runtime_error("Cannot create " + dir.string() + ": a link is already there");
+        }
     }
 #else
     // Why `dir` is not safe for `role`, or nothing when it is.
@@ -489,12 +522,46 @@ namespace
         return target;
     }
 
-    void create_private_directory_level(const fs::path& dir)
+    // Closes a file descriptor when it goes out of scope.
+    class FileDescriptor
     {
-        if (::mkdir(dir.c_str(), S_IRWXU) != 0 && errno != EEXIST)
+    public:
+        explicit FileDescriptor(int fd)
+            : fd_(fd)
+        {
+        }
+        ~FileDescriptor()
+        {
+            if (fd_ >= 0)
+                ::close(fd_);
+        }
+        FileDescriptor(const FileDescriptor&) = delete;
+        FileDescriptor& operator=(const FileDescriptor&) = delete;
+        int get() const
+        {
+            return fd_;
+        }
+
+    private:
+        int fd_;
+    };
+
+    // Creates one private level (mode 0700). The mode is only changed on a directory
+    // this call created, and always through a descriptor opened without following
+    // links, so a link that appears at the path is refused and never chmodded.
+    void create_level(const fs::path& dir)
+    {
+        const bool created = ::mkdir(dir.c_str(), S_IRWXU) == 0;
+        if (!created && errno != EEXIST)
             throw std::runtime_error("Cannot create " + dir.string() + ": " + std::strerror(errno));
-        // mkdir applies the umask; make the mode exact.
-        if (::chmod(dir.c_str(), S_IRWXU) != 0)
+        // Fails for a symlink or anything that is not a directory.
+        const FileDescriptor fd(::open(dir.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC));
+        if (fd.get() < 0)
+            throw std::runtime_error("Cannot open " + dir.string() +
+                                     " as a directory without following links: " + std::strerror(errno));
+        // mkdir applies the umask; make the mode exact. An existing directory is judged by
+        // the checks that follow, not rewritten.
+        if (created && ::fchmod(fd.get(), S_IRWXU) != 0)
             throw std::runtime_error("Cannot restrict " + dir.string() + ": " + std::strerror(errno));
     }
 #endif
@@ -644,6 +711,14 @@ namespace
     }
 } // namespace
 
+namespace detail
+{
+    void create_private_directory_level(const fs::path& dir)
+    {
+        create_level(dir);
+    }
+} // namespace detail
+
 // `dir` with every symlink and junction resolved. A directory this user cannot
 // open (owner-only ACL) cannot be resolved itself; its parent can.
 static fs::path resolve_for_check(const fs::path& dir)
@@ -686,7 +761,7 @@ void ensure_private_directory(const fs::path& dir)
 
     // Each missing level is created private.
     for (auto it = missing.rbegin(); it != missing.rend(); ++it)
-        create_private_directory_level(*it);
+        create_level(*it);
 
     if (const auto reason = unsafe_reason(dir, DirRole::Leaf))
         refuse(dir, *reason);

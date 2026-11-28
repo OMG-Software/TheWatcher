@@ -139,7 +139,9 @@ working document for audit, design review, and regression testing.
   directory, the link's own owner or ACL), so another user cannot retarget a
   link on the path after the check, and missing levels are created only after the
   deepest existing level passed, so a planted link cannot be used to create
-  directories in its target. `--uninstall-service` runs before the
+  directories in its target; a level is created without following links and only
+  a directory just created is chmodded, so a link that appears in the race
+  window cannot redirect the mode change. `--uninstall-service` runs before the
   check. Residual risk: the agent config under its
   own data directory is not checked yet.
 - Config parser file and line sizes are bounded to avoid unbounded local input,

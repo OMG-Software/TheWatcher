@@ -1988,7 +1988,11 @@ void ApiServer::setup_routes()
 
             CommandMessage cmd;
             cmd.command_id = random_command_id();
-            cmd.command_type = body.at("command_type").get<uint8_t>();
+            // Read as an integer first: get<uint8_t>() would wrap 262 to 6 or accept 6.5.
+            const auto& command_type = body.at("command_type");
+            if (!command_type.is_number_unsigned() || command_type.get<uint64_t>() > 255)
+                throw validation::ValidationError("command_type must be an integer from 0 to 255");
+            cmd.command_type = static_cast<uint8_t>(command_type.get<uint64_t>());
             // M-7: Validate against known CommandType values.
             static constexpr uint8_t valid_command_types[] = {
                 static_cast<uint8_t>(CommandType::SET_INTERVAL),

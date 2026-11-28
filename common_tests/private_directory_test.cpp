@@ -643,6 +643,58 @@ SCENARIO("Nothing is created below a path that fails the checks")
     }
 }
 
+SCENARIO("A link that appears where a level was missing is never followed when creating it")
+{
+    GIVEN("a link at the level about to be created, pointing at an existing directory")
+    {
+        const auto target = fresh_parent("private-dir-create-link-target");
+        const auto holder = fresh_parent("private-dir-create-link-holder");
+        const auto link = holder / "level";
+#ifdef _WIN32
+        // The target is open to Users; creating through the junction must not rewrite its ACL.
+        grant_users_write(target);
+        REQUIRE(std::system(("\"mklink /J \"" + link.string() + "\" \"" + target.string() + "\" > NUL\"").c_str()) ==
+                0);
+#else
+        set_mode(target, fs::perms::owner_all | fs::perms::group_read | fs::perms::group_exec | fs::perms::others_read |
+                             fs::perms::others_exec); // 0755
+        fs::create_symlink(target, link);
+#endif
+
+        WHEN("the level is created")
+        {
+            THEN("it is refused")
+            {
+                REQUIRE_THROWS(thewatcher::common::detail::create_private_directory_level(link));
+            }
+
+            AND_THEN("the target was not changed")
+            {
+#ifdef _WIN32
+                // Still open to Users: its ACL was not replaced with the private one.
+                REQUIRE_THROWS(ensure_private_directory(target));
+#else
+                REQUIRE(fs::status(target).permissions() ==
+                        (fs::perms::owner_all | fs::perms::group_read | fs::perms::group_exec | fs::perms::others_read |
+                         fs::perms::others_exec));
+#endif
+            }
+        }
+    }
+
+    GIVEN("a path that does not exist")
+    {
+        const auto dir = fresh_parent("private-dir-create-plain") / "level";
+
+        THEN("the level is created and is private")
+        {
+            REQUIRE_NOTHROW(thewatcher::common::detail::create_private_directory_level(dir));
+            REQUIRE(fs::is_directory(dir));
+            REQUIRE_NOTHROW(ensure_private_directory(dir));
+        }
+    }
+}
+
 // Hidden: depends on the machine. Run with "[default-paths]" to see that the
 // real default parents (C:\ProgramData, /etc, /usr/local/etc) and their
 // ancestors are accepted.
