@@ -352,6 +352,7 @@ export function toDashboardAgents(
         uptime: metrics ? formatDuration(metrics.uptime_seconds) : 'unknown',
         group: agent.maintenance ? 'Maintenance Agents' : 'Approved Agents',
         groupIds: agent.group_ids ?? [],
+        configRevision: agent.config_revision ?? '',
         status: 'green',
         alertColor: unacked.has(agent.agent_id) ? 'red' : 'green',
         components,

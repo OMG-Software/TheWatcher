@@ -12,6 +12,7 @@ import { colorLabel } from '../uiLogic';
 
 export function AgentsPage({
   agents,
+  canDelete,
   isBusy,
   groups,
   onConfigure,
@@ -22,6 +23,7 @@ export function AgentsPage({
   runAction,
 }: {
   agents: DashboardAgent[];
+  canDelete: boolean;
   isBusy: (key: string) => boolean;
   groups: GroupRecord[];
   onConfigure: (agentId: string) => void;
@@ -98,7 +100,7 @@ export function AgentsPage({
                       onClick={() => onConfigure(agent.id)}
                     />
                   </td>
-                  <td><ActionButton busy={isBusy(`${agent.id}:delete`)} danger disabled={!manageable} icon={<Trash2 size={14} />} label="Delete" onClick={() => runAction(`${agent.id}:delete`, () => deleteAgent(agent.id))} /></td>
+                  <td>{canDelete ? <ActionButton busy={isBusy(`${agent.id}:delete`)} danger disabled={!manageable} icon={<Trash2 size={14} />} label="Delete" onClick={() => runAction(`${agent.id}:delete`, () => deleteAgent(agent.id))} /> : null}</td>
                 </tr>
               );
             })}

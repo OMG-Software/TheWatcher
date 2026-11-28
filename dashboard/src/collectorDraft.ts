@@ -30,6 +30,7 @@ export function buildCollectorDraft(agent: DashboardAgent): AgentCollectorConfig
     heartbeat_interval: agent.heartbeatInterval,
     process_limit: agent.processLimit,
     group_ids: agent.groupIds,
+    config_revision: agent.configRevision,
     runbook_markdown: agent.runbookMarkdown,
     collector_config: {
       ...config,

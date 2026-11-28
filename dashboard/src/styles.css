@@ -1452,3 +1452,9 @@ td {
   padding: 0;
   min-width: 0;
 }
+
+.form-note {
+  color: var(--muted, #8b95a5);
+  font-size: 0.85rem;
+  margin: 0.5rem 0;
+}

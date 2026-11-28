@@ -18,6 +18,16 @@ export function canManageUsers(role: UserRole): boolean {
   return role === 'global_admin' || role === 'group_admin';
 }
 
+/** Only admins (global or group) may delete an agent, which is also how an approved agent is revoked. */
+export function canDeleteAgents(role: UserRole): boolean {
+  return role === 'global_admin' || role === 'group_admin';
+}
+
+/** Only the global admin may read or change webhook URLs; other global roles see them masked. */
+export function canEditWebhooks(role: UserRole): boolean {
+  return role === 'global_admin';
+}
+
 /** Only the global admin may create and manage groups. */
 export function canManageGroups(role: UserRole): boolean {
   return role === 'global_admin';

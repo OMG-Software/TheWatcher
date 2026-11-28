@@ -1,0 +1,280 @@
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { App } from './App';
+import type { UserRole } from './models';
+import { FakeApi, agentRecord, fail, ok } from './testing/fakeApi';
+
+const GROUPS = [
+  { group_id: 1, name: 'Prod', built_in: false },
+  { group_id: 2, name: 'Dev', built_in: false },
+];
+
+const view = (viewId: number, name: string, groupId: number, owner = 'someone-else') => ({
+  view_id: viewId,
+  name,
+  owner_user_id: 9,
+  owner_username: owner,
+  is_public: false,
+  group_id: groupId,
+  agent_ids: [],
+  created_at: 1,
+});
+
+async function openDashboard(api: FakeApi) {
+  api.install();
+  render(<App />);
+  await screen.findByRole('navigation', { name: 'Dashboard views' });
+}
+
+// The Views tab gains a count once views load ("Views (3)"), so match by prefix.
+const goTo = (label: string) => fireEvent.click(within(screen.getByRole('navigation')).getByRole('button', { name: new RegExp(`^${label}`) }));
+
+const apiFor = (role: UserRole) => new FakeApi(role).on('GET /api/groups', ok(GROUPS));
+
+afterEach(() => {
+  vi.unstubAllGlobals();
+  window.location.hash = '';
+});
+
+describe('GIVEN a pending enrollment and two groups', () => {
+  const pendingApi = () => apiFor('global_admin').on('GET /api/pending-enrollments', ok([{ ...agentRecord('new-host', 'new-host'), approved: false }]));
+
+  it('WHEN approving without choosing a group THEN the approval names no group', async () => {
+    const api = pendingApi();
+    await openDashboard(api);
+    goTo('Agents');
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Approve' }));
+
+    await waitFor(() => expect(api.count('POST /api/agents/new-host/approve')).toBe(1));
+    expect(api.calls.find((call) => call.path === '/api/agents/new-host/approve')?.body).toEqual({ group_ids: [] });
+  });
+
+  it('WHEN the operator picks the second group THEN only that group is sent, not the first one', async () => {
+    const api = pendingApi();
+    await openDashboard(api);
+    goTo('Agents');
+
+    fireEvent.change(await screen.findByLabelText('Group for new-host'), { target: { value: '2' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Approve' }));
+
+    await waitFor(() => expect(api.count('POST /api/agents/new-host/approve')).toBe(1));
+    expect(api.calls.find((call) => call.path === '/api/agents/new-host/approve')?.body).toEqual({ group_ids: [2] });
+  });
+});
+
+describe('GIVEN an agent that belongs to two groups', () => {
+  const multiGroupApi = (role: UserRole) =>
+    apiFor(role).on('GET /api/agents', ok([{ ...agentRecord('agent-1', 'web-01'), group_ids: [1, 2], config_revision: 'rev-1' }]));
+
+  const openConfigure = async (api: FakeApi) => {
+    await openDashboard(api);
+    goTo('Agents');
+    fireEvent.click(await screen.findByRole('button', { name: 'Configure' }));
+    await screen.findByRole('group', { name: 'Groups' });
+  };
+
+  it('WHEN the modal opens THEN both memberships are shown as checked', async () => {
+    await openConfigure(multiGroupApi('global_admin'));
+
+    expect(screen.getByRole('checkbox', { name: 'Prod' })).toBeChecked();
+    expect(screen.getByRole('checkbox', { name: 'Dev' })).toBeChecked();
+  });
+
+  it('WHEN a global admin saves unchanged THEN every membership and the opened revision are sent back', async () => {
+    const api = multiGroupApi('global_admin');
+    await openConfigure(api);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+
+    await waitFor(() => expect(api.count('POST /api/agents/agent-1/collector_config')).toBe(1));
+    const body = api.calls.find((call) => call.path === '/api/agents/agent-1/collector_config')?.body as { group_ids: number[]; config_revision: string };
+    expect(body.group_ids).toEqual([1, 2]);
+    expect(body.config_revision).toBe('rev-1');
+  });
+
+  it('WHEN one membership is unticked THEN only that group is removed', async () => {
+    const api = multiGroupApi('global_admin');
+    await openConfigure(api);
+
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Prod' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+
+    await waitFor(() => expect(api.count('POST /api/agents/agent-1/collector_config')).toBe(1));
+    const body = api.calls.find((call) => call.path === '/api/agents/agent-1/collector_config')?.body as { group_ids: number[] };
+    expect(body.group_ids).toEqual([2]);
+  });
+
+  it('WHEN a group operator opens it THEN the group boxes are read-only', async () => {
+    await openConfigure(multiGroupApi('group_operator'));
+
+    expect(screen.getByRole('checkbox', { name: 'Prod' })).toBeDisabled();
+  });
+
+  it('WHEN someone else saved first and the server answers 409 THEN the modal stays open with the message', async () => {
+    const api = multiGroupApi('global_admin').on('POST /api/agents/agent-1/collector_config', fail(409, 'changed by someone else'));
+    await openConfigure(api);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+
+    expect(await screen.findByText(/changed by someone else/)).toBeInTheDocument();
+    expect(screen.getByRole('group', { name: 'Groups' })).toBeInTheDocument();
+  });
+});
+
+describe('GIVEN views in several groups', () => {
+  it('WHEN a group operator opens the views page THEN they can edit their own group views, not another group or a public one', async () => {
+    const api = apiFor('group_operator')
+      .on('GET /api/groups', ok([GROUPS[0]]))
+      .on('GET /api/views', ok([view(1, 'prod-view', 1), view(2, 'dev-view', 2), view(3, 'mine', 0, 'tester')]));
+    await openDashboard(api);
+    goTo('Views');
+
+    const row = async (name: string) => (await screen.findByText(name)).closest('tr') as HTMLElement;
+
+    expect(within(await row('prod-view')).getByRole('button', { name: 'Edit' })).toBeInTheDocument();
+    expect(within(await row('mine')).getByRole('button', { name: 'Edit' })).toBeInTheDocument();
+    expect(within(await row('dev-view')).queryByRole('button', { name: 'Edit' })).toBeNull();
+  });
+});
+
+describe('GIVEN a bookmark to a view that does not exist', () => {
+  it('WHEN the page loads THEN the filter is cleared and a notice explains why', async () => {
+    window.location.hash = '#view-99';
+    const api = apiFor('group_viewer').on('GET /api/views', ok([view(1, 'prod-view', 1)]));
+    await openDashboard(api);
+
+    expect(await screen.findByText(/View 99 was not found/)).toBeInTheDocument();
+    expect(screen.queryByText(/Filtered to view/)).toBeNull();
+    expect(await screen.findByText('web-01')).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Dismiss' }));
+
+    expect(screen.queryByText(/View 99 was not found/)).toBeNull();
+    expect(window.location.hash).toBe('');
+  });
+});
+
+describe('GIVEN an approved agent', () => {
+  const agentsApi = (role: UserRole) => apiFor(role).on('GET /api/agents', ok([agentRecord('agent-1', 'web-01')]));
+
+  it.each(['global_operator', 'group_operator'] as const)('WHEN a %s opens the agents page THEN there is no Delete button', async (role) => {
+    await openDashboard(agentsApi(role));
+    goTo('Agents');
+
+    await screen.findByRole('button', { name: 'Configure' });
+
+    expect(screen.queryByRole('button', { name: 'Delete' })).toBeNull();
+  });
+
+  it.each(['global_admin', 'group_admin'] as const)('WHEN a %s opens the agents page THEN Delete is offered', async (role) => {
+    await openDashboard(agentsApi(role));
+    goTo('Agents');
+
+    expect(await screen.findByRole('button', { name: 'Delete' })).toBeInTheDocument();
+  });
+});
+
+describe('GIVEN webhook URLs on the settings page', () => {
+  const settings = (masked: boolean) => ({
+    webhook_url: masked ? 'https://hooks.slack.com/…' : 'https://hooks.slack.com/services/secret',
+    offline_after_seconds: 120,
+    escalation_timeout_seconds: 3600,
+    metrics_retention_days: 30,
+    reports_enabled: false,
+    reports_schedule: 'daily',
+    reports_hour: 8,
+    reports_day_of_week: 1,
+    reports_webhook_url: '',
+    webhooks_masked: masked,
+  });
+
+  it('WHEN a global operator saves THEN the webhook fields are read-only, explained, and not sent', async () => {
+    const api = apiFor('global_operator').on('GET /api/settings', ok(settings(true)));
+    await openDashboard(api);
+    goTo('Settings');
+
+    const webhook = await screen.findByLabelText('Webhook URL');
+    expect(webhook).toHaveValue('https://hooks.slack.com/…');
+    expect(webhook).toHaveAttribute('readonly');
+    expect(screen.getByText(/only be changed by a global admin/)).toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Save Settings' }));
+
+    await waitFor(() => expect(api.count('PUT /api/settings')).toBe(1));
+    const body = api.calls.find((call) => call.method === 'PUT')?.body as Record<string, unknown>;
+    expect(body).not.toHaveProperty('webhook_url');
+    expect(body).not.toHaveProperty('reports_webhook_url');
+    expect(body.offline_after_seconds).toBe(120);
+  });
+
+  it('WHEN a global admin saves THEN the real URL is editable and sent', async () => {
+    const api = apiFor('global_admin').on('GET /api/settings', ok(settings(false)));
+    await openDashboard(api);
+    goTo('Settings');
+
+    const webhook = await screen.findByLabelText('Webhook URL');
+    expect(webhook).not.toHaveAttribute('readonly');
+
+    fireEvent.click(screen.getByRole('button', { name: 'Save Settings' }));
+
+    await waitFor(() => expect(api.count('PUT /api/settings')).toBe(1));
+    expect((api.calls.find((call) => call.method === 'PUT')?.body as Record<string, unknown>).webhook_url).toBe('https://hooks.slack.com/services/secret');
+  });
+});
+
+describe('GIVEN a pending agent whose id is an inherited object key', () => {
+  it('WHEN approving with no group chosen THEN no group is sent', async () => {
+    const api = apiFor('global_admin').on('GET /api/pending-enrollments', ok([{ ...agentRecord('constructor', 'odd-host'), approved: false }]));
+    await openDashboard(api);
+    goTo('Agents');
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Approve' }));
+
+    await waitFor(() => expect(api.count('POST /api/agents/constructor/approve')).toBe(1));
+    expect(api.calls.find((call) => call.path === '/api/agents/constructor/approve')?.body).toEqual({ group_ids: [] });
+  });
+});
+
+describe('GIVEN a bookmarked view while the views list cannot load', () => {
+  it('WHEN Monitoring opens THEN it offers Retry instead of waiting forever, and the bookmark stays', async () => {
+    window.location.hash = '#view-5';
+    const api = apiFor('group_viewer').on('GET /api/views', fail(500, 'views are down'));
+    await openDashboard(api);
+
+    expect(await screen.findByText(/views are down/)).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Retry' })).toBeInTheDocument();
+    expect(screen.queryByText(/Loading…/)).toBeNull();
+    expect(window.location.hash).toBe('#view-5');
+  });
+});
+
+describe('GIVEN a group operator editing a view that has no group', () => {
+  const ungrouped = { ...view(7, 'mine', 0, 'tester'), is_public: false };
+
+  it('WHEN they rename it THEN it stays ungrouped and the group is not changed', async () => {
+    const api = apiFor('group_operator')
+      .on('GET /api/groups', ok([GROUPS[0]]))
+      .on('GET /api/views', ok([ungrouped]));
+    await openDashboard(api);
+    goTo('Views');
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Edit' }));
+    expect(screen.getByRole('option', { name: 'Keep ungrouped' })).toBeInTheDocument();
+    fireEvent.change(screen.getByDisplayValue('mine'), { target: { value: 'renamed' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+
+    await waitFor(() => expect(api.count('PUT /api/views/7')).toBe(1));
+    expect((api.calls.find((call) => call.method === 'PUT')?.body as { group_id: number }).group_id).toBe(0);
+  });
+
+  it('WHEN they create a view THEN there is no ungrouped choice', async () => {
+    const api = apiFor('group_operator').on('GET /api/groups', ok([GROUPS[0]])).on('GET /api/views', ok([]));
+    await openDashboard(api);
+    goTo('Views');
+
+    await screen.findByRole('button', { name: 'Create View' });
+
+    expect(screen.queryByRole('option', { name: 'No group' })).toBeNull();
+  });
+});

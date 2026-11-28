@@ -110,7 +110,7 @@ SCENARIO("Approval refuses a CURVE key that another approved agent holds")
 
         WHEN("an admin approves the agent with the duplicated key")
         {
-            auto res = fx.client.Post("/api/agents/duplicate-agent/approve", "", "application/json");
+            auto res = fx.client.Post("/api/agents/duplicate-agent/approve", R"({"group_ids":[]})", "application/json");
 
             THEN("the request is refused with 409 and nothing is rebound")
             {
@@ -125,7 +125,7 @@ SCENARIO("Approval refuses a CURVE key that another approved agent holds")
 
         WHEN("an admin approves an agent whose key is not in use")
         {
-            auto res = fx.client.Post("/api/agents/unique-agent/approve", "", "application/json");
+            auto res = fx.client.Post("/api/agents/unique-agent/approve", R"({"group_ids":[]})", "application/json");
 
             THEN("the approval succeeds and the key is bound to that agent")
             {

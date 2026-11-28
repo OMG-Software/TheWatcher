@@ -9,6 +9,31 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Security
 
+- A global operator's `PUT /api/settings` is no longer a way to test guesses at a
+  webhook URL: any webhook value other than the masked form is a 403 without
+  being compared to the stored URL.
+- **Behaviour change:** `DELETE /api/agents/:id` is admins only: a global admin
+  for any agent, a group admin for agents of their own groups. Global and group
+  operators get 403 (it was open to every operator) and the dashboard no longer
+  shows them Delete. Since reject now applies to pending agents only, deleting
+  is how an approved agent is revoked, and a global operator can no longer do
+  that.
+- **Behaviour change:** webhook URLs in `/api/settings` are admin-only. A global
+  operator gets them masked (`https://host/…`, with `webhooks_masked: true`) and
+  a `PUT` that changes either URL is a 403 with nothing written; the masked
+  value sent back is ignored for every role. The Settings page shows them
+  read-only to operators.
+- `PUT /api/users/:id/password` checks permission before looking the user up:
+  a non-admin gets 403 for any id but their own, so user ids can no longer be
+  probed. A global admin gets 404 (was 400) for an unknown id.
+- Views no longer reveal agent ids from other groups: group-scoped users
+  only receive the agent ids they can access, in the list, in a single view
+  and in create/update replies (#163).
+- Agent approval is validated first and written in one transaction. It must
+  name its groups (`group_ids`, `[]` for none); the old fallback to a group
+  literally named "Admins" is gone. Unknown agent is 404, an agent that is not
+  pending is 409, a bad or unknown group is 400, and in each case nothing is
+  changed (#63).
 - The agent no longer trusts the server key in an enrollment reply: it must
   be 40 Z85 characters decoding to a 32-byte key, and the config writer
   refuses any value containing CR or LF. Before, a crafted key could inject
@@ -53,6 +78,42 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 
+- `POST /api/alerts/:id/ack` and `DELETE /api/alerts/:id` answer 404 for an id
+  that does not exist (archived alerts count as existing) and keep 403 for an
+  alert of another group.
+- A Configure save with a stale revision gets 409 even when its membership list
+  is out of date; a runbook edit takes the Configure lock so it cannot be
+  reverted by a save that read the agent earlier.
+- Views written before group scoping have their group copied from the view
+  config into the group column at startup, so the store's list finds them for
+  the group's members (SQLite and PostgreSQL).
+- Dashboard: a bookmarked view with a failed views load shows Retry on
+  Monitoring, an agent id such as `constructor` can no longer break approval,
+  and renaming a group operator's ungrouped view keeps it ungrouped.
+- `POST /api/agents/:id/reject` answers 404 for an unknown agent and 409 for an
+  agent that is not pending, instead of 200. It no longer removes a ZAP key
+  (a pending agent has none). `Store::reject_agent` now returns whether it
+  rejected the agent.
+- Group-scoped users can see and open public and ungrouped views, including
+  their own. View visibility is decided in the API only, and legacy views whose
+  group is stored only in the view config are matched too (#60).
+- Group admins and operators can edit and delete the views of their own groups
+  (#61).
+- The Configure save no longer drops `group_ids` silently: a group user who
+  changes an agent's groups gets a 403, unknown group ids are a 400 (also for
+  `POST /api/agents/:id/groups`, which answers 404 for an unknown agent), and
+  the config, the runbook and the groups are saved in one transaction (#62).
+- The Configure modal no longer overwrites a concurrent edit: saves carry the
+  `config_revision` the modal opened with and a stale one is refused with 409.
+  The Group control is now a set of checkboxes, so extra memberships survive an
+  edit (#112).
+- A global viewer can read pending enrollments and silences, and group users
+  see all-agents (`*`) maintenance windows, read only (#66).
+- The Pending Enrollments list has a group picker (default: no group)
+  instead of always approving into the first group, and a `#view-N` bookmark to
+  a missing view is cleared with a notice (#63, #60).
+- The role x route policy is documented in `docs/authorization.md` and
+  enforced by a table-driven test over every route (#71).
 - All alerts now go through one pipeline that applies maintenance, silences,
   severity validation, de-duplication, the runbook link and the webhook.
   Log-match alerts no longer fire during maintenance, offline and log-match
@@ -264,6 +325,12 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Changed
 
+- **Behaviour change:** `POST /api/agents/:id/approve` now requires a JSON body
+  with `group_ids` (use `[]` for no group). A request without it is a 400.
+  `GET /api/agents` returns a `config_revision` per agent and
+  `POST /api/agents/:id/collector_config` accepts it back (#63, #112).
+- `GET /api/silences` and `GET /api/pending-enrollments` need a viewer role
+  rather than an operator (#66).
 - Documentation: PostgreSQL is documented as an implemented backend selected
   with `DB_TYPE=postgres` / `POSTGRES_DSN` (build-time support required), the
   HA guide uses the real `TheWatcherServer.conf` KEY=VALUE format with its

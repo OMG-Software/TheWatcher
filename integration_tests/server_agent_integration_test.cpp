@@ -247,7 +247,10 @@ SCENARIO("A real agent enrolls, sends metrics, disconnects, and the server recor
                 },
                 5s));
 
-            REQUIRE(post_ok(client, "/api/agents/" + agent_id + "/approve"));
+            REQUIRE(post_json(client, "/api/agents/" + agent_id + "/approve",
+                              json{
+                                  {"group_ids", json::array()}
+            }));
             // A second enrollment request within 10 s is rate-limited; verify approval
             // via the HTTP API instead and let the CURVE handshake prove key exchange.
             REQUIRE(eventually(

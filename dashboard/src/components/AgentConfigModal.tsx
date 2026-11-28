@@ -112,19 +112,30 @@ export function AgentConfigModal({
           <section>
             <h2>Access</h2>
             <div className="form-grid">
-              <label title="Controls which group-scoped users can see alerts, metrics, maintenance, and views for this agent.">
-                Group
-                <select
-                  disabled={!global}
-                  value={String(draft.group_ids?.[0] ?? 0)}
-                  onChange={(event) => setDraft((current) => ({ ...current, group_ids: Number(event.target.value) > 0 ? [Number(event.target.value)] : [] }))}
-                >
-                  <option value={0}>No group</option>
-                  {groups.map((group) => (
-                    <option key={group.group_id} value={group.group_id}>{group.name}</option>
-                  ))}
-                </select>
-              </label>
+              {/* An agent can belong to several groups: one checkbox per group keeps every membership. */}
+              <fieldset
+                className="group-checks"
+                disabled={!global}
+                title="Controls which group-scoped users can see alerts, metrics, maintenance, and views for this agent. Only global users can change it."
+              >
+                <legend>Groups</legend>
+                {groups.map((group) => (
+                  <label className="toggle-line" key={group.group_id}>
+                    <input
+                      type="checkbox"
+                      checked={(draft.group_ids ?? []).includes(group.group_id)}
+                      onChange={(event) =>
+                        setDraft((current) => {
+                          const others = (current.group_ids ?? []).filter((id) => id !== group.group_id);
+                          return { ...current, group_ids: event.target.checked ? [...others, group.group_id] : others };
+                        })
+                      }
+                    />
+                    <span>{group.name}</span>
+                  </label>
+                ))}
+                {groups.length === 0 ? <div className="empty-config">No groups defined.</div> : null}
+              </fieldset>
             </div>
           </section>
 

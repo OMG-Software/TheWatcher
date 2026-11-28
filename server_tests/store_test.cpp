@@ -6,6 +6,8 @@
 #include <algorithm>
 #include <filesystem>
 
+#include <sqlite3.h>
+
 using namespace thewatcher;
 using namespace thewatcher::server;
 
@@ -2989,6 +2991,221 @@ SCENARIO("get_runbook never returns another agent's runbook")
         THEN("an alert on agent-b gets no runbook")
         {
             REQUIRE_FALSE(store.get_runbook("agent-b", "cpu", "red").has_value());
+        }
+    }
+}
+
+// ── Approval and configuration saves are single transactions (#63, #62, #112) ─
+
+SCENARIO("A pending agent is approved together with its groups, or not at all")
+{
+    GIVEN("a store with a pending agent and two groups")
+    {
+        SqliteStore store(":memory:");
+        const auto prod = store.create_group("Prod");
+        const auto dev = store.create_group("Dev");
+        AgentRecord rec;
+        rec.agent_id = "pending-agent";
+        rec.first_seen = 1;
+        store.upsert_agent(rec);
+
+        WHEN("it is approved into Dev")
+        {
+            const auto approved = store.approve_pending_agent("pending-agent", {dev});
+
+            THEN("it is approved and belongs to Dev only")
+            {
+                REQUIRE(approved);
+                REQUIRE(store.get_agent("pending-agent")->approved);
+                REQUIRE(store.get_agent_groups("pending-agent") == std::vector<int64_t>{dev});
+            }
+        }
+
+        WHEN("it is approved with a group that does not exist")
+        {
+            THEN("the call throws and the agent is still pending with no groups")
+            {
+                REQUIRE_THROWS(store.approve_pending_agent("pending-agent", {dev, 9999}));
+                REQUIRE_FALSE(store.get_agent("pending-agent")->approved);
+                REQUIRE(store.get_agent_groups("pending-agent").empty());
+            }
+        }
+
+        WHEN("it is approved twice")
+        {
+            REQUIRE(store.approve_pending_agent("pending-agent", {dev}));
+
+            THEN("the second approval reports false and leaves the groups alone")
+            {
+                REQUIRE_FALSE(store.approve_pending_agent("pending-agent", {prod}));
+                REQUIRE(store.get_agent_groups("pending-agent") == std::vector<int64_t>{dev});
+            }
+        }
+
+        WHEN("it was rejected first")
+        {
+            store.reject_agent("pending-agent");
+
+            THEN("approval reports false and the agent stays rejected")
+            {
+                REQUIRE_FALSE(store.approve_pending_agent("pending-agent", {dev}));
+                REQUIRE(store.get_agent("pending-agent")->rejected);
+                REQUIRE_FALSE(store.get_agent("pending-agent")->approved);
+            }
+        }
+
+        THEN("an unknown agent reports false")
+        {
+            REQUIRE_FALSE(store.approve_pending_agent("nobody", {dev}));
+        }
+    }
+}
+
+SCENARIO("An agent configuration save writes the config and groups in one transaction")
+{
+    GIVEN("an approved agent in two groups")
+    {
+        SqliteStore store(":memory:");
+        const auto a = store.create_group("A");
+        const auto b = store.create_group("B");
+        AgentRecord rec;
+        rec.agent_id = "agent-1";
+        rec.approved = true;
+        rec.connected = true;
+        rec.last_seen = 1234;
+        rec.collection_interval = 30;
+        store.upsert_agent(rec);
+        store.set_agent_groups("agent-1", {a, b});
+
+        auto edited = *store.get_agent("agent-1");
+        edited.collection_interval = 60;
+        edited.heartbeat_interval = 7;
+        edited.process_limit = 9;
+        edited.runbook_markdown = "restart the service";
+        edited.collector_config.cpu_readings = 4;
+        // A stale copy of fields the modal does not own must not be written back.
+        edited.last_seen = 1;
+        edited.connected = false;
+
+        WHEN("it is saved without a group list")
+        {
+            store.save_agent_config(edited, std::nullopt);
+
+            THEN("the edited fields are stored and the groups and liveness fields are untouched")
+            {
+                const auto got = *store.get_agent("agent-1");
+                REQUIRE(got.collection_interval == 60);
+                REQUIRE(got.heartbeat_interval == 7);
+                REQUIRE(got.process_limit == 9);
+                REQUIRE(got.runbook_markdown == "restart the service");
+                REQUIRE(got.collector_config.cpu_readings == 4);
+                REQUIRE(got.last_seen == 1234);
+                REQUIRE(got.connected);
+                REQUIRE(store.get_agent_groups("agent-1") == std::vector<int64_t>{a, b});
+            }
+        }
+
+        WHEN("it is saved with a new group list")
+        {
+            store.save_agent_config(edited, std::vector<int64_t>{b});
+
+            THEN("both the config and the groups change")
+            {
+                REQUIRE(store.get_agent("agent-1")->collection_interval == 60);
+                REQUIRE(store.get_agent_groups("agent-1") == std::vector<int64_t>{b});
+            }
+        }
+
+        WHEN("it is saved with a group that does not exist")
+        {
+            THEN("nothing changes")
+            {
+                REQUIRE_THROWS(store.save_agent_config(edited, std::vector<int64_t>{a, 9999}));
+                REQUIRE(store.get_agent("agent-1")->collection_interval == 30);
+                REQUIRE(store.get_agent_groups("agent-1") == std::vector<int64_t>{a, b});
+            }
+        }
+    }
+}
+
+SCENARIO("reject_agent reports whether it rejected a pending agent")
+{
+    GIVEN("a pending agent and an approved agent")
+    {
+        SqliteStore store(":memory:");
+        AgentRecord pending;
+        pending.agent_id = "pending";
+        store.upsert_agent(pending);
+        AgentRecord approved;
+        approved.agent_id = "approved";
+        approved.approved = true;
+        store.upsert_agent(approved);
+
+        THEN("rejecting the pending agent returns true and sets rejected")
+        {
+            REQUIRE(store.reject_agent("pending"));
+            REQUIRE(store.get_agent("pending")->rejected);
+            AND_THEN("rejecting it again returns false")
+            {
+                REQUIRE_FALSE(store.reject_agent("pending"));
+            }
+        }
+
+        THEN("rejecting the approved agent returns false and changes nothing")
+        {
+            REQUIRE_FALSE(store.reject_agent("approved"));
+            REQUIRE(store.get_agent("approved")->approved);
+            REQUIRE_FALSE(store.get_agent("approved")->rejected);
+        }
+
+        THEN("rejecting an unknown agent returns false")
+        {
+            REQUIRE_FALSE(store.reject_agent("nobody"));
+        }
+    }
+}
+
+SCENARIO("A legacy view whose group is only in its config is listed to that group's members")
+{
+    GIVEN("a stored view with group_id 0 in its column and group A in its config, then the store is reopened")
+    {
+        const auto path = unique_store_path("legacy-view-group.db");
+        int64_t member_id = 0;
+        int64_t outsider_id = 0;
+        {
+            SqliteStore store(path.string());
+            const auto group_a = store.create_group("A");
+            member_id = store.create_user("member", "hash", "group_viewer");
+            store.set_user_groups(member_id, {group_a});
+            outsider_id = store.create_user("outsider", "hash", "group_viewer");
+            ViewRecord view;
+            view.name = "legacy";
+            view.owner_user_id = 1;
+            view.group_id = group_a;
+            view.created_at = 1;
+            store.create_view(view);
+        }
+        {
+            // Simulate a row written before group scoping: the column is 0, the group lives in the config.
+            sqlite3* db = nullptr;
+            REQUIRE(sqlite3_open(path.string().c_str(), &db) == SQLITE_OK);
+            REQUIRE(sqlite3_exec(db, "UPDATE views SET group_id=0;", nullptr, nullptr, nullptr) == SQLITE_OK);
+            sqlite3_close(db);
+        }
+
+        WHEN("the store is opened again")
+        {
+            SqliteStore store(path.string());
+
+            THEN("the group member's list includes the view and an outsider's does not")
+            {
+                REQUIRE(store.list_views(member_id).size() == 1);
+                REQUIRE(store.list_views(outsider_id).empty());
+                AND_THEN("the column now carries the group")
+                {
+                    REQUIRE(store.list_views(member_id).front().group_id > 0);
+                }
+            }
         }
     }
 }

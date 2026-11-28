@@ -14,9 +14,9 @@ Current capabilities:
   persist);
 - monitoring view of agent health and latest metrics;
 - approved-agent-only monitoring;
-- pending enrollment approval/rejection on the Agents page (an approved agent
-  is currently assigned to the first group in the group list, or to no group
-  when none exist; there is no group picker yet);
+- pending enrollment approval/rejection on the Agents page (each pending row
+  has a group picker; approving with "No group (global users only)" is valid
+  and assigns no group);
 - hostname-based alert notifications, alert acknowledgement (with a note) and
   archive workflow;
 - custom Views, Silences, Maintenance windows and Settings pages;
@@ -268,15 +268,22 @@ changes which users can see its alerts.
 The Agents view starts with Pending Enrollments for global operators and global
 admins, then shows Agent Management below it.
 
-Pending enrollment rows show unapproved agents awaiting approval. The Approve
-button currently always sends the first group in the group list (or no group
-when there are none); there is no group picker, so use Configure afterwards to
-change groups. Reject marks the enrollment rejected. Approve/Reject buttons
-disappear once an enrollment is decided.
+Pending enrollment rows show unapproved agents awaiting approval. Each row has
+a Group picker; it starts at "No group (global users only)". Approving with that
+choice is valid and sends an empty group list; the operator picks a group only
+when the agent should belong to one, because the approval names its groups
+explicitly. Reject marks the enrollment rejected. Approve/Reject buttons disappear once an
+enrollment is decided.
 
 Agent Management handles approved agents:
 
-- approved agents show command buttons, then Configure, then Delete;
+- the Configure modal's Access section lists one checkbox per group, so an agent
+  in several groups keeps every membership when saved; group users see them
+  read-only. Saving sends the `config_revision` the modal opened with; if
+  someone else saved the agent in the meantime the server answers 409 and the
+  modal shows the message (close and reopen it to load their changes);
+- approved agents show command buttons, then Configure, then Delete (Delete is
+  shown to global and group admins only; operators do not see it);
 - approved agent identity shows the hostname, primary non-loopback IP address,
   and agent id;
 - the Configure modal updates heartbeat interval, poll interval, process sample
@@ -345,15 +352,21 @@ The Views page lists the custom views the API returns for the current user,
 with name, owner, agent count, Public/Private flag, group and creation date.
 Open applies the view as a filter on the Monitoring page (the URL hash becomes
 `#view-<id>`, so it can be bookmarked). Operators can create views (name,
-agents, Public flag, group). Edit and Delete are shown only to operators who
-own the view, or to global operators and admins.
+agents, Public flag, group). Edit and Delete are shown to operators and admins
+only: global operators and admins for every view, and group admins and
+operators for views they own and for views of their own groups. A viewer who owns
+a legacy ungrouped view can open it but not edit or delete it. Editing a view
+keeps its group; a legacy ungrouped view offers "Keep ungrouped" and group users
+cannot create new ungrouped views.
 
 The Views page supports group assignment when a view is created or edited.
 Global account types can see all views and all group choices ("No group" is
-only offered to them). Group account types only receive their assigned groups
-from the API and only see views assigned to those groups; public views from
-other groups are not returned. Agents inside a view are still filtered by the
-same agent visibility rules.
+only offered to them). Group account types see the views of their groups, and
+public or own views that have no group; public views of another group are not
+shown. The agent list of a view only contains the agents the user can access.
+A `#view-<id>` bookmark to a view that no longer exists, or that the user cannot
+open, is dropped with a notice instead of filtering the page to nothing. The
+full policy is in [authorization.md](authorization.md).
 
 ### Silences
 
@@ -381,6 +394,11 @@ every other field from the latest server copy, so a reload (or a change another
 administrator made) is never overridden by values the user did not touch. The
 changed fields stay across a failed save or a failed reload.
 
+Webhook URLs can carry a secret, so only the global admin sees and edits them.
+A global operator sees both URLs masked to scheme and host
+(`https://hooks.slack.com/…`), read-only with a short note, and Save Settings
+leaves the webhook fields out of the request.
+
 ## API Contract
 
 The dashboard consumes:
@@ -404,7 +422,7 @@ The dashboard consumes:
 | `POST /api/agents/:id/approve` | Approve pending enrollment and assign groups. |
 | `POST /api/agents/:id/reject` | Reject pending enrollment. |
 | `POST /api/agents/:id/groups` | Replace an approved agent's group memberships. |
-| `DELETE /api/agents/:id` | Delete agent and metrics. |
+| `DELETE /api/agents/:id` | Delete agent and metrics, and revoke its key; admins only (group admins for agents of their groups). |
 | `POST /api/agents/:id/set_interval` | Legacy endpoint for poll interval update. |
 | `POST /api/agents/:id/set_process_limit` | Legacy endpoint for process limit update. |
 | `POST /api/agents/:id/thresholds` | Legacy endpoint for old threshold rows. |

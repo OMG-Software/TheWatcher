@@ -121,14 +121,14 @@ public:
 
     // Enrolls `agent_id` and approves it (optionally with a JSON request body).
     bool enroll_and_approve(const std::string& agent_id, const std::string& hostname = "enroll-test-host",
-                            const std::string& approve_body = "")
+                            const std::string& approve_body = R"({"group_ids":[]})")
     {
         return enroll_agent(agent_id, hostname) && approve(agent_id, approve_body);
     }
 
     // Approves `agent_id` through the API, sending `body` as JSON. Returns true only
     // when the server answers 200.
-    bool approve(const std::string& agent_id, const std::string& body = "")
+    bool approve(const std::string& agent_id, const std::string& body = R"({"group_ids":[]})")
     {
         auto res = client.Post("/api/agents/" + agent_id + "/approve", body, "application/json");
         return res && res->status == 200;

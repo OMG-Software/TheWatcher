@@ -22,7 +22,7 @@ import { SilencesPage } from './pages/SilencesPage';
 import { UsersPage } from './pages/UsersPage';
 import { ViewsPage } from './pages/ViewsPage';
 import type { SessionInfo } from './models';
-import { canOperate, isGlobal } from './permissions';
+import { canDeleteAgents, canEditWebhooks, canOperate, isGlobal } from './permissions';
 import { summaryCounts, toDisplayAlerts, type OverviewGroupFilter } from './status';
 import { NAV_ITEMS, accountTypeLabel, colorLabel, type DashboardView } from './uiLogic';
 
@@ -65,6 +65,15 @@ function Dashboard({
 
   const { agents, pending, groups, alerts, allAlerts, users, maintenanceWindows, silences, customViews, sectionErrors, loadedAt, error, loading, refresh } = useDashboardData();
   const { isBusy, runAction, clearFailure, context: failureState } = useRunAction(refresh);
+
+  // A bookmark (#view-N) to a view that was deleted, or that this user may not
+  // open, must not leave the page filtered to nothing: the filter is ignored
+  // and a notice says why. Only judged once the views loaded, so a slow or
+  // failed load cannot discard a good bookmark.
+  const activeView = customViews.find((candidate) => candidate.view_id === activeViewId) ?? null;
+  const viewMissing = activeViewId != null && loadedAt !== null && !sectionErrors.views && activeView === null;
+  // The views list failed to load, so the bookmark cannot be resolved yet: say so with a Retry and keep the bookmark.
+  const viewsFailedForBookmark = activeViewId != null && activeView === null && Boolean(sectionErrors.views);
 
   const counts = summaryCounts(agents);
   const displayAlerts = toDisplayAlerts(alerts, agents);
@@ -153,16 +162,21 @@ function Dashboard({
               ))}
             </div>
           ) : null}
-          {activeViewId != null ? (
+          {viewMissing ? (
+            <div className="banner" role="status">
+              View {activeViewId} was not found: it may have been deleted or you may not have access to it.
+              <button className="text-button banner-action" onClick={() => setActiveViewId(null)}>Dismiss</button>
+            </div>
+          ) : null}
+          {viewsFailedForBookmark ? <LoadFailed what="views" message={sectionErrors.views ?? ''} onRetry={retry} /> : null}
+          {activeView ? (
             <div className="banner">
-              Filtered to view: <strong>{customViews.find((v) => v.view_id === activeViewId)?.name ?? 'Unknown'}</strong>
+              Filtered to view: <strong>{activeView.name}</strong>
               <button className="text-button banner-action" onClick={() => setActiveViewId(null)}>Clear</button>
             </div>
           ) : null}
           <MonitoringPage
-            agents={activeViewId != null
-              ? agents.filter((a) => customViews.find((v) => v.view_id === activeViewId)?.agent_ids.includes(a.id) ?? false)
-              : agents}
+            agents={activeView ? agents.filter((a) => activeView.agent_ids.includes(a.id)) : viewMissing || viewsFailedForBookmark ? agents : activeViewId != null ? [] : agents}
             expanded={expanded}
             groupFilter={overviewGroupFilter}
             groups={groups}
@@ -198,6 +212,7 @@ function Dashboard({
             isBusy={isBusy}
             groups={groups}
             onConfigure={setConfigAgentId}
+            canDelete={canDeleteAgents(session.role)}
             operator={operator}
             pending={global && operator ? pending : []}
             pendingLoadFailed={Boolean(sectionErrors.pending)}
@@ -242,7 +257,7 @@ function Dashboard({
           <UsersPage isBusy={isBusy} groups={groups} runAction={runAction} session={session} users={users} />
         </>
       ) : null}
-      {view === 'settings' ? <SettingsPage runAction={runAction} /> : null}
+      {view === 'settings' ? <SettingsPage canEditWebhooks={canEditWebhooks(session.role)} runAction={runAction} /> : null}
       <AppFooter />
     </ActionFailureContext.Provider>
   );
