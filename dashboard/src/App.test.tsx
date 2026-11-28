@@ -228,6 +228,21 @@ describe('GIVEN a form whose save fails', () => {
     expect(api.calls.find((call) => call.method === 'PUT' && call.path === '/api/users/2')?.body).toEqual({ role: 'group_operator' });
   });
 
+  it('WHEN the edit dialog is open THEN Cancel and the click-away button both close it', async () => {
+    const api = new FakeApi('global_admin')
+      .on('GET /api/users', ok([{ user_id: 2, username: 'bob', role: 'group_viewer', group_ids: [], disabled: false, built_in: false }]));
+    await openDashboard(api);
+    goTo('Users');
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Edit' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Close dialog' }));
+    expect(screen.queryByRole('dialog', { name: 'Edit bob' })).toBeNull();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Edit' }));
+    fireEvent.click(within(screen.getByRole('dialog', { name: 'Edit bob' })).getByRole('button', { name: 'Cancel' }));
+    expect(screen.queryByRole('dialog', { name: 'Edit bob' })).toBeNull();
+  });
+
   it('WHEN the server refuses to demote the last global admin THEN the dialog stays open with the message', async () => {
     const api = new FakeApi('global_admin')
       .on('GET /api/users', ok([{ user_id: 2, username: 'bob', role: 'global_admin', group_ids: [], disabled: false, built_in: false }]))

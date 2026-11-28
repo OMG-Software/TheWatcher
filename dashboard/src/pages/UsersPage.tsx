@@ -119,8 +119,10 @@ export function UsersPage({
         const roleChanged = roleEditable && editRole !== editUser.role;
         const groupsChanged = !sameIds(editGroupIds, initialGroupIds);
         return (
-          <div className="modal-backdrop" onClick={closeEdit}>
-            <div className="modal-panel" role="dialog" aria-label={`Edit ${editUser.username}`} onClick={(e) => e.stopPropagation()}>
+          <div className="modal-backdrop">
+            {/* A native button behind the panel: clicking outside the dialog closes it, but keyboard users use Close or Cancel. */}
+            <button type="button" className="modal-dismiss" tabIndex={-1} aria-label="Close dialog" disabled={editBusy} onClick={closeEdit} />
+            <div className="modal-panel" role="dialog" aria-label={`Edit ${editUser.username}`}>
               <div className="modal-header">
                 <h2>Edit {editUser.username}</h2>
                 <button className="icon-button" disabled={editBusy} onClick={closeEdit} aria-label="Close"><X size={14} /></button>
