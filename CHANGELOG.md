@@ -53,6 +53,12 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 
+- Dashboard: `ActionButton`, `AgentConfigModal` and `StatusHistoryModal` held
+  Windows-1252 bytes for "…" and "—", which `vite build` rejects as invalid
+  UTF-8. They are UTF-8 again, and a new test fails whenever any file under
+  `dashboard/src` is not valid UTF-8, whatever its extension, since vitest
+  decodes such files without complaint. Only binary assets (images, fonts,
+  media) are skipped.
 - All alerts now go through one pipeline that applies maintenance, silences,
   severity validation, de-duplication, the runbook link and the webhook.
   Log-match alerts no longer fire during maintenance, offline and log-match
@@ -262,6 +268,40 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   out-of-date request. The API functions the polling callers use take an
   optional `signal` (#187, #190).
 
+- Dashboard: destructive actions (delete agent, user, view, maintenance
+  window; bulk archive) now ask for confirmation in a dialog that names the
+  target (#109).
+- Dashboard: Alerts bulk actions only count and act on alerts that are on
+  screen, and the agent filter lists agents that only have archived alerts
+  (#110).
+- Dashboard: an expanded Monitoring row refreshes its metric history and log
+  matches on the poll interval, with cancellation and per-part errors (#111).
+  Archived alerts no longer refetch on every render; the polling hook fixed
+  that earlier.
+- Dashboard: clicking a component status dot no longer expands or collapses
+  its row; hidden alerts are dropped from the Alerts selection instead of
+  returning when the filter is cleared; and collapsing a Monitoring row aborts
+  its in-flight history and log requests (`fetchMetricHistory` and
+  `fetchLogMatches` take an optional `signal`) (#190).
+- Dashboard: runbooks render numbered lists, inline code, bold, italic, line
+  breaks and links with parentheses in the URL, still without injecting HTML
+  (#113).
+- Dashboard: health shows the status engine's verdict instead of classifying
+  the latest sample, so a one-sample spike is not red when no alert is raised;
+  an offline host reads Offline in the row as in the counter (#114).
+- Dashboard: accessibility: a shared accessible dialog, keyboard row
+  expansion, status in words on component dots, labelled icon buttons and
+  selects, `aria-current` tabs, visible focus, `autocomplete` on login, and an
+  accessible info tooltip replacing `title=` help (#115).
+- Dashboard: a view filter whose view was deleted or is not visible is dropped
+  instead of showing an empty fleet (#165).
+- Dashboard: components with nothing monitored (no disks, interfaces or process
+  watches) no longer hold a healthy host in Warning (#167).
+- Dashboard: the maintenance button no longer sends a hard-coded reason; the
+  operator can enter one (optional).
+- Dashboard: time is read through a clock hook, not during render, and the
+  `react-hooks` warnings in the files touched are fixed.
+
 ### Changed
 
 - Documentation: PostgreSQL is documented as an implemented backend selected
@@ -320,6 +360,14 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   devDependency versions): role gating, action and load errors, 401 to login,
   polling guard and hidden-tab pause, Settings after a failed load, and forms
   after a failed save (#118).
+- `GET /api/agents` returns `indicator_status`, the status engine's latest
+  status per indicator (the newest row of each, however long ago it
+  changed), so the dashboard can show what alerting acted on (#114). Adds
+  `Store::latest_indicator_status_all`, which reads it for all agents in one
+  query (`MAX(id)` per agent and indicator).
+- Dashboard Settings: status history, alerts and log matches retention fields
+  (shown disabled and not sent until the server supports them, #174), and a notice when an Alerts list
+  reaches the server's 1000-alert cap.
 
 ## [0.8.0] - 2026-11-02
 

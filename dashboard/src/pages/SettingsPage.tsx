@@ -1,10 +1,21 @@
 import React from 'react';
 import { fetchSettings, sendReport, updateSettings } from '../api';
 import { ActionError } from '../components/ActionError';
+import { InfoTip } from '../components/InfoTip';
 import { LoadFailed } from '../components/LoadFailed';
 import { usePolling } from '../hooks/usePolling';
 import type { RunAction } from '../hooks/useRunAction';
 import type { ServerSettings } from '../models';
+
+type RetentionKey = 'metrics_retention_days' | 'status_history_retention_days' | 'alerts_retention_days' | 'log_matches_retention_days';
+
+/** Retention settings with the ranges the server accepts. The last three exist only on servers with the retention lifecycle. */
+const RETENTION_FIELDS: { key: RetentionKey; label: string; min: number; max: number; help: string }[] = [
+  { key: 'metrics_retention_days', label: 'Metrics retention (days)', min: 1, max: 365, help: 'Metrics older than this are deleted by the hourly retention job.' },
+  { key: 'status_history_retention_days', label: 'Status history retention (days)', min: 1, max: 3650, help: 'Status history older than this is deleted, except the newest row per indicator.' },
+  { key: 'alerts_retention_days', label: 'Alerts retention (days)', min: 1, max: 3650, help: 'Acknowledged or archived alerts older than this are deleted; open alerts are kept. Also applies to expired silences and ended maintenance windows.' },
+  { key: 'log_matches_retention_days', label: 'Log matches retention (days)', min: 1, max: 3650, help: 'Log matches older than this are deleted.' },
+];
 
 export function SettingsPage({
   runAction,
@@ -74,17 +85,28 @@ export function SettingsPage({
                   onChange={(e) => setField('escalation_timeout_seconds', Number(e.target.value))}
                 />
               </label>
-              <label>
-                Metrics retention (days)
-                <input
-                  min={1}
-                  max={365}
-                  step={1}
-                  type="number"
-                  value={draft.metrics_retention_days}
-                  onChange={(e) => setField('metrics_retention_days', Number(e.target.value))}
-                />
-              </label>
+              {RETENTION_FIELDS.map((field) => {
+                const value = draft[field.key];
+                // A server without the retention lifecycle neither reports nor stores the newer keys.
+                const supported = value !== undefined;
+                return (
+                  <div className="field-with-tip" key={field.key}>
+                    <label>
+                      {field.label}
+                      <input
+                        disabled={!supported}
+                        max={field.max}
+                        min={field.min}
+                        step={1}
+                        type="number"
+                        value={value ?? ''}
+                        onChange={(e) => setField(field.key, Number(e.target.value))}
+                      />
+                    </label>
+                    <InfoTip label={field.label} text={supported ? `${field.help} Allowed: ${field.min} to ${field.max}.` : `${field.help} This server version does not report this setting.`} />
+                  </div>
+                );
+              })}
             </div>
             <h2>Scheduled Reports</h2>
             <div className="form-grid">

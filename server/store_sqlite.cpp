@@ -1065,6 +1065,28 @@ std::optional<StatusHistoryRow> SqliteStore::latest_status_for_indicator(const s
     return std::nullopt;
 }
 
+std::vector<IndicatorStatusRow> SqliteStore::latest_indicator_status_all()
+{
+    // MAX(id) is the newest row of each (agent, indicator): ids only grow, so no timestamp tie-break is needed.
+    Stmt st;
+    check(sqlite3_prepare_v2(db_,
+                             "SELECT agent_id,indicator,new_status FROM status_history WHERE id IN "
+                             "(SELECT MAX(id) FROM status_history GROUP BY agent_id, indicator) "
+                             "ORDER BY agent_id, indicator;",
+                             -1, &st.s, nullptr),
+          db_, "prepare latest_indicator_status_all");
+    std::vector<IndicatorStatusRow> out;
+    while (sqlite3_step(st.s) == SQLITE_ROW)
+    {
+        const auto text = [&](int col) {
+            const auto* value = reinterpret_cast<const char*>(sqlite3_column_text(st.s, col));
+            return value ? std::string(value) : std::string();
+        };
+        out.push_back({text(0), text(1), text(2)});
+    }
+    return out;
+}
+
 std::vector<StatusHistoryRow> SqliteStore::list_status_history(const std::string& agent_id, int limit)
 {
     Stmt st;

@@ -14,6 +14,7 @@ import type {
   PercentThresholds,
   SystemMetrics,
 } from './models';
+import { colorLabel } from './uiLogic';
 
 export type SummaryKey = 'green' | 'yellow' | 'amber' | 'red' | 'blue' | 'offline';
 export type OverviewGroupFilter = 'all' | 'ungrouped' | string;
@@ -95,30 +96,36 @@ export function collectorConfigWithDefaults(config?: CollectorConfig): Collector
   };
 }
 
-export function classifyPercent(value: number, thresholds: PercentThresholds = DEFAULT_PERCENT_THRESHOLDS): HealthColor {
-  if (!Number.isFinite(value)) return 'grey';
-  if (value >= thresholds.critical_percent) return 'red';
-  if (value >= thresholds.degraded_percent) return 'amber';
-  if (value >= thresholds.warning_percent) return 'yellow';
-  return 'green';
-}
-
-export function classifyNetworkMbps(value: number, thresholds: NetworkThresholds = DEFAULT_NETWORK_THRESHOLDS): HealthColor {
-  if (!Number.isFinite(value)) return 'grey';
-  if (value >= thresholds.critical_mbps) return 'red';
-  if (value >= thresholds.degraded_mbps) return 'amber';
-  if (value >= thresholds.warning_mbps) return 'yellow';
-  return 'green';
-}
-
+/**
+ * The worst of several statuses. Grey means "no status" (not monitored, or not evaluated
+ * yet), so it never outranks a real status: grey wins only when nothing else is left.
+ * An empty list is green.
+ */
 export function worstColor(colors: HealthColor[]): HealthColor {
-  return colors.reduce((worst, color) => (COLOR_RANK[color] > COLOR_RANK[worst] ? color : worst), 'green');
+  if (colors.length === 0) return 'green';
+  const known = colors.filter((color) => color !== 'grey');
+  if (known.length === 0) return 'grey';
+  return known.reduce((worst, color) => (COLOR_RANK[color] > COLOR_RANK[worst] ? color : worst), 'green');
 }
 
-export function hostStatus(agent: Pick<DashboardAgent, 'maintenance' | 'components'>): HealthColor {
+/**
+ * One status per host, from the component statuses the server reported.
+ * - Maintenance is blue; an offline host is grey ("Offline" in the UI), whatever its last metrics said.
+ * - Components with no status (nothing monitored, or not evaluated yet) are ignored, so they
+ *   cannot hold a healthy host in Warning. A host with no status at all is grey.
+ */
+export function hostStatus(agent: Pick<DashboardAgent, 'maintenance' | 'connected' | 'components'>): HealthColor {
   if (agent.maintenance) return 'blue';
-  const componentWorst = worstColor(agent.components.map((component) => component.color));
-  return componentWorst === 'grey' ? 'yellow' : componentWorst;
+  if (!agent.connected) return 'grey';
+  // Heartbeat only says the host is connected, which is already known here; it must not make a
+  // host with no evaluated indicator look healthy.
+  return worstColor(agent.components.filter((component) => component.key !== 'heartbeat').map((component) => component.color));
+}
+
+/** The label for a host row: "Offline" for a disconnected host, otherwise the status name. */
+export function hostStatusLabel(agent: Pick<DashboardAgent, 'maintenance' | 'connected' | 'status'>): string {
+  if (!agent.maintenance && !agent.connected) return 'Offline';
+  return colorLabel(agent.status);
 }
 
 export function formatBytes(bytes: number): string {
@@ -209,19 +216,32 @@ function noDataComponents(agent: AgentRecord): ComponentHealth[] {
   ];
 }
 
+const SERVER_STATUSES: readonly HealthColor[] = ['green', 'grey', 'yellow', 'amber', 'red', 'blue'];
+
+/**
+ * What the status engine last decided for one indicator. The server only raises an alert after
+ * the configured number of consecutive readings, so this is the status to show, not the latest
+ * sample classified here. Grey when the server has not reported the indicator yet.
+ */
+function serverStatus(agent: AgentRecord, indicator: string): HealthColor {
+  const status = agent.indicator_status?.[indicator] as HealthColor | undefined;
+  return status && SERVER_STATUSES.includes(status) ? status : 'grey';
+}
+
+const NOT_EVALUATED = 'Awaiting server evaluation';
+
 function metricComponents(agent: AgentRecord, metrics?: SystemMetrics): ComponentHealth[] {
   if (agent.maintenance) return maintenanceComponents();
   if (!metrics) return noDataComponents(agent);
 
   const config = collectorConfigWithDefaults(agent.collector_config);
+  // Which disks, interfaces and processes the server evaluates follows the agent's collector
+  // config; only the statuses come from the server.
   const diskConfigByMount = new Map(config.disks.map((disk) => [disk.mount_point, disk]));
   const monitoredDisks =
     config.disks.length === 0
       ? metrics.disks
       : metrics.disks.filter((disk) => diskConfigByMount.get(disk.mount_point)?.enabled);
-  const diskStatuses = monitoredDisks.map((disk) =>
-    classifyPercent(disk.usage_percent, diskConfigByMount.get(disk.mount_point)?.thresholds ?? DEFAULT_PERCENT_THRESHOLDS),
-  );
   const diskUsage = maxPercent(monitoredDisks.map((disk) => disk.usage_percent));
   const hottestDisk = monitoredDisks.reduce(
     (current, disk) => (disk.usage_percent > (current?.usage_percent ?? Number.NEGATIVE_INFINITY) ? disk : current),
@@ -236,11 +256,6 @@ function metricComponents(agent: AgentRecord, metrics?: SystemMetrics): Componen
     (sum, net) => sum + net.errors_in + net.errors_out + net.drops_in + net.drops_out,
     0,
   );
-  const networkStatuses = monitoredNetworks.map((net) => {
-    if (!net.is_up) return 'red' as HealthColor;
-    if (net.errors_in + net.errors_out + net.drops_in + net.drops_out > 0) return 'red' as HealthColor;
-    return classifyNetworkMbps(networkMbps(net), networkConfigByName.get(net.interface_name)?.thresholds ?? DEFAULT_NETWORK_THRESHOLDS);
-  });
   const networkTraffic = monitoredNetworks.reduce((sum, net) => sum + networkMbps(net), 0);
   const topCpu = maxPercent(metrics.top_processes.map((process) => process.cpu_percent));
   const enabledWatches = config.processes.filter((process) => process.enabled && process.name.trim().length > 0);
@@ -248,46 +263,48 @@ function metricComponents(agent: AgentRecord, metrics?: SystemMetrics): Componen
     const count = metrics.top_processes.filter((process) => process.name === watch.name).length;
     return count < watch.expected_count;
   });
-  const processColor =
-    enabledWatches.length === 0
-      ? metrics.top_processes.length === 0
-        ? 'grey'
-        : 'green'
-      : missingProcesses.length > 0
-        ? 'red'
-        : 'green';
+  const diskColor = monitoredDisks.length === 0 ? 'grey' : worstColor(monitoredDisks.map((disk) => serverStatus(agent, `disk:${disk.mount_point}`)));
+  const networkColor = monitoredNetworks.length === 0 ? 'grey' : worstColor(monitoredNetworks.map((net) => serverStatus(agent, `network:${net.interface_name}`)));
+  // Without watches the server evaluates no process indicator, so there is nothing to show.
+  const processColor = enabledWatches.length === 0 ? 'grey' : worstColor(enabledWatches.map((watch) => serverStatus(agent, `process:${watch.name}`)));
+  const cpuColor = serverStatus(agent, 'cpu');
+  const memoryColor = serverStatus(agent, 'memory');
+  const pendingDetail = (color: HealthColor, detail: string) => (color === 'grey' ? `${detail} (${NOT_EVALUATED.toLowerCase()})` : detail);
 
   return [
     {
       key: 'cpu',
       label: 'CPU',
-      color: classifyPercent(metrics.cpu.usage_percent, config.cpu),
+      color: cpuColor,
       value: `${metrics.cpu.usage_percent.toFixed(0)}%`,
-      detail: `${metrics.cpu.num_logical_cores} logical cores`,
+      detail: pendingDetail(cpuColor, `${metrics.cpu.num_logical_cores} logical cores`),
       percent: metrics.cpu.usage_percent,
     },
     {
       key: 'memory',
       label: 'Memory',
-      color: classifyPercent(metrics.memory.usage_percent, config.memory),
+      color: memoryColor,
       value: `${metrics.memory.usage_percent.toFixed(0)}%`,
-      detail: `${formatBytes(metrics.memory.used_bytes)} / ${formatBytes(metrics.memory.total_bytes)}`,
+      detail: pendingDetail(memoryColor, `${formatBytes(metrics.memory.used_bytes)} / ${formatBytes(metrics.memory.total_bytes)}`),
       percent: metrics.memory.usage_percent,
     },
     {
       key: 'disk',
       label: 'Disk',
-      color: monitoredDisks.length === 0 ? 'grey' : worstColor(diskStatuses),
+      color: diskColor,
       value: monitoredDisks.length === 0 ? 'none' : `${diskUsage.toFixed(0)}%`,
-      detail: hottestDisk ? diskLabel(hottestDisk.mount_point, hottestDisk.device) : 'No monitored fixed disks',
+      detail: hottestDisk ? pendingDetail(diskColor, diskLabel(hottestDisk.mount_point, hottestDisk.device)) : 'No monitored fixed disks',
       percent: Number.isFinite(diskUsage) ? diskUsage : undefined,
     },
     {
       key: 'network',
       label: 'Network',
-      color: monitoredNetworks.length === 0 ? 'grey' : worstColor(networkStatuses),
+      color: networkColor,
       value: monitoredNetworks.length === 0 ? 'none' : `${networkTraffic.toFixed(0)} Mb/s`,
-      detail: networkErrors > 0 ? `${networkErrors} errors/drops` : `${monitoredNetworks.length} interface(s)`,
+      detail:
+        monitoredNetworks.length === 0
+          ? 'No monitored interfaces'
+          : pendingDetail(networkColor, networkErrors > 0 ? `${networkErrors} errors/drops` : `${monitoredNetworks.length} interface(s)`),
     },
     {
       key: 'processes',
@@ -303,8 +320,8 @@ function metricComponents(agent: AgentRecord, metrics?: SystemMetrics): Componen
         missingProcesses.length > 0
           ? `Missing ${missingProcesses.map((process) => process.name).join(', ')}`
           : enabledWatches.length > 0
-            ? `${enabledWatches.length} watched process(es)`
-            : `${metrics.top_processes.length} tracked process(es)`,
+            ? pendingDetail(processColor, `${enabledWatches.length} watched process(es)`)
+            : 'No watched processes',
       percent: metrics.top_processes.length === 0 ? undefined : topCpu,
     },
     heartbeatComponent(agent),
@@ -429,6 +446,7 @@ export function summaryCounts(agents: DashboardAgent[]): Record<SummaryKey, numb
       return;
     }
     const status = agentStatus(agent);
+    // A host with nothing evaluated yet is not known healthy, so it counts as Warning.
     if (status === 'grey') counts.yellow += 1;
     else counts[status as SummaryKey] += 1;
   });

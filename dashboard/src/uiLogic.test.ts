@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { NAV_ITEMS, accountTypeLabel, colorLabel, isInsecureOrigin, parseMarkdownBlocks, parseViewHash, safeMarkdownHref } from './uiLogic';
+import { NAV_ITEMS, accountTypeLabel, colorLabel, isInsecureOrigin, parseInlineMarkdown, parseMarkdownBlocks, parseViewHash, safeMarkdownHref } from './uiLogic';
 
 describe('GIVEN dashboard navigation rules', () => {
   it('WHEN the nav item list is read THEN it matches the requested top-level order without pending enrollments', () => {
@@ -44,7 +44,7 @@ describe('GIVEN agent runbook markdown', () => {
     expect(blocks).toEqual([
       { type: 'heading', level: 1, text: 'CPU critical' },
       { type: 'paragraph', text: 'Check service health before restarting.' },
-      { type: 'list', items: ['Open dashboard', 'Restart worker'] },
+      { type: 'list', ordered: false, items: ['Open dashboard', 'Restart worker'] },
       { type: 'code', text: 'systemctl status watcher' },
     ]);
   });
@@ -92,5 +92,60 @@ describe('GIVEN the page origin', () => {
     ['http:', 'dash.example.com', true],
   ])('WHEN the page is %s//%s THEN the insecure-origin warning is %s', (protocol, hostname, expected) => {
     expect(isInsecureOrigin({ protocol, hostname })).toBe(expected);
+  });
+});
+
+describe('GIVEN runbook markdown with numbered lists and inline formatting (issue #113)', () => {
+  it('WHEN a numbered list is parsed THEN it is an ordered list, separate from a bullet list', () => {
+    const blocks = parseMarkdownBlocks(['1. Stop service', '2) Clear cache', '- note'].join('\n'));
+    expect(blocks).toEqual([
+      { type: 'list', ordered: true, items: ['Stop service', 'Clear cache'] },
+      { type: 'list', ordered: false, items: ['note'] },
+    ]);
+  });
+
+  it('WHEN a paragraph spans lines THEN the line breaks are kept', () => {
+    expect(parseMarkdownBlocks('first\nsecond')).toEqual([{ type: 'paragraph', text: 'first\nsecond' }]);
+  });
+
+  it('WHEN text has code, bold and italic THEN they become inline nodes', () => {
+    expect(parseInlineMarkdown('run `ls -l` **now**, *then* stop')).toEqual([
+      { type: 'text', text: 'run ' },
+      { type: 'code', text: 'ls -l' },
+      { type: 'text', text: ' ' },
+      { type: 'bold', children: [{ type: 'text', text: 'now' }] },
+      { type: 'text', text: ', ' },
+      { type: 'italic', children: [{ type: 'text', text: 'then' }] },
+      { type: 'text', text: ' stop' },
+    ]);
+  });
+
+  it('WHEN a link URL contains parentheses THEN the whole URL is kept', () => {
+    expect(parseInlineMarkdown('[wiki](https://en.wikipedia.org/wiki/Foo_(bar))')).toEqual([
+      { type: 'link', href: 'https://en.wikipedia.org/wiki/Foo_(bar)', children: [{ type: 'text', text: 'wiki' }] },
+    ]);
+  });
+
+  it('WHEN a link target is not http, https or mailto THEN it has no href', () => {
+    expect(parseInlineMarkdown('[x](javascript:alert(1))')).toEqual([{ type: 'link', href: null, children: [{ type: 'text', text: 'x' }] }]);
+  });
+
+  it('WHEN text has stray markers or HTML THEN it stays plain text', () => {
+    expect(parseInlineMarkdown('2 * 3 and <b>x</b> [open')).toEqual([{ type: 'text', text: '2 * 3 and <b>x</b> [open' }]);
+  });
+});
+
+describe('GIVEN hostile runbook lines (Sonar S8786)', () => {
+  it('WHEN a line is a marker followed by very long whitespace THEN parsing stays fast and linear', () => {
+    const started = performance.now();
+    const blocks = parseMarkdownBlocks([`1.${' '.repeat(200_000)}x`, `-${' '.repeat(200_000)}`, `#${'\t'.repeat(200_000)}y`, `1${' '.repeat(200_000)}`].join('\n'));
+    expect(performance.now() - started).toBeLessThan(500);
+    expect(blocks.length).toBeGreaterThan(0);
+  });
+
+  it('WHEN markers are not followed by text THEN they stay a paragraph, and #### is not a heading', () => {
+    expect(parseMarkdownBlocks('- ')).toEqual([{ type: 'paragraph', text: '-' }]);
+    expect(parseMarkdownBlocks('#### big')).toEqual([{ type: 'paragraph', text: '#### big' }]);
+    expect(parseMarkdownBlocks('## Title')).toEqual([{ type: 'heading', level: 2, text: 'Title' }]);
   });
 });

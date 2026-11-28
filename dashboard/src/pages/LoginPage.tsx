@@ -31,11 +31,11 @@ export function LoginPage({ notice = null, onLogin }: { notice?: string | null; 
         {error ? <div className="banner error" role="alert">Login failed: {error}</div> : null}
         <label>
           Username
-          <input value={username} onChange={(event) => setUsername(event.target.value)} />
+          <input autoComplete="username" value={username} onChange={(event) => setUsername(event.target.value)} />
         </label>
         <label>
           Password
-          <input type="password" value={password} onChange={(event) => setPassword(event.target.value)} />
+          <input autoComplete="current-password" type="password" value={password} onChange={(event) => setPassword(event.target.value)} />
         </label>
         <button className="text-button" type="submit">Sign in</button>
       </form>

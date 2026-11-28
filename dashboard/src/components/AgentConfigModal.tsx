@@ -5,6 +5,7 @@ import { buildCollectorDraft } from '../collectorDraft';
 import { ActionError } from './ActionError';
 import { ActionButton } from './ActionButton';
 import { AgentIdentity } from './AgentIdentity';
+import { useDialog } from './Modal';
 import { AnomalyInputs, NetworkThresholdInputs, NumberField, ThresholdInputs, ThresholdRow } from './ThresholdInputs';
 import { ActionFailureContext, type RunAction } from '../hooks/useRunAction';
 import type { AgentCollectorConfigUpdate, CollectorConfig, DashboardAgent, DiskMonitorConfig, GroupRecord, LogMonitorConfig, NetworkInterfaceConfig, ProcessWatchConfig } from '../models';
@@ -27,20 +28,12 @@ export function AgentConfigModal({
   operator: boolean;
   runAction: RunAction;
 }) {
-  // Snapshot the agent locally. The parent polls every 5s and rebuilds
-  // `agents` with new object references, which would otherwise re-render
-  // the form on every poll and risk fighting controlled-input state.
-  // We only swap the snapshot when the *selected* agent id changes — i.e.
-  // when the user opens a different agent's modal.
-  const [agent, setAgent] = React.useState(agentProp);
-  React.useEffect(() => {
-    if (agentProp.id !== agent.id) setAgent(agentProp);
-  }, [agentProp, agent.id]);
-
+  // Snapshot the agent once. The parent polls every 5s and rebuilds `agents` with new object
+  // references, which would otherwise re-render the form on every poll and fight the
+  // controlled inputs. The parent gives this modal `key={agent.id}`, so opening a different
+  // agent's modal mounts a fresh snapshot.
+  const [agent] = React.useState(agentProp);
   const [draft, setDraft] = React.useState<AgentCollectorConfigUpdate>(() => buildCollectorDraft(agent));
-  React.useEffect(() => {
-    setDraft(buildCollectorDraft(agent));
-  }, [agent]);
 
   const updateConfig = (update: (config: CollectorConfig) => CollectorConfig) => {
     setDraft((current) => ({ ...current, collector_config: update(current.collector_config) }));
@@ -90,10 +83,18 @@ export function AgentConfigModal({
     onClose();
   };
 
+  const dialogRef = React.useRef<HTMLFormElement>(null);
+  const onKeyDown = useDialog(dialogRef, !busy, dismiss);
+
   return (
     <div className="modal-backdrop" role="presentation">
       <form
+        aria-label={`Configure ${agent.name}`}
+        aria-modal="true"
         className="config-modal"
+        onKeyDown={onKeyDown}
+        ref={dialogRef}
+        role="dialog"
         onSubmit={(event) => {
           event.preventDefault();
           void runAction(`${agent.id}:collector_config`, () => setAgentCollectorConfig(agent.id, draft), { inline: true }).then((saved) => {
@@ -146,6 +147,7 @@ export function AgentConfigModal({
           <section className="wide-section">
             <h2>Runbook</h2>
             <textarea
+              aria-label="Runbook (Markdown)"
               className="runbook-editor"
               disabled={!operator}
               rows={10}
@@ -241,7 +243,7 @@ export function AgentConfigModal({
                     <input type="checkbox" checked={process.enabled} onChange={(event) => updateProcess(index, (current) => ({ ...current, enabled: event.target.checked }))} />
                     <span>Enabled</span>
                   </label>
-                  <input title="Exact executable or process name expected to be running on this agent." value={process.name} placeholder="exact executable name" onChange={(event) => updateProcess(index, (current) => ({ ...current, name: event.target.value }))} />
+                  <input aria-label="Process name" title="Exact executable or process name expected to be running on this agent." value={process.name} placeholder="exact executable name" onChange={(event) => updateProcess(index, (current) => ({ ...current, name: event.target.value }))} />
                   <NumberField help="Expected number of matching processes. Alerts are raised when fewer are running." label="Expected" min={1} value={process.expected_count} onChange={(value) => updateProcess(index, (current) => ({ ...current, expected_count: value }))} />
                   <ActionButton busy={false} danger icon={<Trash2 size={14} />} label="Remove" onClick={() => updateConfig((config) => ({ ...config, processes: config.processes.filter((_, currentIndex) => currentIndex !== index) }))} />
                 </div>
@@ -272,10 +274,10 @@ export function AgentConfigModal({
                     <input type="checkbox" checked={log.enabled} onChange={(event) => updateLog(index, (current) => ({ ...current, enabled: event.target.checked }))} />
                     <span>Enabled</span>
                   </label>
-                  <input title="Absolute path to the log file the agent should scan." value={log.path} placeholder="/var/log/syslog" onChange={(event) => updateLog(index, (current) => ({ ...current, path: event.target.value }))} />
-                  <input title="Regular expression pattern that identifies matching log lines." value={log.pattern} placeholder="regex pattern" onChange={(event) => updateLog(index, (current) => ({ ...current, pattern: event.target.value }))} />
-                  <input title="Dashboard indicator name to use when this log pattern matches." value={log.indicator_name} placeholder="indicator name" onChange={(event) => updateLog(index, (current) => ({ ...current, indicator_name: event.target.value }))} />
-                  <select title="Alert severity raised when this log pattern matches." value={log.severity} onChange={(event) => updateLog(index, (current) => ({ ...current, severity: event.target.value as LogMonitorConfig['severity'] }))}>
+                  <input aria-label="Log file path" title="Absolute path to the log file the agent should scan." value={log.path} placeholder="/var/log/syslog" onChange={(event) => updateLog(index, (current) => ({ ...current, path: event.target.value }))} />
+                  <input aria-label="Log match pattern" title="Regular expression pattern that identifies matching log lines." value={log.pattern} placeholder="regex pattern" onChange={(event) => updateLog(index, (current) => ({ ...current, pattern: event.target.value }))} />
+                  <input aria-label="Log indicator name" title="Dashboard indicator name to use when this log pattern matches." value={log.indicator_name} placeholder="indicator name" onChange={(event) => updateLog(index, (current) => ({ ...current, indicator_name: event.target.value }))} />
+                  <select aria-label="Log severity" title="Alert severity raised when this log pattern matches." value={log.severity} onChange={(event) => updateLog(index, (current) => ({ ...current, severity: event.target.value as LogMonitorConfig['severity'] }))}>
                     <option value="yellow">Warning</option>
                     <option value="amber">Degraded</option>
                     <option value="red">Critical</option>
@@ -291,7 +293,7 @@ export function AgentConfigModal({
         <ActionError actionKey={`${agent.id}:collector_config`} />
         <div className="modal-actions">
           <button className="text-button" type="button" disabled={busy} onClick={dismiss}>Cancel</button>
-          <button className="text-button" type="submit" disabled={!operator || busy}>{busy ? '...' : 'Save'}</button>
+          <button className="text-button" type="submit" disabled={!operator || busy}>{busy ? 'Saving…' : 'Save'}</button>
         </div>
       </form>
     </div>

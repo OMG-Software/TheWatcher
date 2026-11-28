@@ -4,6 +4,8 @@ import { createMaintenanceWindow, deleteMaintenanceWindow } from '../api';
 import { ActionError } from '../components/ActionError';
 import { ActionButton } from '../components/ActionButton';
 import { AgentIdentity } from '../components/AgentIdentity';
+import { ConfirmDialog } from '../components/ConfirmDialog';
+import { useNow } from '../hooks/useNow';
 import type { RunAction } from '../hooks/useRunAction';
 import type { DashboardAgent, MaintenanceWindowRecord } from '../models';
 
@@ -24,20 +26,34 @@ export function MaintenancePage({
   runAction: RunAction;
   windows: MaintenanceWindowRecord[];
 }) {
-  const [agentId, setAgentId] = React.useState('*');
+  const [agentChoice, setAgentId] = React.useState('*');
+  // A group user cannot target "all agents", so fall back to their first agent.
+  const agentId = !global && agentChoice === '*' && agents.length > 0 ? agents[0].id : agentChoice;
   const [reason, setReason] = React.useState('');
   const [startDate, setStartDate] = React.useState('');
   const [startTime, setStartTime] = React.useState('00:00');
   const [durationHours, setDurationHours] = React.useState(1);
 
-  const fmt = (ms: number) => new Date(ms).toLocaleString();
+  const [deleting, setDeleting] = React.useState<MaintenanceWindowRecord | null>(null);
+  const now = useNow();
+  const deleteKey = deleting ? `mw:delete:${deleting.window_id}` : '';
 
-  React.useEffect(() => {
-    if (!global && agentId === '*' && agents.length > 0) setAgentId(agents[0].id);
-  }, [agentId, agents, global]);
+  const fmt = (ms: number) => new Date(ms).toLocaleString();
 
   return (
     <main className="table-wrap management-wrap">
+      {deleting ? (
+        <ConfirmDialog
+          busy={isBusy(deleteKey)}
+          confirmLabel="Delete window"
+          danger
+          errorKey={deleteKey}
+          message={<>Delete the maintenance window for <strong>{deleting.agent_id === '*' ? 'all agents' : (agents.find((a) => a.id === deleting.agent_id)?.name ?? deleting.agent_id)}</strong> ({fmt(deleting.start_ms)} to {fmt(deleting.end_ms)})? Alerts are no longer suppressed for that time.</>}
+          onCancel={() => setDeleting(null)}
+          onConfirm={() => runAction(deleteKey, () => deleteMaintenanceWindow(deleting.window_id), { inline: true })}
+          title="Delete maintenance window"
+        />
+      ) : null}
       <div className="management-header"><h1>Maintenance Windows</h1></div>
       {operator ? (
         <form
@@ -110,7 +126,6 @@ export function MaintenancePage({
             ) : null}
             {windows.map((w) => {
               const agent = agents.find((a) => a.id === w.agent_id);
-              const now = Date.now();
               const active = w.start_ms <= now && w.end_ms > now;
               return (
                 <tr key={w.window_id} className={active ? 'maint-active' : ''}>
@@ -126,7 +141,7 @@ export function MaintenancePage({
                       disabled={!operator}
                       icon={<Trash2 size={14} />}
                       label="Delete"
-                      onClick={() => runAction(`mw:delete:${w.window_id}`, () => deleteMaintenanceWindow(w.window_id))}
+                      onClick={() => setDeleting(w)}
                     />
                   </td>
                 </tr>

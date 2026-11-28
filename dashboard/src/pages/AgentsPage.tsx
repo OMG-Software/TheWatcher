@@ -4,16 +4,18 @@ import { canManageAgent, maintenanceAction, maintenanceActionLabel } from '../ag
 import { deleteAgent, requestAgentStatus, restartAgentCollectors, resumeAgent, setAgentDescription, setMaintenance } from '../api';
 import { ActionButton } from '../components/ActionButton';
 import { AgentIdentity } from '../components/AgentIdentity';
+import { ConfirmDialog } from '../components/ConfirmDialog';
 import { PendingEnrollments } from '../components/PendingEnrollments';
 import { StatusDot } from '../components/StatusDot';
+import { useNow } from '../hooks/useNow';
 import type { RunAction } from '../hooks/useRunAction';
 import type { DashboardAgent, GroupRecord } from '../models';
-import { colorLabel } from '../uiLogic';
+import { hostStatusLabel } from '../status';
 
 export function AgentsPage({
   agents,
-  isBusy,
   groups,
+  isBusy,
   onConfigure,
   operator,
   pending,
@@ -22,8 +24,8 @@ export function AgentsPage({
   runAction,
 }: {
   agents: DashboardAgent[];
-  isBusy: (key: string) => boolean;
   groups: GroupRecord[];
+  isBusy: (key: string) => boolean;
   onConfigure: (agentId: string) => void;
   operator: boolean;
   pending: DashboardAgent[];
@@ -32,9 +34,37 @@ export function AgentsPage({
   runAction: RunAction;
 }) {
   const [descDrafts, setDescDrafts] = React.useState<Record<string, string>>({});
+  // Delete and entering maintenance ask first; the dialog names the agent.
+  const [confirming, setConfirming] = React.useState<{ kind: 'delete' | 'maintenance'; agent: DashboardAgent } | null>(null);
+  const now = useNow();
+  const confirmKey = confirming ? `${confirming.agent.id}:${confirming.kind}` : '';
 
   return (
     <main className="table-wrap management-wrap">
+      {confirming?.kind === 'delete' ? (
+        <ConfirmDialog
+          busy={isBusy(confirmKey)}
+          confirmLabel="Delete agent"
+          danger
+          errorKey={confirmKey}
+          message={<>Delete agent <strong>{confirming.agent.name}</strong>? Its metric history and alerts are removed and its key is revoked. This cannot be undone.</>}
+          onCancel={() => setConfirming(null)}
+          onConfirm={() => runAction(confirmKey, () => deleteAgent(confirming.agent.id), { inline: true })}
+          title="Delete agent"
+        />
+      ) : null}
+      {confirming?.kind === 'maintenance' ? (
+        <ConfirmDialog
+          busy={isBusy(confirmKey)}
+          confirmLabel="Enter maintenance"
+          errorKey={confirmKey}
+          message={<>Put <strong>{confirming.agent.name}</strong> into maintenance? Its monitoring is paused and its active alerts are cleared until you resume it.</>}
+          onCancel={() => setConfirming(null)}
+          onConfirm={(reason) => runAction(confirmKey, () => setMaintenance(confirming.agent.id, reason, 0), { inline: true })}
+          reasonLabel="Reason"
+          title="Enter maintenance"
+        />
+      ) : null}
       {showPending ? <PendingEnrollments agents={pending} isBusy={isBusy} groups={groups} loadFailed={pendingLoadFailed} runAction={runAction} /> : null}
       <div className="management-header"><h1>Agent Management</h1></div>
       <div className="table-container">
@@ -79,12 +109,12 @@ export function AgentsPage({
                     </div>
                   </td>
                   <td>{agent.platform}</td>
-                  <td><StatusDot color={agent.status} label={colorLabel(agent.status)} /></td>
-                  <td className="uptime">{agent.lastSeen > 0 ? `${Math.floor((Date.now() - agent.lastSeen) / 60000)}m` : 'never'}</td>
+                  <td><StatusDot color={agent.status} label={hostStatusLabel(agent)} /></td>
+                  <td className="uptime">{agent.lastSeen > 0 ? `${Math.max(0, Math.floor((now - agent.lastSeen) / 60000))}m` : 'never'}</td>
                   <td>{agent.groupIds.map((id) => groups.find((group) => group.group_id === id)?.name ?? id).join(', ') || 'No group'}</td>
                   <td>
                     <div className="button-row">
-                      <ActionButton busy={isBusy(`${agent.id}:${maintenanceCommand}`)} disabled={!manageable} icon={agent.maintenance ? <Play size={14} /> : <Pause size={14} />} label={maintenanceActionLabel(agent)} onClick={() => runAction(`${agent.id}:${maintenanceCommand}`, () => agent.maintenance ? resumeAgent(agent.id) : setMaintenance(agent.id, 'operator request', 0))} />
+                      <ActionButton busy={isBusy(`${agent.id}:${maintenanceCommand}`)} disabled={!manageable} icon={agent.maintenance ? <Play size={14} /> : <Pause size={14} />} label={maintenanceActionLabel(agent)} onClick={() => (agent.maintenance ? void runAction(`${agent.id}:${maintenanceCommand}`, () => resumeAgent(agent.id)) : setConfirming({ kind: 'maintenance', agent }))} />
                       <ActionButton busy={isBusy(`${agent.id}:restart`)} disabled={!manageable} icon={<RotateCw size={14} />} label="Restart" onClick={() => runAction(`${agent.id}:restart`, () => restartAgentCollectors(agent.id))} />
                       <ActionButton busy={isBusy(`${agent.id}:status`)} disabled={!manageable} icon={<Search size={14} />} label="Status" onClick={() => runAction(`${agent.id}:status`, () => requestAgentStatus(agent.id))} />
                     </div>
@@ -98,7 +128,7 @@ export function AgentsPage({
                       onClick={() => onConfigure(agent.id)}
                     />
                   </td>
-                  <td><ActionButton busy={isBusy(`${agent.id}:delete`)} danger disabled={!manageable} icon={<Trash2 size={14} />} label="Delete" onClick={() => runAction(`${agent.id}:delete`, () => deleteAgent(agent.id))} /></td>
+                  <td><ActionButton busy={isBusy(`${agent.id}:delete`)} danger disabled={!manageable} icon={<Trash2 size={14} />} label="Delete" onClick={() => setConfirming({ kind: 'delete', agent })} /></td>
                 </tr>
               );
             })}

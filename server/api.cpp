@@ -18,6 +18,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <unordered_set>
 
 #include <httplib.h>
@@ -1503,6 +1504,14 @@ void ApiServer::setup_routes()
         try
         {
             auto agents = store_.list_approved_agents();
+            std::unordered_map<std::string, json> indicator_statuses; // agent_id -> {indicator: status}
+            for (const auto& row : store_.latest_indicator_status_all())
+            {
+                auto& per_agent = indicator_statuses[row.agent_id];
+                if (!per_agent.is_object())
+                    per_agent = json::object();
+                per_agent[row.indicator] = row.new_status;
+            }
             LOGF_TRACE("GET /api/agents returned %zu agent(s)", agents.size());
             json arr = json::array();
             for (auto& a : agents)
@@ -1511,6 +1520,14 @@ void ApiServer::setup_routes()
                     continue;
                 auto item = agent_to_json(a);
                 item["group_ids"] = store_.get_agent_groups(a.agent_id);
+                // The status engine's verdict per indicator (issue #114), so the
+                // dashboard shows what alerting acted on instead of re-deriving it.
+                // The newest row of each indicator is its current status however
+                // long ago it changed; the map is read once for the whole list.
+                json indicator_status = json::object();
+                if (const auto found = indicator_statuses.find(a.agent_id); found != indicator_statuses.end())
+                    indicator_status = found->second;
+                item["indicator_status"] = std::move(indicator_status);
                 arr.push_back(item);
             }
             set_json(res, arr);

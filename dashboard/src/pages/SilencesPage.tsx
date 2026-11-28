@@ -3,6 +3,7 @@ import { Plus, Trash2 } from 'lucide-react';
 import { createSilence, deleteSilence } from '../api';
 import { ActionError } from '../components/ActionError';
 import { ActionButton } from '../components/ActionButton';
+import { useNow } from '../hooks/useNow';
 import type { RunAction } from '../hooks/useRunAction';
 import type { DashboardAgent, SilenceRecord } from '../models';
 
@@ -23,14 +24,13 @@ export function SilencesPage({
   runAction: RunAction;
   silences: SilenceRecord[];
 }) {
-  const [agentId, setAgentId] = React.useState('*');
+  const [agentChoice, setAgentId] = React.useState('*');
+  // A group user cannot target "all agents", so fall back to their first agent.
+  const agentId = !global && agentChoice === '*' && agents.length > 0 ? agents[0].id : agentChoice;
   const [indicator, setIndicator] = React.useState('*');
   const [reason, setReason] = React.useState('');
   const [hours, setHours] = React.useState(1);
-
-  React.useEffect(() => {
-    if (!global && agentId === '*' && agents.length > 0) setAgentId(agents[0].id);
-  }, [agentId, agents, global]);
+  const now = useNow();
 
   return (
     <main className="table-wrap management-wrap">
@@ -104,7 +104,7 @@ export function SilencesPage({
             ) : null}
             {silences.map((s) => {
               const agent = agents.find((a) => a.id === s.agent_id);
-              const expired = s.until_ms <= Date.now();
+              const expired = s.until_ms <= now;
               return (
                 <tr key={s.silence_id} className={expired ? 'row-muted' : ''}>
                   <td>{s.agent_id === '*' ? 'All agents' : (agent?.name || s.agent_id)}</td>

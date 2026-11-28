@@ -1121,6 +1121,19 @@ std::optional<StatusHistoryRow> PostgresStore::latest_status_for_indicator(const
                             col(res.r, 0, 4),       col(res.r, 0, 5), col_int64(res.r, 0, 6)};
 }
 
+std::vector<IndicatorStatusRow> PostgresStore::latest_indicator_status_all()
+{
+    // MAX(id) is the newest row of each (agent, indicator); "C" collation keeps the order the same as SQLite's.
+    Res res(PQexec(conn_, "SELECT agent_id,indicator,new_status FROM status_history WHERE id IN "
+                          "(SELECT MAX(id) FROM status_history GROUP BY agent_id, indicator) "
+                          "ORDER BY agent_id COLLATE \"C\", indicator COLLATE \"C\";"));
+    check_res(res.r, "latest_indicator_status_all");
+    std::vector<IndicatorStatusRow> out;
+    for (int i = 0; i < PQntuples(res.r); ++i)
+        out.push_back({col(res.r, i, 0), col(res.r, i, 1), col(res.r, i, 2)});
+    return out;
+}
+
 std::vector<StatusHistoryRow> PostgresStore::list_status_history(const std::string& agent_id, int limit)
 {
     const auto p_lim = s(limit);

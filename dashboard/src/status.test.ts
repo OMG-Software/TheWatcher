@@ -5,14 +5,13 @@ import {
   DEFAULT_PERCENT_THRESHOLDS,
   DEFAULT_THRESHOLDS,
   agentStatus,
-  classifyNetworkMbps,
-  classifyPercent,
   collectorConfigWithDefaults,
   formatBytes,
   formatDuration,
   isUptimeAlarm,
   groupOverviewAgents,
   hostStatus,
+  hostStatusLabel,
   primaryIpAddress,
   summaryCounts,
   toDashboardAgents,
@@ -44,15 +43,6 @@ function agent(overrides: Partial<AgentRecord> = {}): AgentRecord {
   };
 }
 
-describe('GIVEN dashboard health thresholds', () => {
-  it('WHEN percentages are classified THEN severity increases at warning, degraded, and critical levels', () => {
-    expect(classifyPercent(12)).toBe('green');
-    expect(classifyPercent(80)).toBe('yellow');
-    expect(classifyPercent(90)).toBe('amber');
-    expect(classifyPercent(95)).toBe('red');
-  });
-});
-
 describe('GIVEN agents with component health', () => {
   it('WHEN summary counts are calculated THEN each agent contributes to its host state', () => {
     const agents: DashboardAgent[] = [
@@ -73,7 +63,7 @@ describe('GIVEN backend agents and metrics', () => {
     expect(rows).toHaveLength(1);
     expect(rows[0].components.find((component) => component.key === 'cpu')?.color).toBe('grey');
     expect(rows[0].components.at(-1)).toMatchObject({ key: 'heartbeat', color: 'green' });
-    expect(rows[0].status).toBe('yellow');
+    expect(rows[0].status).toBe('grey');
   });
 
   it('WHEN a disconnected agent row is built THEN heartbeat is the final no-data indicator', () => {
@@ -96,7 +86,7 @@ describe('GIVEN backend agents and metrics', () => {
     expect(rows[0].components.at(-1)).toMatchObject({ key: 'heartbeat', color: 'blue' });
   });
 
-  it('WHEN collector config is supplied THEN dashboard health uses absolute per-agent thresholds and watches', () => {
+  it('WHEN the server reports indicator statuses THEN the dashboard shows them instead of classifying the latest sample (issue #114)', () => {
     const metrics: MetricsSnapshot = {
       agent_id: 'agent-1',
       timestamp_ms: 1000,
@@ -122,10 +112,13 @@ describe('GIVEN backend agents and metrics', () => {
           networks: [{ interface_name: 'eth0', enabled: true, thresholds: DEFAULT_NETWORK_THRESHOLDS }],
           processes: [{ name: 'TheWatcherAgent.exe', expected_count: 2, enabled: true }],
         },
+        // One 55% sample is above the 50% warning line, but the server has not confirmed it
+        // (cpu_readings) and so reports cpu as green and raised no alert.
+        indicator_status: { cpu: 'green', memory: 'green', 'network:eth0': 'yellow', 'process:TheWatcherAgent.exe': 'red' },
       }),
     ], [metrics]);
 
-    expect(rows[0].components.find((component) => component.key === 'cpu')).toMatchObject({ color: 'yellow' });
+    expect(rows[0].components.find((component) => component.key === 'cpu')).toMatchObject({ color: 'green', value: '55%' });
     expect(rows[0].components.find((component) => component.key === 'network')).toMatchObject({ color: 'yellow' });
     expect(rows[0].components.find((component) => component.key === 'processes')).toMatchObject({ color: 'red' });
   });
@@ -310,39 +303,6 @@ describe('GIVEN isUptimeAlarm', () => {
   });
 });
 
-describe('GIVEN classifyNetworkMbps', () => {
-  it('WHEN traffic is below warning threshold THEN color is green', () => {
-    expect(classifyNetworkMbps(0)).toBe('green');
-    expect(classifyNetworkMbps(99)).toBe('green');
-  });
-
-  it('WHEN traffic crosses warning THEN color is yellow', () => {
-    expect(classifyNetworkMbps(100)).toBe('yellow');
-    expect(classifyNetworkMbps(149)).toBe('yellow');
-  });
-
-  it('WHEN traffic crosses degraded THEN color is amber', () => {
-    expect(classifyNetworkMbps(200)).toBe('amber');
-  });
-
-  it('WHEN traffic crosses critical THEN color is red', () => {
-    expect(classifyNetworkMbps(300)).toBe('red');
-  });
-
-  it('WHEN traffic uses custom thresholds THEN they override the defaults', () => {
-    const custom = { warning_mbps: 10, degraded_mbps: 20, critical_mbps: 30 };
-    expect(classifyNetworkMbps(5, custom)).toBe('green');
-    expect(classifyNetworkMbps(15, custom)).toBe('yellow');
-    expect(classifyNetworkMbps(25, custom)).toBe('amber');
-    expect(classifyNetworkMbps(35, custom)).toBe('red');
-  });
-
-  it('WHEN given a non-finite value THEN color is grey', () => {
-    expect(classifyNetworkMbps(Number.NaN)).toBe('grey');
-    expect(classifyNetworkMbps(Infinity)).toBe('grey');
-  });
-});
-
 describe('GIVEN worstColor', () => {
   it('WHEN all colors are green THEN returns green', () => {
     expect(worstColor(['green', 'green'])).toBe('green');
@@ -357,34 +317,52 @@ describe('GIVEN worstColor', () => {
     expect(worstColor(['red', 'amber'])).toBe('red');
   });
 
-  it('WHEN severity order is green < grey < yellow < amber < red THEN highest wins', () => {
-    expect(worstColor(['green', 'grey'])).toBe('grey');
+  it('WHEN severity order is green < yellow < amber < red THEN highest wins', () => {
     expect(worstColor(['grey', 'yellow'])).toBe('yellow');
     expect(worstColor(['yellow', 'amber'])).toBe('amber');
     expect(worstColor(['amber', 'red'])).toBe('red');
   });
+
+  it('WHEN some colors are grey (no status) THEN grey is ignored (issue #167)', () => {
+    expect(worstColor(['green', 'grey'])).toBe('green');
+    expect(worstColor(['grey', 'green', 'grey'])).toBe('green');
+  });
+
+  it('WHEN every color is grey THEN returns grey', () => {
+    expect(worstColor(['grey', 'grey'])).toBe('grey');
+  });
 });
+
+const comp = (key: DashboardAgent['components'][number]['key'], color: DashboardAgent['components'][number]['color']) => ({ key, label: key, color, value: '', detail: '' });
 
 describe('GIVEN hostStatus', () => {
   it('WHEN the agent is in maintenance THEN status is blue regardless of components', () => {
-    const result = hostStatus({ maintenance: true, components: [{ key: 'cpu', label: 'CPU', color: 'red', value: '99%', detail: '' }] });
-    expect(result).toBe('blue');
+    expect(hostStatus({ maintenance: true, connected: true, components: [comp('cpu', 'red')] })).toBe('blue');
   });
 
-  it('WHEN all components are grey (no data) THEN status is promoted to yellow', () => {
-    const result = hostStatus({ maintenance: false, components: [{ key: 'cpu', label: 'CPU', color: 'grey', value: 'no data', detail: '' }] });
-    expect(result).toBe('yellow');
+  it('WHEN no component has a status THEN status is grey', () => {
+    expect(hostStatus({ maintenance: false, connected: true, components: [comp('cpu', 'grey'), comp('heartbeat', 'green')] })).toBe('grey');
   });
 
   it('WHEN components include a red component THEN status is red', () => {
-    const result = hostStatus({
-      maintenance: false,
-      components: [
-        { key: 'cpu', label: 'CPU', color: 'green', value: '10%', detail: '' },
-        { key: 'memory', label: 'Memory', color: 'red', value: '98%', detail: '' },
-      ],
-    });
-    expect(result).toBe('red');
+    expect(hostStatus({ maintenance: false, connected: true, components: [comp('cpu', 'green'), comp('memory', 'red')] })).toBe('red');
+  });
+
+  it('WHEN only some components are not monitored THEN they do not hold the host in warning (issue #167)', () => {
+    const components = [comp('cpu', 'green'), comp('memory', 'green'), comp('disk', 'grey'), comp('network', 'grey'), comp('processes', 'grey'), comp('heartbeat', 'green')];
+    expect(hostStatus({ maintenance: false, connected: true, components })).toBe('green');
+  });
+
+  it('WHEN the host is offline THEN status is grey and labelled Offline, not a metric colour (issue #114)', () => {
+    const host = { maintenance: false, connected: false, components: [comp('cpu', 'green'), comp('memory', 'green')] };
+    const status = hostStatus(host);
+    expect(status).toBe('grey');
+    expect(hostStatusLabel({ ...host, status })).toBe('Offline');
+  });
+
+  it('WHEN the host is connected THEN its label is the status name', () => {
+    expect(hostStatusLabel({ maintenance: false, connected: true, status: 'amber' })).toBe('Degraded');
+    expect(hostStatusLabel({ maintenance: true, connected: false, status: 'blue' })).toBe('Maintenance');
   });
 });
 
@@ -449,10 +427,10 @@ describe('GIVEN toDashboardAgents with metric components', () => {
     };
   }
 
-  it('WHEN disk usage is high THEN disk component color reflects severity', () => {
+  it('WHEN the server reports a disk red THEN the disk component is red and shows the usage', () => {
     const snapshot = baseSnapshot('comp-agent');
     snapshot.metrics.disks[0].usage_percent = 96;
-    const [dashAgent] = toDashboardAgents([baseAgent()], [snapshot]);
+    const [dashAgent] = toDashboardAgents([baseAgent({ indicator_status: { 'disk:/': 'red' } })], [snapshot]);
     const disk = dashAgent.components.find((c) => c.key === 'disk')!;
     expect(disk.color).toBe('red');
     expect(disk.value).toBe('96%');
@@ -488,19 +466,19 @@ describe('GIVEN toDashboardAgents with metric components', () => {
     expect(dashAgent.ipAddress).toBe('192.0.2.10');
   });
 
-  it('WHEN a network interface has packet errors THEN network component is red', () => {
+  it('WHEN the server reports a network interface red for packet errors THEN network component is red', () => {
     const snapshot = baseSnapshot('comp-agent');
     snapshot.metrics.networks[0].errors_in = 5;
-    const [dashAgent] = toDashboardAgents([baseAgent()], [snapshot]);
+    const [dashAgent] = toDashboardAgents([baseAgent({ indicator_status: { 'network:eth0': 'red' } })], [snapshot]);
     const net = dashAgent.components.find((c) => c.key === 'network')!;
     expect(net.color).toBe('red');
     expect(net.detail).toMatch(/errors/);
   });
 
-  it('WHEN an interface is down THEN network component is red', () => {
+  it('WHEN the server reports a down interface red THEN network component is red', () => {
     const snapshot = baseSnapshot('comp-agent');
     snapshot.metrics.networks[0].is_up = false;
-    const [dashAgent] = toDashboardAgents([baseAgent()], [snapshot]);
+    const [dashAgent] = toDashboardAgents([baseAgent({ indicator_status: { 'network:eth0': 'red' } })], [snapshot]);
     const net = dashAgent.components.find((c) => c.key === 'network')!;
     expect(net.color).toBe('red');
   });
@@ -514,13 +492,45 @@ describe('GIVEN toDashboardAgents with metric components', () => {
     expect(net.value).toBe('none');
   });
 
-  it('WHEN memory usage is high THEN memory component reflects severity', () => {
+  it('WHEN the server reports memory red THEN the memory component is red and shows the usage', () => {
     const snapshot = baseSnapshot('comp-agent');
     snapshot.metrics.memory.usage_percent = 95;
-    const [dashAgent] = toDashboardAgents([baseAgent()], [snapshot]);
+    const [dashAgent] = toDashboardAgents([baseAgent({ indicator_status: { memory: 'red' } })], [snapshot]);
     const mem = dashAgent.components.find((c) => c.key === 'memory')!;
     expect(mem.color).toBe('red');
     expect(mem.value).toBe('95%');
+  });
+
+  it('WHEN the server has not reported an indicator yet THEN the component is grey and says it awaits evaluation', () => {
+    const [dashAgent] = toDashboardAgents([baseAgent({ indicator_status: {} })], [baseSnapshot('comp-agent')]);
+    const cpu = dashAgent.components.find((c) => c.key === 'cpu')!;
+    expect(cpu.color).toBe('grey');
+    expect(cpu.detail).toMatch(/awaiting server evaluation/);
+  });
+
+  it('WHEN a host has no monitored disks, interfaces or processes THEN it is healthy, not Warning (issue #167)', () => {
+    const snapshot = baseSnapshot('comp-agent');
+    snapshot.metrics.networks = [{ interface_name: 'lo', ip_address: '127.0.0.1', mac_address: '', bytes_sent_per_sec: 0, bytes_recv_per_sec: 0, errors_in: 0, errors_out: 0, drops_in: 0, drops_out: 0, is_up: true }];
+    const noDisks = baseAgent({
+      indicator_status: { cpu: 'green', memory: 'green' },
+      collector_config: { ...DEFAULT_COLLECTOR_CONFIG, disks: [{ mount_point: '/', device: '/dev/sda1', enabled: false, thresholds: DEFAULT_PERCENT_THRESHOLDS }] },
+    });
+    const [dashAgent] = toDashboardAgents([noDisks], [snapshot]);
+    expect(dashAgent.status).toBe('green');
+    expect(summaryCounts([dashAgent])).toMatchObject({ green: 1, yellow: 0 });
+  });
+
+  it('WHEN a host is offline THEN the row and the summary agree it is offline (issue #114)', () => {
+    const [dashAgent] = toDashboardAgents([baseAgent({ connected: false, indicator_status: { cpu: 'green', memory: 'green' } })], [baseSnapshot('comp-agent')]);
+    expect(dashAgent.status).toBe('grey');
+    expect(hostStatusLabel(dashAgent)).toBe('Offline');
+    expect(summaryCounts([dashAgent])).toMatchObject({ offline: 1, yellow: 0, green: 0 });
+  });
+
+  it('WHEN an indicator is for a disk the agent no longer reports THEN it does not affect the host', () => {
+    const [dashAgent] = toDashboardAgents([baseAgent({ indicator_status: { cpu: 'green', memory: 'green', 'disk:/': 'green', 'disk:/gone': 'red' } })], [baseSnapshot('comp-agent')]);
+    expect(dashAgent.components.find((c) => c.key === 'disk')!.color).toBe('green');
+    expect(dashAgent.status).toBe('green');
   });
 
   it('WHEN the agent description is set THEN toDashboardAgents maps it through', () => {

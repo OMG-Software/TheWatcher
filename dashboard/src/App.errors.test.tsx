@@ -289,13 +289,15 @@ describe('GIVEN a view whose save is still running', () => {
     fireEvent.click((await screen.findAllByRole('button', { name: 'Edit' }))[0]);
     fireEvent.click(screen.getByRole('button', { name: 'Save' }));
 
-    fireEvent.click(await screen.findByRole('button', { name: 'Delete' })); // starts a newer action
+    fireEvent.click(await screen.findByRole('button', { name: 'Delete' }));
+    fireEvent.click(await screen.findByRole('button', { name: 'Delete view' })); // confirming starts a newer action
 
     await waitFor(() => expect(api.count('DELETE /api/views/2')).toBe(1));
-    expect(screen.getByRole('button', { name: 'Cancel' })).toBeDisabled();
+    const rowCancel = within(screen.getByRole('table')).getByRole('button', { name: 'Cancel', hidden: true });
+    expect(rowCancel).toBeDisabled();
     save.resolve(ok());
     removal.resolve(ok());
-    await waitFor(() => expect(screen.queryByRole('button', { name: 'Cancel' })).toBeNull());
+    await waitFor(() => expect(screen.queryByRole('button', { name: 'Cancel', hidden: true })).toBeNull());
   });
 });
 

@@ -217,6 +217,82 @@ SCENARIO("GET /api/agents survives an agent hostname with invalid UTF-8 (issue #
     }
 }
 
+SCENARIO("GET /api/agents carries the status engine's latest status per indicator (issue #114)")
+{
+    GIVEN("an agent whose cpu went green to red and whose disk went green to amber")
+    {
+        ApiFixture fx;
+        fx.store->upsert_agent(agent("a1", "", true));
+        fx.store->upsert_agent(agent("quiet", "", true));
+        using thewatcher::server::StatusHistoryRow;
+        fx.store->insert_status_history(StatusHistoryRow{0, "a1", "cpu", "grey", "green", "cpu ok", 1000});
+        fx.store->insert_status_history(StatusHistoryRow{0, "a1", "cpu", "green", "red", "cpu high", 2000});
+        fx.store->insert_status_history(StatusHistoryRow{0, "a1", "disk:/", "grey", "amber", "disk full", 1500});
+        REQUIRE(login_as_default_admin(fx.client));
+
+        WHEN("the agent list is requested")
+        {
+            auto res = fx.client.Get("/api/agents");
+
+            THEN("each agent lists the newest status of every indicator it has history for")
+            {
+                REQUIRE(res);
+                REQUIRE(res->status == 200);
+                const auto agents = nlohmann::json::parse(res->body);
+                REQUIRE(agents.size() == 2);
+                for (const auto& item : agents)
+                {
+                    if (item["agent_id"] == "a1")
+                    {
+                        REQUIRE(item["indicator_status"]["cpu"] == "red");
+                        REQUIRE(item["indicator_status"]["disk:/"] == "amber");
+                        REQUIRE(item["indicator_status"].size() == 2);
+                    }
+                    else
+                    {
+                        // No evaluation yet: an empty object, not a missing field.
+                        REQUIRE(item["indicator_status"].is_object());
+                        REQUIRE(item["indicator_status"].empty());
+                    }
+                }
+            }
+        }
+    }
+}
+
+SCENARIO("indicator_status keeps a stable indicator whose only row is old (issue #114)")
+{
+    GIVEN("an agent with one old disk:/ transition to green and 250 newer cpu transitions")
+    {
+        ApiFixture fx;
+        fx.store->upsert_agent(agent("a1", "", true));
+        using thewatcher::server::StatusHistoryRow;
+        fx.store->insert_status_history(StatusHistoryRow{0, "a1", "disk:/", "grey", "green", "disk ok", 1});
+        for (int i = 0; i < 250; ++i)
+        {
+            const bool high = i % 2 == 0;
+            fx.store->insert_status_history(StatusHistoryRow{0, "a1", "cpu", high ? "green" : "yellow",
+                                                             high ? "yellow" : "green", "cpu flaps", 1000 + i});
+        }
+        REQUIRE(login_as_default_admin(fx.client));
+
+        WHEN("the agent list is requested")
+        {
+            auto res = fx.client.Get("/api/agents");
+
+            THEN("disk:/ is still green and cpu has its newest status")
+            {
+                REQUIRE(res);
+                REQUIRE(res->status == 200);
+                const auto agents = nlohmann::json::parse(res->body);
+                REQUIRE(agents.size() == 1);
+                REQUIRE(agents[0]["indicator_status"]["disk:/"] == "green");
+                REQUIRE(agents[0]["indicator_status"]["cpu"] == "green"); // i=249 is odd: yellow -> green
+            }
+        }
+    }
+}
+
 SCENARIO("Oversize settings values are rejected, not truncated (issue #147)")
 {
     GIVEN("a logged-in global admin")

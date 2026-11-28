@@ -256,8 +256,8 @@ export async function bulkArchiveAlerts(alertIds: number[]): Promise<void> {
   await jsonPost<{ ok: boolean }>('/api/alerts/bulk-archive', { alert_ids: alertIds });
 }
 
-export async function fetchMetricHistory(agentId: string, limit = 20): Promise<MetricsSnapshot[]> {
-  return fetchJson<MetricsSnapshot[]>(`/api/metrics/${encodeURIComponent(agentId)}?limit=${limit}`);
+export async function fetchMetricHistory(agentId: string, limit = 20, signal?: AbortSignal): Promise<MetricsSnapshot[]> {
+  return fetchJson<MetricsSnapshot[]>(`/api/metrics/${encodeURIComponent(agentId)}?limit=${limit}`, false, signal);
 }
 
 export async function fetchMaintenanceWindows(signal?: AbortSignal): Promise<MaintenanceWindowRecord[]> {
@@ -350,9 +350,11 @@ export async function fetchAgentHistory(agentId: string, limit = 100): Promise<S
   );
 }
 
-export async function fetchLogMatches(agentId: string, limit = 200): Promise<LogMatchRecord[]> {
+export async function fetchLogMatches(agentId: string, limit = 200, signal?: AbortSignal): Promise<LogMatchRecord[]> {
   return fetchJson<LogMatchRecord[]>(
     `/api/agents/${encodeURIComponent(agentId)}/log-matches?limit=${limit}`,
+    false,
+    signal,
   );
 }
 
