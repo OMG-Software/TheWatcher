@@ -9,6 +9,9 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Security
 
+- A global operator's `PUT /api/settings` is no longer a way to test guesses at a
+  webhook URL: any webhook value other than the masked form is a 403 without
+  being compared to the stored URL.
 - **Behaviour change:** `DELETE /api/agents/:id` is admins only: a global admin
   for any agent, a group admin for agents of their own groups. Global and group
   operators get 403 (it was open to every operator) and the dashboard no longer
@@ -75,6 +78,18 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 
+- `POST /api/alerts/:id/ack` and `DELETE /api/alerts/:id` answer 404 for an id
+  that does not exist (archived alerts count as existing) and keep 403 for an
+  alert of another group.
+- A Configure save with a stale revision gets 409 even when its membership list
+  is out of date; a runbook edit takes the Configure lock so it cannot be
+  reverted by a save that read the agent earlier.
+- Views written before group scoping have their group copied from the view
+  config into the group column at startup, so the store's list finds them for
+  the group's members (SQLite and PostgreSQL).
+- Dashboard: a bookmarked view with a failed views load shows Retry on
+  Monitoring, an agent id such as `constructor` can no longer break approval,
+  and renaming a group operator's ungrouped view keeps it ungrouped.
 - `POST /api/agents/:id/reject` answers 404 for an unknown agent and 409 for an
   agent that is not pending, instead of 200. It no longer removes a ZAP key
   (a pending agent has none). `Store::reject_agent` now returns whether it

@@ -1120,3 +1120,213 @@ SCENARIO("A command for an offline agent is refused after the access check, not 
         }
     }
 }
+
+// ── Alerts: a missing id is a 404, an out-of-scope one a 403 ─────────────────
+
+SCENARIO("Acknowledging or deleting an alert answers 404 for a missing id and 403 for one out of scope")
+{
+    GIVEN("an alert on a group A agent, an alert on a group B agent, and an archived group B alert")
+    {
+        AccessWorld w;
+        const auto now = ApiFixture::now_ms();
+        thewatcher::server::AlertRecord alert;
+        alert.agent_id = "agent-b";
+        alert.indicator = "cpu";
+        alert.new_status = "red";
+        alert.created_at = now;
+        const auto live_b = w.store->insert_alert(alert);
+        alert.agent_id = "agent-b";
+        const auto archived_b = w.store->insert_alert(alert);
+        w.store->soft_delete_alert(archived_b, now);
+
+        WHEN("a global admin and a group A operator ack an alert id that does not exist")
+        {
+            const auto admin = w.request("POST", "/api/alerts/999999/ack", "admin", json::object());
+            const auto group_op = w.request("POST", "/api/alerts/999999/ack", "a_op", json::object());
+
+            THEN("both get 404")
+            {
+                REQUIRE(admin.status == 404);
+                REQUIRE(group_op.status == 404);
+            }
+        }
+
+        WHEN("a group A operator deletes an alert id that does not exist")
+        {
+            THEN("it is a 404")
+            {
+                REQUIRE(w.request("DELETE", "/api/alerts/999999", "a_op").status == 404);
+            }
+        }
+
+        WHEN("a group A operator acks or deletes a live alert of group B")
+        {
+            const auto ack =
+                w.request("POST", "/api/alerts/" + std::to_string(live_b) + "/ack", "a_op", json::object());
+            const auto del = w.request("DELETE", "/api/alerts/" + std::to_string(live_b), "a_op");
+
+            THEN("both are 403, the alert exists")
+            {
+                REQUIRE(ack.status == 403);
+                REQUIRE(del.status == 403);
+            }
+        }
+
+        WHEN("a group A operator acks an archived alert of group B")
+        {
+            const auto ack =
+                w.request("POST", "/api/alerts/" + std::to_string(archived_b) + "/ack", "a_op", json::object());
+
+            THEN("it is a 403, not a 404: archived alerts still exist")
+            {
+                REQUIRE(ack.status == 403);
+            }
+        }
+    }
+}
+
+// ── A runbook edit changes the Configure revision ─────────────────────────────
+
+SCENARIO("A runbook edit made after a Configure modal opened makes that save a conflict")
+{
+    GIVEN("an operator whose Configure modal holds the agent's revision")
+    {
+        AccessWorld w;
+        const auto listed = w.request("GET", "/api/agents", "admin");
+        std::string revision;
+        for (const auto& a : listed.body)
+            if (a.at("agent_id") == "agent-a")
+                revision = a.at("config_revision").get<std::string>();
+
+        WHEN("someone saves a runbook through the runbook endpoint and the modal then saves")
+        {
+            REQUIRE(w.request("POST", "/api/agents/agent-a/runbook", "admin",
+                              {
+                                  {"markdown", "new steps"}
+            })
+                        .status == 200);
+            const auto res =
+                w.request("POST", "/api/agents/agent-a/collector_config", "a_op",
+                          collector_body(45, {
+                                                 {"config_revision", revision   },
+                                                 {"group_ids",       {w.group_a}}
+            }));
+
+            THEN("the modal's save is a 409 and the runbook is kept")
+            {
+                REQUIRE(res.status == 409);
+                REQUIRE(w.store->get_agent("agent-a")->runbook_markdown == "new steps");
+            }
+        }
+    }
+}
+
+// ── Stale revision wins over a membership mismatch ───────────────────────────
+
+SCENARIO("A stale Configure save reports a conflict before it reports a membership change")
+{
+    GIVEN("a group A operator who opened the modal, then an admin adds the agent to group B")
+    {
+        AccessWorld w;
+        const auto listed = w.request("GET", "/api/agents", "a_op");
+        std::string old_revision;
+        for (const auto& a : listed.body)
+            if (a.at("agent_id") == "agent-a")
+                old_revision = a.at("config_revision").get<std::string>();
+        w.store->set_agent_groups("agent-a", {w.group_a, w.group_b});
+        const std::string path = "/api/agents/agent-a/collector_config";
+
+        WHEN("the operator saves with the old revision and the old membership list")
+        {
+            const auto res =
+                w.request("POST", path, "a_op",
+                          collector_body(45, {
+                                                 {"config_revision", old_revision},
+                                                 {"group_ids",       {w.group_a} }
+            }));
+
+            THEN("it is a 409 for the stale revision, not a 403")
+            {
+                REQUIRE(res.status == 409);
+            }
+        }
+
+        WHEN("the operator sends the current revision but a different membership list")
+        {
+            const auto fresh = w.request("GET", "/api/agents", "admin");
+            std::string revision;
+            for (const auto& a : fresh.body)
+                if (a.at("agent_id") == "agent-a")
+                    revision = a.at("config_revision").get<std::string>();
+            const auto res =
+                w.request("POST", path, "a_op",
+                          collector_body(45, {
+                                                 {"config_revision", revision   },
+                                                 {"group_ids",       {w.group_a}}
+            }));
+
+            THEN("it is a 403: the membership change is theirs")
+            {
+                REQUIRE(res.status == 403);
+            }
+        }
+
+        WHEN("the operator sends no revision and a different membership list")
+        {
+            const auto res = w.request("POST", path, "a_op",
+                                       collector_body(45, {
+                                                              {"group_ids", {w.group_a}}
+            }));
+
+            THEN("it is a 403")
+            {
+                REQUIRE(res.status == 403);
+            }
+        }
+    }
+}
+
+// ── The webhook PUT is not an oracle for the stored URL ──────────────────────
+
+SCENARIO("A global operator learns nothing about the stored webhook URL from a PUT")
+{
+    GIVEN("a stored webhook URL")
+    {
+        AccessWorld w;
+        const std::string url = "https://hooks.slack.com/services/T000/B000/secret";
+        w.store->set_setting("notifications.webhook_url", url);
+
+        WHEN("a global operator sends the exact stored URL, and a wrong guess")
+        {
+            const auto exact = w.request("PUT", "/api/settings", "g_op",
+                                         {
+                                             {"webhook_url", url}
+            });
+            const auto guess = w.request("PUT", "/api/settings", "g_op",
+                                         {
+                                             {"webhook_url", url + "x"}
+            });
+
+            THEN("both get the same 403, so the answer reveals nothing")
+            {
+                REQUIRE(exact.status == 403);
+                REQUIRE(guess.status == 403);
+                REQUIRE(exact.body == guess.body);
+            }
+        }
+
+        WHEN("a global admin sends the exact stored URL")
+        {
+            const auto res = w.request("PUT", "/api/settings", "admin",
+                                       {
+                                           {"webhook_url", url}
+            });
+
+            THEN("it is accepted unchanged")
+            {
+                REQUIRE(res.status == 200);
+                REQUIRE(w.store->get_setting("notifications.webhook_url") == url);
+            }
+        }
+    }
+}

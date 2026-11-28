@@ -11,7 +11,9 @@ export function PendingEnrollments({ agents, groups, isBusy, loadFailed = false,
   // default: an agent with no group is visible to global users only, so an
   // operator has to name a group on purpose. Group ids start at 1, but compare
   // with null/undefined rather than truthiness so no id is ever skipped.
-  const [chosenGroup, setChosenGroup] = React.useState<Record<string, number | null>>({});
+  // A Map, so an agent id such as "constructor" can never read an inherited key.
+  const [chosenGroup, setChosenGroup] = React.useState<Map<string, number | null>>(new Map());
+  const selectedGroup = (agentId: string): number | null => chosenGroup.get(agentId) ?? null;
   return (
     <section className="embedded-management">
       <div className="management-header"><h1>Pending Enrollments</h1></div>
@@ -26,15 +28,15 @@ export function PendingEnrollments({ agents, groups, isBusy, loadFailed = false,
               <td>
                 <select
                   aria-label={`Group for ${agent.name || agent.id}`}
-                  value={chosenGroup[agent.id] == null ? '' : String(chosenGroup[agent.id])}
-                  onChange={(event) => setChosenGroup((current) => ({ ...current, [agent.id]: event.target.value === '' ? null : Number(event.target.value) }))}
+                  value={selectedGroup(agent.id) === null ? '' : String(selectedGroup(agent.id))}
+                  onChange={(event) => setChosenGroup((current) => new Map(current).set(agent.id, event.target.value === '' ? null : Number(event.target.value)))}
                 >
                   <option value="">No group (global users only)</option>
                   {groups.map((group) => <option key={group.group_id} value={group.group_id}>{group.name}</option>)}
                 </select>
               </td>
               <td><div className="button-row">
-                <ActionButton busy={isBusy(`${agent.id}:approve`)} icon={<Check size={14} />} label="Approve" onClick={() => runAction(`${agent.id}:approve`, () => approveAgent(agent.id, chosenGroup[agent.id] == null ? [] : [chosenGroup[agent.id] as number]))} />
+                <ActionButton busy={isBusy(`${agent.id}:approve`)} icon={<Check size={14} />} label="Approve" onClick={() => runAction(`${agent.id}:approve`, () => approveAgent(agent.id, selectedGroup(agent.id) === null ? [] : [selectedGroup(agent.id) as number]))} />
                 <ActionButton busy={isBusy(`${agent.id}:reject`)} icon={<X size={14} />} label="Reject" onClick={() => runAction(`${agent.id}:reject`, () => rejectAgent(agent.id))} />
               </div></td>
             </tr>

@@ -7,6 +7,8 @@
 #include <algorithm>
 #include <cstdlib>
 
+#include <libpq-fe.h>
+
 using namespace thewatcher;
 using namespace thewatcher::server;
 
@@ -639,6 +641,116 @@ SCENARIO("[postgres] Silence rules can be created, listed, deleted, and matched"
             {
                 store.delete_silence(sid);
                 CHECK_FALSE(store.is_silenced("pg-silence-agent", "cpu", 5000));
+            }
+        }
+    }
+}
+
+// ── Approval, reject and Configure saves are transactional (#63, #62, #112) ──
+
+SCENARIO("[postgres] A pending agent is approved with its groups, rejected only while pending, and saved atomically")
+{
+    if (!postgres_is_available())
+        SKIP("PostgreSQL not available");
+    GIVEN("a pending agent and a group")
+    {
+        PostgresStore store(test_dsn());
+        const auto group = store.create_group("pg-approve-group");
+        store.delete_agent("pg-approve-agent");
+        store.upsert_agent(make_agent("pg-approve-agent"));
+
+        WHEN("it is approved with a group that does not exist")
+        {
+            THEN("the call throws and the agent is still pending with no groups")
+            {
+                REQUIRE_THROWS(store.approve_pending_agent("pg-approve-agent", {group, 987654321}));
+                REQUIRE_FALSE(store.get_agent("pg-approve-agent")->approved);
+                REQUIRE(store.get_agent_groups("pg-approve-agent").empty());
+            }
+        }
+
+        WHEN("it is approved into the group")
+        {
+            REQUIRE(store.approve_pending_agent("pg-approve-agent", {group}));
+
+            THEN("it is approved, in that group, and can no longer be approved or rejected")
+            {
+                REQUIRE(store.get_agent("pg-approve-agent")->approved);
+                REQUIRE(store.get_agent_groups("pg-approve-agent") == std::vector<int64_t>{group});
+                REQUIRE_FALSE(store.approve_pending_agent("pg-approve-agent", {}));
+                REQUIRE_FALSE(store.reject_agent("pg-approve-agent"));
+            }
+
+            AND_WHEN("its Configure fields and groups are saved together")
+            {
+                auto edited = *store.get_agent("pg-approve-agent");
+                edited.collection_interval = 77;
+                edited.runbook_markdown = "steps";
+                store.save_agent_config(edited, std::vector<int64_t>{});
+
+                THEN("both are stored")
+                {
+                    REQUIRE(store.get_agent("pg-approve-agent")->collection_interval == 77);
+                    REQUIRE(store.get_agent("pg-approve-agent")->runbook_markdown == "steps");
+                    REQUIRE(store.get_agent_groups("pg-approve-agent").empty());
+                }
+            }
+        }
+
+        WHEN("a pending agent is rejected")
+        {
+            store.delete_agent("pg-reject-agent");
+            store.upsert_agent(make_agent("pg-reject-agent"));
+
+            THEN("reject_agent reports true once, then false")
+            {
+                REQUIRE(store.reject_agent("pg-reject-agent"));
+                REQUIRE_FALSE(store.reject_agent("pg-reject-agent"));
+                REQUIRE_FALSE(store.reject_agent("pg-no-such-agent"));
+            }
+        }
+    }
+}
+
+SCENARIO("[postgres] A legacy view whose group is only in its config is listed to that group's members")
+{
+    if (!postgres_is_available())
+        SKIP("PostgreSQL not available");
+    GIVEN("a view stored with group_id 0 and the group in its config")
+    {
+        int64_t member_id = 0;
+        int64_t view_id = 0;
+        {
+            PostgresStore store(test_dsn());
+            const auto group = store.create_group("pg-legacy-view-group");
+            member_id = store.create_user("pg-legacy-member-" + std::to_string(group), "hash", "group_viewer");
+            store.set_user_groups(member_id, {group});
+            ViewRecord view;
+            view.name = "pg-legacy";
+            view.owner_user_id = 1;
+            view.group_id = group;
+            view.created_at = 1;
+            view_id = store.create_view(view);
+        }
+        {
+            // Simulate a row written before group scoping: the column is 0.
+            PGconn* conn = PQconnectdb(test_dsn());
+            REQUIRE(PQstatus(conn) == CONNECTION_OK);
+            const auto sql = "UPDATE views SET group_id=0 WHERE view_id=" + std::to_string(view_id) + ";";
+            PQclear(PQexec(conn, sql.c_str()));
+            PQfinish(conn);
+        }
+
+        WHEN("the store is opened again")
+        {
+            PostgresStore store(test_dsn());
+
+            THEN("the group member's list includes the view")
+            {
+                const auto views = store.list_views(member_id);
+                REQUIRE(std::any_of(views.begin(), views.end(), [view_id](const ViewRecord& v) {
+                    return v.view_id == view_id;
+                }));
             }
         }
     }

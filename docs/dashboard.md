@@ -269,8 +269,10 @@ The Agents view starts with Pending Enrollments for global operators and global
 admins, then shows Agent Management below it.
 
 Pending enrollment rows show unapproved agents awaiting approval. Each row has
-a Group picker; it starts at "No group (global users only)" and the operator has
-to pick a group on purpose, because the approval names its groups explicitly. Reject
+a Group picker; it starts at "No group (global users only)". Approving with that
+choice is valid and sends an empty group list; the operator picks a group only
+when the agent should belong to one, because the approval names its groups
+explicitly. Reject
 marks the enrollment rejected. Approve/Reject buttons disappear once an
 enrollment is decided.
 
@@ -351,9 +353,12 @@ The Views page lists the custom views the API returns for the current user,
 with name, owner, agent count, Public/Private flag, group and creation date.
 Open applies the view as a filter on the Monitoring page (the URL hash becomes
 `#view-<id>`, so it can be bookmarked). Operators can create views (name,
-agents, Public flag, group). Edit and Delete are shown to global operators and
-admins, to the view's owner, and to group admins and operators for views of their
-own groups.
+agents, Public flag, group). Edit and Delete are shown to operators and admins
+only: global operators and admins for every view, and group admins and
+operators for views they own and for views of their own groups. A viewer who owns
+a legacy ungrouped view can open it but not edit or delete it. Editing a view
+keeps its group; a legacy ungrouped view offers "Keep ungrouped" and group users
+cannot create new ungrouped views.
 
 The Views page supports group assignment when a view is created or edited.
 Global account types can see all views and all group choices ("No group" is

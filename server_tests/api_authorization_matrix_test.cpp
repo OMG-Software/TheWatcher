@@ -293,6 +293,9 @@ const std::vector<Row>& rows()
         {"GET",    "/api/pending-enrollments",                 "",                                                                                                     GLOBAL_ANY                         },
         {"POST",   "/api/agents/pending-1/approve",            R"({"group_ids":[{group_a}]})",                                                                         GLOBAL_OPS                         },
         {"POST",   "/api/agents/pending-2/reject",             "",                                                                                                     GLOBAL_OPS                         },
+        // A missing alert is a 404 (roles that may act), an out-of-scope one a 403.
+        {"POST",   "/api/alerts/999999/ack",                   "{}",                                                                                                   {401, 404, 404, 403, 404, 404, 403}},
+        {"DELETE", "/api/alerts/999999",                       "",                                                                                                     {401, 404, 404, 403, 404, 404, 403}},
         // Reject needs a pending agent: unknown is 404, approved is 409 (global operators); others are refused first.
         {"POST",   "/api/agents/ghost/reject",                 "",                                                                                                     {401, 404, 404, 403, 403, 403, 403}},
         {"POST",   "/api/agents/{agent_b}/reject",             "",                                                                                                     {401, 409, 409, 403, 403, 403, 403}},

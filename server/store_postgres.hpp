@@ -121,6 +121,7 @@ private:
     void add_column_if_missing(const std::string& table, const std::string& column, const char* ddl);
     void init_schema();
     void bootstrap_defaults();
+    void backfill_view_groups();
 
     PGconn* conn_ = nullptr;
 };

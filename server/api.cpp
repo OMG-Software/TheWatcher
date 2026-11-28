@@ -805,6 +805,17 @@ namespace
         return view.owner_user_id == session.user_id || view.group_id > 0;
     }
 
+    // The alert with this id, archived or not.
+    std::optional<AlertRecord> find_alert(Store& store, int64_t alert_id)
+    {
+        for (auto& alert : store.list_alerts(true))
+        {
+            if (alert.alert_id == alert_id)
+                return std::move(alert);
+        }
+        return std::nullopt;
+    }
+
     // Reads a JSON array of group ids; anything else is the caller's mistake.
     std::vector<int64_t> parse_group_ids(const json& value)
     {
@@ -1413,10 +1424,18 @@ void ApiServer::setup_routes()
         if (!session)
             return;
         const auto alert_id = std::stoll(req.path_params.at("id"));
-        auto allowed = false;
-        for (const auto& alert : store_.list_alerts(false))
-            allowed = allowed || (alert.alert_id == alert_id && can_access_agent(*session, alert.agent_id));
-        if (!allowed)
+        // A missing id is a 404 (archived alerts still exist); an alert of
+        // another group is a 403.
+        const auto found = find_alert(store_, alert_id);
+        if (!found)
+        {
+            res.status = 404;
+            set_json(res, json{
+                              {"error", "alert not found"}
+            });
+            return;
+        }
+        if (!can_access_agent(*session, found->agent_id))
         {
             res.status = 403;
             set_json(res, json{
@@ -1567,10 +1586,18 @@ void ApiServer::setup_routes()
         if (!session)
             return;
         const auto alert_id = std::stoll(req.path_params.at("id"));
-        auto allowed = false;
-        for (const auto& alert : store_.list_alerts(false))
-            allowed = allowed || (alert.alert_id == alert_id && can_access_agent(*session, alert.agent_id));
-        if (!allowed)
+        // A missing id is a 404 (archived alerts still exist); an alert of
+        // another group is a 403.
+        const auto found = find_alert(store_, alert_id);
+        if (!found)
+        {
+            res.status = 404;
+            set_json(res, json{
+                              {"error", "alert not found"}
+            });
+            return;
+        }
+        if (!can_access_agent(*session, found->agent_id))
         {
             res.status = 403;
             set_json(res, json{
@@ -2233,11 +2260,26 @@ void ApiServer::setup_routes()
                 return;
             }
 
+            const auto current_groups = store_.get_agent_groups(id);
+            // Issue #112: refuse a save made from a stale snapshot. A request
+            // without config_revision is applied unconditionally. Checked before
+            // the membership rule below, so an operator whose modal is out of date
+            // gets the conflict, not a permission error for a change they did not make.
+            if (body.contains("config_revision") &&
+                body.at("config_revision").get<std::string>() != agent_config_revision(*rec, current_groups))
+            {
+                res.status = 409;
+                set_json(res, json{
+                                  {"error", "this agent's configuration was changed by someone else; reload it and "
+                                            "apply your edits again"}
+                });
+                return;
+            }
+
             // Issue #62: group changes are explicit and validated. Only global
             // roles change an agent's groups; a group user may resubmit the
             // current list (the modal always sends it) but not alter it.
             std::optional<std::vector<int64_t>> new_groups;
-            const auto current_groups = store_.get_agent_groups(id);
             if (body.contains("group_ids"))
             {
                 auto requested = parse_group_ids(body.at("group_ids"));
@@ -2261,19 +2303,6 @@ void ApiServer::setup_routes()
                         return;
                     }
                 }
-            }
-
-            // Issue #112: refuse a save made from a stale snapshot. A request
-            // without config_revision is applied unconditionally.
-            if (body.contains("config_revision") &&
-                body.at("config_revision").get<std::string>() != agent_config_revision(*rec, current_groups))
-            {
-                res.status = 409;
-                set_json(res, json{
-                                  {"error", "this agent's configuration was changed by someone else; reload it and "
-                                            "apply your edits again"}
-                });
-                return;
             }
 
             rec->collection_interval = interval;
@@ -2644,6 +2673,9 @@ void ApiServer::setup_routes()
             const auto markdown = body.value("markdown", std::string(""));
             if (markdown.size() > 65536)
                 throw std::runtime_error("markdown must be 65536 characters or fewer");
+            // Same lock as the Configure save, which writes the runbook from a
+            // record it read earlier: without it that save could revert this one.
+            std::lock_guard<std::mutex> config_lock(config_mutex_);
             store_.set_agent_runbook(id, markdown);
             LOGF_INFO("Set agent runbook agent_id=%s by=%s", id.c_str(), session->username.c_str());
             set_json(res, json{
@@ -2710,11 +2742,12 @@ void ApiServer::setup_routes()
         try
         {
             const auto body = json::parse(req.body);
-            // Webhook URLs: a value equal to the stored URL, or to its masked
-            // form (what GET shows non-admins), changes nothing, so the
-            // placeholder is never saved over a real URL. Any other value is
-            // a change, which only a global admin may make. Checked before
-            // anything is written.
+            // Webhook URLs. The masked form (what GET shows non-admins) and an
+            // omitted field mean "unchanged", so the placeholder is never saved
+            // over a real URL. A global admin may send a new URL; for anyone
+            // else every other value is a 403 and is never compared with the
+            // stored URL, so the answer cannot be used to guess the secret.
+            // Checked before anything is written.
             const bool admin = normalize_role(session->role) == "global_admin";
             std::vector<std::pair<std::string, std::string>> webhook_writes;
             for (const auto& [field, setting] : webhook_settings)
@@ -2723,7 +2756,7 @@ void ApiServer::setup_routes()
                     continue;
                 const auto value = body.at(std::string(field)).get<std::string>();
                 const auto stored = store_.get_setting(std::string(setting), "");
-                if (value == stored || value == mask_webhook_url(stored))
+                if (value == mask_webhook_url(stored))
                     continue;
                 if (!admin)
                 {
@@ -2733,7 +2766,8 @@ void ApiServer::setup_routes()
                     });
                     return;
                 }
-                webhook_writes.emplace_back(std::string(setting), value);
+                if (value != stored)
+                    webhook_writes.emplace_back(std::string(setting), value);
             }
             // Issue #147: a truncated URL is a different URL, so an oversize one
             // is rejected. Checked before any setting is written, so this

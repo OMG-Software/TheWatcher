@@ -568,9 +568,32 @@ void PostgresStore::init_schema()
     add_column_if_missing("runbooks", "markdown", "ALTER TABLE runbooks ADD COLUMN markdown TEXT NOT NULL DEFAULT '';");
 }
 
+// Views stored before group scoping keep their group only in config_json, with
+// group_id 0 in the column, so a filter on the column misses them. Copy the group
+// into the column once at startup; the column is then the single source of truth.
+void PostgresStore::backfill_view_groups()
+{
+    Res res(PQexec(conn_, "SELECT view_id,config_json FROM views WHERE group_id=0;"));
+    check_res(res.r, "backfill_view_groups");
+    for (int i = 0; i < PQntuples(res.r); ++i)
+    {
+        const auto cfg = nlohmann::json::parse(col(res.r, i, 1), nullptr, false);
+        if (!cfg.is_object() || !cfg.contains("group_id") || !cfg["group_id"].is_number_integer() ||
+            cfg["group_id"].get<int64_t>() <= 0)
+            continue;
+        const auto p_group = s(cfg["group_id"].get<int64_t>());
+        const auto p_view = s(col_int64(res.r, i, 0));
+        const char* params[] = {p_group.c_str(), p_view.c_str()};
+        Res up(PQexecParams(conn_, "UPDATE views SET group_id=$1 WHERE view_id=$2 AND group_id=0;", 2, nullptr, params,
+                            nullptr, nullptr, 0));
+        check_res(up.r, "backfill_view_groups update");
+    }
+}
+
 void PostgresStore::bootstrap_defaults()
 {
     LOG_FUNCTION_TRACE
+    backfill_view_groups();
     // create_group is idempotent via INSERT … ON CONFLICT DO NOTHING
     create_group("Admins");
     const char* check_sql = "SELECT user_id FROM users WHERE username='thewatcher';";

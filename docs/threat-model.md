@@ -93,7 +93,9 @@ working document for audit, design review, and regression testing.
   runbooks (agent-scoped entries), views and view agent ids by shared group
   membership. A view returned to a group user lists only the agents that user
   can access, even when a global admin put agents of other groups in it
-  (#163). The full role-by-route policy and its test matrix are in
+  (#163). Separately, a public ungrouped view (no group) is readable by every
+  signed-in user without sharing a group with its owner; the agent-id filter
+  above still applies to what it lists. The full role-by-route policy and its test matrix are in
   [authorization.md](authorization.md).
 - Agent approval must name its groups and is one store transaction: a bad
   request leaves the agent pending, and there is no default group. An agent

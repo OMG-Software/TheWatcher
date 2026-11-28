@@ -25,7 +25,7 @@ behave exactly as `global_admin`, `global_operator` and `global_viewer`.
 |--------|---------|
 | 401 | no valid session |
 | 403 | the role may never use the route, or the resource exists but is outside the caller's groups |
-| 404 | the id does not exist (checked after the role, and for group users after group scope: an agent outside your groups is a 403, whether or not it exists) |
+| 404 | the id does not exist. Order: role first. Then, for alerts and views, existence (a missing alert id is 404 for every operator role, archived alerts count as existing) and then group scope. For per-agent routes, group scope comes before existence: an agent outside a group user's groups is 403 whether or not it exists. Silences and maintenance windows answer 403 for a group user's missing id as well. |
 | 400 | malformed body, unknown group, or a value that is not allowed |
 | 409 | the request conflicts with current state: an agent that is not pending, a duplicate key, or a stale configuration revision |
 
@@ -57,7 +57,12 @@ test. Do not change a single route to 404 without changing the rule.
   `config_revision` for each agent, a hash of the fields the Configure modal
   saves. `collector_config` accepts it back as `config_revision`; if the agent
   has changed since, the save is refused with 409 and nothing is written.
-  Leaving it out saves unconditionally.
+  Leaving it out saves unconditionally. The revision is checked before the
+  group-membership rule, so an operator whose modal is out of date gets 409,
+  not a 403 for a membership change they did not make; a changed membership
+  list sent with the current revision, or with none, is still 403. The runbook
+  endpoint takes the same lock as the Configure save, so a runbook edit cannot
+  be silently reverted by a save that read the agent earlier.
 - **Views.** Visibility is decided in one place in the API
   (`view_visible_to_session`):
   - global roles see every view;
@@ -84,10 +89,12 @@ test. Do not change a single route to 404 without changing the rule.
   `global_operator` gets them masked to scheme and host plus `/…`
   (credentials, path and query dropped; an empty URL stays empty) and
   `webhooks_masked: true`. A `PUT` from a global operator that carries a
-  webhook field different from the stored URL, including an empty value, is a
-  403 and writes nothing. Sending a field back unchanged, or its masked form,
-  or leaving it out, changes nothing, and the masked form is never stored over
-  a real URL, for any role. Other settings stay writable by global operators.
+  webhook field other than its masked form, including an empty value and the
+  exact stored URL, is a 403 and writes nothing: the value is never compared
+  with the stored URL, so the answer cannot be used to guess the secret. The
+  masked form or an omitted field changes nothing, and the masked form is
+  never stored over a real URL, for any role (a global admin compares raw
+  values). Other settings stay writable by global operators.
 - **Settings, reports, groups and runbooks** are global. Creating groups,
   users with global roles, and runbooks needs `global_admin`.
 

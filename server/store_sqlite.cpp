@@ -566,9 +566,40 @@ void SqliteStore::init_schema()
                           "ALTER TABLE alerts ADD COLUMN runbook_url TEXT NOT NULL DEFAULT '';");
 }
 
+// Views stored before group scoping keep their group only in config_json, with
+// group_id 0 in the column, so a filter on the column misses them. Copy the group
+// into the column once at startup; the column is then the single source of truth.
+void SqliteStore::backfill_view_groups()
+{
+    std::vector<std::pair<int64_t, int64_t>> fixes;
+    {
+        Stmt st;
+        check(sqlite3_prepare_v2(db_, "SELECT view_id,config_json FROM views WHERE group_id=0;", -1, &st.s, nullptr),
+              db_, "prepare backfill_view_groups");
+        while (sqlite3_step(st.s) == SQLITE_ROW)
+        {
+            const auto cfg = nlohmann::json::parse(text_col(st.s, 1), nullptr, false);
+            if (cfg.is_object() && cfg.contains("group_id") && cfg["group_id"].is_number_integer() &&
+                cfg["group_id"].get<int64_t>() > 0)
+                fixes.emplace_back(sqlite3_column_int64(st.s, 0), cfg["group_id"].get<int64_t>());
+        }
+    }
+    for (const auto& [view_id, group_id] : fixes)
+    {
+        Stmt up;
+        check(
+            sqlite3_prepare_v2(db_, "UPDATE views SET group_id=? WHERE view_id=? AND group_id=0;", -1, &up.s, nullptr),
+            db_, "prepare backfill_view_groups update");
+        sqlite3_bind_int64(up.s, 1, group_id);
+        sqlite3_bind_int64(up.s, 2, view_id);
+        check(sqlite3_step(up.s), db_, "step backfill_view_groups update");
+    }
+}
+
 void SqliteStore::bootstrap_defaults()
 {
     LOG_FUNCTION_TRACE
+    backfill_view_groups();
     const auto admin_group = create_group("Admins");
     Stmt st;
     check(sqlite3_prepare_v2(db_, "SELECT user_id FROM users WHERE username='thewatcher';", -1, &st.s, nullptr), db_,

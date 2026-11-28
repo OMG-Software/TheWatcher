@@ -6,6 +6,8 @@
 #include <algorithm>
 #include <filesystem>
 
+#include <sqlite3.h>
+
 using namespace thewatcher;
 using namespace thewatcher::server;
 
@@ -3159,6 +3161,51 @@ SCENARIO("reject_agent reports whether it rejected a pending agent")
         THEN("rejecting an unknown agent returns false")
         {
             REQUIRE_FALSE(store.reject_agent("nobody"));
+        }
+    }
+}
+
+SCENARIO("A legacy view whose group is only in its config is listed to that group's members")
+{
+    GIVEN("a stored view with group_id 0 in its column and group A in its config, then the store is reopened")
+    {
+        const auto path = unique_store_path("legacy-view-group.db");
+        int64_t member_id = 0;
+        int64_t outsider_id = 0;
+        {
+            SqliteStore store(path.string());
+            const auto group_a = store.create_group("A");
+            member_id = store.create_user("member", "hash", "group_viewer");
+            store.set_user_groups(member_id, {group_a});
+            outsider_id = store.create_user("outsider", "hash", "group_viewer");
+            ViewRecord view;
+            view.name = "legacy";
+            view.owner_user_id = 1;
+            view.group_id = group_a;
+            view.created_at = 1;
+            store.create_view(view);
+        }
+        {
+            // Simulate a row written before group scoping: the column is 0, the group lives in the config.
+            sqlite3* db = nullptr;
+            REQUIRE(sqlite3_open(path.string().c_str(), &db) == SQLITE_OK);
+            REQUIRE(sqlite3_exec(db, "UPDATE views SET group_id=0;", nullptr, nullptr, nullptr) == SQLITE_OK);
+            sqlite3_close(db);
+        }
+
+        WHEN("the store is opened again")
+        {
+            SqliteStore store(path.string());
+
+            THEN("the group member's list includes the view and an outsider's does not")
+            {
+                REQUIRE(store.list_views(member_id).size() == 1);
+                REQUIRE(store.list_views(outsider_id).empty());
+                AND_THEN("the column now carries the group")
+                {
+                    REQUIRE(store.list_views(member_id).front().group_id > 0);
+                }
+            }
         }
     }
 }

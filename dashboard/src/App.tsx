@@ -72,6 +72,8 @@ function Dashboard({
   // failed load cannot discard a good bookmark.
   const activeView = customViews.find((candidate) => candidate.view_id === activeViewId) ?? null;
   const viewMissing = activeViewId != null && loadedAt !== null && !sectionErrors.views && activeView === null;
+  // The views list failed to load, so the bookmark cannot be resolved yet: say so with a Retry and keep the bookmark.
+  const viewsFailedForBookmark = activeViewId != null && activeView === null && Boolean(sectionErrors.views);
 
   const counts = summaryCounts(agents);
   const displayAlerts = toDisplayAlerts(alerts, agents);
@@ -166,14 +168,15 @@ function Dashboard({
               <button className="text-button banner-action" onClick={() => setActiveViewId(null)}>Dismiss</button>
             </div>
           ) : null}
-          {activeViewId != null && !viewMissing ? (
+          {viewsFailedForBookmark ? <LoadFailed what="views" message={sectionErrors.views ?? ''} onRetry={retry} /> : null}
+          {activeView ? (
             <div className="banner">
-              Filtered to view: <strong>{activeView?.name ?? 'Loading…'}</strong>
+              Filtered to view: <strong>{activeView.name}</strong>
               <button className="text-button banner-action" onClick={() => setActiveViewId(null)}>Clear</button>
             </div>
           ) : null}
           <MonitoringPage
-            agents={activeView ? agents.filter((a) => activeView.agent_ids.includes(a.id)) : viewMissing ? agents : activeViewId != null ? [] : agents}
+            agents={activeView ? agents.filter((a) => activeView.agent_ids.includes(a.id)) : viewMissing || viewsFailedForBookmark ? agents : activeViewId != null ? [] : agents}
             expanded={expanded}
             groupFilter={overviewGroupFilter}
             groups={groups}

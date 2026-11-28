@@ -222,3 +222,59 @@ describe('GIVEN webhook URLs on the settings page', () => {
     expect((api.calls.find((call) => call.method === 'PUT')?.body as Record<string, unknown>).webhook_url).toBe('https://hooks.slack.com/services/secret');
   });
 });
+
+describe('GIVEN a pending agent whose id is an inherited object key', () => {
+  it('WHEN approving with no group chosen THEN no group is sent', async () => {
+    const api = apiFor('global_admin').on('GET /api/pending-enrollments', ok([{ ...agentRecord('constructor', 'odd-host'), approved: false }]));
+    await openDashboard(api);
+    goTo('Agents');
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Approve' }));
+
+    await waitFor(() => expect(api.count('POST /api/agents/constructor/approve')).toBe(1));
+    expect(api.calls.find((call) => call.path === '/api/agents/constructor/approve')?.body).toEqual({ group_ids: [] });
+  });
+});
+
+describe('GIVEN a bookmarked view while the views list cannot load', () => {
+  it('WHEN Monitoring opens THEN it offers Retry instead of waiting forever, and the bookmark stays', async () => {
+    window.location.hash = '#view-5';
+    const api = apiFor('group_viewer').on('GET /api/views', fail(500, 'views are down'));
+    await openDashboard(api);
+
+    expect(await screen.findByText(/views are down/)).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Retry' })).toBeInTheDocument();
+    expect(screen.queryByText(/Loading…/)).toBeNull();
+    expect(window.location.hash).toBe('#view-5');
+  });
+});
+
+describe('GIVEN a group operator editing a view that has no group', () => {
+  const ungrouped = { ...view(7, 'mine', 0, 'tester'), is_public: false };
+
+  it('WHEN they rename it THEN it stays ungrouped and the group is not changed', async () => {
+    const api = apiFor('group_operator')
+      .on('GET /api/groups', ok([GROUPS[0]]))
+      .on('GET /api/views', ok([ungrouped]));
+    await openDashboard(api);
+    goTo('Views');
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Edit' }));
+    expect(screen.getByRole('option', { name: 'Keep ungrouped' })).toBeInTheDocument();
+    fireEvent.change(screen.getByDisplayValue('mine'), { target: { value: 'renamed' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+
+    await waitFor(() => expect(api.count('PUT /api/views/7')).toBe(1));
+    expect((api.calls.find((call) => call.method === 'PUT')?.body as { group_id: number }).group_id).toBe(0);
+  });
+
+  it('WHEN they create a view THEN there is no ungrouped choice', async () => {
+    const api = apiFor('group_operator').on('GET /api/groups', ok([GROUPS[0]])).on('GET /api/views', ok([]));
+    await openDashboard(api);
+    goTo('Views');
+
+    await screen.findByRole('button', { name: 'Create View' });
+
+    expect(screen.queryByRole('option', { name: 'No group' })).toBeNull();
+  });
+});

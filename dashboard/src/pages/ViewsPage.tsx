@@ -46,12 +46,6 @@ export function ViewsPage({
     }
   }, [globalAccount, groups, newGroupId]);
 
-  React.useEffect(() => {
-    if (!globalAccount && editId !== null && groups.length > 0 && !groups.some((group) => group.group_id === editGroupId)) {
-      setEditGroupId(groups[0].group_id);
-    }
-  }, [editGroupId, editId, globalAccount, groups]);
-
   const startEdit = (v: ViewRecord) => {
     if (editId !== null) clear(`view:save:${editId}`); // the editor being replaced takes its old failure with it
     setEditId(v.view_id);
@@ -101,7 +95,8 @@ export function ViewsPage({
                           {agents.map((a) => <option key={a.id} value={a.id}>{a.name}</option>)}
                         </select>
                         <select value={editGroupId} onChange={(e) => setEditGroupId(Number(e.target.value))}>
-                          {globalAccount ? <option value={0}>No group</option> : null}
+                          {/* A group user may keep a legacy ungrouped view ungrouped, but cannot move a view out of its group. */}
+                          {globalAccount || editGroupId === 0 ? <option value={0}>{globalAccount ? 'No group' : 'Keep ungrouped'}</option> : null}
                           {groups.map((group) => <option key={group.group_id} value={group.group_id}>{group.name}</option>)}
                         </select>
                         <ActionError actionKey={`view:save:${v.view_id}`} />
