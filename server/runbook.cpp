@@ -123,32 +123,4 @@ std::string resolve_runbook_url(Store& store, const std::string& agent_id, const
     return {};
 }
 
-AlertRecord make_offline_alert(Store& store, const std::string& agent_id, int64_t now_ms)
-{
-    AlertRecord alert;
-    alert.agent_id = agent_id;
-    alert.indicator = std::string(indicators::kHeartbeat);
-    alert.old_status = "green";
-    alert.new_status = "red";
-    alert.message = "Agent has gone offline (no heartbeat received)";
-    alert.created_at = now_ms;
-    alert.runbook_url = resolve_runbook_url(store, agent_id, alert.indicator, alert.new_status);
-    return alert;
-}
-
-AlertRecord make_log_match_alert(Store& store, const std::string& agent_id, const std::string& indicator,
-                                 const std::string& severity, const std::string& path, const std::string& matched_line,
-                                 int64_t now_ms)
-{
-    AlertRecord alert;
-    alert.agent_id = agent_id;
-    alert.indicator = indicator;
-    alert.old_status = "green";
-    alert.new_status = severity;
-    alert.message = "Log match in " + path + ": " + matched_line.substr(0, 200);
-    alert.created_at = now_ms;
-    alert.runbook_url = resolve_runbook_url(store, agent_id, indicator, severity);
-    return alert;
-}
-
 } // namespace thewatcher::server

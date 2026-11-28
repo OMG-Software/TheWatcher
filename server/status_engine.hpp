@@ -1,12 +1,12 @@
 #pragma once
 
+#include "alert_pipeline.hpp"
 #include "common/collector_config.hpp"
 #include "common/metrics.hpp"
 #include "store.hpp"
 
-#include <nlohmann/json.hpp>
-
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <unordered_map>
 
@@ -27,18 +27,13 @@ std::string status_to_string(IndicatorStatus status);
 IndicatorStatus status_from_string(const std::string& value);
 bool is_worse_status(IndicatorStatus previous, IndicatorStatus current);
 
-// True when a silence rule covers an alert on `indicator`: a rule for the exact
-// name, for its kind ("disk" covers "disk:/") or for '*'. See indicators.hpp.
-bool is_alert_silenced(Store& store, const std::string& agent_id, const std::string& indicator, int64_t now_ms);
-
-// The JSON body POSTed to the webhook for a new alert. It carries the runbook
-// link attached to the alert and the agent's own markdown runbook (#53).
-nlohmann::json build_webhook_payload(Store& store, const AlertRecord& alert, int64_t alert_id);
-
 class StatusEngine
 {
 public:
+    // Alerts are stored but send no webhook.
     explicit StatusEngine(Store& store);
+    // Alerts go through `pipeline`, which applies maintenance, silences and webhooks.
+    StatusEngine(Store& store, AlertPipeline& pipeline);
 
     void evaluate_metrics(const std::string& agent_id, const SystemMetrics& metrics, int64_t timestamp_ms);
     void enter_maintenance(const std::string& agent_id, const std::string& reason, int64_t until_ms, int64_t now_ms);
@@ -74,6 +69,8 @@ private:
                                        int64_t now_ms);
 
     Store& store_;
+    std::unique_ptr<AlertPipeline> owned_pipeline_; // set only by the Store-only constructor
+    AlertPipeline& pipeline_;
     int64_t last_prune_ms_ = 0;
     std::unordered_map<std::string, BaselineCacheEntry> baseline_cache_;
     std::unordered_map<std::string, StalenessEntry> staleness_cache_;

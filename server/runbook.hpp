@@ -25,14 +25,4 @@ bool is_valid_runbook_url(std::string_view url);
 std::string resolve_runbook_url(Store& store, const std::string& agent_id, const std::string& indicator,
                                 const std::string& status);
 
-// Alerts the server raises outside the status engine, built with their runbook
-// link resolved the same way (the caller inserts them).
-// The offline scan: a red "Heartbeat" alert.
-AlertRecord make_offline_alert(Store& store, const std::string& agent_id, int64_t now_ms);
-// A log match on `indicator` with `severity` ("yellow", "amber" or "red"); the
-// message quotes at most the first 200 characters of the matched line.
-AlertRecord make_log_match_alert(Store& store, const std::string& agent_id, const std::string& indicator,
-                                 const std::string& severity, const std::string& path, const std::string& matched_line,
-                                 int64_t now_ms);
-
 } // namespace thewatcher::server

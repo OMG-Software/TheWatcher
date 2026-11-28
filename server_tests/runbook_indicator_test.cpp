@@ -1,7 +1,9 @@
 // Behaviour tests for the indicator names the server raises alerts on (#151) and
 // for runbook URL validation (#11) and resolution (#53).
 
+#include "../server/alert_pipeline.hpp"
 #include "../server/indicators.hpp"
+#include "../server/offline_alerts.hpp"
 #include "../server/runbook.hpp"
 #include "../server/status_engine.hpp"
 #include "../server/store_sqlite.hpp"
@@ -11,6 +13,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <optional>
 
 using namespace thewatcher;
 using namespace thewatcher::server;
@@ -459,63 +462,112 @@ SCENARIO("Alerts carry the per-agent runbook and the matching link")
     }
 }
 
-SCENARIO("Offline and log-match alerts carry the matching runbook link")
+SCENARIO("Offline and log-match alerts carry the matching runbook link through the pipeline")
 {
-    GIVEN("an agent with runbooks for Heartbeat and for a log indicator")
+    GIVEN("an offline agent with runbooks for Heartbeat and for a log indicator")
     {
         SqliteStore store(":memory:");
         insert_agent(store, "agent-x");
         add_runbook(store, "agent-x", "Heartbeat", "red", "https://wiki/offline");
         add_runbook(store, "", "syslog", "amber", "https://wiki/syslog");
+        AlertPipeline pipeline(store);
 
-        WHEN("the offline alert is built")
+        auto find_alert = [&](const std::string& indicator) -> std::optional<AlertRecord> {
+            for (const auto& alert : store.list_alerts(true))
+            {
+                if (alert.indicator == indicator)
+                    return alert;
+            }
+            return std::nullopt;
+        };
+
+        WHEN("the offline scan raises the alert")
         {
-            const auto alert = make_offline_alert(store, "agent-x", 5000);
+            OfflineAlerts offline(store, pipeline);
+            REQUIRE(offline.raise_for_offline_agents(5000) == 1);
+            const auto it = find_alert("Heartbeat");
+            REQUIRE(it.has_value());
 
             THEN("it is a red Heartbeat alert with the agent's runbook link")
             {
-                REQUIRE(alert.agent_id == "agent-x");
-                REQUIRE(alert.indicator == "Heartbeat");
-                REQUIRE(alert.old_status == "green");
-                REQUIRE(alert.new_status == "red");
-                REQUIRE(alert.created_at == 5000);
-                REQUIRE(alert.runbook_url == "https://wiki/offline");
+                REQUIRE(it->agent_id == "agent-x");
+                REQUIRE(it->old_status == "green");
+                REQUIRE(it->new_status == "red");
+                REQUIRE(it->created_at == 5000);
+                REQUIRE(it->runbook_url == "https://wiki/offline");
             }
         }
 
-        WHEN("a log-match alert is built for the matching indicator and severity")
+        WHEN("a log match on the matching indicator and severity is raised")
         {
-            const auto alert =
-                make_log_match_alert(store, "agent-x", "syslog", "amber", "/var/log/syslog", "oops", 6000);
+            REQUIRE(pipeline.raise(log_match_request("agent-x", "syslog", "amber", "/var/log/syslog", "oops", 6000)) ==
+                    AlertOutcome::Raised);
+            const auto it = find_alert("syslog");
+            REQUIRE(it.has_value());
 
             THEN("it carries the log runbook link and the message")
             {
-                REQUIRE(alert.indicator == "syslog");
-                REQUIRE(alert.new_status == "amber");
-                REQUIRE(alert.runbook_url == "https://wiki/syslog");
-                REQUIRE(alert.message == "Log match in /var/log/syslog: oops");
+                REQUIRE(it->new_status == "amber");
+                REQUIRE(it->runbook_url == "https://wiki/syslog");
+                REQUIRE(it->message == "Log match in /var/log/syslog: oops");
             }
         }
 
-        WHEN("a log-match alert has a severity no runbook covers")
+        WHEN("a log match has a severity no runbook covers")
         {
-            const auto alert = make_log_match_alert(store, "agent-x", "syslog", "red", "/p", "x", 6000);
+            pipeline.raise(log_match_request("agent-x", "syslog", "red", "/p", "x", 6000));
 
             THEN("the link is empty")
             {
-                REQUIRE(alert.runbook_url.empty());
+                REQUIRE(find_alert("syslog").has_value());
+                REQUIRE(find_alert("syslog")->runbook_url.empty());
             }
         }
 
         WHEN("the matched line is longer than 200 characters")
         {
-            const auto alert =
-                make_log_match_alert(store, "agent-x", "syslog", "amber", "/p", std::string(500, 'z'), 6000);
+            const auto request = log_match_request("agent-x", "syslog", "amber", "/p", std::string(500, 'z'), 6000);
 
             THEN("only the first 200 characters are kept")
             {
-                REQUIRE(alert.message == "Log match in /p: " + std::string(200, 'z'));
+                REQUIRE(request.message == "Log match in /p: " + std::string(200, 'z'));
             }
+        }
+    }
+
+    GIVEN("a runbook whose stored URL is not http(s) and a valid global wildcard")
+    {
+        SqliteStore store(":memory:");
+        insert_agent(store, "agent-y");
+        add_runbook(store, "agent-y", "syslog", "amber", "javascript:alert(1)");
+        add_runbook(store, "", "*", "amber", "https://wiki/fallback");
+        AlertPipeline pipeline(store);
+
+        WHEN("a log match is raised")
+        {
+            pipeline.raise(log_match_request("agent-y", "syslog", "amber", "/p", "x", 7000));
+
+            THEN("the pipeline skips the invalid URL and links the valid fallback")
+            {
+                const auto alerts = store.list_alerts(true);
+                REQUIRE(alerts.size() == 1);
+                REQUIRE(alerts[0].runbook_url == "https://wiki/fallback");
+            }
+        }
+    }
+
+    GIVEN("an agent with a 'disk' kind silence")
+    {
+        SqliteStore store(":memory:");
+        insert_agent(store, "agent-z");
+        store.create_silence({0, "agent-z", "disk", "planned", 10'000'000, "admin", 1});
+        AlertPipeline pipeline(store);
+
+        THEN("the pipeline's single silence check applies the kind rule to a per-mount alert")
+        {
+            REQUIRE(pipeline.raise({"agent-z", "disk:/", "green", "red", "full", 5000, false}) ==
+                    AlertOutcome::SuppressedSilence);
+            REQUIRE(pipeline.raise({"agent-z", "memory", "green", "red", "full", 5000, false}) == AlertOutcome::Raised);
         }
     }
 }
