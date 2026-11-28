@@ -57,8 +57,8 @@ int OfflineAlerts::raise_for_offline_agents(int64_t now_ms)
     {
         if (is_operator_disconnected(agent_id))
             continue;
-        const auto outcome = pipeline_.raise(
-            {agent_id, "Heartbeat", "green", "red", "Agent has gone offline (no heartbeat received)", now_ms, true});
+        const auto outcome = pipeline_.raise({agent_id, "Heartbeat", "green", "red",
+                                              "Agent has gone offline (no heartbeat received)", now_ms, false, true});
         if (outcome == AlertOutcome::Raised)
         {
             ++raised;

@@ -70,7 +70,14 @@ AlertOutcome AlertPipeline::raise(const AlertRequest& request)
     if (const auto runbook = store_.get_runbook(alert.agent_id, alert.indicator, alert.new_status))
         alert.runbook_url = runbook->url;
 
-    const auto alert_id = store_.insert_alert(alert);
+    const auto alert_id =
+        request.single_open_heartbeat ? store_.insert_heartbeat_alert_if_absent(alert) : store_.insert_alert(alert);
+    if (alert_id == 0)
+    {
+        // Another node won the race; it already stored and announced the alert.
+        LOGF_DEBUG("Heartbeat alert already open agent_id=%s", alert.agent_id.c_str());
+        return AlertOutcome::Deduplicated;
+    }
     LOGF_WARNING("Generated alert id=%lld agent_id=%s indicator=%s old=%s new=%s", static_cast<long long>(alert_id),
                  alert.agent_id.c_str(), alert.indicator.c_str(), alert.old_status.c_str(), alert.new_status.c_str());
     notify(alert, alert_id);

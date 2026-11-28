@@ -175,6 +175,31 @@ struct ViewRecord
     int64_t created_at = 0;
 };
 
+// Everything the configure-modal save changes on one agent. Applied by
+// Store::save_agent_configuration in a single transaction.
+struct AgentConfigUpdate
+{
+    int collection_interval = 30;
+    int heartbeat_interval = 5;
+    int process_limit = 25;
+    CollectorConfig collector_config;
+    std::optional<std::string> runbook_markdown;   // nullopt keeps the stored runbook
+    std::optional<std::vector<int64_t>> group_ids; // nullopt keeps the group memberships
+};
+
+// Threading and transaction contract (see docs/architecture.md, "Store
+// threading and transactions"):
+//  - Implementations are not thread safe. make_store() returns a store wrapped
+//    in SynchronizedStore, which holds one mutex for every call, so callers on
+//    any thread (HTTP workers, the server thread, the status engine) can share
+//    it. Every new virtual method must be forwarded there; the compiler
+//    enforces it because SynchronizedStore implements this interface.
+//  - A method that writes more than one row or statement must be atomic: wrap
+//    it in the backend's RAII transaction guard.
+//  - Read paths throw on database errors; "no rows" is only ever a successful,
+//    empty result.
+//  - Never rewrite a whole agent row from a snapshot: use the narrow setters
+//    below. upsert_agent is for enrollment (and test fixtures) only.
 class Store
 {
 public:
@@ -193,6 +218,18 @@ public:
                                        int64_t until_ms) = 0;
     virtual void set_agent_thresholds(const AgentRecord& rec) = 0;
     virtual void set_agent_collector_config(const std::string& agent_id, const CollectorConfig& config) = 0;
+    // Narrow updates: each touches only the named columns, so it cannot
+    // revert a concurrent change to any other column.
+    virtual void touch_agent(const std::string& agent_id, int64_t last_seen_ms, bool connected) = 0;
+    virtual void set_agent_collection_interval(const std::string& agent_id, int seconds) = 0;
+    virtual void set_agent_heartbeat_interval(const std::string& agent_id, int seconds) = 0;
+    virtual void set_agent_process_limit(const std::string& agent_id, int limit) = 0;
+    // Applies the whole configure-modal save atomically (intervals, process
+    // limit, collector config, optional runbook, optional group memberships).
+    // Returns false, having changed nothing, when the agent does not exist.
+    // Throws, having changed nothing, when any part fails (for example an
+    // unknown group id).
+    virtual bool save_agent_configuration(const std::string& agent_id, const AgentConfigUpdate& update) = 0;
 
     virtual std::vector<GroupRecord> list_groups() = 0;
     virtual int64_t create_group(const std::string& name) = 0;
@@ -233,6 +270,10 @@ public:
                                     const std::string& target_status, int count) = 0;
     virtual void clear_pending_status(const std::string& agent_id, const std::string& indicator) = 0;
     virtual int64_t insert_alert(const AlertRecord& alert) = 0;
+    // Inserts `alert` only when the agent has no live (not deleted) Heartbeat
+    // alert, as one atomic statement. Returns the new alert id, or 0 when a live
+    // Heartbeat alert already existed and nothing was inserted.
+    virtual int64_t insert_heartbeat_alert_if_absent(const AlertRecord& alert) = 0;
     virtual std::vector<AlertRecord> list_alerts(bool include_deleted = false) = 0;
     virtual std::vector<AlertRecord> list_unacknowledged_alerts() = 0;
     virtual void acknowledge_alert(int64_t alert_id, const std::string& username, int64_t acknowledged_at,

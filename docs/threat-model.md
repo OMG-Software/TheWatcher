@@ -78,6 +78,14 @@ working document for audit, design review, and regression testing.
 - Log-monitor paths and patterns are validated server-side, restricted to
   global admins, and enforced against an agent-local `LOG_ALLOWED_DIRS`
   allowlist the server cannot change.
+- Store integrity: group membership saves are transactional, so a failed save
+  cannot leave an agent or user with no groups (which would hide the agent
+  from, or lock out, group-scoped users). A database read error is an
+  exception, never "no rows": a locked database cannot make `is_silenced`
+  return false or `get_session` log a user out silently. Heartbeats use
+  narrow updates, so a stale snapshot cannot revert maintenance state or a
+  collector config. Residual risk: a store call that fails mid-way surfaces
+  as an HTTP 500 and the caller retries.
 
 ### Repudiation
 

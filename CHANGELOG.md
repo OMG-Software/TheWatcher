@@ -123,6 +123,44 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   unprivileged writers, and root-reserved blocks count as used (#158).
 - Encoding a frame with an empty payload no longer passes a null pointer to
   libcbor (undefined behaviour reported by UBSan on every heartbeat) (#162).
+- The store is now safe to share between threads. `make_store` returns the
+  backend wrapped in `SynchronizedStore`, which holds one mutex for every
+  call, so HTTP workers, the data-plane thread and the status engine no
+  longer interleave statements or transactions on the single SQLite or
+  PostgreSQL connection (#73).
+- Group assignments on PostgreSQL (`set_agent_groups`, `set_user_groups`) are
+  transactional: a failed insert, such as an unknown group id, no longer
+  leaves the agent or user with no groups. The configure-modal save
+  (`POST /api/agents/:id/collector_config`) is one transaction through the
+  new `save_agent_configuration`, so a failure saves nothing (#72).
+- SQLite reads no longer report a database error as "no rows": a locked or
+  failing database makes `get_session`, `is_silenced`, `has_open_alert`,
+  `get_offline_unalerted_agent_ids` and the list calls throw instead of
+  returning an empty result (an active silence could be ignored, and alert
+  de-duplication could be skipped, creating a duplicate alert). The
+  connection now waits up to 5 seconds for a competing lock (#78).
+- Bulk acknowledge and bulk delete of alerts run in one transaction on both
+  backends, and the dead-agent alert is created with an atomic
+  insert-if-absent (#79). On PostgreSQL this runs under a per-agent advisory
+  lock, so two server nodes cannot create duplicates once every node runs
+  0.9.0. A pre-0.9.0 node does not take the lock: during a rolling upgrade,
+  upgrade every node before running them concurrently, or accept that one
+  duplicate Heartbeat alert per agent is possible in that window. The offline
+  scan reaches it through `AlertPipeline` (`AlertRequest::single_open_heartbeat`),
+  so silences, maintenance and the webhook still apply and the webhook is sent
+  only when the insert happened. `insert_heartbeat_alert_if_absent` now returns
+  the new alert id (0 when a live Heartbeat alert already existed).
+- `SynchronizedStore` forwards `has_open_alert` under its lock.
+- A heartbeat or an API setting no longer rewrites the whole agent row from a
+  stale snapshot, which silently reverted a collector config, heartbeat
+  interval, runbook or maintenance change saved at the same moment. The data
+  plane and API now use narrow setters (`touch_agent`,
+  `set_agent_collection_interval`, `set_agent_heartbeat_interval`,
+  `set_agent_process_limit`); `upsert_agent` is for enrollment (#51).
+- The store owns its database handles with RAII (`sqlite::Connection`,
+  `postgres::Connection`), so a constructor that throws no longer leaks the
+  connection; prepared statements are movable and transactions use a guard
+  that rolls back without masking the original error (part of #100).
 - The Windows installer registers the server service with
   `TheWatcherServer.conf`, the file the server actually reads, instead of a
   non-existent `server.json`; the docs name the same file and

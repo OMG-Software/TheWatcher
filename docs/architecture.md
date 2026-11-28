@@ -142,6 +142,50 @@ see [Build Environment](build-environment.md)) both persist:
 Schema migrations are implemented as additive `ALTER TABLE` calls guarded by
 column checks in `init_schema()` of each store.
 
+### Store threading and transactions
+
+Files: `server/store_synchronized.hpp`, `server/sqlite_raii.hpp`,
+`server/postgres_raii.hpp`.
+
+- One database connection per store, and a connection is used by one thread
+  at a time. `make_store()` wraps the backend in `SynchronizedStore`, which
+  holds a single mutex for the whole of every public call. A transaction
+  lives inside one call, so no other call can run inside it. The wrapper
+  implements the full `Store` interface: a new virtual method that is not
+  forwarded there does not compile, so the lock cannot be forgotten.
+  Backends never call back into the wrapper. Tests that construct
+  `SqliteStore` or `PostgresStore` directly are single-threaded.
+- A method that writes more than one row or statement is atomic. Use the
+  RAII guard (`sqlite::Transaction`, `postgres::Transaction`): it begins on
+  construction, rolls back on destruction unless `commit()` succeeded, and
+  never throws from the destructor, so the original error is kept. Do not
+  start a transaction inside another one: share a private helper that does
+  not begin its own (see `replace_agent_groups`).
+- Insert-if-absent across server nodes (`insert_heartbeat_alert_if_absent`,
+  called by `AlertPipeline` for requests with `single_open_heartbeat`, which
+  skips the webhook when it returns 0)
+  cannot rely on the in-process mutex. On PostgreSQL the check and the insert
+  run in one transaction holding
+  `pg_advisory_xact_lock(hashtext('thewatcher:heartbeat:<agent_id>'))`,
+  which serialises them per agent across every node. The lock only protects
+  nodes that take it: a node older than 0.9.0 still scans then inserts
+  without it, so upgrade every node before running a mixed cluster
+  concurrently, or accept a possible duplicate Heartbeat alert during the
+  upgrade. No unique index is used, so existing databases that already hold
+  duplicates need no migration.
+- Read paths throw on a database error. `sqlite::step_row` returns false only
+  for `SQLITE_DONE`; "no rows" is never the result of a busy or failing
+  statement. SQLite waits up to 5 seconds for a lock (`busy_timeout`).
+- Never rewrite a whole agent row from a snapshot. Use the narrow setters
+  (`touch_agent`, `set_agent_collection_interval`,
+  `set_agent_heartbeat_interval`, `set_agent_process_limit`,
+  `set_agent_collector_config`, `set_agent_runbook`, `set_agent_maintenance`,
+  `set_agent_thresholds`, `set_agent_description`) or, for the configure
+  modal, `save_agent_configuration`, which applies every field and the group
+  memberships in one transaction. `upsert_agent` is for enrollment only.
+- Database handles and statements are owned by RAII types
+  (`sqlite::Connection`, `sqlite::Stmt`, `postgres::Connection`).
+
 ## REST API
 
 Implemented in `server/api.cpp`.

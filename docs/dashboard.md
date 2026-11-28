@@ -368,6 +368,10 @@ metrics
   `offline_after_seconds` with no inbound frame.
 - `maintenance` becomes true from the maintenance action or pause ACK.
 - `maintenance` becomes false after successful resume ACK.
+- ACKs for the other commands (interval, process limit, restart collectors,
+  status request) leave `maintenance` alone, so an operator's maintenance
+  window, reason and expiry survive them. Like any inbound frame, they still
+  set `connected` to true.
 - Maintenance suppresses and clears active alerts for that host.
 - Worsening indicator transitions create alerts. Recoveries are history-only.
 - Alert delete is a soft delete; alert history remains in SQLite.
