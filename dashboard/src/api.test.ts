@@ -332,6 +332,66 @@ describe('GIVEN agent management API actions', () => {
     });
   });
 
+  it('WHEN a user changes their own password THEN the current password is sent with the new one', async () => {
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: async () => ({ ok: true }) });
+    vi.stubGlobal('fetch', fetchMock);
+
+    await changeUserPassword(5, 'newpass123', 'oldpass456');
+
+    expect(fetchMock).toHaveBeenCalledWith('/api/users/5/password', {
+      body: JSON.stringify({ password: 'newpass123', current_password: 'oldpass456' }),
+      credentials: 'include',
+      headers: { 'Content-Type': 'application/json' },
+      method: 'PUT',
+    });
+  });
+
+  it('WHEN an admin resets another user THEN no current_password key is sent', async () => {
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: async () => ({ ok: true }) });
+    vi.stubGlobal('fetch', fetchMock);
+
+    await changeUserPassword(6, 'newpass123');
+
+    const body = JSON.parse(fetchMock.mock.calls[0][1].body as string) as Record<string, unknown>;
+    expect(body).toEqual({ password: 'newpass123' });
+    expect(Object.keys(body)).not.toContain('current_password');
+  });
+
+  it('WHEN the server refuses a wrong current password THEN the server message reaches the caller', async () => {
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: false,
+      status: 403,
+      statusText: 'Forbidden',
+      json: async () => ({ error: 'current password is incorrect' }),
+    });
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(changeUserPassword(5, 'newpass123', 'wrong')).rejects.toThrow('current password is incorrect');
+  });
+
+  it('WHEN the error body never arrives THEN the request still rejects with the status line after the wait', async () => {
+    vi.useFakeTimers();
+    try {
+      const fetchMock = vi.fn().mockResolvedValue({
+        ok: false,
+        status: 403,
+        statusText: 'Forbidden',
+        json: () => new Promise(() => undefined),
+      });
+      vi.stubGlobal('fetch', fetchMock);
+
+      const outcome = changeUserPassword(5, 'newpass123', 'wrong').then(
+        () => 'resolved',
+        (err: Error) => err.message,
+      );
+      await vi.advanceTimersByTimeAsync(2500);
+
+      await expect(outcome).resolves.toBe('403 Forbidden');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('WHEN setMaintenance is called THEN the correct payload is sent to the agent endpoint', async () => {
     const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: async () => ({ ok: true }) });
     vi.stubGlobal('fetch', fetchMock);

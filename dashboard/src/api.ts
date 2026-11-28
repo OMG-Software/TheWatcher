@@ -23,9 +23,29 @@ async function fetchJson<T>(path: string): Promise<T> {
   return response.json() as Promise<T>;
 }
 
+/** How long a refused request waits for its error body before falling back to the status line alone. */
+const ERROR_BODY_WAIT_MS = 2000;
+
+/** Status line plus the server's `error` text when the body arrives in time, so a refusal says why (e.g. wrong current password). */
+async function failureMessage(response: Response): Promise<string> {
+  const status = `${response.status} ${response.statusText}`;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const stalled = new Promise<null>((resolve) => {
+      timer = setTimeout(() => resolve(null), ERROR_BODY_WAIT_MS);
+    });
+    const body = (await Promise.race([response.json() as Promise<{ error?: unknown }>, stalled])) as { error?: unknown } | null;
+    return body && typeof body.error === 'string' && body.error ? `${status}: ${body.error}` : status;
+  } catch {
+    return status;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function mutateJson<T>(path: string, init: RequestInit): Promise<T> {
   const response = await fetch(`${API_BASE}${path}`, { ...init, credentials: 'include' });
-  if (!response.ok) throw new Error(`${response.status} ${response.statusText}`);
+  if (!response.ok) throw new Error(await failureMessage(response));
   return response.json() as Promise<T>;
 }
 
@@ -224,9 +244,10 @@ export async function deleteUser(userId: number): Promise<void> {
   await mutateJson<{ ok: boolean }>(`/api/users/${userId}`, { method: 'DELETE' });
 }
 
-export async function changeUserPassword(userId: number, password: string): Promise<void> {
+/** `currentPassword` is required by the server when changing your own password and is omitted for an admin reset of another user. */
+export async function changeUserPassword(userId: number, password: string, currentPassword?: string): Promise<void> {
   await mutateJson<{ ok: boolean }>(`/api/users/${userId}/password`, {
-    body: JSON.stringify({ password }),
+    body: JSON.stringify(currentPassword === undefined ? { password } : { password, current_password: currentPassword }),
     headers: { 'Content-Type': 'application/json' },
     method: 'PUT',
   });

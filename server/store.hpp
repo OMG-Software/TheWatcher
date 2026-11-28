@@ -4,6 +4,7 @@
 #include "common/metrics.hpp"
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
@@ -78,6 +79,25 @@ struct SessionRecord
     std::string role;
     int64_t created_at = 0;
     int64_t expires_at = 0;
+};
+
+// Milliseconds since the Unix epoch, read afresh on every call, for a store
+// operation that must judge expiry at the moment it acts rather than when
+// the request arrived.
+using WallClock = std::function<int64_t()>;
+
+// Outcome of Store::update_user_password_if_current_and_revoke_sessions.
+struct PasswordChangeResult
+{
+    enum class Status
+    {
+        Changed,         // hash replaced, sessions revoked
+        UserNotFound,    // no such user
+        PasswordChanged, // the stored hash is no longer the expected one; nothing changed
+        SessionEnded,    // the user was disabled or the caller's session is gone; nothing changed
+    };
+    Status status = Status::UserNotFound;
+    int revoked = 0; // sessions revoked, meaningful for Changed
 };
 
 struct StatusHistoryRow
@@ -175,6 +195,33 @@ struct ViewRecord
     int64_t created_at = 0;
 };
 
+// Everything the configure-modal save changes on one agent. Applied by
+// Store::save_agent_configuration in a single transaction.
+struct AgentConfigUpdate
+{
+    int collection_interval = 30;
+    int heartbeat_interval = 5;
+    int process_limit = 25;
+    CollectorConfig collector_config;
+    std::optional<std::string> runbook_markdown;   // nullopt keeps the stored runbook
+    std::optional<std::vector<int64_t>> group_ids; // nullopt keeps the group memberships
+};
+
+// Threading and transaction contract (see docs/architecture.md, "Store
+// threading and transactions"):
+//  - Implementations are not thread safe. make_store() returns a store wrapped
+//    in SynchronizedStore, which holds one mutex for every call, so callers on
+//    any thread (HTTP workers, the server thread, the status engine) can share
+//    it. Every new virtual method must be forwarded there. The compiler
+//    enforces that only for PURE virtual methods (a missing override leaves
+//    SynchronizedStore abstract); a virtual with a default implementation
+//    would silently run unlocked, so declare new methods pure (= 0).
+//  - A method that writes more than one row or statement must be atomic: wrap
+//    it in the backend's RAII transaction guard.
+//  - Read paths throw on database errors; "no rows" is only ever a successful,
+//    empty result.
+//  - Never rewrite a whole agent row from a snapshot: use the narrow setters
+//    below. upsert_agent is for enrollment (and test fixtures) only.
 class Store
 {
 public:
@@ -195,6 +242,18 @@ public:
                                        int64_t until_ms) = 0;
     virtual void set_agent_thresholds(const AgentRecord& rec) = 0;
     virtual void set_agent_collector_config(const std::string& agent_id, const CollectorConfig& config) = 0;
+    // Narrow updates: each touches only the named columns, so it cannot
+    // revert a concurrent change to any other column.
+    virtual void touch_agent(const std::string& agent_id, int64_t last_seen_ms, bool connected) = 0;
+    virtual void set_agent_collection_interval(const std::string& agent_id, int seconds) = 0;
+    virtual void set_agent_heartbeat_interval(const std::string& agent_id, int seconds) = 0;
+    virtual void set_agent_process_limit(const std::string& agent_id, int limit) = 0;
+    // Applies the whole configure-modal save atomically (intervals, process
+    // limit, collector config, optional runbook, optional group memberships).
+    // Returns false, having changed nothing, when the agent does not exist.
+    // Throws, having changed nothing, when any part fails (for example an
+    // unknown group id).
+    virtual bool save_agent_configuration(const std::string& agent_id, const AgentConfigUpdate& update) = 0;
 
     virtual std::vector<GroupRecord> list_groups() = 0;
     virtual int64_t create_group(const std::string& name) = 0;
@@ -210,7 +269,8 @@ public:
     // the id was unknown or the built_in guard refused the change, which
     // the API layer maps to 404.
     virtual int disable_user(int64_t user_id) = 0;
-    virtual void enable_user(int64_t user_id) = 0;
+    // Returns the number of users re-enabled (0: unknown id).
+    virtual int enable_user(int64_t user_id) = 0;
     virtual int delete_user(int64_t user_id) = 0;
     virtual void update_user_password(int64_t user_id, const std::string& password_hash) = 0;
     virtual void create_session(const SessionRecord& session) = 0;
@@ -218,6 +278,60 @@ public:
     // expired at now_ms, or belongs to a disabled user.
     virtual std::optional<SessionRecord> get_session(const std::string& token, int64_t now_ms) = 0;
     virtual void delete_session(const std::string& token) = 0;
+    // Revokes every session of user_id except the one whose token is
+    // keep_token (empty keeps none). Returns the number of rows removed.
+    virtual int delete_sessions_for_user(int64_t user_id, const std::string& keep_token = "") = 0;
+    // Removes sessions that expired at or before now_ms. Returns the number
+    // removed. A row another transaction holds (PostgreSQL) is skipped rather
+    // than waited for and is left for a later purge, so a purge never holds
+    // some of a user's rows while waiting on another of them.
+    virtual int delete_expired_sessions(int64_t now_ms) = 0;
+    // Creates the session only while the user still exists, is enabled and
+    // still has password_hash (the hash the login verified). Returns false
+    // otherwise, so a login that raced a password reset or disable cannot
+    // mint a session after the old ones were revoked. Atomic.
+    virtual bool create_session_if_credentials_current(const SessionRecord& session,
+                                                       const std::string& password_hash) = 0;
+    // Replaces the password hash and revokes the user's sessions except
+    // keep_token (empty keeps none) as one atomic operation: either both
+    // happen or neither does. Returns the number of sessions revoked.
+    virtual std::optional<int> update_user_password_and_revoke_sessions(int64_t user_id,
+                                                                        const std::string& password_hash,
+                                                                        const std::string& keep_token = "") = 0;
+    // Self-service password change: replaces the hash and revokes every other
+    // session of the user in one transaction, keeping caller_token (the raw
+    // token of the session that asked). The update is one statement that
+    // applies only while the stored hash still equals expected_hash (the hash
+    // the caller verified the current password against), the user is enabled
+    // and caller_token is still one of the user's sessions and unexpired
+    // (expires_at > now, as get_session checks). The request's arrival time is
+    // not used: both stores read `clock` once their transaction has begun
+    // (SQLite then holds the write lock) and again after their last
+    // statement, just before the commit, because the session can run out
+    // while a statement waits for a lock or runs. Otherwise nothing
+    // is changed or revoked and the status says why, checked in this order:
+    // UserNotFound (no such user), PasswordChanged (an admin reset landed in
+    // between; it may also have revoked the caller's session), SessionEnded
+    // (the user was disabled, or the caller's session was revoked, signed out
+    // or expired, so the request no longer speaks for a live session). The
+    // caller's session stays valid until the change commits: SQLite holds the
+    // only write lock for the whole transaction, and PostgreSQL locks the
+    // session row FOR SHARE after the update, so a sign-out on another node
+    // either commits first (and the change is refused) or waits. Atomic.
+    virtual PasswordChangeResult update_user_password_if_current_and_revoke_sessions(int64_t user_id,
+                                                                                     const std::string& expected_hash,
+                                                                                     const std::string& new_hash,
+                                                                                     const std::string& caller_token,
+                                                                                     const WallClock& clock) = 0;
+    // Enables the user and, only when that is a real disabled-to-enabled
+    // change, revokes every leftover session of the user, in one transaction.
+    // Returns the number of sessions revoked (0 for an already enabled user,
+    // which is not an error), or nullopt when the user does not exist.
+    virtual std::optional<int> enable_user_and_revoke_sessions(int64_t user_id) = 0;
+    // Disables the user and revokes all of their sessions as one atomic
+    // operation, so re-enabling cannot revive old sessions. Returns the number
+    // of users affected (0: unknown id or built-in; nothing is revoked then).
+    virtual int disable_user_and_revoke_sessions(int64_t user_id) = 0;
 
     virtual void insert_metrics(const MetricsRow& row) = 0;
     virtual std::vector<MetricsRow> get_metrics(const std::string& agent_id, int limit = 100) = 0;
@@ -237,6 +351,9 @@ public:
                                     const std::string& target_status, int count) = 0;
     virtual void clear_pending_status(const std::string& agent_id, const std::string& indicator) = 0;
     virtual int64_t insert_alert(const AlertRecord& alert) = 0;
+    // Inserts `alert` only when the agent has no live (not deleted) Heartbeat
+    // alert, as one atomic statement. Returns whether a row was inserted.
+    virtual bool insert_heartbeat_alert_if_absent(const AlertRecord& alert) = 0;
     virtual std::vector<AlertRecord> list_alerts(bool include_deleted = false) = 0;
     virtual std::vector<AlertRecord> list_unacknowledged_alerts() = 0;
     virtual void acknowledge_alert(int64_t alert_id, const std::string& username, int64_t acknowledged_at,

@@ -4,7 +4,10 @@
 #include "store.hpp"
 #include "zap_handler.hpp"
 
+#include <array>
+#include <atomic>
 #include <functional>
+#include <limits>
 #include <mutex>
 #include <optional>
 #include <queue>
@@ -28,6 +31,15 @@ struct PendingCommand
 {
     std::string agent_id;
     CommandMessage cmd;
+};
+
+// A trusted-proxy network: address bytes (IPv4 as IPv4-mapped IPv6), family and the
+// number of leading bits that must match.
+struct ProxyRange
+{
+    std::array<unsigned char, 16> bytes{};
+    int prefix_bits = 128;
+    bool is_v4 = false; // address family; a range only matches its own family
 };
 
 // REST API server (runs on its own thread via httplib).
@@ -57,11 +69,40 @@ public:
 
     void stop();
 
-    // Addresses (exact remote_addr strings, e.g. "127.0.0.1" or "::1") of
+    // Addresses or CIDR ranges (e.g. "127.0.0.1", "::1", "10.0.0.0/8") of
     // reverse proxies whose X-Forwarded-For / X-Real-IP headers are trusted
     // for login throttling. Empty (the default) means the headers are
-    // ignored and the TCP peer address is always used.
+    // ignored and the TCP peer address is always used. Invalid entries are
+    // skipped with a warning.
     void set_trusted_proxies(std::vector<std::string> proxies);
+
+    // Test seam, call before start(): replaces the clock used by the login
+    // throttle and installs a hook that runs right after an attempt's slot is
+    // counted (with the username), so tests can drive window expiry without
+    // sleeping. Both are empty in production.
+    void set_login_test_hooks(std::function<int64_t()> clock,
+                              std::function<void(const std::string&)> after_reservation);
+
+    // Test seam, call before start(): runs on the request thread with the
+    // user id after a self-service password change verified the current
+    // password and before the store applies the change, so a test can land an
+    // admin reset exactly in that window. Empty in production.
+    void set_password_change_test_hook(std::function<void(int64_t)> after_current_password_verified);
+
+    // Deletes the sessions that expired at or before now_ms (wall-clock time)
+    // when at least five minutes passed since the last successful purge
+    // finished. The five minutes are measured on a monotonic clock, so a
+    // wall-clock jump neither stops purges nor runs them back to back, and a
+    // slow purge does not shorten the gap to the next one. A failed purge is
+    // retried on the next call. Safe to call from any thread. Requests call it
+    // opportunistically; the server's periodic job calls it too, so an idle
+    // server still purges.
+    void purge_expired_sessions_if_due(int64_t now_ms);
+
+    // Test seam, call before the first purge: replaces the monotonic clock
+    // (milliseconds) that spaces the purges. Empty in production, which uses
+    // std::chrono::steady_clock.
+    void set_session_purge_clock(std::function<int64_t()> clock);
 
     // Decides whether an agent can receive a command right now. Without a
     // check the persisted `connected` flag is used. The server installs a
@@ -88,10 +129,72 @@ private:
     // the agent cannot receive commands.
     bool admit_command(const std::string& agent_id, httplib::Response& res);
     std::string enqueue_simple_command(const std::string& id, CommandType ct);
-    // Client address used for login throttling: honours X-Forwarded-For /
-    // X-Real-IP only when the TCP peer is a trusted proxy. Falls back to the
-    // peer address when the header value is not a plausible IP literal.
+    // Client address used for login throttling: honours X-Real-IP /
+    // X-Forwarded-For only when the TCP peer is a trusted proxy. For a trusted
+    // peer a present but malformed forwarded value yields "unknown-client"
+    // (its own bucket); the peer address is used when the peer is not trusted
+    // or no forwarding header was sent.
     std::string client_ip(const httplib::Request& req);
+    // Monotonic milliseconds that space the session purges (the test clock
+    // when one is installed).
+    int64_t session_purge_clock_ms() const;
+    // Writes an AUDIT line (NOTICE) for an authentication or authorization
+    // event. user/target are sanitised; detail must not contain secrets.
+    void audit(const char* event, const char* outcome, const std::string& user, const std::string& source,
+               const std::string& target = "") const;
+    // RAII hold on one login attempt's slot in the three throttle counters.
+    // arm() is called once the slot was counted (under login_mutex_). The
+    // destructor gives the slot back unless keep() recorded a genuine
+    // credential failure, so a success or an exception never consumes a slot
+    // and never touches other in-flight attempts' slots.
+    class LoginReservation
+    {
+    public:
+        LoginReservation(ApiServer& api, std::string pair_key, std::string username, std::string remote);
+        LoginReservation(const LoginReservation&) = delete;
+        LoginReservation& operator=(const LoginReservation&) = delete;
+        ~LoginReservation();
+        // Records the window each counter entry belonged to when this attempt
+        // was counted. release() then touches an entry only while it is still
+        // that window's entry: pruning may have dropped it and a newer attempt
+        // recreated the key, and that newer slot must not be decremented.
+        void arm(int64_t pair_window, int64_t account_window, int64_t ip_window) noexcept
+        {
+            armed_ = true;
+            pair_window_ = pair_window;
+            account_window_ = account_window;
+            ip_window_ = ip_window;
+        }
+        void keep() noexcept
+        {
+            armed_ = false;
+        }
+        void release();
+
+    private:
+        ApiServer& api_;
+        std::string pair_key_;
+        std::string username_;
+        std::string remote_;
+        bool armed_ = false;
+        int64_t pair_window_ = 0;
+        int64_t account_window_ = 0;
+        int64_t ip_window_ = 0;
+    };
+
+    // Why a credential check was refused by the throttle (HTTP 429).
+    struct ThrottleDenial
+    {
+        const char* message;
+        const char* retry_after; // seconds, for the Retry-After header
+    };
+    // Counts one credential check against the three throttle windows, keyed as
+    // login keys them (pair_key = "<ip>|<username>", username, ip), or returns
+    // why it is refused. On admission the slot is armed on `reservation`.
+    // Shared by login and the current-password check of a password change.
+    std::optional<ThrottleDenial> reserve_login_attempt(LoginReservation& reservation, const std::string& pair_key,
+                                                        const std::string& username, const std::string& remote,
+                                                        int64_t now);
 
     Store& store_;
     ZapHandler& zap_;
@@ -110,12 +213,25 @@ private:
     // Account-wide failure tracker keyed by username alone (high threshold):
     // username -> (fail_count, window_start_ms)
     std::unordered_map<std::string, std::pair<int, int64_t>> login_account_failures_;
-    std::vector<std::string> trusted_proxies_; // guarded by login_mutex_
+    std::vector<ProxyRange> trusted_proxies_; // guarded by login_mutex_
     // SEC-12: per-source-IP failure throttle: ip -> (fail_count, window_start_ms)
     std::unordered_map<std::string, std::pair<int, int64_t>> login_ip_failures_;
     int64_t login_lockout_ms_;
     int64_t login_ip_window_ms_;
     std::mutex login_mutex_;
+    // Argon2 hash of a throwaway password; verified when a login names an
+    // unknown or disabled user so those paths cost the same as a real one.
+    std::string dummy_password_hash_;
+    // Purge-clock time at which the last successful purge finished, or
+    // never_purged before the first one (so the first call always purges,
+    // whatever the monotonic clock's origin).
+    static constexpr int64_t never_purged = std::numeric_limits<int64_t>::min();
+    std::atomic<int64_t> last_session_purge_done_ms_{never_purged};
+    std::atomic<bool> session_purge_running_{false}; // at most one purge in flight
+    std::function<int64_t()> login_clock_;
+    std::function<int64_t()> purge_clock_;
+    std::function<void(const std::string&)> after_reservation_hook_;
+    std::function<void(int64_t)> password_change_hook_;
 };
 
 } // namespace thewatcher::server

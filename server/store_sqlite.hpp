@@ -1,5 +1,6 @@
 #pragma once
 
+#include "sqlite_raii.hpp"
 #include "store.hpp"
 
 #include <string>
@@ -29,6 +30,11 @@ public:
                                int64_t until_ms) override;
     void set_agent_thresholds(const AgentRecord& rec) override;
     void set_agent_collector_config(const std::string& agent_id, const CollectorConfig& config) override;
+    void touch_agent(const std::string& agent_id, int64_t last_seen_ms, bool connected) override;
+    void set_agent_collection_interval(const std::string& agent_id, int seconds) override;
+    void set_agent_heartbeat_interval(const std::string& agent_id, int seconds) override;
+    void set_agent_process_limit(const std::string& agent_id, int limit) override;
+    bool save_agent_configuration(const std::string& agent_id, const AgentConfigUpdate& update) override;
 
     std::vector<GroupRecord> list_groups() override;
     int64_t create_group(const std::string& name) override;
@@ -41,12 +47,24 @@ public:
     void set_user_groups(int64_t user_id, const std::vector<int64_t>& group_ids) override;
     std::vector<int64_t> get_user_groups(int64_t user_id) override;
     int disable_user(int64_t user_id) override;
-    void enable_user(int64_t user_id) override;
+    int enable_user(int64_t user_id) override;
     int delete_user(int64_t user_id) override;
     void update_user_password(int64_t user_id, const std::string& password_hash) override;
     void create_session(const SessionRecord& session) override;
     std::optional<SessionRecord> get_session(const std::string& token, int64_t now_ms) override;
     void delete_session(const std::string& token) override;
+    int delete_sessions_for_user(int64_t user_id, const std::string& keep_token = "") override;
+    int delete_expired_sessions(int64_t now_ms) override;
+    bool create_session_if_credentials_current(const SessionRecord& session, const std::string& password_hash) override;
+    std::optional<int> update_user_password_and_revoke_sessions(int64_t user_id, const std::string& password_hash,
+                                                                const std::string& keep_token = "") override;
+    PasswordChangeResult update_user_password_if_current_and_revoke_sessions(int64_t user_id,
+                                                                             const std::string& expected_hash,
+                                                                             const std::string& new_hash,
+                                                                             const std::string& caller_token,
+                                                                             const WallClock& clock) override;
+    std::optional<int> enable_user_and_revoke_sessions(int64_t user_id) override;
+    int disable_user_and_revoke_sessions(int64_t user_id) override;
 
     void insert_metrics(const MetricsRow& row) override;
     std::vector<MetricsRow> get_metrics(const std::string& agent_id, int limit) override;
@@ -65,6 +83,7 @@ public:
                             int count) override;
     void clear_pending_status(const std::string& agent_id, const std::string& indicator) override;
     int64_t insert_alert(const AlertRecord& alert) override;
+    bool insert_heartbeat_alert_if_absent(const AlertRecord& alert) override;
     std::vector<AlertRecord> list_alerts(bool include_deleted) override;
     std::vector<AlertRecord> list_unacknowledged_alerts() override;
     void acknowledge_alert(int64_t alert_id, const std::string& username, int64_t acknowledged_at,
@@ -114,12 +133,19 @@ public:
 
 private:
     void exec(const char* sql);
+    // Group replacement without its own transaction, shared by set_agent_groups
+    // and save_agent_configuration (SQLite has no nested BEGIN).
+    void replace_agent_groups(const std::string& agent_id, const std::vector<int64_t>& group_ids);
     bool column_exists(const std::string& table, const std::string& column);
     void add_column_if_missing(const std::string& table, const std::string& column, const char* ddl);
     void init_schema();
+    // One-time upgrade: sessions are stored as token hashes now, so rows
+    // written by older versions (raw tokens) are deleted once. See
+    // session_tokens_hashed_setting.
+    void migrate_session_tokens();
     void bootstrap_defaults();
 
-    sqlite3* db_ = nullptr;
+    sqlite::Connection db_; // owned handle: closed even if the constructor throws
 };
 
 } // namespace thewatcher::server

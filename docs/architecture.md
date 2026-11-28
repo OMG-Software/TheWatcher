@@ -240,6 +240,83 @@ see [Build Environment](build-environment.md)) both persist:
 Schema migrations are implemented as additive `ALTER TABLE` calls guarded by
 column checks in `init_schema()` of each store.
 
+### Store threading and transactions
+
+Files: `server/store_synchronized.hpp`, `server/sqlite_raii.hpp`,
+`server/postgres_raii.hpp`.
+
+- One database connection per store, and a connection is used by one thread
+  at a time. `make_store()` wraps the backend in `SynchronizedStore`, which
+  holds a single mutex for the whole of every public call. A transaction
+  lives inside one call, so no other call can run inside it. The wrapper
+  implements the full `Store` interface: a new pure virtual method that is
+  not forwarded there does not compile, so the lock cannot be forgotten. The
+  compiler enforces this only for pure virtuals (`= 0`); a virtual with a
+  default implementation would not need an override and would run unlocked,
+  so every `Store` method is declared pure (today none has a default body)
+  and new ones must be too. Each forwarder takes the lock with
+  `const auto lock = lock_for_call(__func__);`, and new ones must too. Tests
+  can install a lock observer (`set_lock_observer`) that is told, with the
+  method's name, when a call has to wait for the lock and when it takes it;
+  race tests use it to prove that two calls really overlapped instead of
+  inferring it from sleeps. Production installs none and takes the same path
+  without the reports: `lock_for_call` tries the lock and, if another call
+  holds it, blocks on a new `std::unique_lock`. The mutex is only ever held
+  by a `unique_lock`, never by a bare `lock()` or `unlock()`, so it is
+  released however the call ends.
+  Backends never call back into the wrapper. Tests that construct
+  `SqliteStore` or `PostgresStore` directly are single-threaded.
+- A method that writes more than one row or statement is atomic. Use the
+  RAII guard (`sqlite::Transaction`, `postgres::Transaction`): it begins on
+  construction, rolls back on destruction unless `commit()` succeeded, and
+  never throws from the destructor, so the original error is kept. Do not
+  start a transaction inside another one: share a private helper that does
+  not begin its own (see `replace_agent_groups`).
+  PostgreSQL runs at READ COMMITTED whatever the DSN, role or database
+  default says: `postgres::Connection` sets it as the session default right
+  after connecting (this covers single-statement writes such as the login's
+  `FOR SHARE` insert), and `postgres::Transaction` begins with
+  `BEGIN ISOLATION LEVEL READ COMMITTED`. The store's compare-and-swap updates
+  and row locks rely on READ COMMITTED re-checking a row after waiting for its
+  lock; under REPEATABLE READ or SERIALIZABLE (for example `options=-c
+  default_transaction_isolation=serializable` in the DSN) those waits would
+  end in serialization errors.
+  Transactions that lock both a `users` row and a `sessions` row take the
+  `users` row first: a disable, an admin reset and a self-service password
+  change (whose UPDATE locks the user and which then locks the caller's
+  session `FOR SHARE`, so a sign-out on another node cannot delete it before
+  the change commits). A sign-out locks only its `sessions` row, and the
+  expired-session purge takes only rows no one else holds
+  (`FOR UPDATE SKIP LOCKED`), leaving the rest to a later purge. Keep that
+  order in new code so these cannot deadlock.
+- A store method that judges time inside a transaction takes a `WallClock`
+  (`std::function<int64_t()>`, milliseconds since the epoch) rather than a
+  fixed time, and reads it after any wait for a lock and again after its last
+  statement, just before the commit, so time spent waiting or running
+  counts.
+- Insert-if-absent across server nodes (`insert_heartbeat_alert_if_absent`)
+  cannot rely on the in-process mutex. On PostgreSQL the check and the insert
+  run in one transaction holding
+  `pg_advisory_xact_lock(hashtext('thewatcher:heartbeat:<agent_id>'))`,
+  which serialises them per agent across every node. The lock only protects
+  nodes that take it: a node older than 0.9.0 still scans then inserts
+  without it, so upgrade every node before running a mixed cluster
+  concurrently, or accept a possible duplicate Heartbeat alert during the
+  upgrade. No unique index is used, so existing databases that already hold
+  duplicates need no migration.
+- Read paths throw on a database error. `sqlite::step_row` returns false only
+  for `SQLITE_DONE`; "no rows" is never the result of a busy or failing
+  statement. SQLite waits up to 5 seconds for a lock (`busy_timeout`).
+- Never rewrite a whole agent row from a snapshot. Use the narrow setters
+  (`touch_agent`, `set_agent_collection_interval`,
+  `set_agent_heartbeat_interval`, `set_agent_process_limit`,
+  `set_agent_collector_config`, `set_agent_runbook`, `set_agent_maintenance`,
+  `set_agent_thresholds`, `set_agent_description`) or, for the configure
+  modal, `save_agent_configuration`, which applies every field and the group
+  memberships in one transaction. `upsert_agent` is for enrollment only.
+- Database handles and statements are owned by RAII types
+  (`sqlite::Connection`, `sqlite::Stmt`, `postgres::Connection`).
+
 ## REST API
 
 Implemented in `server/api.cpp`.
@@ -248,7 +325,7 @@ Important endpoints:
 
 | Endpoint | Purpose |
 | --- | --- |
-| `POST /api/login` | Create a SQLite-backed authenticated session. |
+| `POST /api/login` | Create an authenticated session (the store keeps only the SHA-256 of its token). |
 | `POST /api/logout` | Delete the current session. |
 | `GET /api/session` | Return the current session. |
 | `GET /api/agents` | List approved agents and runtime state. |
@@ -261,6 +338,7 @@ Important endpoints:
 | `POST /api/groups` | Create a group. |
 | `GET /api/users` | List users. |
 | `POST /api/users` | Create a user with role and groups. |
+| `PUT /api/users/:id/password` | Change a password; changing your own needs `current_password`, an admin reset of another user does not. |
 | `GET /api/alerts` | List active alerts. |
 | `GET /api/alerts/unacknowledged` | List active unacknowledged alerts. |
 | `POST /api/alerts/:id/ack` | Acknowledge an alert. |

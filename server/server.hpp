@@ -97,7 +97,8 @@ private:
     // The periodic server maintenance tick, run about once a second from run()
     // whether or not any agent is sending data. It ends timed and scheduled
     // maintenance (#44, #45) and, at most once an hour, prunes data past its
-    // retention period (#76). Other periodic jobs that must not depend on
+    // retention period (#76). It also purges expired sessions, so an idle
+    // server still does. Other periodic jobs that must not depend on
     // traffic belong here.
     void run_periodic_maintenance(int64_t now_ms);
 

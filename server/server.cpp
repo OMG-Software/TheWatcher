@@ -310,6 +310,12 @@ void Server::run_periodic_maintenance(int64_t now_ms)
         LOGF_ERROR("Maintenance reconcile failed: %s", e.what());
     }
 
+    // Expired sessions are also purged from requests; doing it here too means an
+    // idle server (no logins, no dashboard) does not keep them. The API object
+    // spaces the purges five minutes apart and retries after a failure.
+    if (api_)
+        api_->purge_expired_sessions_if_due(now_ms);
+
     constexpr int64_t retention_interval_ms = 3'600'000; // once an hour
     if (now_ms - last_retention_run_ms_ >= retention_interval_ms)
     {
@@ -437,9 +443,9 @@ void Server::handle_router_frame(zmq::socket_t& router)
 
     // Update last_seen timestamp for every inbound frame.
     const bool was_offline = !rec->connected;
-    rec->connected = true;
-    rec->last_seen = now_ms();
-    store_->upsert_agent(*rec);
+    // Narrow update: only last_seen and connected change, so a concurrent
+    // operator save of any other column is never reverted (#51).
+    store_->touch_agent(agent_id, now_ms(), true);
     if (was_offline)
     {
         offline_alerts_->agent_seen(agent_id); // #156: an operator disconnect ends here
@@ -538,28 +544,28 @@ void Server::handle_router_frame(zmq::socket_t& router)
                         auto command_agent = store_->get_agent(agent_id);
                         if (command_agent)
                         {
+                            // Narrow updates only: rewriting the whole row from this
+                            // snapshot would revert concurrent operator saves.
+                            const auto ack_time = now_ms();
                             if (command->second.type == CommandType::DISCONNECT)
                             {
-                                command_agent->connected = false;
+                                store_->touch_agent(agent_id, ack_time, false);
                                 // #156: deliberate, so the offline scan must not alert.
                                 offline_alerts_->mark_operator_disconnect(agent_id);
                             }
-                            else if (command->second.type == CommandType::RESUME)
+                            else
                             {
-                                command_agent->maintenance = false;
-                                command_agent->maintenance_reason = "";
-                                command_agent->maintenance_until = 0;
-                            }
-                            command_agent->last_seen = now_ms();
-                            store_->upsert_agent(*command_agent);
-                            if (command->second.type == CommandType::PAUSE)
-                            {
-                                // Keeps the reason and expiry the API already stored.
-                                status_engine_->pause_agent(agent_id, command_agent->last_seen);
-                            }
-                            else if (command->second.type == CommandType::RESUME)
-                            {
-                                status_engine_->exit_maintenance(agent_id);
+                                store_->touch_agent(agent_id, ack_time, command_agent->connected);
+                                if (command->second.type == CommandType::PAUSE)
+                                {
+                                    // Keeps the reason and expiry the API already stored.
+                                    status_engine_->pause_agent(agent_id, ack_time);
+                                }
+                                else
+                                {
+                                    // Clears the maintenance columns with a narrow update.
+                                    status_engine_->exit_maintenance(agent_id);
+                                }
                             }
                         }
                     }

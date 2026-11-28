@@ -14,6 +14,7 @@
 #include <charconv>
 #include <chrono>
 #include <cmath>
+#include <cstring>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -48,6 +49,19 @@ ApiServer::ApiServer(Store& store, ZapHandler& zap, const std::string& host, int
 {
     LOG_FUNCTION_TRACE
     LOGF_DEBUG("Constructing API server host=%s port=%d", host_.c_str(), port_);
+    // Hash of random bytes generated now, with the same Argon2 parameters as
+    // hash_password, so verifying against it costs what a real verification
+    // costs (issue #154) and no secret-looking literal lives in the source.
+    if (sodium_init() < 0)
+        throw std::runtime_error("libsodium initialisation failed");
+    std::array<unsigned char, 32> random_password{};
+    randombytes_buf(random_password.data(), random_password.size());
+    std::array<char, crypto_pwhash_STRBYTES> dummy{};
+    if (crypto_pwhash_str(dummy.data(), reinterpret_cast<const char*>(random_password.data()), random_password.size(),
+                          crypto_pwhash_OPSLIMIT_INTERACTIVE, crypto_pwhash_MEMLIMIT_INTERACTIVE) != 0)
+        throw std::runtime_error("password hashing failed");
+    sodium_memzero(random_password.data(), random_password.size());
+    dummy_password_hash_ = dummy.data();
     setup_routes();
 }
 
@@ -90,14 +104,11 @@ void ApiServer::stop()
     }
 }
 
-void ApiServer::set_trusted_proxies(std::vector<std::string> proxies)
-{
-    std::lock_guard<std::mutex> lk(login_mutex_);
-    trusted_proxies_ = std::move(proxies);
-}
-
 namespace
 {
+
+    // Bucket for requests whose forwarded client address is malformed.
+    constexpr std::string_view unknown_client = "unknown-client";
 
     // Strips leading and trailing spaces and tabs. The view aliases the input.
     std::string_view trim_ws(std::string_view v)
@@ -109,55 +120,401 @@ namespace
         return v;
     }
 
-    // Plausible IPv4/IPv6 literal: bounded length, digits / hex / '.' / ':' only.
-    bool plausible_ip_literal(std::string_view v)
+    // Replaces control characters and quotes so a value is safe inside a
+    // quoted log field, and bounds its length.
+    std::string sanitize_audit_text(std::string_view text)
     {
-        if (v.empty() || v.size() > 45)
+        constexpr std::size_t max_len = 128;
+        std::string out;
+        for (const char c : text.substr(0, max_len))
+        {
+            const auto u = static_cast<unsigned char>(c);
+            out += (u < 0x20 || u == 0x7f || c == '"' || c == '\\') ? '?' : c;
+        }
+        if (text.size() > max_len)
+            out += "...";
+        return out;
+    }
+
+    using IpBytes = std::array<unsigned char, 16>;
+
+    // A parsed address: 16 bytes (IPv4 stored IPv4-mapped) plus its family.
+    // An IPv4-mapped IPv6 literal such as ::ffff:192.0.2.1 counts as IPv4, so
+    // a trusted range of one family never matches the other.
+    struct IpAddr
+    {
+        IpBytes bytes{};
+        bool is_v4 = false;
+    };
+
+    bool is_mapped_v4(const IpBytes& b)
+    {
+        return std::all_of(b.begin(), b.begin() + 10,
+                           [](unsigned char x) {
+                               return x == 0;
+                           }) &&
+               b[10] == 0xff && b[11] == 0xff;
+    }
+
+    // Strictly parses an IPv4 or IPv6 literal (no zone, no port).
+    std::optional<IpAddr> parse_ip(std::string_view text)
+    {
+        if (text.empty() || text.size() > 45)
+            return std::nullopt;
+        const std::string s(text);
+        IpAddr out;
+        in6_addr v6{};
+        in_addr v4{};
+        if (inet_pton(AF_INET6, s.c_str(), &v6) == 1)
+        {
+            std::memcpy(out.bytes.data(), &v6, out.bytes.size());
+            out.is_v4 = is_mapped_v4(out.bytes);
+        }
+        else if (inet_pton(AF_INET, s.c_str(), &v4) == 1)
+        {
+            out.bytes[10] = out.bytes[11] = 0xff;
+            std::memcpy(out.bytes.data() + 12, &v4, 4);
+            out.is_v4 = true;
+        }
+        else
+            return std::nullopt;
+        return out;
+    }
+
+    // Canonical text form, so "::1" and "0:0::1" share one throttle bucket.
+    std::string format_ip(const IpAddr& ip)
+    {
+        std::array<char, 46> buf{};
+        if (ip.is_v4)
+        {
+            in_addr a{};
+            std::memcpy(&a, ip.bytes.data() + 12, 4);
+            inet_ntop(AF_INET, &a, buf.data(), static_cast<socklen_t>(buf.size()));
+        }
+        else
+        {
+            in6_addr a{};
+            std::memcpy(&a, ip.bytes.data(), ip.bytes.size());
+            inet_ntop(AF_INET6, &a, buf.data(), static_cast<socklen_t>(buf.size()));
+        }
+        return buf.data();
+    }
+
+    // Parses "addr" or "addr/prefix". The prefix of a dotted IPv4 range counts
+    // IPv4 bits; an IPv6 literal counts all 128 bits (an IPv4-mapped literal
+    // needs a prefix of at least 96). Returns nullopt for anything malformed.
+    std::optional<ProxyRange> parse_proxy_range(std::string_view entry)
+    {
+        entry = trim_ws(entry);
+        const auto slash = entry.find('/');
+        const auto addr = entry.substr(0, slash);
+        const auto ip = parse_ip(addr);
+        if (!ip)
+            return std::nullopt;
+        const bool dotted_v4 = addr.find(':') == std::string_view::npos;
+        int bits = dotted_v4 ? 32 : 128;
+        if (slash != std::string_view::npos)
+        {
+            const auto digits = entry.substr(slash + 1);
+            int parsed = -1;
+            const auto [end, ec] = std::from_chars(digits.data(), digits.data() + digits.size(), parsed);
+            if (digits.empty() || ec != std::errc{} || end != digits.data() + digits.size() || parsed < 0 ||
+                parsed > bits)
+                return std::nullopt;
+            bits = parsed;
+        }
+        const int prefix_bits = dotted_v4 ? bits + 96 : bits;
+        if (ip->is_v4 && prefix_bits < 96)
+            return std::nullopt;
+        return ProxyRange{ip->bytes, prefix_bits, ip->is_v4};
+    }
+
+    bool in_range(const IpAddr& ip, const ProxyRange& range)
+    {
+        if (ip.is_v4 != range.is_v4)
             return false;
-        return std::all_of(v.begin(), v.end(), [](char c) {
-            return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F') || c == '.' || c == ':';
-        });
+        const int full = range.prefix_bits / 8;
+        if (!std::equal(ip.bytes.begin(), ip.bytes.begin() + full, range.bytes.begin()))
+            return false;
+        const int rem = range.prefix_bits % 8;
+        if (rem == 0)
+            return true;
+        const auto mask = static_cast<unsigned char>(0xFF << (8 - rem));
+        return (ip.bytes[full] & mask) == (range.bytes[full] & mask);
     }
 
 } // namespace
 
-// Returns the address used for login throttling. The TCP peer is used unless it
-// is a trusted proxy; then the first untrusted X-Forwarded-For entry (or X-Real-IP
-// when the former is absent) is used. Falls back to the peer if it is not a plausible IP.
+void ApiServer::set_trusted_proxies(std::vector<std::string> proxies)
+{
+    std::vector<ProxyRange> ranges;
+    for (const auto& entry : proxies)
+    {
+        if (const auto range = parse_proxy_range(entry))
+            ranges.push_back(*range);
+        else
+            LOGF_WARNING("Ignoring invalid TRUSTED_PROXIES entry \"%s\"", sanitize_audit_text(entry).c_str());
+    }
+    std::lock_guard<std::mutex> lk(login_mutex_);
+    trusted_proxies_ = std::move(ranges);
+}
+
+void ApiServer::set_login_test_hooks(std::function<int64_t()> clock,
+                                     std::function<void(const std::string&)> after_reservation)
+{
+    login_clock_ = std::move(clock);
+    after_reservation_hook_ = std::move(after_reservation);
+}
+
+void ApiServer::set_password_change_test_hook(std::function<void(int64_t)> after_current_password_verified)
+{
+    password_change_hook_ = std::move(after_current_password_verified);
+}
+
+void ApiServer::set_session_purge_clock(std::function<int64_t()> clock)
+{
+    purge_clock_ = std::move(clock);
+}
+
+// Marks a response whose handler already wrote its own audit line, so the
+// post-routing hook does not add a permission_denied line for it. The header
+// is internal: the hook removes it before the response is sent.
+constexpr const char* audited_header = "X-TW-Audited";
+
+// Returns the address used for login throttling. The TCP peer is used unless
+// it is a trusted proxy. For a trusted proxy the single X-Real-IP value wins
+// (the proxy must set or overwrite it); otherwise every X-Forwarded-For line
+// is joined and walked right to left, skipping trusted proxies, and the first
+// untrusted entry is the client. A header that is present but not a valid IP
+// yields unknown_client, a bucket of its own: falling back to the peer would
+// let one malformed request throttle every user behind the proxy.
 std::string ApiServer::client_ip(const httplib::Request& req)
 {
     const std::string remote = req.remote_addr;
-    std::vector<std::string> proxies;
+    std::vector<ProxyRange> proxies;
     {
         std::lock_guard<std::mutex> lk(login_mutex_);
         proxies = trusted_proxies_;
     }
-    const auto is_trusted = [&proxies](std::string_view addr) {
-        return std::find(proxies.begin(), proxies.end(), addr) != proxies.end();
+    const auto is_trusted = [&proxies](const IpAddr& ip) {
+        return std::any_of(proxies.begin(), proxies.end(), [&ip](const ProxyRange& r) {
+            return in_range(ip, r);
+        });
     };
-    if (!is_trusted(remote))
+    const auto peer = parse_ip(remote);
+    if (!peer || !is_trusted(*peer))
         return remote;
 
-    std::string candidate;
-    const std::string xff = req.get_header_value("X-Forwarded-For");
-    // Walk right to left: the rightmost entries were appended by our own
-    // proxies; the first untrusted one is the real client. Anything further
-    // left is client-supplied and spoofable.
+    if (const auto real_ip_lines = req.get_header_value_count("X-Real-IP"); real_ip_lines > 0)
+    {
+        const auto ip = real_ip_lines == 1 ? parse_ip(trim_ws(req.get_header_value("X-Real-IP"))) : std::nullopt;
+        return ip ? format_ip(*ip) : std::string(unknown_client);
+    }
+
+    std::string xff;
+    const auto xff_lines = req.get_header_value_count("X-Forwarded-For");
+    for (std::size_t i = 0; i < xff_lines; ++i)
+    {
+        if (i > 0) // by line index: an empty first line must still leave an empty entry
+            xff += ',';
+        xff += req.get_header_value("X-Forwarded-For", "", i);
+    }
+
+    // A header that was sent must be a list of valid addresses: one empty or
+    // invalid entry anywhere (",", "a,", ",a", "junk, a") makes it malformed,
+    // however many valid hops sit beside it. Absent means no header line.
+    if (xff_lines > 0)
+    {
+        std::string_view all = xff;
+        for (;;)
+        {
+            const auto comma = all.find(',');
+            if (!parse_ip(trim_ws(all.substr(0, comma))))
+                return std::string(unknown_client);
+            if (comma == std::string_view::npos)
+                break;
+            all.remove_prefix(comma + 1);
+        }
+    }
+
     std::string_view rest = xff;
     while (!rest.empty())
     {
         const auto comma = rest.rfind(',');
         const auto entry = trim_ws(comma == std::string_view::npos ? rest : rest.substr(comma + 1));
         rest = comma == std::string_view::npos ? std::string_view{} : rest.substr(0, comma);
-        if (entry.empty() || is_trusted(entry))
-            continue;
-        candidate = std::string(entry);
-        break;
+        const auto ip = parse_ip(entry);
+        if (!ip)
+            return std::string(unknown_client);
+        if (!is_trusted(*ip))
+            return format_ip(*ip);
     }
-    if (candidate.empty() && trim_ws(xff).empty())
-        candidate = std::string(trim_ws(req.get_header_value("X-Real-IP")));
+    // No forwarding header, or only trusted hops: the proxy itself.
+    return remote;
+}
 
-    return plausible_ip_literal(candidate) ? candidate : remote;
+// Writes one key=value AUDIT line at NOTICE. user/source/target are
+// sanitised, so a hostile username cannot forge or split log lines.
+void ApiServer::audit(const char* event, const char* outcome, const std::string& user, const std::string& source,
+                      const std::string& target) const
+{
+    std::string line = std::string("AUDIT event=") + event + " outcome=" + outcome + " user=\"" +
+                       sanitize_audit_text(user) + "\" source=" + sanitize_audit_text(source);
+    if (!target.empty())
+        line += " target=\"" + sanitize_audit_text(target) + "\"";
+    LOG_NOTICE(line);
+}
+
+int64_t ApiServer::session_purge_clock_ms() const
+{
+    if (purge_clock_)
+        return purge_clock_();
+    return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
+// Purges expired sessions at most once every five minutes. Called from login
+// and session validation, and from the server's periodic job so an idle server
+// purges too. now_ms (wall clock) is only the expiry cutoff; the spacing runs
+// on the monotonic purge clock from the end of the last successful purge, so a
+// failure is retried, a slow purge does not shorten the gap and a wall-clock
+// jump changes nothing. One flag keeps concurrent callers from purging
+// together.
+void ApiServer::purge_expired_sessions_if_due(int64_t now_ms)
+{
+    constexpr int64_t purge_interval_ms = 5LL * 60LL * 1000LL;
+    const auto due = [this] {
+        const auto last = last_session_purge_done_ms_.load();
+        return last == never_purged || session_purge_clock_ms() - last >= purge_interval_ms;
+    };
+    if (!due() || session_purge_running_.exchange(true))
+        return;
+    // Clears the in-flight flag on every way out of this function.
+    struct RunningFlagReset
+    {
+        std::atomic<bool>& flag;
+        ~RunningFlagReset()
+        {
+            flag.store(false);
+        }
+    } reset{session_purge_running_};
+    // Recheck while holding the flag: another request may have finished a
+    // purge between our first check and taking the flag.
+    if (!due())
+        return;
+    try
+    {
+        const auto removed = store_.delete_expired_sessions(now_ms);
+        // Stamped when the purge finished, and only if it succeeded.
+        last_session_purge_done_ms_.store(session_purge_clock_ms());
+        if (removed > 0)
+            LOGF_DEBUG("Purged %d expired session(s)", removed);
+    }
+    catch (const std::exception& e)
+    {
+        LOGF_WARNING("Expired session purge failed: %s", e.what());
+    }
+}
+
+ApiServer::LoginReservation::LoginReservation(ApiServer& api, std::string pair_key, std::string username,
+                                              std::string remote)
+    : api_(api)
+    , pair_key_(std::move(pair_key))
+    , username_(std::move(username))
+    , remote_(std::move(remote))
+{
+}
+
+ApiServer::LoginReservation::~LoginReservation()
+{
+    release();
+}
+
+// Gives this attempt's slot back in all three counters (erasing an entry that
+// reaches zero). Does nothing when not armed or already released.
+void ApiServer::LoginReservation::release()
+{
+    if (!armed_)
+        return;
+    armed_ = false;
+    std::lock_guard<std::mutex> lk(api_.login_mutex_);
+    // Touches an entry only while it is still the window this attempt was
+    // counted in (window_start identifies the window: a key can only be
+    // recreated after its old window expired, so the values never repeat).
+    const auto give_back = [](auto& map, const std::string& key, int64_t window) {
+        const auto it = map.find(key);
+        if (it == map.end() || it->second.second != window)
+            return;
+        --it->second.first;
+        if (it->second.first <= 0)
+            map.erase(it);
+    };
+    give_back(api_.login_failures_, pair_key_, pair_window_);
+    give_back(api_.login_account_failures_, username_, account_window_);
+    give_back(api_.login_ip_failures_, remote_, ip_window_);
+}
+
+// Admits one credential check or refuses it, in ONE critical section (#154):
+// the limit check and the up-front count of the attempt cannot be split by a
+// concurrent request. Used by login and by the current-password check of a
+// self-service password change (#145), which must share the same keys so a
+// stolen session cannot guess the password more cheaply than a login can.
+// On admission the slot is armed on `reservation`, which gives it back unless
+// the caller keep()s it as a genuine credential failure.
+std::optional<ApiServer::ThrottleDenial> ApiServer::reserve_login_attempt(LoginReservation& reservation,
+                                                                          const std::string& pair_key,
+                                                                          const std::string& username,
+                                                                          const std::string& remote, int64_t now)
+{
+    constexpr int max_failures = 5;
+    constexpr int max_ip_failures = 10;
+    constexpr int max_account_failures = 50;
+
+    std::lock_guard<std::mutex> lk(login_mutex_);
+
+    // Prune expired windows: an entry whose window has elapsed
+    // is removed, which also implements the fixed-window reset.
+    const auto prune = [now](auto& map, int64_t window_ms) {
+        for (auto it = map.begin(); it != map.end();)
+        {
+            if (now - it->second.second >= window_ms)
+                it = map.erase(it);
+            else
+                ++it;
+        }
+    };
+    prune(login_failures_, login_lockout_ms_);
+    prune(login_account_failures_, login_lockout_ms_);
+    prune(login_ip_failures_, login_ip_window_ms_);
+
+    const auto count_of = [](const auto& map, const std::string& key) {
+        const auto it = map.find(key);
+        return it == map.end() ? 0 : it->second.first;
+    };
+
+    if (count_of(login_failures_, pair_key) >= max_failures)
+        return ThrottleDenial{"too many failed login attempts; try again later", "900"};
+    // SEC-12: throttle by source IP across all usernames so a
+    // single host cannot spray many accounts (or lock them out).
+    if (count_of(login_ip_failures_, remote) >= max_ip_failures)
+        return ThrottleDenial{"too many login attempts from this address; try again later", "60"};
+    if (count_of(login_account_failures_, username) >= max_account_failures)
+        return ThrottleDenial{"too many failed login attempts; try again later", "900"};
+
+    // Reserve this attempt; the guard gives the slot back unless the
+    // attempt ends as a genuine credential failure.
+    const auto reserve = [now](auto& map, const std::string& key) {
+        auto& [count, window_start] = map[key];
+        if (count == 0)
+            window_start = now;
+        ++count;
+        return window_start;
+    };
+    const auto pair_window = reserve(login_failures_, pair_key);
+    const auto account_window = reserve(login_account_failures_, username);
+    const auto ip_window = reserve(login_ip_failures_, remote);
+    reservation.arm(pair_window, account_window, ip_window);
+    return std::nullopt;
 }
 
 void ApiServer::drain_commands(std::vector<PendingCommand>& out)
@@ -791,6 +1148,9 @@ std::optional<SessionRecord> ApiServer::current_session(const httplib::Request& 
     auto token = cookie_value(req, "tw_session");
     if (token.empty())
         return std::nullopt;
+    purge_expired_sessions_if_due(now_ms());
+    // Read the clock again: the purge may have waited (for another writer or
+    // the store's lock), and a session that expired meanwhile must be refused.
     return store_.get_session(token, now_ms());
 }
 
@@ -925,8 +1285,28 @@ void ApiServer::setup_routes()
         res.status = 204;
         apply_browser_origin_headers(req, res);
     });
-    http_->set_post_routing_handler([](const httplib::Request& req, httplib::Response& res) {
+    http_->set_post_routing_handler([this](const httplib::Request& req, httplib::Response& res) {
         apply_browser_origin_headers(req, res);
+        // Issue #70: every 403 is an authorization failure. Handling it here
+        // covers all routes without touching each handler.
+        if (res.has_header(audited_header))
+        {
+            res.headers.erase(audited_header); // internal marker, never sent
+        }
+        else if (res.status == 403)
+        {
+            std::string user = "-";
+            try
+            {
+                if (const auto session = current_session(req))
+                    user = session->username;
+            }
+            catch (const std::exception&)
+            {
+                // The audit line still records the denial with an unknown user.
+            }
+            audit("permission_denied", "denied", user, client_ip(req), req.method + " " + req.path);
+        }
     });
 
     http_->Post("/api/login", [this](const httplib::Request& req, httplib::Response& res) {
@@ -945,11 +1325,14 @@ void ApiServer::setup_routes()
             const auto password = body.at("password").get<std::string>();
 
             // M-2: Reject absurdly long credentials before hashing.
-            if (username.size() > 64 || password.size() > 256)
+            // A NUL byte would pass the throttle as its own key but be cut off
+            // where the store binds the name as a C string, so the same account
+            // would be guessed under fresh keys. Refuse it like any bad name.
+            if (username.size() > 64 || password.size() > 256 || username.find('\0') != std::string::npos)
             {
                 res.status = 400;
                 set_json(res, json{
-                                  {"error", "username or password too long"}
+                                  {"error", "username or password invalid"}
                 });
                 return;
             }
@@ -965,96 +1348,51 @@ void ApiServer::setup_routes()
             // The client IP honours X-Forwarded-For / X-Real-IP only from
             // trusted proxies (see client_ip). Expired entries are pruned so
             // all maps stay bounded.
-            constexpr int max_failures = 5;
-            constexpr int max_ip_failures = 10;
-            constexpr int max_account_failures = 50;
-            const auto now = now_ms();
+            //
+            // Issue #154: the limit check and the failure count happen in ONE
+            // critical section. Each admitted attempt is counted up front (a
+            // reservation) and the counters are released again on success, so
+            // concurrent requests cannot all slip past the check while the
+            // slow password hash runs.
+            const auto now = login_clock_ ? login_clock_() : now_ms();
             const std::string remote = client_ip(req);
             const std::string pair_key = remote + "|" + username;
+            purge_expired_sessions_if_due(now);
+            LoginReservation reservation(*this, pair_key, username, remote);
+            if (const auto denial = reserve_login_attempt(reservation, pair_key, username, remote, now))
             {
-                std::lock_guard<std::mutex> lk(login_mutex_);
-
-                // Prune expired windows: an entry whose window has elapsed
-                // is removed, which also implements the fixed-window reset.
-                const auto prune = [now](auto& map, int64_t window_ms) {
-                    for (auto it = map.begin(); it != map.end();)
-                    {
-                        if (now - it->second.second >= window_ms)
-                            it = map.erase(it);
-                        else
-                            ++it;
-                    }
-                };
-                prune(login_failures_, login_lockout_ms_);
-                prune(login_account_failures_, login_lockout_ms_);
-                prune(login_ip_failures_, login_ip_window_ms_);
-
-                const auto pair_it = login_failures_.find(pair_key);
-                if (pair_it != login_failures_.end() && pair_it->second.first >= max_failures)
-                {
-                    LOGF_WARNING("Login locked out for repeated failures from %s", remote.c_str());
-                    res.status = 429;
-                    res.set_header("Retry-After", "900");
-                    set_json(res, json{
-                                      {"error", "too many failed login attempts; try again later"}
-                    });
-                    return;
-                }
-
-                // SEC-12: throttle by source IP across all usernames so a
-                // single host cannot spray many accounts (or lock them out).
-                const auto ip_it = login_ip_failures_.find(remote);
-                if (ip_it != login_ip_failures_.end() && ip_it->second.first >= max_ip_failures)
-                {
-                    LOGF_WARNING("Login throttled for source address %s", remote.c_str());
-                    res.status = 429;
-                    res.set_header("Retry-After", "60");
-                    set_json(res, json{
-                                      {"error", "too many login attempts from this address; try again later"}
-                    });
-                    return;
-                }
-
-                const auto acct_it = login_account_failures_.find(username);
-                if (acct_it != login_account_failures_.end() && acct_it->second.first >= max_account_failures)
-                {
-                    LOGF_WARNING("Account-wide login limit reached (last source %s)", remote.c_str());
-                    res.status = 429;
-                    res.set_header("Retry-After", "900");
-                    set_json(res, json{
-                                      {"error", "too many failed login attempts; try again later"}
-                    });
-                    return;
-                }
+                audit("login", "locked_out", username, remote);
+                res.status = 429;
+                res.set_header("Retry-After", denial->retry_after);
+                set_json(res, json{
+                                  {"error", denial->message}
+                });
+                return;
             }
 
+            if (after_reservation_hook_)
+                after_reservation_hook_(username);
+
+            // Issue #154: unknown and disabled users are verified against a
+            // dummy hash so every failure path pays for one Argon2 run and
+            // response time does not reveal which usernames exist.
             auto user = store_.get_user_by_username(username);
-            if (!user || user->disabled ||
-                crypto_pwhash_str_verify(user->password_hash.c_str(), password.c_str(), password.size()) != 0)
+            const bool usable = user && !user->disabled;
+            const char* hash = usable ? user->password_hash.c_str() : dummy_password_hash_.c_str();
+            const bool verified = crypto_pwhash_str_verify(hash, password.c_str(), password.size()) == 0;
+            if (!usable || !verified)
             {
-                {
-                    std::lock_guard<std::mutex> lk(login_mutex_);
-                    const auto record_failure = [now](auto& map, const std::string& key) {
-                        auto& [count, window_start] = map[key];
-                        if (count == 0)
-                            window_start = now;
-                        ++count;
-                    };
-                    record_failure(login_failures_, pair_key);
-                    record_failure(login_account_failures_, username);
-                    record_failure(login_ip_failures_, remote);
-                }
+                reservation.keep(); // a genuine credential failure stays counted
+                audit("login", "failure", username, remote);
                 res.status = 401;
                 set_json(res, json{
                                   {"error", "invalid credentials"}
                 });
                 return;
             }
-
-            {
-                std::lock_guard<std::mutex> lk(login_mutex_);
-                login_failures_.erase(pair_key);
-            }
+            // Correct password: give back only this attempt's slot, so other
+            // in-flight attempts keep theirs.
+            reservation.release();
 
             SessionRecord session;
             session.token = random_token();
@@ -1063,7 +1401,19 @@ void ApiServer::setup_routes()
             session.role = user->role;
             session.created_at = now;
             session.expires_at = now + (8LL * 60LL * 60LL * 1000LL);
-            store_.create_session(session);
+            // Created only if the hash that was just verified is still the
+            // user's current one, so a login that raced a password reset or a
+            // disable cannot outlive the revocation.
+            if (!store_.create_session_if_credentials_current(session, user->password_hash))
+            {
+                audit("login", "failure", username, remote);
+                res.status = 401;
+                set_json(res, json{
+                                  {"error", "invalid credentials"}
+                });
+                return;
+            }
+            audit("login", "success", user->username, remote);
             res.set_header("Set-Cookie", "tw_session=" + session.token +
                                              "; Path=/; HttpOnly; SameSite=Strict; Secure; Max-Age=28800");
             set_json(res, json{
@@ -1092,7 +1442,13 @@ void ApiServer::setup_routes()
 
         auto token = cookie_value(req, "tw_session");
         if (!token.empty())
+        {
+            const auto session = store_.get_session(token, now_ms());
             store_.delete_session(token);
+            // Recorded only once the session is really gone.
+            if (session)
+                audit("logout", "success", session->username, client_ip(req));
+        }
         res.set_header("Set-Cookie", "tw_session=; Path=/; HttpOnly; SameSite=Strict; Secure; Max-Age=0");
         set_json(res, json{
                           {"ok", true}
@@ -1223,6 +1579,8 @@ void ApiServer::setup_routes()
                 throw std::runtime_error("username and password are required");
             if (username.size() > 64)
                 throw std::runtime_error("username must be 64 characters or fewer");
+            if (username.find('\0') != std::string::npos)
+                throw std::runtime_error("username must not contain NUL bytes");
             if (password.size() > 256)
                 throw std::runtime_error("password must be 256 characters or fewer");
             if (!is_valid_role(role))
@@ -1248,6 +1606,7 @@ void ApiServer::setup_routes()
             store_.set_user_groups(user_id, group_ids);
             LOGF_INFO("Created user username=%s role=%s group_count=%zu", username.c_str(), role.c_str(),
                       group_ids.size());
+            audit("user_create", "success", session->username, client_ip(req), username);
             set_json(res, json{
                               {"user_id", user_id}
             });
@@ -1883,12 +2242,7 @@ void ApiServer::setup_routes()
                 throw std::runtime_error("interval_seconds must be greater than zero");
             LOGF_INFO("Setting collection interval id=%s interval_seconds=%d", id.c_str(), secs);
 
-            auto rec = store_.get_agent(id);
-            if (rec)
-            {
-                rec->collection_interval = secs;
-                store_.upsert_agent(*rec);
-            }
+            store_.set_agent_collection_interval(id, secs);
 
             SetIntervalArgs args{secs};
             CommandMessage cmd;
@@ -1937,12 +2291,7 @@ void ApiServer::setup_routes()
                 throw std::runtime_error("limit must be greater than zero");
             LOGF_INFO("Setting process limit id=%s limit=%d", id.c_str(), limit);
 
-            auto rec = store_.get_agent(id);
-            if (rec)
-            {
-                rec->process_limit = limit;
-                store_.upsert_agent(*rec);
-            }
+            store_.set_agent_process_limit(id, limit);
 
             SetProcessLimitArgs args{limit};
             CommandMessage cmd;
@@ -2060,10 +2409,11 @@ void ApiServer::setup_routes()
                 return;
             }
 
-            rec->collection_interval = interval;
-            rec->heartbeat_interval = heartbeat_interval;
-            rec->process_limit = process_limit;
-            rec->collector_config = config;
+            AgentConfigUpdate update;
+            update.collection_interval = interval;
+            update.heartbeat_interval = heartbeat_interval;
+            update.process_limit = process_limit;
+            update.collector_config = config;
             if (body.contains("runbook_markdown"))
             {
                 // Issue #147: reject, as POST /api/agents/:id/runbook does; a
@@ -2072,15 +2422,23 @@ void ApiServer::setup_routes()
                 auto markdown = body.at("runbook_markdown").get<std::string>();
                 if (markdown.size() > 65536)
                     throw std::runtime_error("runbook_markdown must be 65536 bytes or fewer");
-                rec->runbook_markdown = std::move(markdown);
+                update.runbook_markdown = std::move(markdown);
             }
-            store_.upsert_agent(*rec);
-            store_.set_agent_collector_config(id, config);
             if (body.contains("group_ids"))
             {
                 auto group_ids = body.at("group_ids").get<std::vector<int64_t>>();
                 if (is_global_role(session->role))
-                    store_.set_agent_groups(id, group_ids);
+                    update.group_ids = std::move(group_ids);
+            }
+            // One transaction: a failed group assignment must not leave the
+            // intervals, config and runbook half-saved (#72).
+            if (!store_.save_agent_configuration(id, update))
+            {
+                res.status = 404;
+                set_json(res, json{
+                                  {"error", "agent not found"}
+                });
+                return;
             }
             LOGF_INFO("Updated collector config id=%s interval=%d heartbeat_interval=%d process_limit=%d "
                       "disk_configs=%zu network_configs=%zu "
@@ -2611,7 +2969,7 @@ void ApiServer::setup_routes()
         try
         {
             const auto user_id = std::stoll(req.path_params.at("id"));
-            const auto affected = store_.disable_user(user_id);
+            const auto affected = store_.disable_user_and_revoke_sessions(user_id);
             if (affected == 0)
             {
                 // SEC-14: unknown id or the built_in guard refused the change;
@@ -2623,6 +2981,7 @@ void ApiServer::setup_routes()
                 return;
             }
             LOGF_INFO("Disabled user user_id=%lld", static_cast<long long>(user_id));
+            audit("user_disable", "success", session->username, client_ip(req), "user_id=" + std::to_string(user_id));
             set_json(res, json{
                               {"ok", true}
             });
@@ -2652,8 +3011,21 @@ void ApiServer::setup_routes()
         try
         {
             const auto user_id = std::stoll(req.path_params.at("id"));
-            store_.enable_user(user_id);
+            // Defence in depth: disabling already revoked the sessions, so drop
+            // any leftover only on a real disabled-to-enabled change, in the
+            // same transaction. A retried enable of an enabled user succeeds
+            // and must not sign out sessions created since.
+            const auto enabled = store_.enable_user_and_revoke_sessions(user_id);
+            if (!enabled)
+            {
+                res.status = 404;
+                set_json(res, json{
+                                  {"error", "user not found"}
+                });
+                return;
+            }
             LOGF_INFO("Enabled user user_id=%lld", static_cast<long long>(user_id));
+            audit("user_enable", "success", session->username, client_ip(req), "user_id=" + std::to_string(user_id));
             set_json(res, json{
                               {"ok", true}
             });
@@ -2694,6 +3066,10 @@ void ApiServer::setup_routes()
                 return;
             }
             LOGF_INFO("Deleted user user_id=%lld", static_cast<long long>(user_id));
+            // The sessions table cascades on user delete (FK in both stores), so no
+            // separate revocation is needed and a cleanup failure cannot turn a
+            // committed delete into an error response.
+            audit("user_delete", "success", session->username, client_ip(req), "user_id=" + std::to_string(user_id));
             set_json(res, json{
                               {"ok", true}
             });
@@ -2746,9 +3122,120 @@ void ApiServer::setup_routes()
                 throw std::runtime_error("password is required");
             if (password.size() > 256)
                 throw std::runtime_error("password must be 256 characters or fewer");
-            store_.update_user_password(user_id, hash_password(password));
+            const bool self_service = user_id == session->user_id;
+            // Issue #145: changing your own password, whatever your role,
+            // proves knowledge of the current one, so a stolen session cannot
+            // lock the owner out. An admin resetting someone else's needs
+            // none. Wrong guesses count against the login throttle under the
+            // keys login uses, so this route is no cheaper to brute-force than
+            // login. The slot is given back unless the guess was wrong.
+            const auto remote = client_ip(req);
+            const auto pair_key = remote + "|" + session->username;
+            LoginReservation reservation(*this, pair_key, session->username, remote);
+            if (self_service)
+            {
+                const auto current = body.find("current_password");
+                if (current == body.end() || !current->is_string())
+                    throw std::runtime_error("current_password is required");
+                const auto& current_password = current->get_ref<const std::string&>();
+                if (current_password.size() > 256)
+                    throw std::runtime_error("current_password must be 256 characters or fewer");
+                const auto now = login_clock_ ? login_clock_() : now_ms();
+                if (const auto denial = reserve_login_attempt(reservation, pair_key, session->username, remote, now))
+                {
+                    audit("password_change", "locked_out", session->username, remote, target_user->username);
+                    res.set_header(audited_header, "1");
+                    res.status = 429;
+                    res.set_header("Retry-After", denial->retry_after);
+                    set_json(res, json{
+                                      {"error", denial->message}
+                    });
+                    return;
+                }
+                if (crypto_pwhash_str_verify(target_user->password_hash.c_str(), current_password.c_str(),
+                                             current_password.size()) != 0)
+                {
+                    reservation.keep(); // a genuine credential failure stays counted
+                    audit("password_change", "failure", session->username, remote, target_user->username);
+                    // Already audited as a failed password change; the post-routing
+                    // hook must not add a permission_denied line for the same 403.
+                    res.set_header(audited_header, "1");
+                    res.status = 403;
+                    set_json(res, json{
+                                      {"error", "current password is incorrect"}
+                    });
+                    return;
+                }
+                reservation.release();
+            }
+            // Issue #145: a new password invalidates existing logins. On a
+            // self-service change the current session is kept (so the user
+            // is not logged out of the page that made the change); an admin
+            // reset of another account revokes all of that account's sessions.
+            // The store applies the new hash and the revocation atomically,
+            // so a failure cannot leave the new password set while old
+            // sessions stay valid.
+            const auto new_hash = hash_password(password);
+            std::optional<int> revoked;
+            if (self_service)
+            {
+                if (password_change_hook_)
+                    password_change_hook_(user_id);
+                // Applied only while the hash the current password was verified
+                // against is still the stored one, the user is still enabled
+                // and this request's session still exists. If an admin reset
+                // landed in between, the reset wins: 409 Conflict (the request
+                // is valid but clashes with the account's new state), nothing
+                // changed, no session revoked and no success audited. The user
+                // can retry with the new password the admin chose.
+                const auto outcome = store_.update_user_password_if_current_and_revoke_sessions(
+                    user_id, target_user->password_hash, new_hash, cookie_value(req, "tw_session"), now_ms);
+                if (outcome.status == PasswordChangeResult::Status::PasswordChanged)
+                {
+                    audit("password_change", "conflict", session->username, remote, target_user->username);
+                    res.status = 409;
+                    set_json(res,
+                             json{
+                                 {"error", "password was changed by someone else; sign in again with the new one"}
+                    });
+                    return;
+                }
+                // The account was disabled, or this session was revoked or
+                // signed out, after the session was checked: the request no
+                // longer speaks for a live session, so it is refused as
+                // unauthenticated (even if an enable followed) and nothing
+                // changes.
+                if (outcome.status == PasswordChangeResult::Status::SessionEnded)
+                {
+                    audit("password_change", "session_ended", session->username, remote, target_user->username);
+                    res.status = 401;
+                    set_json(res, json{
+                                      {"error", "session ended before the change was saved; sign in again"}
+                    });
+                    return;
+                }
+                if (outcome.status == PasswordChangeResult::Status::Changed)
+                    revoked = outcome.revoked;
+            }
+            else
+            {
+                revoked = store_.update_user_password_and_revoke_sessions(user_id, new_hash, std::string{});
+            }
+            // No value: the user was deleted after the lookup above, so
+            // nothing changed and nothing is audited as a success.
+            if (!revoked)
+            {
+                res.status = 404;
+                set_json(res, json{
+                                  {"error", "user not found"}
+                });
+                return;
+            }
             LOGF_INFO("Changed password for user_id=%lld by=%s", static_cast<long long>(user_id),
                       session->username.c_str());
+            audit("password_change", "success", session->username, client_ip(req), target_user->username);
+            if (*revoked > 0)
+                audit("session_revoke", "success", session->username, client_ip(req), target_user->username);
             set_json(res, json{
                               {"ok", true}
             });

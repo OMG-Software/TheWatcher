@@ -3,6 +3,7 @@
 #include "store_postgres.hpp"
 
 #include "common/SingleLog.hpp"
+#include "session_token.hpp"
 
 #include <nlohmann/json.hpp>
 
@@ -242,32 +243,26 @@ namespace
 // ── Construction ──────────────────────────────────────────────────────────────
 
 PostgresStore::PostgresStore(const std::string& dsn)
+    : conn_(dsn) // owns the handle from here on, so a throw below cannot leak it
 {
     LOG_FUNCTION_TRACE
+    LOGF_DEBUG("Opened PostgreSQL store dsn=%s", redact_dsn(dsn).c_str());
     if (sodium_init() < 0)
         throw std::runtime_error("libsodium initialization failed");
-    LOGF_DEBUG("Opening PostgreSQL store dsn=%s", redact_dsn(dsn).c_str());
-    conn_ = PQconnectdb(dsn.c_str());
-    if (!conn_ || PQstatus(conn_) != CONNECTION_OK)
-    {
-        const std::string msg = conn_ ? PQerrorMessage(conn_) : "out of memory";
-        if (conn_)
-            PQfinish(conn_);
-        conn_ = nullptr;
-        throw std::runtime_error("PostgreSQL connect failed: " + msg);
-    }
     init_schema();
+    migrate_session_tokens();
     bootstrap_defaults();
 }
 
 PostgresStore::~PostgresStore()
 {
     LOG_FUNCTION_TRACE
-    if (conn_)
-    {
-        PQfinish(conn_);
-        LOG_DEBUG("PostgreSQL store closed");
-    }
+    LOG_DEBUG("Closing PostgreSQL store");
+}
+
+int PostgresStore::backend_pid() const noexcept
+{
+    return PQbackendPID(conn_);
 }
 
 void PostgresStore::exec(const char* sql)
@@ -518,6 +513,32 @@ void PostgresStore::init_schema()
     )");
     add_column_if_missing("runbooks", "agent_id", "ALTER TABLE runbooks ADD COLUMN agent_id TEXT NOT NULL DEFAULT '';");
     add_column_if_missing("runbooks", "markdown", "ALTER TABLE runbooks ADD COLUMN markdown TEXT NOT NULL DEFAULT '';");
+}
+
+// Sessions now hold the SHA-256 of their token, so rows written by older
+// versions (raw tokens) can never match a lookup again. They are deleted once.
+// The marker insert and the delete share one transaction: the marker's
+// presence means "rows are hashed", so a later start never deletes again, and
+// a failure between the two statements rolls both back. Two servers starting
+// together are serialised by the marker's primary key: the second insert waits
+// for the first commit, then inserts nothing and deletes nothing.
+void PostgresStore::migrate_session_tokens()
+{
+    postgres::Transaction tx(conn_);
+    const char* params[] = {session_tokens_hashed_setting};
+    Res marker(PQexecParams(conn_, "INSERT INTO server_settings(key,value) VALUES($1,'1') ON CONFLICT DO NOTHING;", 1,
+                            nullptr, params, nullptr, nullptr, 0));
+    check_res(marker.r, "migrate_session_tokens marker");
+    const char* inserted = PQcmdTuples(marker.r);
+    if (inserted == nullptr || std::atoi(inserted) == 0)
+        return; // already migrated: nothing was written, the guard rolls back
+    Res del(PQexec(conn_, "DELETE FROM sessions;"));
+    check_res(del.r, "migrate_session_tokens delete");
+    const char* affected = PQcmdTuples(del.r);
+    const int cleared = affected != nullptr ? std::atoi(affected) : 0;
+    tx.commit();
+    if (cleared > 0)
+        LOGF_NOTICE("Session tokens are now stored hashed: cleared %d session(s), users sign in again once", cleared);
 }
 
 void PostgresStore::bootstrap_defaults()
@@ -784,6 +805,67 @@ void PostgresStore::set_agent_collector_config(const std::string& agent_id, cons
     check_res(res.r, "set_agent_collector_config");
 }
 
+void PostgresStore::touch_agent(const std::string& agent_id, int64_t last_seen_ms, bool connected)
+{
+    const auto p_ls = s(last_seen_ms);
+    const char* params[] = {p_ls.c_str(), connected ? "true" : "false", agent_id.c_str()};
+    Res res(PQexecParams(conn_, "UPDATE agents SET last_seen=$1,connected=$2::boolean WHERE agent_id=$3;", 3, nullptr,
+                         params, nullptr, nullptr, 0));
+    check_res(res.r, "touch_agent");
+}
+
+void PostgresStore::update_agent_int(const char* sql, const char* ctx, const std::string& agent_id, int value)
+{
+    const auto p_value = s(value);
+    const char* params[] = {p_value.c_str(), agent_id.c_str()};
+    Res res(PQexecParams(conn_, sql, 2, nullptr, params, nullptr, nullptr, 0));
+    check_res(res.r, ctx);
+}
+
+void PostgresStore::set_agent_collection_interval(const std::string& agent_id, int seconds)
+{
+    update_agent_int("UPDATE agents SET collection_interval=$1 WHERE agent_id=$2;", "set_agent_collection_interval",
+                     agent_id, seconds);
+}
+
+void PostgresStore::set_agent_heartbeat_interval(const std::string& agent_id, int seconds)
+{
+    update_agent_int("UPDATE agents SET heartbeat_interval=$1 WHERE agent_id=$2;", "set_agent_heartbeat_interval",
+                     agent_id, seconds);
+}
+
+void PostgresStore::set_agent_process_limit(const std::string& agent_id, int limit)
+{
+    update_agent_int("UPDATE agents SET process_limit=$1 WHERE agent_id=$2;", "set_agent_process_limit", agent_id,
+                     limit);
+}
+
+bool PostgresStore::save_agent_configuration(const std::string& agent_id, const AgentConfigUpdate& update)
+{
+    postgres::Transaction tx(conn_);
+    const auto p_ci = s(update.collection_interval);
+    const auto p_hi = s(update.heartbeat_interval);
+    const auto p_pl = s(update.process_limit);
+    const auto cfg_json = nlohmann::json(update.collector_config).dump();
+    // A null runbook parameter keeps the stored runbook.
+    const char* runbook = update.runbook_markdown ? update.runbook_markdown->c_str() : nullptr;
+    const char* params[] = {p_ci.c_str(), p_hi.c_str(), p_pl.c_str(), cfg_json.c_str(), runbook, agent_id.c_str()};
+    {
+        Res res(PQexecParams(conn_,
+                             "UPDATE agents SET collection_interval=$1,heartbeat_interval=$2,process_limit=$3,"
+                             "collector_config_json=$4,runbook_markdown=COALESCE($5::text,runbook_markdown) "
+                             "WHERE agent_id=$6;",
+                             6, nullptr, params, nullptr, nullptr, 0));
+        check_res(res.r, "save_agent_configuration");
+        if (std::string(PQcmdTuples(res.r)) == "0")
+            return false; // unknown agent: the guard rolls back the empty transaction
+    }
+    if (update.group_ids)
+        replace_agent_groups(agent_id, *update.group_ids);
+    tx.commit();
+    return true;
+}
+
 void PostgresStore::set_agent_description(const std::string& agent_id, const std::string& description)
 {
     const char* params[] = {description.c_str(), agent_id.c_str()};
@@ -835,8 +917,17 @@ std::vector<int64_t> PostgresStore::get_agent_groups(const std::string& agent_id
     return out;
 }
 
-void PostgresStore::set_agent_groups(const std::string& agent_id, const std::vector<int64_t>& group_ids)
+void PostgresStore::replace_agent_groups(const std::string& agent_id, const std::vector<int64_t>& group_ids)
 {
+    // Lock the parent row first. Without it two connections replacing an empty
+    // membership set both delete nothing, both insert, and the union survives.
+    // With it the second one waits for the first to commit, then deletes what
+    // the first inserted, so the result is always one of the requested sets.
+    // The caller holds the transaction that keeps the lock until commit.
+    const char* lock_params[] = {agent_id.c_str()};
+    Res lock(PQexecParams(conn_, "SELECT 1 FROM agents WHERE agent_id=$1 FOR UPDATE;", 1, nullptr, lock_params, nullptr,
+                          nullptr, 0));
+    check_res(lock.r, "set_agent_groups lock");
     const char* del_params[] = {agent_id.c_str()};
     Res del(PQexecParams(conn_, "DELETE FROM agent_groups WHERE agent_id=$1;", 1, nullptr, del_params, nullptr, nullptr,
                          0));
@@ -849,6 +940,15 @@ void PostgresStore::set_agent_groups(const std::string& agent_id, const std::vec
                              2, nullptr, params, nullptr, nullptr, 0));
         check_res(ins.r, "set_agent_groups insert");
     }
+}
+
+void PostgresStore::set_agent_groups(const std::string& agent_id, const std::vector<int64_t>& group_ids)
+{
+    // Atomic: a failed insert (for example an unknown group id) rolls the
+    // delete back, so the agent keeps its previous groups.
+    postgres::Transaction tx(conn_);
+    replace_agent_groups(agent_id, group_ids);
+    tx.commit();
 }
 
 // ── Users ─────────────────────────────────────────────────────────────────────
@@ -889,7 +989,13 @@ int64_t PostgresStore::create_user(const std::string& username, const std::strin
 
 void PostgresStore::set_user_groups(int64_t user_id, const std::vector<int64_t>& group_ids)
 {
+    postgres::Transaction tx(conn_); // atomic: see set_agent_groups
     const auto p_uid = s(user_id);
+    // Lock the parent row first, for the reason given in replace_agent_groups.
+    const char* lock_params[] = {p_uid.c_str()};
+    Res lock(PQexecParams(conn_, "SELECT 1 FROM users WHERE user_id=$1::bigint FOR UPDATE;", 1, nullptr, lock_params,
+                          nullptr, nullptr, 0));
+    check_res(lock.r, "set_user_groups lock");
     const char* del_params[] = {p_uid.c_str()};
     Res del(
         PQexecParams(conn_, "DELETE FROM user_groups WHERE user_id=$1;", 1, nullptr, del_params, nullptr, nullptr, 0));
@@ -902,6 +1008,7 @@ void PostgresStore::set_user_groups(int64_t user_id, const std::vector<int64_t>&
                              2, nullptr, params, nullptr, nullptr, 0));
         check_res(ins.r, "set_user_groups insert");
     }
+    tx.commit();
 }
 
 std::vector<int64_t> PostgresStore::get_user_groups(int64_t user_id)
@@ -932,13 +1039,15 @@ int PostgresStore::disable_user(int64_t user_id)
     return affected != nullptr ? std::atoi(affected) : 0;
 }
 
-void PostgresStore::enable_user(int64_t user_id)
+int PostgresStore::enable_user(int64_t user_id)
 {
     const auto p = s(user_id);
     const char* params[] = {p.c_str()};
     Res res(PQexecParams(conn_, "UPDATE users SET disabled=FALSE WHERE user_id=$1;", 1, nullptr, params, nullptr,
                          nullptr, 0));
     check_res(res.r, "enable_user");
+    const char* affected = PQcmdTuples(res.r);
+    return affected != nullptr ? std::atoi(affected) : 0; // 0: no such user
 }
 
 // Deletes a non-built-in user. Returns the affected row count, so 0 means an
@@ -968,10 +1077,11 @@ void PostgresStore::update_user_password(int64_t user_id, const std::string& pas
 
 void PostgresStore::create_session(const SessionRecord& session)
 {
+    const auto token_hash = hash_session_token(session.token);
     const auto p_uid = s(session.user_id);
     const auto p_cat = s(session.created_at);
     const auto p_eat = s(session.expires_at);
-    const char* params[] = {session.token.c_str(), p_uid.c_str(), p_cat.c_str(), p_eat.c_str()};
+    const char* params[] = {token_hash.c_str(), p_uid.c_str(), p_cat.c_str(), p_eat.c_str()};
     Res res(PQexecParams(
         conn_, "INSERT INTO sessions(token,user_id,created_at,expires_at) VALUES($1,$2,$3,$4) ON CONFLICT DO NOTHING;",
         4, nullptr, params, nullptr, nullptr, 0));
@@ -982,8 +1092,9 @@ void PostgresStore::create_session(const SessionRecord& session)
 // otherwise nullopt. Throws on SQL error.
 std::optional<SessionRecord> PostgresStore::get_session(const std::string& token, int64_t now_ms)
 {
+    const auto token_hash = hash_session_token(token);
     const auto p_now = s(now_ms);
-    const char* params[] = {token.c_str(), p_now.c_str()};
+    const char* params[] = {token_hash.c_str(), p_now.c_str()};
     Res res(PQexecParams(conn_, R"(
         SELECT s.token,s.user_id,u.username,u.role,s.created_at,s.expires_at
         FROM sessions s JOIN users u ON u.user_id=s.user_id
@@ -993,15 +1104,239 @@ std::optional<SessionRecord> PostgresStore::get_session(const std::string& token
     check_res(res.r, "get_session");
     if (PQntuples(res.r) == 0)
         return std::nullopt;
-    return SessionRecord{col(res.r, 0, 0), col_int64(res.r, 0, 1), col(res.r, 0, 2),
-                         col(res.r, 0, 3), col_int64(res.r, 0, 4), col_int64(res.r, 0, 5)};
+    // The row holds the hash; the caller's own token goes back out so that
+    // passing it to another store call hashes it only once.
+    return SessionRecord{token,
+                         col_int64(res.r, 0, 1),
+                         col(res.r, 0, 2),
+                         col(res.r, 0, 3),
+                         col_int64(res.r, 0, 4),
+                         col_int64(res.r, 0, 5)};
 }
 
 void PostgresStore::delete_session(const std::string& token)
 {
-    const char* params[] = {token.c_str()};
+    const auto token_hash = hash_session_token(token);
+    const char* params[] = {token_hash.c_str()};
     Res res(PQexecParams(conn_, "DELETE FROM sessions WHERE token=$1;", 1, nullptr, params, nullptr, nullptr, 0));
     check_res(res.r, "delete_session");
+}
+
+// Revokes all of a user's sessions except keep_token (empty keeps none).
+int PostgresStore::delete_sessions_for_user(int64_t user_id, const std::string& keep_token)
+{
+    const auto p_uid = s(user_id);
+    const auto kept_hash = hash_kept_session_token(keep_token);
+    const char* params[] = {p_uid.c_str(), kept_hash.c_str()};
+    Res res(PQexecParams(conn_, "DELETE FROM sessions WHERE user_id=$1 AND token<>$2;", 2, nullptr, params, nullptr,
+                         nullptr, 0));
+    check_res(res.r, "delete_sessions_for_user");
+    const char* affected = PQcmdTuples(res.r);
+    return affected != nullptr ? std::atoi(affected) : 0;
+}
+
+int PostgresStore::delete_expired_sessions(int64_t now_ms)
+{
+    const auto p_now = s(now_ms);
+    const char* params[] = {p_now.c_str()};
+    // SKIP LOCKED: an expired row that another transaction holds (a password
+    // change holds the caller's session FOR SHARE while it deletes the user's
+    // other sessions) is left for a later purge instead of waited for, so the
+    // purge can never hold some of a user's rows while waiting on another.
+    Res res(PQexecParams(conn_,
+                         "DELETE FROM sessions WHERE token IN "
+                         "(SELECT token FROM sessions WHERE expires_at<=$1::bigint FOR UPDATE SKIP LOCKED);",
+                         1, nullptr, params, nullptr, nullptr, 0));
+    check_res(res.r, "delete_expired_sessions");
+    const char* affected = PQcmdTuples(res.r);
+    return affected != nullptr ? std::atoi(affected) : 0;
+}
+
+bool PostgresStore::create_session_if_credentials_current(const SessionRecord& session,
+                                                          const std::string& password_hash)
+{
+    const auto token_hash = hash_session_token(session.token);
+    const auto p_uid = s(session.user_id);
+    const auto p_cat = s(session.created_at);
+    const auto p_eat = s(session.expires_at);
+    const char* params[] = {token_hash.c_str(), p_uid.c_str(), p_cat.c_str(), p_eat.c_str(), password_hash.c_str()};
+    // Under READ COMMITTED a plain INSERT ... SELECT reads users from the
+    // statement's snapshot without locking the row, so a reset or disable that
+    // commits (and deletes the user's sessions) in between would leave this
+    // new session behind. FOR SHARE locks the row first: it conflicts with the
+    // reset's UPDATE (FOR NO KEY UPDATE; FOR KEY SHARE would not), so a login
+    // that arrives during a change waits for it and then re-checks the updated
+    // row (and inserts nothing), while a login that wins commits before the
+    // change's UPDATE can proceed. The change then deletes the sessions in a
+    // later statement, with a fresh snapshot that sees this row.
+    Res res(PQexecParams(conn_,
+                         "WITH u AS (SELECT user_id FROM users "
+                         "WHERE user_id=$2::bigint AND password_hash=$5 AND disabled=FALSE FOR SHARE) "
+                         "INSERT INTO sessions(token,user_id,created_at,expires_at) "
+                         "SELECT $1::text,user_id,$3::bigint,$4::bigint FROM u "
+                         "ON CONFLICT DO NOTHING;",
+                         5, nullptr, params, nullptr, nullptr, 0));
+    check_res(res.r, "create_session_if_credentials_current");
+    const char* affected = PQcmdTuples(res.r);
+    return affected != nullptr && std::atoi(affected) > 0;
+}
+
+std::optional<int> PostgresStore::update_user_password_and_revoke_sessions(int64_t user_id,
+                                                                           const std::string& password_hash,
+                                                                           const std::string& keep_token)
+{
+    const auto p_uid = s(user_id);
+    // UPDATE first, then DELETE as a separate statement in the same
+    // transaction: the DELETE gets a new snapshot after the UPDATE holds the
+    // row lock, so it sees every session a concurrent login committed first.
+    postgres::Transaction tx(conn_);
+    const char* upd_params[] = {password_hash.c_str(), p_uid.c_str()};
+    Res upd(PQexecParams(conn_, "UPDATE users SET password_hash=$1 WHERE user_id=$2::bigint;", 2, nullptr, upd_params,
+                         nullptr, nullptr, 0));
+    check_res(upd.r, "update_user_password_and_revoke_sessions update");
+    const char* changed = PQcmdTuples(upd.r);
+    if (changed == nullptr || std::atoi(changed) == 0)
+    {
+        tx.commit();
+        return std::nullopt; // no such user
+    }
+    const auto kept_hash = hash_kept_session_token(keep_token);
+    const char* del_params[] = {p_uid.c_str(), kept_hash.c_str()};
+    Res del(PQexecParams(conn_, "DELETE FROM sessions WHERE user_id=$1::bigint AND token<>$2;", 2, nullptr, del_params,
+                         nullptr, nullptr, 0));
+    check_res(del.r, "update_user_password_and_revoke_sessions delete");
+    const char* affected = PQcmdTuples(del.r);
+    const int revoked = affected != nullptr ? std::atoi(affected) : 0;
+    tx.commit();
+    return revoked;
+}
+
+PasswordChangeResult PostgresStore::update_user_password_if_current_and_revoke_sessions(
+    int64_t user_id, const std::string& expected_hash, const std::string& new_hash, const std::string& caller_token,
+    const WallClock& clock)
+{
+    const auto p_uid = s(user_id);
+    // An empty caller_token hashes to "" and matches no session.
+    const auto caller_hash = hash_kept_session_token(caller_token);
+    postgres::Transaction tx(conn_);
+    // The statements below can wait for row locks, and time passes while they
+    // do, so expiry is judged on a fresh reading again before the commit.
+    const auto p_now = s(clock());
+    // Every condition is in the one statement. If an admin reset or a disable
+    // holds the row lock, this waits for it and re-evaluates the WHERE against
+    // the committed row (READ COMMITTED), so a changed hash or a disabled
+    // user updates nothing. A disable also deletes the caller's session, and a
+    // later enable does not bring it back, so the EXISTS still fails after a
+    // disable and enable that both committed before this statement started.
+    // A session is valid while expires_at > now, the same test get_session
+    // applies, so an expired session cannot finish a change either.
+    const char* upd_params[] = {new_hash.c_str(), p_uid.c_str(), expected_hash.c_str(), caller_hash.c_str(),
+                                p_now.c_str()};
+    Res upd(PQexecParams(conn_,
+                         "UPDATE users SET password_hash=$1 "
+                         "WHERE user_id=$2::bigint AND password_hash=$3 AND disabled=FALSE "
+                         "AND EXISTS (SELECT 1 FROM sessions "
+                         "WHERE sessions.token=$4 AND sessions.user_id=users.user_id "
+                         "AND sessions.expires_at>$5::bigint);",
+                         5, nullptr, upd_params, nullptr, nullptr, 0));
+    check_res(upd.r, "update_user_password_if_current update");
+    const char* changed = PQcmdTuples(upd.r);
+    if (changed == nullptr || std::atoi(changed) == 0)
+    {
+        // Nothing written; the guard rolls back. A changed hash is reported
+        // before an ended session, because an admin reset also revokes the
+        // caller's session and the conflict is the more useful answer.
+        const char* stored_params[] = {p_uid.c_str()};
+        Res stored(PQexecParams(conn_, "SELECT password_hash FROM users WHERE user_id=$1::bigint;", 1, nullptr,
+                                stored_params, nullptr, nullptr, 0));
+        check_res(stored.r, "update_user_password_if_current stored hash");
+        if (PQntuples(stored.r) == 0)
+            return {PasswordChangeResult::Status::UserNotFound, 0};
+        if (expected_hash != PQgetvalue(stored.r, 0, 0))
+            return {PasswordChangeResult::Status::PasswordChanged, 0};
+        return {PasswordChangeResult::Status::SessionEnded, 0};
+    }
+    // The EXISTS above reads the caller's session without locking it, so a
+    // sign-out on another node could delete that row and commit before this
+    // transaction does. Locking the row FOR SHARE closes that gap: a delete
+    // already in flight makes this wait, and READ COMMITTED re-checks the row
+    // once it commits, so a committed sign-out returns no row and the change
+    // is refused; a delete that starts later waits for this commit. The lock
+    // order is the users row (taken by the UPDATE) and then the sessions row,
+    // the same order a disable or an admin reset uses; a sign-out locks only
+    // the sessions row, and the expired-session purge skips locked rows. No
+    // pair of these can deadlock. The lock also keeps expires_at fixed, so it
+    // is read here and compared with the clock just before the commit.
+    const char* lock_params[] = {caller_hash.c_str(), p_uid.c_str()};
+    Res lock(PQexecParams(conn_, "SELECT expires_at FROM sessions WHERE token=$1 AND user_id=$2::bigint FOR SHARE;", 2,
+                          nullptr, lock_params, nullptr, nullptr, 0));
+    check_res(lock.r, "update_user_password_if_current lock session");
+    if (PQntuples(lock.r) == 0)
+        return {PasswordChangeResult::Status::SessionEnded, 0}; // the guard rolls back the UPDATE
+    const int64_t caller_expires_at = std::stoll(PQgetvalue(lock.r, 0, 0));
+    const char* del_params[] = {p_uid.c_str(), caller_hash.c_str()};
+    Res del(PQexecParams(conn_, "DELETE FROM sessions WHERE user_id=$1::bigint AND token<>$2;", 2, nullptr, del_params,
+                         nullptr, nullptr, 0));
+    check_res(del.r, "update_user_password_if_current delete");
+    // Final check, after every statement that could wait: the caller's
+    // session must still be valid now (expires_at > now, as get_session
+    // checks). Otherwise the guard rolls back the UPDATE and the DELETE.
+    if (caller_expires_at <= clock())
+        return {PasswordChangeResult::Status::SessionEnded, 0};
+    const char* affected = PQcmdTuples(del.r);
+    const int revoked = affected != nullptr ? std::atoi(affected) : 0;
+    tx.commit();
+    return {PasswordChangeResult::Status::Changed, revoked};
+}
+
+std::optional<int> PostgresStore::enable_user_and_revoke_sessions(int64_t user_id)
+{
+    const auto p_uid = s(user_id);
+    postgres::Transaction tx(conn_);
+    const char* params[] = {p_uid.c_str()};
+    // Only a disabled user changes, so a retried enable is not a transition.
+    Res upd(PQexecParams(conn_, "UPDATE users SET disabled=FALSE WHERE user_id=$1::bigint AND disabled=TRUE;", 1,
+                         nullptr, params, nullptr, nullptr, 0));
+    check_res(upd.r, "enable_user_and_revoke_sessions update");
+    const char* changed = PQcmdTuples(upd.r);
+    if (changed != nullptr && std::atoi(changed) > 0)
+    {
+        Res del(PQexecParams(conn_, "DELETE FROM sessions WHERE user_id=$1::bigint;", 1, nullptr, params, nullptr,
+                             nullptr, 0));
+        check_res(del.r, "enable_user_and_revoke_sessions delete");
+        const char* affected = PQcmdTuples(del.r);
+        const int revoked = affected != nullptr ? std::atoi(affected) : 0;
+        tx.commit();
+        return revoked;
+    }
+    Res exists(
+        PQexecParams(conn_, "SELECT 1 FROM users WHERE user_id=$1::bigint;", 1, nullptr, params, nullptr, nullptr, 0));
+    check_res(exists.r, "enable_user_and_revoke_sessions exists");
+    if (PQntuples(exists.r) == 0)
+        return std::nullopt;
+    return 0; // already enabled: success, nothing revoked, nothing written
+}
+
+int PostgresStore::disable_user_and_revoke_sessions(int64_t user_id)
+{
+    const auto p_uid = s(user_id);
+    // Same two-statement order as the password reset, for the same reason.
+    // The built-in admin is excluded exactly as in disable_user.
+    postgres::Transaction tx(conn_);
+    const char* params[] = {p_uid.c_str()};
+    Res upd(PQexecParams(conn_, "UPDATE users SET disabled=TRUE WHERE user_id=$1::bigint AND built_in=FALSE;", 1,
+                         nullptr, params, nullptr, nullptr, 0));
+    check_res(upd.r, "disable_user_and_revoke_sessions update");
+    const char* changed = PQcmdTuples(upd.r);
+    const int affected = changed != nullptr ? std::atoi(changed) : 0;
+    if (affected > 0)
+    {
+        Res del(PQexecParams(conn_, "DELETE FROM sessions WHERE user_id=$1::bigint;", 1, nullptr, params, nullptr,
+                             nullptr, 0));
+        check_res(del.r, "disable_user_and_revoke_sessions delete");
+    }
+    tx.commit();
+    return affected;
 }
 
 // ── Metrics ───────────────────────────────────────────────────────────────────
@@ -1277,6 +1612,52 @@ int64_t PostgresStore::insert_alert(const AlertRecord& alert)
     return col_int64(res.r, 0, 0);
 }
 
+bool PostgresStore::insert_heartbeat_alert_if_absent(const AlertRecord& alert)
+{
+    // READ COMMITTED lets two server nodes both see "no live alert" and both
+    // insert. A transaction-scoped advisory lock keyed on the agent serialises
+    // them: the second node waits, then its INSERT's fresh snapshot sees the
+    // first node's committed row. No unique index, so this also works on a
+    // database that already holds duplicates. (SQLite has a single writer, so
+    // its single statement is enough.)
+    postgres::Transaction tx(conn_);
+    {
+        const std::string lock_key = "thewatcher:heartbeat:" + alert.agent_id;
+        const char* lock_params[] = {lock_key.c_str()};
+        Res lock(PQexecParams(conn_, "SELECT pg_advisory_xact_lock(hashtext($1));", 1, nullptr, lock_params, nullptr,
+                              nullptr, 0));
+        check_res(lock.r, "insert_heartbeat_alert_if_absent lock");
+    }
+    const auto p_cat = s(alert.created_at);
+    const auto p_aat = s(alert.acknowledged_at);
+    const auto p_dat = s(alert.deleted_at);
+    const auto p_eat = s(alert.escalated_at);
+    const char* params[] = {alert.agent_id.c_str(),
+                            alert.old_status.c_str(),
+                            alert.new_status.c_str(),
+                            alert.message.c_str(),
+                            p_cat.c_str(),
+                            alert.acknowledged_by.c_str(),
+                            p_aat.c_str(),
+                            p_dat.c_str(),
+                            alert.note.c_str(),
+                            p_eat.c_str(),
+                            alert.runbook_url.c_str()};
+    Res res(PQexecParams(conn_, R"(
+        INSERT INTO alerts(agent_id,indicator,old_status,new_status,message,created_at,
+            acknowledged_by,acknowledged_at,deleted_at,note,escalated_at,runbook_url)
+        SELECT $1::text,'Heartbeat',$2,$3,$4,$5::bigint,$6,$7::bigint,$8::bigint,$9,$10::bigint,$11
+        WHERE NOT EXISTS (
+            SELECT 1 FROM alerts WHERE agent_id=$1::text AND indicator='Heartbeat' AND deleted_at=0
+        );
+    )",
+                         11, nullptr, params, nullptr, nullptr, 0));
+    check_res(res.r, "insert_heartbeat_alert_if_absent");
+    const bool inserted = std::string(PQcmdTuples(res.r)) != "0";
+    tx.commit();
+    return inserted;
+}
+
 namespace
 {
     constexpr const char* ALERT_SELECT =
@@ -1328,8 +1709,11 @@ void PostgresStore::acknowledge_alert(int64_t alert_id, const std::string& usern
 void PostgresStore::bulk_acknowledge_alerts(const std::vector<int64_t>& alert_ids, const std::string& username,
                                             int64_t acknowledged_at, const std::string& note)
 {
+    // All or nothing: a failure part-way must not leave half the alerts changed.
+    postgres::Transaction tx(conn_);
     for (const auto id : alert_ids)
         acknowledge_alert(id, username, acknowledged_at, note);
+    tx.commit();
 }
 
 void PostgresStore::soft_delete_alert(int64_t alert_id, int64_t deleted_at)
@@ -1344,8 +1728,10 @@ void PostgresStore::soft_delete_alert(int64_t alert_id, int64_t deleted_at)
 
 void PostgresStore::bulk_soft_delete_alerts(const std::vector<int64_t>& alert_ids, int64_t deleted_at)
 {
+    postgres::Transaction tx(conn_);
     for (const auto id : alert_ids)
         soft_delete_alert(id, deleted_at);
+    tx.commit();
 }
 
 void PostgresStore::clear_active_alerts_for_agent(const std::string& agent_id, int64_t cleared_at)

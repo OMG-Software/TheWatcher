@@ -9,7 +9,7 @@ not connect to agents.
 
 Current capabilities:
 
-- login/logout with SQLite-backed sessions (the session cookie is `Secure`, so
+- login/logout with database-backed sessions (the session cookie is `Secure`, so
   the dashboard must be served over HTTPS, or from `localhost`, for login to
   persist);
 - monitoring view of agent health and latest metrics;
@@ -217,6 +217,30 @@ type. Group admins can create users only inside their own groups and cannot
 assign global account types. Global and group operators have read-only user
 access.
 
+The Password button opens a change-password form. Every role sees it on its
+own row; only a global admin sees it on other users' rows, because the API
+refuses anyone else with 403. On your own account (any role, including a
+global admin) the form asks for the Current password as well as the New
+password, and Save stays disabled until both are filled in. The form stays open
+until the server accepts the change, and a refusal is shown inside the form
+with the server's reason. After a wrong current password (403) or a throttle
+(429, wait for the time it gives), the new password is kept and the current
+one is cleared so you can retry in the form. Two refusals mean your session is
+gone, and retrying in the form cannot work:
+- 401: your session ended (signed out, revoked, expired, or the account was
+  disabled) while the change was in flight. Sign in again before retrying.
+- 409: an admin reset your password first. A reset also signs out all of your
+  sessions, so sign in again with the password the admin set, then change it.
+Both fields are cleared on success or Cancel. While a change is saving, both
+fields are locked. Closing the form before the server answers is final: the
+answer is discarded, so a refusal does not reopen the form and a late answer
+never touches a form opened since. Closing does not cancel a request already
+sent, so the change may still have been applied. A global admin resetting
+another user's password is asked only for the new password.
+
+A self-service change keeps the session that made it and signs out your other
+sessions; a global admin's reset signs out all of that user's sessions.
+
 Account types:
 
 | Type | Scope |
@@ -283,6 +307,7 @@ The dashboard consumes:
 | `POST /api/groups` | Create a group. |
 | `GET /api/users` | List users and group memberships. |
 | `POST /api/users` | Create a user with hashed password, role, and group memberships. |
+| `PUT /api/users/:id/password` | Change a password. Own account (any role): body needs `password` and `current_password` (400 if missing, 403 if wrong, 429 when throttled). A global admin resetting another user sends only `password` (only a global admin may reset another user; 403 otherwise). A self-service change keeps the requesting session and revokes the account's others (409 if an admin reset landed first; 401 if the account was disabled or the requesting session ended or expired first, and nothing changes); an admin reset revokes all of the target's sessions. |
 | `GET /api/alerts` | List active, non-deleted alerts. |
 | `GET /api/alerts/unacknowledged` | List active unacknowledged alerts. |
 | `POST /api/alerts/:id/ack` | Acknowledge an alert. |

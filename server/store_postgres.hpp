@@ -2,6 +2,7 @@
 
 #ifdef HAVE_LIBPQ
 
+#include "postgres_raii.hpp"
 #include "store.hpp"
 
 #include <string>
@@ -17,6 +18,11 @@ public:
     explicit PostgresStore(const std::string& dsn);
     ~PostgresStore() override;
 
+    // Process ID of the server backend serving this store's connection
+    // (PQbackendPID). For diagnostics and for tests that must name exactly
+    // which backend is waiting on a lock (pg_blocking_pids). Not part of Store.
+    int backend_pid() const noexcept;
+
     void upsert_agent(const AgentRecord& rec) override;
     std::optional<AgentRecord> get_agent(const std::string& agent_id) override;
     std::vector<AgentRecord> list_agents() override;
@@ -31,6 +37,11 @@ public:
                                int64_t until_ms) override;
     void set_agent_thresholds(const AgentRecord& rec) override;
     void set_agent_collector_config(const std::string& agent_id, const CollectorConfig& config) override;
+    void touch_agent(const std::string& agent_id, int64_t last_seen_ms, bool connected) override;
+    void set_agent_collection_interval(const std::string& agent_id, int seconds) override;
+    void set_agent_heartbeat_interval(const std::string& agent_id, int seconds) override;
+    void set_agent_process_limit(const std::string& agent_id, int limit) override;
+    bool save_agent_configuration(const std::string& agent_id, const AgentConfigUpdate& update) override;
 
     std::vector<GroupRecord> list_groups() override;
     int64_t create_group(const std::string& name) override;
@@ -45,7 +56,7 @@ public:
     // SEC-14: built-in users are never changed. Returns the affected row
     // count, so 0 means an unknown id or a built-in user. Throws on SQL error.
     int disable_user(int64_t user_id) override;
-    void enable_user(int64_t user_id) override;
+    int enable_user(int64_t user_id) override;
     // SEC-14: built-in users are never deleted. Returns the affected row
     // count, so 0 means an unknown id or a built-in user. Throws on SQL error.
     int delete_user(int64_t user_id) override;
@@ -55,6 +66,18 @@ public:
     // otherwise nullopt. Throws on SQL error.
     std::optional<SessionRecord> get_session(const std::string& token, int64_t now_ms) override;
     void delete_session(const std::string& token) override;
+    int delete_sessions_for_user(int64_t user_id, const std::string& keep_token = "") override;
+    int delete_expired_sessions(int64_t now_ms) override;
+    bool create_session_if_credentials_current(const SessionRecord& session, const std::string& password_hash) override;
+    std::optional<int> update_user_password_and_revoke_sessions(int64_t user_id, const std::string& password_hash,
+                                                                const std::string& keep_token = "") override;
+    PasswordChangeResult update_user_password_if_current_and_revoke_sessions(int64_t user_id,
+                                                                             const std::string& expected_hash,
+                                                                             const std::string& new_hash,
+                                                                             const std::string& caller_token,
+                                                                             const WallClock& clock) override;
+    std::optional<int> enable_user_and_revoke_sessions(int64_t user_id) override;
+    int disable_user_and_revoke_sessions(int64_t user_id) override;
 
     void insert_metrics(const MetricsRow& row) override;
     std::vector<MetricsRow> get_metrics(const std::string& agent_id, int limit) override;
@@ -73,6 +96,7 @@ public:
                             int count) override;
     void clear_pending_status(const std::string& agent_id, const std::string& indicator) override;
     int64_t insert_alert(const AlertRecord& alert) override;
+    bool insert_heartbeat_alert_if_absent(const AlertRecord& alert) override;
     std::vector<AlertRecord> list_alerts(bool include_deleted) override;
     std::vector<AlertRecord> list_unacknowledged_alerts() override;
     void acknowledge_alert(int64_t alert_id, const std::string& username, int64_t acknowledged_at,
@@ -122,12 +146,21 @@ public:
 
 private:
     void exec(const char* sql);
+    // Group replacement without its own transaction, shared by set_agent_groups
+    // and save_agent_configuration.
+    void replace_agent_groups(const std::string& agent_id, const std::vector<int64_t>& group_ids);
+    // Runs one UPDATE agents SET <column>=$1 WHERE agent_id=$2 with an int value.
+    void update_agent_int(const char* sql, const char* ctx, const std::string& agent_id, int value);
     bool column_exists(const std::string& table, const std::string& column);
     void add_column_if_missing(const std::string& table, const std::string& column, const char* ddl);
     void init_schema();
+    // One-time upgrade: sessions are stored as token hashes now, so rows
+    // written by older versions (raw tokens) are deleted once. See
+    // session_tokens_hashed_setting.
+    void migrate_session_tokens();
     void bootstrap_defaults();
 
-    PGconn* conn_ = nullptr;
+    postgres::Connection conn_; // owned handle: closed even if the constructor throws
 };
 
 } // namespace thewatcher::server

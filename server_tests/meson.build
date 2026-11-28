@@ -12,7 +12,9 @@ store_test = executable(
   include_directories: root_inc,
   dependencies: [server_store_dep, catch2_dep, sqlite_dep, platform_deps],
 )
-test('store', store_test)
+# Every SqliteStore(":memory:") hashes the default admin password, so the
+# suite is slow under load; meson's 30s default timed out on busy machines.
+test('store', store_test, timeout: 120)
 
 status_engine_test = executable(
   'status_engine_test',
@@ -110,7 +112,8 @@ login_rate_limit_test = executable(
   include_directories: root_inc,
   dependencies: [server_dep, common_dep, catch2_dep, http_dep, cppzmq_dep, sqlite_dep, platform_deps],
 )
-test('login_rate_limit', login_rate_limit_test, is_parallel: false)
+# Argon2 verifications and real window expiries need more than the 30s default.
+test('login_rate_limit', login_rate_limit_test, timeout: 120, is_parallel: false)
 
 api_server_test = executable(
   'api_server_test',
@@ -150,3 +153,22 @@ if libpq_dep.found()
     env: ['THEWATCHER_POSTGRES_TEST_DSN=host=localhost dbname=thewatcher_test user=thewatcher_test password=thewatcher_test'],
   )
 endif
+
+auth_sessions_test = executable(
+  'auth_sessions_test',
+  ['auth_sessions_test.cpp'],
+  include_directories: root_inc,
+  dependencies: [server_dep, common_dep, catch2_dep, http_dep, cppzmq_dep, sqlite_dep, sodium_dep, platform_deps],
+)
+# Like login_rate_limit, these scenarios run real Argon2 hashes and
+# verifications through the HTTP API (about 17 s on a 16-core machine), which is
+# more than meson's 30s default allows on two-core CI runners and the FreeBSD VM.
+test('auth_sessions', auth_sessions_test, timeout: 120, is_parallel: false)
+
+store_concurrency_test = executable(
+  'store_concurrency_test',
+  ['store_concurrency_test.cpp'],
+  include_directories: root_inc,
+  dependencies: [server_store_dep, catch2_dep, sqlite_dep, platform_deps],
+)
+test('store_concurrency', store_concurrency_test)

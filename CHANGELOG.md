@@ -9,6 +9,55 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Security
 
+- Login throttling no longer lets a client-supplied or malformed
+  `X-Forwarded-For` / `X-Real-IP` choose or poison the throttle bucket.
+  `TRUSTED_PROXIES` now accepts CIDR ranges, `X-Real-IP` is preferred, all
+  `X-Forwarded-For` lines are read (any empty or invalid entry makes the header
+  malformed), and a malformed forwarded address gets
+  its own bucket instead of the proxy's address. This only holds if the
+  trusted proxy overwrites or strips any client-supplied `X-Real-IP` and
+  `X-Forwarded-For` (#153).
+- Unknown and disabled usernames are verified against a dummy Argon2 hash to
+  reduce timing-based username enumeration (not eliminate it), and the login rate
+  limit check and failure count are one atomic step, so concurrent guesses
+  cannot exceed the limits (#154).
+- Sessions are revoked when a password changes (the caller's own session is
+  kept on a self-service change), and when a user is disabled or deleted;
+  expired sessions are purged periodically. New store methods
+  `delete_sessions_for_user` and `delete_expired_sessions` (SQLite and
+  PostgreSQL) (#145).
+- Authentication and authorization events are audit logged as `AUDIT` lines
+  at NOTICE: login success/failure/lockout, logout, every 403, user
+  create/disable/enable/delete, password change and session revocation (#70).
+- Hardened the new login and session code after review: a successful login
+  releases only its own throttle slot, an empty forwarded header and the
+  wrong address family no longer fall back to the proxy address or trust
+  the wrong peers, a login that verified an old password cannot create a
+  session after a reset or disable, the password change and session
+  revocation are atomic, and the dummy hash is generated randomly at startup.
+  New store methods `create_session_if_credentials_current` and
+  `update_user_password_and_revoke_sessions` (#145, #153, #154).
+- Login throttle follow-ups: an attempt that outlives its throttle window no
+  longer decrements a newer window's slot (reservations remember the window
+  they were counted in), and an empty first `X-Forwarded-For` header line is
+  malformed instead of being skipped when the lines are joined (#153, #154).
+- Review follow-ups on user and session handling: disabling a user and
+  revoking their sessions is now one atomic store operation
+  (`disable_user_and_revoke_sessions`), enabling an unknown user id returns
+  404, the logout audit line is written only after the session is deleted, an
+  invalid entry anywhere in `X-Forwarded-For` makes the header malformed, and
+  the expired-session purge rechecks that it is still due and advances its
+  clock only on success (#145, #153, #70).
+- Enabling a user now relies on a single UPDATE that reports the rows it
+  changed (`enable_user` returns a count), so enabling an id deleted a moment
+  earlier returns 404 instead of success (#145).
+- On PostgreSQL a login now locks the user row (`FOR SHARE`) before inserting
+  its session, and the password reset and disable run UPDATE then DELETE as
+  two statements in one transaction, so a login racing a reset or disable
+  can no longer leave a session behind. A password change for a user deleted
+  mid-request now returns 404 instead of being audited as a success
+  (`update_user_password_and_revoke_sessions` returns no value for an unknown
+  user) (#145).
 - The agent no longer trusts the server key in an enrollment reply: it must
   be 40 Z85 characters decoding to a 32-byte key, and the config writer
   refuses any value containing CR or LF. Before, a crafted key could inject
@@ -50,6 +99,100 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - The browser Origin check accepts the loopback exception only for real
   `127.0.0.0/8` addresses; DNS names such as `127.attacker.example` no
   longer match (#164).
+- Changing your own password now requires `current_password` in the
+  `PUT /api/users/:id/password` body, for every role including a global
+  admin. A missing or non-string value is 400; a wrong value is 403 and
+  changes nothing. A global admin resetting another user's password needs no
+  current password. Wrong guesses count against the login throttle under the
+  login keys, so a stolen session cannot brute-force the password, and are
+  audited as `password_change` `failure` (or `locked_out`, 429). The dashboard
+  asks for the current password only on your own account, and now shows the
+  server's reason when a change is refused (#145).
+- Review follow-ups on the password change and sessions (#145): a username
+  containing a NUL byte is rejected at login and user creation (it bypassed the
+  login throttle keys); a self-service password change is applied only if the
+  stored hash is still the one that was verified, in one transaction with the
+  revocation, and an admin reset that landed first makes it fail with 409 (new
+  Store method `update_user_password_if_current_and_revoke_sessions`);
+  enabling a user revokes leftover sessions only on a real disabled-to-enabled
+  change and a repeated enable is harmless (new Store method
+  `enable_user_and_revoke_sessions`); a wrong current password is audited only
+  as `password_change` `failure`; expired sessions are also purged by the
+  server's periodic job; the SQLite session transactions use the RAII guard so a
+  failing ROLLBACK cannot mask the original error; on PostgreSQL
+  `set_agent_groups` and `set_user_groups` lock the parent row first, so two
+  concurrent replacements cannot leave the union of both sets. The dashboard
+  keeps the Change Password form open and shows the server's reason when a
+  change is refused, hides the Password button on other users' rows unless you
+  are a global admin, and stops waiting for an error body after two seconds.
+  The form's fields are locked while it saves, and an answer that arrives after
+  the form was closed (or replaced by a new one) is discarded instead of
+  reopening or overwriting it. The rolled-back-reset test now holds the reset
+  inside its store call with a SQLite write lock and sends a real
+  `/api/login` while it is held. A new test seam, `SynchronizedStore`'s lock
+  observer, reports when a call waits for the store's lock and when it takes
+  it, so the test proves rather than infers that the reset held the lock and
+  the login waited for it. It then checks that the login's session survives
+  the rollback. A new test checks that `make_store` always returns a
+  `SynchronizedStore`. `lock_for_call` holds the store's mutex only through a
+  `std::unique_lock` (a held lock is waited for by constructing a new one, not
+  by a bare `lock()` in a branch), and production takes the same path as tests
+  with the reports skipped. `store_concurrency` checks the observer's events
+  exactly: `Acquired` alone for an uncontended call, `Waiting` then `Acquired`
+  for a call that arrives while another holds the lock.
+  The PostgreSQL lock tests check that the fixture connection blocks the exact
+  backend under test (new `PostgresStore::backend_pid`), so an unrelated lock
+  wait no longer counts. The `auth_sessions` suite gets a 120-second test
+  timeout like `login_rate_limit`, because its real Argon2 work exceeded
+  meson's 30-second default on the Linux and FreeBSD CI runners.
+- A self-service password change is now also refused when the account was
+  disabled, or the session that sent it ended, between the current-password
+  check and the update: the one UPDATE also requires the user to be enabled
+  and the caller's session to exist. The answer is 401, nothing changes and
+  `password_change` `session_ended` is audited (new
+  `PasswordChangeResult::Status::SessionEnded`). Before, a disable followed by
+  an enable in that window let a session that had been revoked still set a new
+  password. The store method's token argument is now the required
+  `caller_token`, and it takes a `WallClock` (`std::function<int64_t()>`)
+  instead of a fixed time: the caller's session must also be unexpired
+  (`expires_at > now`, as `get_session` checks), judged when the change runs,
+  not when the request arrived: both stores read the clock once their
+  transaction has begun (SQLite then holds the write lock) and again after
+  their last statement, just before they commit, and refuse with 401 if the
+  session expired meanwhile. On PostgreSQL the change then locks the caller's
+  session row `FOR SHARE` before it revokes or commits, so a sign-out of that
+  session on another node either commits first, and the change is refused
+  with 401, or waits for the change to commit. The lock order (users row, then
+  sessions row) matches a disable and an admin reset, and a sign-out locks
+  only the sessions row, so they cannot deadlock.
+  The PostgreSQL expired-session purge now skips rows another transaction
+  holds (`FOR UPDATE SKIP LOCKED`) and leaves them to a later purge, so it
+  never waits behind a password change. A request's session lookup reads the
+  clock again after its purge, so a session that expired while the purge
+  waited is refused rather than accepted. The purge-spacing test waits for a
+  lock observer to see the purge reach the store instead of sleeping 200 ms.
+  Expired-session purges are now spaced five minutes from the
+  end of the previous successful purge on a monotonic clock, so a slow purge or
+  a wall-clock jump cannot make them run back to back or stop them.
+  PostgreSQL now always runs at READ COMMITTED: `postgres::Connection` sets it
+  as the session default after connecting and `postgres::Transaction` begins
+  with `BEGIN ISOLATION LEVEL READ COMMITTED`, so a stricter default from the
+  DSN, role or database cannot turn the store's lock-wait re-checks into
+  serialization errors (#145). The isolation test adds its server option
+  through libpq's own DSN parser, so it also works when
+  `THEWATCHER_POSTGRES_TEST_DSN` is a `postgresql://` URI. The parser's own
+  test makes its URI password at run time, so no credential is written in the
+  source.
+- Session tokens are stored as their SHA-256 (lowercase hex) instead of raw, so a
+  database copy or backup no longer contains usable logins. The stores hash
+  inside `create_session`, `get_session`, `delete_session`,
+  `delete_sessions_for_user` and `create_session_if_credentials_current`;
+  the `Store` interface is unchanged. **Upgrading signs everyone out once:**
+  on first start the server deletes every existing session and records that in
+  `server_settings` (key `session_tokens_hashed`), in the same transaction,
+  so it never runs again (SQLite and PostgreSQL). During a rolling upgrade of a
+  shared PostgreSQL database, a server still on the old version writes raw
+  tokens that the new version ignores until they expire (#145).
 
 ### Fixed
 
@@ -151,6 +294,38 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   unprivileged writers, and root-reserved blocks count as used (#158).
 - Encoding a frame with an empty payload no longer passes a null pointer to
   libcbor (undefined behaviour reported by UBSan on every heartbeat) (#162).
+- The store is now safe to share between threads. `make_store` returns the
+  backend wrapped in `SynchronizedStore`, which holds one mutex for every
+  call, so HTTP workers, the data-plane thread and the status engine no
+  longer interleave statements or transactions on the single SQLite or
+  PostgreSQL connection (#73).
+- Group assignments on PostgreSQL (`set_agent_groups`, `set_user_groups`) are
+  transactional: a failed insert, such as an unknown group id, no longer
+  leaves the agent or user with no groups. The configure-modal save
+  (`POST /api/agents/:id/collector_config`) is one transaction through the
+  new `save_agent_configuration`, so a failure saves nothing (#72).
+- SQLite reads no longer report a database error as "no rows": a locked or
+  failing database makes `get_session`, `is_silenced`,
+  `get_offline_unalerted_agent_ids` and the list calls throw instead of
+  returning an empty result (an active silence could be ignored). The
+  connection now waits up to 5 seconds for a competing lock (#78).
+- Bulk acknowledge and bulk delete of alerts run in one transaction on both
+  backends, and the dead-agent alert is created with an atomic
+  insert-if-absent (#79). On PostgreSQL this runs under a per-agent advisory
+  lock, so two server nodes cannot create duplicates once every node runs
+  0.9.0. A pre-0.9.0 node does not take the lock: during a rolling upgrade,
+  upgrade every node before running them concurrently, or accept that one
+  duplicate Heartbeat alert per agent is possible in that window.
+- A heartbeat or an API setting no longer rewrites the whole agent row from a
+  stale snapshot, which silently reverted a collector config, heartbeat
+  interval, runbook or maintenance change saved at the same moment. The data
+  plane and API now use narrow setters (`touch_agent`,
+  `set_agent_collection_interval`, `set_agent_heartbeat_interval`,
+  `set_agent_process_limit`); `upsert_agent` is for enrollment (#51).
+- The store owns its database handles with RAII (`sqlite::Connection`,
+  `postgres::Connection`), so a constructor that throws no longer leaks the
+  connection; prepared statements are movable and transactions use a guard
+  that rolls back without masking the original error (part of #100).
 - The Windows installer registers the server service with
   `TheWatcherServer.conf`, the file the server actually reads, instead of a
   non-existent `server.json`; the docs name the same file and

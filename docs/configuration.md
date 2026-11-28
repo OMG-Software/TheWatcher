@@ -44,12 +44,12 @@ Options:
 | `API_PORT` | `8080` | HTTP REST API port consumed by the dashboard. |
 | `DB_PATH` | `thewatcher.db` | SQLite database path when `DB_TYPE` is `sqlite`. Relative paths resolve beside the active server config file so server restarts from different working directories keep using the same database. |
 | `DB_TYPE` | `sqlite` | Storage backend: `sqlite` or `postgres`. `postgres` needs a server binary built with PostgreSQL support (see [Build Environment](build-environment.md)); a binary built without it stops at startup with `Unsupported db_type: postgres`. Any other value stops the server the same way. |
-| `POSTGRES_DSN` | empty | libpq connection string used when `DB_TYPE` is `postgres`, for example `host=db.example.com port=5432 dbname=thewatcher user=thewatcher password=... sslmode=require`. It usually holds a password, so keep the config file owner-only like `SERVER_SECRET_KEY`. Known issue: at debug log level the server currently writes the raw DSN, password included, to `TheWatcherServer.log` (`make_store`); do not enable debug logging against a production database, and restrict the log file like the config until this is fixed. Ignored when `DB_TYPE` is `sqlite`. |
+| `POSTGRES_DSN` | empty | libpq connection string used when `DB_TYPE` is `postgres`, for example `host=db.example.com port=5432 dbname=thewatcher user=thewatcher password=... sslmode=require`. It usually holds a password, so keep the config file owner-only like `SERVER_SECRET_KEY`. Known issue: at debug log level the server currently writes the raw DSN, password included, to `TheWatcherServer.log` (`make_store`); do not enable debug logging against a production database, and restrict the log file like the config until this is fixed. The server always runs its PostgreSQL work at READ COMMITTED: a `default_transaction_isolation` set in the DSN `options` or on the role or database is overridden for its connections. Ignored when `DB_TYPE` is `sqlite`. |
 | `OFFLINE_AFTER_SECONDS` | `60` | Default offline timeout. Approved connected agents are marked disconnected when `last_seen` is older than the effective timeout `max(base, 3 x the agent's heartbeat interval)`, where base is the `offline_after_seconds` runtime setting if saved in the dashboard, else this value. Set `0` or a negative value to disable automatic offline marking, unless a positive `offline_after_seconds` is saved in the dashboard, which then takes over. |
 | `SERVER_PUBLIC_KEY` | generated | Server CURVE public key. Approved enrollment responses include this key and its fingerprint so agents can learn and pin it. |
 | `SERVER_SECRET_KEY` | generated | Server CURVE secret key. Keep this private. |
 | `ENROLLMENT_TOKEN` | empty | Optional pre-shared token. When set, every enrollment request must carry a matching token (`ENROLLMENT_TOKEN` in the agent config), so arbitrary hosts cannot create pending-agent records. Leave empty for tokenless first-run enrollment. |
-| `TRUSTED_PROXIES` | empty | Comma-separated list of reverse-proxy addresses whose `X-Forwarded-For` / `X-Real-IP` headers the API trusts when attributing login attempts for throttling. Whitespace around entries is ignored and empty entries are skipped. Empty (the default) trusts no proxy, so those headers are ignored and the TCP peer address is used. Omitted from the saved file when empty. |
+| `TRUSTED_PROXIES` | empty | Comma-separated list of reverse-proxy addresses or CIDR ranges (for example `127.0.0.1,10.0.0.0/8,::1`) whose `X-Real-IP` / `X-Forwarded-For` headers the API trusts when attributing login attempts for throttling. Entries are parsed strictly; invalid entries are skipped with a warning. Empty (the default) trusts no proxy, so those headers are ignored and the TCP peer address is used. For a request from a trusted proxy, a single `X-Real-IP` value wins (your proxy must set or overwrite it, for example nginx `proxy_set_header X-Real-IP $remote_addr;`); otherwise all `X-Forwarded-For` lines are joined and read right to left, and the first address that is not itself a trusted proxy is the client. A trusted range only matches peers of its own address family. A forwarded header that is present but empty, contains an empty entry, or is not a valid IP address is counted in a separate `unknown-client` bucket, never against the proxy address, so one malformed request cannot lock out other users. Omitted from the saved file when empty. |
 
 If `server_public_key` is empty, the server does not enable CURVE on the data
 socket. The default generated config enables CURVE.
@@ -179,7 +179,13 @@ group: Admins
 ```
 
 Passwords are stored as libsodium password hashes, not plaintext. Sessions are
-stored in SQLite and returned to the browser as HTTP-only `tw_session` cookies.
+stored in the database (SQLite or PostgreSQL) as the SHA-256 of the session
+token, never the token itself, and the token is returned to the browser as an
+HTTP-only `tw_session` cookie. **Upgrading from a version that stored raw
+session tokens signs everyone out once:** the first start deletes the old
+sessions, and users sign in again. Changing your own password requires the
+current password (`current_password`); a global admin resetting another user's
+password does not.
 Unsafe authenticated API requests that include an `Origin` or `Referer` header
 must match the API scheme, host, and effective port, or come from a loopback
 dashboard origin talking to a loopback API. `X-Forwarded-Proto` is used when the

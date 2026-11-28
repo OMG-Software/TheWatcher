@@ -5,6 +5,15 @@ import { ActionButton } from '../components/ActionButton';
 import type { RunAction } from '../hooks/useRunAction';
 import type { GroupRecord, SessionInfo, UserRecord } from '../models';
 import { canManageGroups, canManageUsers, isGlobal } from '../permissions';
+import {
+  canChangePassword,
+  closedPasswordForm,
+  needsCurrentPassword,
+  openPasswordForm,
+  settlePasswordChange,
+  submitPasswordChange,
+  type PasswordFormState,
+} from '../passwordForm';
 import { accountTypeLabel } from '../uiLogic';
 
 export function UsersPage({
@@ -25,13 +34,14 @@ export function UsersPage({
   const [password, setPassword] = React.useState('');
   const [role, setRole] = React.useState<UserRecord['role']>('group_viewer');
   const [groupId, setGroupId] = React.useState<number>(groups[0]?.group_id ?? 0);
-  const [pwUserId, setPwUserId] = React.useState<number | null>(null);
-  const [pwValue, setPwValue] = React.useState('');
+  const [pwForm, setPwForm] = React.useState<PasswordFormState>(closedPasswordForm);
 
   const admin = canManageUsers(session.role);
   const globalAdmin = session.role === 'global_admin';
   const globalAccount = isGlobal(session.role);
   const currentUser = users.find((u) => u.username === session.username);
+  // Changing your own password (any role) must prove the current one; an admin reset of someone else does not.
+  const changingOwnPassword = needsCurrentPassword(pwForm, currentUser?.user_id);
 
   React.useEffect(() => {
     if (!globalAccount && groups.length > 0 && !groups.some((group) => group.group_id === groupId)) {
@@ -41,33 +51,55 @@ export function UsersPage({
 
   return (
     <main className="table-wrap management-wrap">
-      {pwUserId !== null ? (
-        <div className="modal-backdrop" onClick={() => setPwUserId(null)}>
+      {pwForm.userId !== null ? (
+        <div className="modal-backdrop" onClick={() => setPwForm(closedPasswordForm)}>
           <div className="modal-panel" onClick={(e) => e.stopPropagation()}>
             <div className="modal-header">
               <h2>Change Password</h2>
-              <button className="icon-button" onClick={() => setPwUserId(null)}><X size={14} /></button>
+              <button className="icon-button" onClick={() => setPwForm(closedPasswordForm)}><X size={14} /></button>
             </div>
+            {changingOwnPassword ? (
+              <label>
+                Current password
+                <input
+                  type="password"
+                  autoComplete="current-password"
+                  autoFocus
+                  disabled={pwForm.saving}
+                  value={pwForm.current}
+                  onChange={(e) => setPwForm({ ...pwForm, current: e.target.value })}
+                />
+              </label>
+            ) : null}
             <label>
               New password
               <input
                 type="password"
-                autoFocus
-                value={pwValue}
-                onChange={(e) => setPwValue(e.target.value)}
+                autoComplete="new-password"
+                autoFocus={!changingOwnPassword}
+                // Locked while saving: the answer replaces the form with the one that was sent.
+                disabled={pwForm.saving}
+                value={pwForm.value}
+                onChange={(e) => setPwForm({ ...pwForm, value: e.target.value })}
               />
             </label>
+            {pwForm.error ? <p className="form-error" role="alert">{pwForm.error}</p> : null}
             <div className="button-row modal-actions">
-              <button className="text-button secondary" onClick={() => setPwUserId(null)}>Cancel</button>
+              <button className="text-button secondary" onClick={() => setPwForm(closedPasswordForm)}>Cancel</button>
               <button
                 className="text-button"
-                disabled={!pwValue}
+                disabled={pwForm.saving || !pwForm.value || (changingOwnPassword && !pwForm.current)}
                 onClick={() => {
-                  const id = pwUserId;
-                  const pw = pwValue;
-                  setPwUserId(null);
-                  setPwValue('');
-                  void runAction(`user:${id}:pw`, () => changeUserPassword(id, pw));
+                  const id = pwForm.userId;
+                  if (id === null) return;
+                  const sent = { ...pwForm, error: null, saving: true };
+                  const current = changingOwnPassword ? sent.current : undefined;
+                  setPwForm(sent);
+                  // The modal stays open until the server accepts the change; a refusal is shown inside it. The answer is
+                  // applied only if this opening is still shown, so dismissing the modal meanwhile is final.
+                  void submitPasswordChange(sent, () => changeUserPassword(id, sent.value, current)).then((result) =>
+                    setPwForm((shown) => settlePasswordChange(shown, sent, result)),
+                  );
                 }}
               >
                 Save
@@ -123,7 +155,7 @@ export function UsersPage({
         <table className="management-table">
           <thead><tr><th>User</th><th>Type</th><th>Groups</th><th>State</th><th>Actions</th></tr></thead>
           <tbody>{users.map((user) => {
-            const canChangePw = admin || currentUser?.user_id === user.user_id;
+            const canChangePw = canChangePassword(session.role, currentUser?.user_id, user.user_id);
             return (
               <tr key={user.user_id} className={user.disabled ? 'row-archived' : ''}>
                 <td>{user.username}</td>
@@ -137,7 +169,7 @@ export function UsersPage({
                         busy={busyAction === `user:${user.user_id}:pw`}
                         icon={<SlidersHorizontal size={14} />}
                         label="Password"
-                        onClick={() => { setPwUserId(user.user_id); setPwValue(''); }}
+                        onClick={() => setPwForm(openPasswordForm(user.user_id))}
                       />
                     ) : null}
                     {globalAdmin && !user.built_in ? (

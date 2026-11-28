@@ -1283,6 +1283,13 @@ td {
   font-size: 10px;
 }
 
+.modal-panel .form-error {
+  margin: 0;
+  padding: 0 16px 14px;
+  color: var(--red);
+  font-size: 11px;
+}
+
 .modal-panel .checkbox-label {
   padding: 0 16px 14px;
   font-size: 11px;
