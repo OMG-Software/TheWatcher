@@ -3,7 +3,7 @@
 #include "common/SingleLog.hpp"
 #include "common/metrics.hpp"
 #include "common/protocol.hpp"
-#include "webhook_security.hpp"
+#include "setting_parse.hpp"
 
 #include <nlohmann/json.hpp>
 
@@ -11,8 +11,6 @@
 #include <cmath>
 #include <stdexcept>
 #include <vector>
-
-#include <httplib.h>
 
 namespace thewatcher::server
 {
@@ -66,46 +64,6 @@ namespace
     {
         return network.interface_name != "lo";
     }
-
-    void send_webhook(Store& store, const AlertRecord& alert, int64_t alert_id)
-    {
-        const auto webhook_url = store.get_setting("notifications.webhook_url", "");
-        if (webhook_url.empty())
-            return;
-
-        const auto target = parse_webhook_url(webhook_url);
-        if (!target)
-        {
-            LOGF_WARNING("Skipping unsupported webhook URL: %s", webhook_url.c_str());
-            return;
-        }
-
-        json payload = {
-            {"alert_id",    alert_id         },
-            {"agent_id",    alert.agent_id   },
-            {"indicator",   alert.indicator  },
-            {"old_status",  alert.old_status },
-            {"new_status",  alert.new_status },
-            {"message",     alert.message    },
-            {"created_at",  alert.created_at },
-            {"runbook_url", alert.runbook_url},
-        };
-
-        httplib::Client client(target->host, target->port);
-        client.set_connection_timeout(2, 0);
-        client.set_read_timeout(2, 0);
-        // Invalid UTF-8 from an agent (#56) must not throw out of evaluation.
-        auto response =
-            client.Post(target->path, payload.dump(-1, ' ', false, json::error_handler_t::replace), "application/json");
-        if (!response)
-        {
-            LOGF_WARNING("Webhook notification failed alert_id=%lld url=%s", static_cast<long long>(alert_id),
-                         webhook_url.c_str());
-            return;
-        }
-        LOGF_DEBUG("Webhook notification sent alert_id=%lld status=%d", static_cast<long long>(alert_id),
-                   response->status);
-    }
 } // namespace
 
 std::string status_to_string(IndicatorStatus status)
@@ -152,6 +110,14 @@ bool is_worse_status(IndicatorStatus previous, IndicatorStatus current)
 
 StatusEngine::StatusEngine(Store& store)
     : store_(store)
+    , owned_pipeline_(std::make_unique<AlertPipeline>(store))
+    , pipeline_(*owned_pipeline_)
+{
+}
+
+StatusEngine::StatusEngine(Store& store, AlertPipeline& pipeline)
+    : store_(store)
+    , pipeline_(pipeline)
 {
 }
 
@@ -161,8 +127,8 @@ void StatusEngine::evaluate_metrics(const std::string& agent_id, const SystemMet
     if (timestamp_ms - last_prune_ms_ >= prune_interval_ms)
     {
         last_prune_ms_ = timestamp_ms;
-        const auto retention_days_str = store_.get_setting("metrics_retention_days", "30");
-        const int retention_days = std::max(1, std::stoi(retention_days_str));
+        const int retention_days = std::max(
+            1, parse_int_setting(store_.get_setting("metrics_retention_days", "30"), 30, "metrics_retention_days"));
         const int64_t cutoff_ms = timestamp_ms - static_cast<int64_t>(retention_days) * 86'400'000LL;
         store_.prune_metrics_before(cutoff_ms);
         LOGF_DEBUG("Pruned metrics older than %d days", retention_days);
@@ -514,29 +480,9 @@ void StatusEngine::record_transition(const std::string& agent_id, const std::str
 
     if (previous_row && is_worse_status(previous, next))
     {
-        if (store_.is_silenced(agent_id, indicator, timestamp_ms))
-        {
-            LOGF_DEBUG("Alert suppressed by silence rule agent_id=%s indicator=%s", agent_id.c_str(),
-                       indicator.c_str());
-        }
-        else
-        {
-            AlertRecord alert;
-            alert.agent_id = agent_id;
-            alert.indicator = indicator;
-            alert.old_status = status_to_string(previous);
-            alert.new_status = status_to_string(next);
-            alert.message = final_message;
-            alert.created_at = timestamp_ms;
-            const auto runbook = store_.get_runbook(agent_id, indicator, alert.new_status);
-            if (runbook)
-                alert.runbook_url = runbook->url;
-            const auto alert_id = store_.insert_alert(alert);
-            LOGF_WARNING("Generated alert id=%lld agent_id=%s indicator=%s old=%s new=%s",
-                         static_cast<long long>(alert_id), agent_id.c_str(), indicator.c_str(),
-                         alert.old_status.c_str(), alert.new_status.c_str());
-            send_webhook(store_, alert, alert_id);
-        }
+        // Maintenance, silences, runbook and webhook are applied by the pipeline.
+        pipeline_.raise({agent_id, indicator, status_to_string(previous), status_to_string(next), final_message,
+                         timestamp_ms, false});
     }
 }
 

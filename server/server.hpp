@@ -1,8 +1,11 @@
 #pragma once
 
+#include "alert_pipeline.hpp"
 #include "api.hpp"
 #include "common/protocol.hpp"
 #include "config.hpp"
+#include "notification_worker.hpp"
+#include "offline_alerts.hpp"
 #include "startup_signal.hpp"
 #include "store.hpp"
 #include "zap_handler.hpp"
@@ -10,8 +13,10 @@
 #include <atomic>
 #include <chrono>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 
 #include <zmq.hpp>
 
@@ -79,15 +84,28 @@ private:
     // a closed connection's routing id cannot be reused by another peer to
     // receive that agent's commands.
     void expire_routes();
+    // Rebuilds the API-visible set of agents that have a learned route.
+    void publish_reachable_agents();
+    // Thread-safe: true when agent_id has a learned route. Used by API threads.
+    bool has_route(const std::string& agent_id) const;
 
-    // Send a scheduled digest report if one is due.
+    // Queue the scheduled digest report if one is due, and record the outcome
+    // of earlier ones.
     void maybe_send_report(int64_t now_ms);
 
     ServerConfig config_;
     zmq::context_t ctx_{2}; // 2 IO threads
+    // Outbound webhooks and report digests run on this worker's own thread so
+    // a slow endpoint cannot stall the data plane (#48). Declared before the
+    // pipeline that uses it so it is destroyed after it.
+    NotificationWorker notifier_;
     std::unique_ptr<Store> store_;
     std::unique_ptr<ZapHandler> zap_;
     std::unique_ptr<ApiServer> api_;
+    // The one path every alert takes (#52), and the offline-agent alerts that
+    // use it (#156).
+    std::unique_ptr<AlertPipeline> alerts_;
+    std::unique_ptr<OfflineAlerts> offline_alerts_;
     // command_id -> dispatched command; evicted on matching ACK or TTL expiry
     std::unordered_map<std::string, DispatchedCommand> dispatched_commands_;
     // Issue #141: agent_id -> ROUTER routing id of the connection that last
@@ -102,6 +120,10 @@ private:
     };
     std::unordered_map<std::string, AgentRoute> agent_routes_;
     std::unordered_map<std::string, std::string> route_owners_;
+    // Copy of agent_routes_ keys for the API threads (the maps above belong to
+    // the server thread).
+    mutable std::mutex reachable_mutex_;
+    std::unordered_set<std::string> reachable_agents_;
     // agent_id -> last enrollment request time (ms); used for rate limiting
     std::unordered_map<std::string, int64_t> enrollment_last_request_ms_;
     // SEC-05: peer address -> last enrollment request time (ms); a second,
@@ -111,7 +133,11 @@ private:
     // Set by stop() and never cleared, so a stop that arrives before or during
     // startup is not lost.
     std::atomic<bool> stop_requested_{false};
-    int64_t last_report_ms_ = 0;
+    // Scheduled digest delivery state (#49). The last-sent time itself is
+    // persisted in the reports.last_sent_ms setting.
+    bool report_in_flight_ = false;
+    int report_failures_ = 0;
+    int64_t next_report_attempt_ms_ = 0;
 };
 
 } // namespace thewatcher::server
