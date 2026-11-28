@@ -1,3 +1,4 @@
+#include "../server/session_token.hpp"
 #include "../server/store_sqlite.hpp"
 #include "test_support/temp_dir.hpp"
 
@@ -5,6 +6,11 @@
 
 #include <algorithm>
 #include <filesystem>
+#include <memory>
+#include <string>
+#include <vector>
+
+#include <sqlite3.h>
 
 using namespace thewatcher;
 using namespace thewatcher::server;
@@ -2989,6 +2995,241 @@ SCENARIO("get_runbook never returns another agent's runbook")
         THEN("an alert on agent-b gets no runbook")
         {
             REQUIRE_FALSE(store.get_runbook("agent-b", "cpu", "red").has_value());
+        }
+    }
+}
+
+// ── Session tokens at rest (#145) ─────────────────────────────────────────────
+
+namespace
+{
+// Reads the sessions table through a second connection, so the test sees what
+// is really on disk rather than what the store hands back.
+std::vector<std::string> stored_session_tokens(const std::filesystem::path& path)
+{
+    sqlite3* raw = nullptr;
+    REQUIRE(sqlite3_open(path.string().c_str(), &raw) == SQLITE_OK);
+    const std::unique_ptr<sqlite3, decltype(&sqlite3_close)> db(raw, &sqlite3_close);
+    sqlite3_stmt* stmt = nullptr;
+    REQUIRE(sqlite3_prepare_v2(db.get(), "SELECT token FROM sessions ORDER BY token;", -1, &stmt, nullptr) ==
+            SQLITE_OK);
+    const std::unique_ptr<sqlite3_stmt, decltype(&sqlite3_finalize)> guard(stmt, &sqlite3_finalize);
+    std::vector<std::string> tokens;
+    while (sqlite3_step(stmt) == SQLITE_ROW)
+        tokens.emplace_back(reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0)));
+    return tokens;
+}
+
+void run_raw_sql(const std::filesystem::path& path, const std::string& sql)
+{
+    sqlite3* raw = nullptr;
+    REQUIRE(sqlite3_open(path.string().c_str(), &raw) == SQLITE_OK);
+    const std::unique_ptr<sqlite3, decltype(&sqlite3_close)> db(raw, &sqlite3_close);
+    REQUIRE(sqlite3_exec(db.get(), sql.c_str(), nullptr, nullptr, nullptr) == SQLITE_OK);
+}
+
+SessionRecord make_admin_session(const std::string& token, int64_t expires_at = 99999)
+{
+    SessionRecord session;
+    session.token = token;
+    session.user_id = 1; // the bootstrapped admin
+    session.created_at = 1000;
+    session.expires_at = expires_at;
+    return session;
+}
+} // namespace
+
+SCENARIO("hash_session_token returns the lowercase hex SHA-256 of a token")
+{
+    GIVEN("the well-known SHA-256 test vectors")
+    {
+        THEN("the helper reproduces them")
+        {
+            REQUIRE(hash_session_token("abc") == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+            REQUIRE(hash_session_token("") == "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+        }
+    }
+}
+
+SCENARIO("sessions are stored as SHA-256 hashes of their tokens")
+{
+    GIVEN("a file-backed store holding a session created with a raw token")
+    {
+        const auto path = unique_store_path("session-hash.db");
+        SqliteStore store(path.string());
+        store.create_session(make_admin_session("raw-token-one"));
+
+        THEN("the table holds the hex hash and no row equals the raw token")
+        {
+            const auto rows = stored_session_tokens(path);
+            REQUIRE(rows.size() == 1);
+            REQUIRE(rows[0] == hash_session_token("raw-token-one"));
+            REQUIRE(rows[0] != "raw-token-one");
+        }
+
+        WHEN("the session is looked up with the raw token")
+        {
+            const auto found = store.get_session("raw-token-one", 5000);
+
+            THEN("the record carries the raw token, so passing it back never hashes twice")
+            {
+                REQUIRE(found.has_value());
+                REQUIRE(found->token == "raw-token-one");
+                REQUIRE(store.get_session(found->token, 5000).has_value());
+            }
+        }
+
+        WHEN("the stored hash is presented as if it were a token")
+        {
+            THEN("it does not authenticate")
+            {
+                REQUIRE_FALSE(store.get_session(hash_session_token("raw-token-one"), 5000).has_value());
+            }
+        }
+
+        WHEN("the session is deleted by its raw token")
+        {
+            store.delete_session("raw-token-one");
+
+            THEN("it is gone")
+            {
+                REQUIRE_FALSE(store.get_session("raw-token-one", 5000).has_value());
+                REQUIRE(stored_session_tokens(path).empty());
+            }
+        }
+
+        WHEN("a second session is created and the user's sessions are revoked except the first")
+        {
+            store.create_session(make_admin_session("raw-token-two"));
+            const auto revoked = store.delete_sessions_for_user(1, "raw-token-one");
+
+            THEN("only the kept session survives")
+            {
+                REQUIRE(revoked == 1);
+                REQUIRE(store.get_session("raw-token-one", 5000).has_value());
+                REQUIRE_FALSE(store.get_session("raw-token-two", 5000).has_value());
+            }
+        }
+
+        WHEN("the user's sessions are revoked with no kept token")
+        {
+            store.create_session(make_admin_session("raw-token-two"));
+
+            THEN("every session goes")
+            {
+                REQUIRE(store.delete_sessions_for_user(1) == 2);
+                REQUIRE(stored_session_tokens(path).empty());
+            }
+        }
+
+        WHEN("a password change keeps the caller's raw token")
+        {
+            store.create_session(make_admin_session("raw-token-two"));
+            const auto revoked = store.update_user_password_and_revoke_sessions(1, "new-hash", "raw-token-two");
+
+            THEN("that session survives and the other is revoked")
+            {
+                REQUIRE(revoked.has_value());
+                REQUIRE(*revoked == 1);
+                REQUIRE(store.get_session("raw-token-two", 5000).has_value());
+                REQUIRE_FALSE(store.get_session("raw-token-one", 5000).has_value());
+            }
+        }
+
+        WHEN("an expired session is purged")
+        {
+            store.create_session(make_admin_session("raw-token-old", 2000));
+
+            THEN("only the expired row is removed")
+            {
+                REQUIRE(store.delete_expired_sessions(5000) == 1);
+                REQUIRE(stored_session_tokens(path) == std::vector<std::string>{hash_session_token("raw-token-one")});
+            }
+        }
+    }
+}
+
+SCENARIO("a session created after a credentials check is also stored hashed")
+{
+    GIVEN("a file-backed store and the admin's current password hash")
+    {
+        const auto path = unique_store_path("session-hash-login.db");
+        SqliteStore store(path.string());
+        const auto admin = store.get_user_by_username("thewatcher");
+        REQUIRE(admin.has_value());
+
+        WHEN("create_session_if_credentials_current succeeds")
+        {
+            REQUIRE(
+                store.create_session_if_credentials_current(make_admin_session("login-token"), admin->password_hash));
+
+            THEN("the table holds only the hash and the raw token still looks up")
+            {
+                REQUIRE(stored_session_tokens(path) == std::vector<std::string>{hash_session_token("login-token")});
+                const auto found = store.get_session("login-token", 5000);
+                REQUIRE(found.has_value());
+                REQUIRE(found->token == "login-token");
+            }
+        }
+    }
+}
+
+SCENARIO("upgrading clears sessions that were stored as raw tokens, exactly once")
+{
+    GIVEN("a database from before token hashing holding a raw-token session")
+    {
+        const auto path = unique_store_path("session-migrate.db");
+        {
+            SqliteStore first(path.string());
+        }
+        // A pre-upgrade database has the schema but no migration marker, and
+        // its session rows hold raw tokens. Dropping every setting removes the
+        // marker whatever it is called.
+        run_raw_sql(path, "DELETE FROM server_settings;"
+                          "INSERT INTO sessions(token,user_id,created_at,expires_at) "
+                          "VALUES('legacy-raw-token',1,1000,99999999999);");
+        REQUIRE(stored_session_tokens(path) == std::vector<std::string>{"legacy-raw-token"});
+
+        WHEN("the upgraded server opens it")
+        {
+            SqliteStore upgraded(path.string());
+
+            THEN("the old session is gone and its raw token no longer authenticates")
+            {
+                REQUIRE(stored_session_tokens(path).empty());
+                REQUIRE_FALSE(upgraded.get_session("legacy-raw-token", 5000).has_value());
+            }
+
+            AND_WHEN("a new session is created and the server is restarted")
+            {
+                upgraded.create_session(make_admin_session("fresh-token", 99999999999LL));
+                SqliteStore restarted(path.string());
+
+                THEN("the migration does not run again and the new session survives")
+                {
+                    REQUIRE(restarted.get_session("fresh-token", 5000).has_value());
+                    REQUIRE(stored_session_tokens(path) == std::vector<std::string>{hash_session_token("fresh-token")});
+                }
+            }
+        }
+    }
+
+    GIVEN("a brand new database")
+    {
+        const auto path = unique_store_path("session-migrate-new.db");
+
+        WHEN("it is opened, a session is made and it is opened again")
+        {
+            {
+                SqliteStore first(path.string());
+                first.create_session(make_admin_session("kept-token", 99999999999LL));
+            }
+            SqliteStore second(path.string());
+
+            THEN("the session is still there")
+            {
+                REQUIRE(second.get_session("kept-token", 5000).has_value());
+            }
         }
     }
 }

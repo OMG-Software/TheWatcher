@@ -1,5 +1,6 @@
 #ifdef HAVE_LIBPQ
 
+#include "../server/session_token.hpp"
 #include "../server/store_postgres.hpp"
 #include "../server/store_synchronized.hpp"
 
@@ -13,6 +14,7 @@
 #include <future>
 #include <memory>
 #include <optional>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -1217,6 +1219,221 @@ SCENARIO("[postgres] A password reset or disable revokes a session a login commi
         }
         login_tx.run("ROLLBACK");
         change_store.delete_user(user_id);
+    }
+}
+
+// ── Session tokens at rest (#145) ─────────────────────────────────────────────
+
+namespace
+{
+// Reads the user's session tokens straight from the table through a side
+// connection, so the test sees what is on disk rather than what the store
+// hands back.
+std::vector<std::string> stored_session_tokens(int64_t user_id)
+{
+    PgSideConnection side;
+    REQUIRE(PQstatus(side.conn) == CONNECTION_OK);
+    const auto sql = "SELECT token FROM sessions WHERE user_id=" + std::to_string(user_id) + " ORDER BY token";
+    PGresult* res = PQexec(side.conn, sql.c_str());
+    REQUIRE(PQresultStatus(res) == PGRES_TUPLES_OK);
+    std::vector<std::string> tokens;
+    for (int row = 0; row < PQntuples(res); ++row)
+        tokens.emplace_back(PQgetvalue(res, row, 0));
+    PQclear(res);
+    return tokens;
+}
+
+SessionRecord make_pg_session(int64_t user_id, const std::string& token, int64_t expires_at = 4'000'000'000'000LL)
+{
+    SessionRecord session;
+    session.token = token;
+    session.user_id = user_id;
+    session.created_at = 1;
+    session.expires_at = expires_at;
+    return session;
+}
+
+std::string unique_suffix()
+{
+    return std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
+}
+} // namespace
+
+SCENARIO("[postgres] Sessions are stored as SHA-256 hashes of their tokens")
+{
+    if (!postgres_is_available())
+        SKIP("PostgreSQL not available");
+    GIVEN("a user with a session created from a raw token")
+    {
+        PostgresStore store(test_dsn());
+        const auto suffix = unique_suffix();
+        const auto user_id = store.create_user("hash-" + suffix, "hash-of-password", "global_viewer");
+        const auto first = "raw-first-" + suffix;
+        const auto second = "raw-second-" + suffix;
+        store.create_session(make_pg_session(user_id, first));
+
+        THEN("the table holds the hex hash and no row equals the raw token")
+        {
+            const auto rows = stored_session_tokens(user_id);
+            REQUIRE(rows.size() == 1);
+            CHECK(rows[0] == hash_session_token(first));
+            CHECK(rows[0] != first);
+        }
+
+        WHEN("the session is looked up with the raw token")
+        {
+            const auto found = store.get_session(first, 5000);
+
+            THEN("the record carries the raw token, so passing it back never hashes twice")
+            {
+                REQUIRE(found.has_value());
+                CHECK(found->token == first);
+                CHECK(store.get_session(found->token, 5000).has_value());
+                CHECK_FALSE(store.get_session(hash_session_token(first), 5000).has_value());
+            }
+        }
+
+        WHEN("the session is deleted by its raw token")
+        {
+            store.delete_session(first);
+
+            THEN("it is gone")
+            {
+                CHECK_FALSE(store.get_session(first, 5000).has_value());
+                CHECK(stored_session_tokens(user_id).empty());
+            }
+        }
+
+        WHEN("the user's other sessions are revoked while keeping the first")
+        {
+            store.create_session(make_pg_session(user_id, second));
+            const auto revoked = store.delete_sessions_for_user(user_id, first);
+
+            THEN("only the kept session survives")
+            {
+                CHECK(revoked == 1);
+                CHECK(store.get_session(first, 5000).has_value());
+                CHECK_FALSE(store.get_session(second, 5000).has_value());
+            }
+        }
+
+        WHEN("a password change keeps the caller's raw token")
+        {
+            store.create_session(make_pg_session(user_id, second));
+            const auto revoked = store.update_user_password_and_revoke_sessions(user_id, "new-hash-" + suffix, second);
+
+            THEN("that session survives and the other is revoked")
+            {
+                REQUIRE(revoked.has_value());
+                CHECK(*revoked == 1);
+                CHECK(store.get_session(second, 5000).has_value());
+                CHECK_FALSE(store.get_session(first, 5000).has_value());
+            }
+        }
+
+        WHEN("every session of the user is revoked with no kept token")
+        {
+            store.create_session(make_pg_session(user_id, second));
+
+            THEN("none is left")
+            {
+                CHECK(store.delete_sessions_for_user(user_id) == 2);
+                CHECK(stored_session_tokens(user_id).empty());
+            }
+        }
+
+        WHEN("an expired session is purged")
+        {
+            store.create_session(make_pg_session(user_id, second, 2000));
+            store.delete_expired_sessions(5000);
+
+            THEN("only the expired row is removed")
+            {
+                CHECK(stored_session_tokens(user_id) == std::vector<std::string>{hash_session_token(first)});
+            }
+        }
+
+        store.delete_user(user_id);
+    }
+}
+
+SCENARIO("[postgres] A session created after a credentials check is also stored hashed")
+{
+    if (!postgres_is_available())
+        SKIP("PostgreSQL not available");
+    GIVEN("a user and the password hash a login just verified")
+    {
+        PostgresStore store(test_dsn());
+        const auto suffix = unique_suffix();
+        const auto password_hash = "login-hash-" + suffix;
+        const auto user_id = store.create_user("login-" + suffix, password_hash, "global_viewer");
+        const auto token = "login-token-" + suffix;
+
+        WHEN("create_session_if_credentials_current succeeds")
+        {
+            REQUIRE(store.create_session_if_credentials_current(make_pg_session(user_id, token), password_hash));
+
+            THEN("the table holds only the hash and the raw token still looks up")
+            {
+                CHECK(stored_session_tokens(user_id) == std::vector<std::string>{hash_session_token(token)});
+                const auto found = store.get_session(token, 5000);
+                REQUIRE(found.has_value());
+                CHECK(found->token == token);
+            }
+        }
+
+        store.delete_user(user_id);
+    }
+}
+
+SCENARIO("[postgres] Upgrading clears sessions stored as raw tokens, exactly once")
+{
+    if (!postgres_is_available())
+        SKIP("PostgreSQL not available");
+    GIVEN("a database from before token hashing holding a raw-token session")
+    {
+        const auto suffix = unique_suffix();
+        int64_t user_id = 0;
+        {
+            PostgresStore store(test_dsn());
+            user_id = store.create_user("migrate-" + suffix, "hash-of-password", "global_viewer");
+        }
+        // A pre-upgrade database has no migration marker and raw token rows.
+        {
+            PgSideConnection side;
+            REQUIRE(PQstatus(side.conn) == CONNECTION_OK);
+            side.run(std::string("DELETE FROM server_settings WHERE key='") + session_tokens_hashed_setting + "'");
+            side.run("INSERT INTO sessions(token,user_id,created_at,expires_at) VALUES('legacy-raw-" + suffix + "'," +
+                     std::to_string(user_id) + ",1,4000000000000)");
+        }
+        REQUIRE(stored_session_tokens(user_id) == std::vector<std::string>{"legacy-raw-" + suffix});
+
+        WHEN("the upgraded server opens it")
+        {
+            PostgresStore upgraded(test_dsn());
+
+            THEN("the old session is gone and its raw token no longer authenticates")
+            {
+                CHECK(stored_session_tokens(user_id).empty());
+                CHECK_FALSE(upgraded.get_session("legacy-raw-" + suffix, 5000).has_value());
+            }
+
+            AND_WHEN("a new session is created and the server is restarted")
+            {
+                upgraded.create_session(make_pg_session(user_id, "fresh-" + suffix));
+                PostgresStore restarted(test_dsn());
+
+                THEN("the migration does not run again and the new session survives")
+                {
+                    CHECK(restarted.get_session("fresh-" + suffix, 5000).has_value());
+                    CHECK(stored_session_tokens(user_id) ==
+                          std::vector<std::string>{hash_session_token("fresh-" + suffix)});
+                }
+            }
+        }
+
+        PostgresStore cleanup(test_dsn());
+        cleanup.delete_user(user_id);
     }
 }
 #endif // HAVE_LIBPQ

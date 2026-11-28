@@ -174,7 +174,13 @@ group: Admins
 ```
 
 Passwords are stored as libsodium password hashes, not plaintext. Sessions are
-stored in SQLite and returned to the browser as HTTP-only `tw_session` cookies.
+stored in the database (SQLite or PostgreSQL) as the SHA-256 of the session
+token, never the token itself, and the token is returned to the browser as an
+HTTP-only `tw_session` cookie. **Upgrading from a version that stored raw
+session tokens signs everyone out once:** the first start deletes the old
+sessions, and users sign in again. Changing your own password requires the
+current password (`current_password`); a global admin resetting another user's
+password does not.
 Unsafe authenticated API requests that include an `Origin` or `Referer` header
 must match the API scheme, host, and effective port, or come from a loopback
 dashboard origin talking to a loopback API. `X-Forwarded-Proto` is used when the

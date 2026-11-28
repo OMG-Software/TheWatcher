@@ -27,11 +27,14 @@ export function UsersPage({
   const [groupId, setGroupId] = React.useState<number>(groups[0]?.group_id ?? 0);
   const [pwUserId, setPwUserId] = React.useState<number | null>(null);
   const [pwValue, setPwValue] = React.useState('');
+  const [pwCurrent, setPwCurrent] = React.useState('');
 
   const admin = canManageUsers(session.role);
   const globalAdmin = session.role === 'global_admin';
   const globalAccount = isGlobal(session.role);
   const currentUser = users.find((u) => u.username === session.username);
+  // Changing your own password (any role) must prove the current one; an admin reset of someone else does not.
+  const changingOwnPassword = pwUserId !== null && pwUserId === currentUser?.user_id;
 
   React.useEffect(() => {
     if (!globalAccount && groups.length > 0 && !groups.some((group) => group.group_id === groupId)) {
@@ -48,26 +51,41 @@ export function UsersPage({
               <h2>Change Password</h2>
               <button className="icon-button" onClick={() => setPwUserId(null)}><X size={14} /></button>
             </div>
+            {changingOwnPassword ? (
+              <label>
+                Current password
+                <input
+                  type="password"
+                  autoComplete="current-password"
+                  autoFocus
+                  value={pwCurrent}
+                  onChange={(e) => setPwCurrent(e.target.value)}
+                />
+              </label>
+            ) : null}
             <label>
               New password
               <input
                 type="password"
-                autoFocus
+                autoComplete="new-password"
+                autoFocus={!changingOwnPassword}
                 value={pwValue}
                 onChange={(e) => setPwValue(e.target.value)}
               />
             </label>
             <div className="button-row modal-actions">
-              <button className="text-button secondary" onClick={() => setPwUserId(null)}>Cancel</button>
+              <button className="text-button secondary" onClick={() => { setPwUserId(null); setPwCurrent(''); }}>Cancel</button>
               <button
                 className="text-button"
-                disabled={!pwValue}
+                disabled={!pwValue || (changingOwnPassword && !pwCurrent)}
                 onClick={() => {
                   const id = pwUserId;
                   const pw = pwValue;
+                  const current = changingOwnPassword ? pwCurrent : undefined;
                   setPwUserId(null);
                   setPwValue('');
-                  void runAction(`user:${id}:pw`, () => changeUserPassword(id, pw));
+                  setPwCurrent('');
+                  void runAction(`user:${id}:pw`, () => changeUserPassword(id, pw, current));
                 }}
               >
                 Save
@@ -137,7 +155,7 @@ export function UsersPage({
                         busy={busyAction === `user:${user.user_id}:pw`}
                         icon={<SlidersHorizontal size={14} />}
                         label="Password"
-                        onClick={() => { setPwUserId(user.user_id); setPwValue(''); }}
+                        onClick={() => { setPwUserId(user.user_id); setPwValue(''); setPwCurrent(''); }}
                       />
                     ) : null}
                     {globalAdmin && !user.built_in ? (

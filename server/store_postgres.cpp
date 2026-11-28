@@ -3,6 +3,7 @@
 #include "store_postgres.hpp"
 
 #include "common/SingleLog.hpp"
+#include "session_token.hpp"
 
 #include <nlohmann/json.hpp>
 
@@ -249,6 +250,7 @@ PostgresStore::PostgresStore(const std::string& dsn)
     if (sodium_init() < 0)
         throw std::runtime_error("libsodium initialization failed");
     init_schema();
+    migrate_session_tokens();
     bootstrap_defaults();
 }
 
@@ -506,6 +508,32 @@ void PostgresStore::init_schema()
     )");
     add_column_if_missing("runbooks", "agent_id", "ALTER TABLE runbooks ADD COLUMN agent_id TEXT NOT NULL DEFAULT '';");
     add_column_if_missing("runbooks", "markdown", "ALTER TABLE runbooks ADD COLUMN markdown TEXT NOT NULL DEFAULT '';");
+}
+
+// Sessions now hold the SHA-256 of their token, so rows written by older
+// versions (raw tokens) can never match a lookup again. They are deleted once.
+// The marker insert and the delete share one transaction: the marker's
+// presence means "rows are hashed", so a later start never deletes again, and
+// a failure between the two statements rolls both back. Two servers starting
+// together are serialised by the marker's primary key: the second insert waits
+// for the first commit, then inserts nothing and deletes nothing.
+void PostgresStore::migrate_session_tokens()
+{
+    postgres::Transaction tx(conn_);
+    const char* params[] = {session_tokens_hashed_setting};
+    Res marker(PQexecParams(conn_, "INSERT INTO server_settings(key,value) VALUES($1,'1') ON CONFLICT DO NOTHING;", 1,
+                            nullptr, params, nullptr, nullptr, 0));
+    check_res(marker.r, "migrate_session_tokens marker");
+    const char* inserted = PQcmdTuples(marker.r);
+    if (inserted == nullptr || std::atoi(inserted) == 0)
+        return; // already migrated: nothing was written, the guard rolls back
+    Res del(PQexec(conn_, "DELETE FROM sessions;"));
+    check_res(del.r, "migrate_session_tokens delete");
+    const char* affected = PQcmdTuples(del.r);
+    const int cleared = affected != nullptr ? std::atoi(affected) : 0;
+    tx.commit();
+    if (cleared > 0)
+        LOGF_NOTICE("Session tokens are now stored hashed: cleared %d session(s), users sign in again once", cleared);
 }
 
 void PostgresStore::bootstrap_defaults()
@@ -1022,10 +1050,11 @@ void PostgresStore::update_user_password(int64_t user_id, const std::string& pas
 
 void PostgresStore::create_session(const SessionRecord& session)
 {
+    const auto token_hash = hash_session_token(session.token);
     const auto p_uid = s(session.user_id);
     const auto p_cat = s(session.created_at);
     const auto p_eat = s(session.expires_at);
-    const char* params[] = {session.token.c_str(), p_uid.c_str(), p_cat.c_str(), p_eat.c_str()};
+    const char* params[] = {token_hash.c_str(), p_uid.c_str(), p_cat.c_str(), p_eat.c_str()};
     Res res(PQexecParams(
         conn_, "INSERT INTO sessions(token,user_id,created_at,expires_at) VALUES($1,$2,$3,$4) ON CONFLICT DO NOTHING;",
         4, nullptr, params, nullptr, nullptr, 0));
@@ -1036,8 +1065,9 @@ void PostgresStore::create_session(const SessionRecord& session)
 // otherwise nullopt. Throws on SQL error.
 std::optional<SessionRecord> PostgresStore::get_session(const std::string& token, int64_t now_ms)
 {
+    const auto token_hash = hash_session_token(token);
     const auto p_now = s(now_ms);
-    const char* params[] = {token.c_str(), p_now.c_str()};
+    const char* params[] = {token_hash.c_str(), p_now.c_str()};
     Res res(PQexecParams(conn_, R"(
         SELECT s.token,s.user_id,u.username,u.role,s.created_at,s.expires_at
         FROM sessions s JOIN users u ON u.user_id=s.user_id
@@ -1047,13 +1077,20 @@ std::optional<SessionRecord> PostgresStore::get_session(const std::string& token
     check_res(res.r, "get_session");
     if (PQntuples(res.r) == 0)
         return std::nullopt;
-    return SessionRecord{col(res.r, 0, 0), col_int64(res.r, 0, 1), col(res.r, 0, 2),
-                         col(res.r, 0, 3), col_int64(res.r, 0, 4), col_int64(res.r, 0, 5)};
+    // The row holds the hash; the caller's own token goes back out so that
+    // passing it to another store call hashes it only once.
+    return SessionRecord{token,
+                         col_int64(res.r, 0, 1),
+                         col(res.r, 0, 2),
+                         col(res.r, 0, 3),
+                         col_int64(res.r, 0, 4),
+                         col_int64(res.r, 0, 5)};
 }
 
 void PostgresStore::delete_session(const std::string& token)
 {
-    const char* params[] = {token.c_str()};
+    const auto token_hash = hash_session_token(token);
+    const char* params[] = {token_hash.c_str()};
     Res res(PQexecParams(conn_, "DELETE FROM sessions WHERE token=$1;", 1, nullptr, params, nullptr, nullptr, 0));
     check_res(res.r, "delete_session");
 }
@@ -1062,7 +1099,8 @@ void PostgresStore::delete_session(const std::string& token)
 int PostgresStore::delete_sessions_for_user(int64_t user_id, const std::string& keep_token)
 {
     const auto p_uid = s(user_id);
-    const char* params[] = {p_uid.c_str(), keep_token.c_str()};
+    const auto kept_hash = hash_kept_session_token(keep_token);
+    const char* params[] = {p_uid.c_str(), kept_hash.c_str()};
     Res res(PQexecParams(conn_, "DELETE FROM sessions WHERE user_id=$1 AND token<>$2;", 2, nullptr, params, nullptr,
                          nullptr, 0));
     check_res(res.r, "delete_sessions_for_user");
@@ -1083,10 +1121,11 @@ int PostgresStore::delete_expired_sessions(int64_t now_ms)
 bool PostgresStore::create_session_if_credentials_current(const SessionRecord& session,
                                                           const std::string& password_hash)
 {
+    const auto token_hash = hash_session_token(session.token);
     const auto p_uid = s(session.user_id);
     const auto p_cat = s(session.created_at);
     const auto p_eat = s(session.expires_at);
-    const char* params[] = {session.token.c_str(), p_uid.c_str(), p_cat.c_str(), p_eat.c_str(), password_hash.c_str()};
+    const char* params[] = {token_hash.c_str(), p_uid.c_str(), p_cat.c_str(), p_eat.c_str(), password_hash.c_str()};
     // Under READ COMMITTED a plain INSERT ... SELECT reads users from the
     // statement's snapshot without locking the row, so a reset or disable that
     // commits (and deletes the user's sessions) in between would leave this
@@ -1127,7 +1166,8 @@ std::optional<int> PostgresStore::update_user_password_and_revoke_sessions(int64
         tx.commit();
         return std::nullopt; // no such user
     }
-    const char* del_params[] = {p_uid.c_str(), keep_token.c_str()};
+    const auto kept_hash = hash_kept_session_token(keep_token);
+    const char* del_params[] = {p_uid.c_str(), kept_hash.c_str()};
     Res del(PQexecParams(conn_, "DELETE FROM sessions WHERE user_id=$1::bigint AND token<>$2;", 2, nullptr, del_params,
                          nullptr, nullptr, 0));
     check_res(del.r, "update_user_password_and_revoke_sessions delete");

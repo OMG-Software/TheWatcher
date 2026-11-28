@@ -9,7 +9,7 @@ not connect to agents.
 
 Current capabilities:
 
-- login/logout with SQLite-backed sessions (the session cookie is `Secure`, so
+- login/logout with database-backed sessions (the session cookie is `Secure`, so
   the dashboard must be served over HTTPS, or from `localhost`, for login to
   persist);
 - monitoring view of agent health and latest metrics;
@@ -217,6 +217,13 @@ type. Group admins can create users only inside their own groups and cannot
 assign global account types. Global and group operators have read-only user
 access.
 
+The Password button opens a change-password form. On your own account (any
+role, including a global admin) the form asks for the Current password as well
+as the New password, and Save stays disabled until both are filled in; the
+server refuses a wrong current password with 403 and the form shows its
+reason. When an admin resets another user's password the form asks only for the
+new password. A successful change signs out that account's other sessions.
+
 Account types:
 
 | Type | Scope |
@@ -283,6 +290,7 @@ The dashboard consumes:
 | `POST /api/groups` | Create a group. |
 | `GET /api/users` | List users and group memberships. |
 | `POST /api/users` | Create a user with hashed password, role, and group memberships. |
+| `PUT /api/users/:id/password` | Change a password. Own account (any role): body needs `password` and `current_password` (400 if missing, 403 if wrong, 429 when throttled). A global admin resetting another user sends only `password`. Revokes the account's other sessions. |
 | `GET /api/alerts` | List active, non-deleted alerts. |
 | `GET /api/alerts/unacknowledged` | List active unacknowledged alerts. |
 | `POST /api/alerts/:id/ack` | Acknowledge an alert. |

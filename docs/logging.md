@@ -144,7 +144,8 @@ for `AUDIT event=` finds them.
 
 Events: `login` (`success`, `failure`, `locked_out`), `logout`,
 `permission_denied` (every HTTP 403), `user_create`, `user_disable`,
-`user_enable`, `user_delete`, `password_change` and `session_revoke`. Fields
+`user_enable`, `user_delete`, `password_change` (`success`, `failure` for a wrong
+current password, `locked_out` when throttled) and `session_revoke`. Fields
 are the acting `user`, the client `source` address (as resolved for login
 throttling, see `TRUSTED_PROXIES`) and, where relevant, the `target`.
 Usernames and other client-supplied values have control characters, quotes

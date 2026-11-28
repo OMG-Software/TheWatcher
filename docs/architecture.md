@@ -192,7 +192,7 @@ Important endpoints:
 
 | Endpoint | Purpose |
 | --- | --- |
-| `POST /api/login` | Create a SQLite-backed authenticated session. |
+| `POST /api/login` | Create an authenticated session (the store keeps only the SHA-256 of its token). |
 | `POST /api/logout` | Delete the current session. |
 | `GET /api/session` | Return the current session. |
 | `GET /api/agents` | List approved agents and runtime state. |
@@ -205,6 +205,7 @@ Important endpoints:
 | `POST /api/groups` | Create a group. |
 | `GET /api/users` | List users. |
 | `POST /api/users` | Create a user with role and groups. |
+| `PUT /api/users/:id/password` | Change a password; changing your own needs `current_password`, an admin reset of another user does not. |
 | `GET /api/alerts` | List active alerts. |
 | `GET /api/alerts/unacknowledged` | List active unacknowledged alerts. |
 | `POST /api/alerts/:id/ack` | Acknowledge an alert. |

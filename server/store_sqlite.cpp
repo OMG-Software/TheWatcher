@@ -1,5 +1,6 @@
 #include "store_sqlite.hpp"
 
+#include "session_token.hpp"
 #include "store_synchronized.hpp"
 
 #ifdef HAVE_LIBPQ
@@ -176,6 +177,7 @@ SqliteStore::SqliteStore(const std::string& path)
         throw std::runtime_error("libsodium initialization failed");
     LOGF_DEBUG("Opened SQLite store path=%s", path.c_str());
     init_schema();
+    migrate_session_tokens();
     bootstrap_defaults();
 }
 
@@ -488,6 +490,32 @@ void SqliteStore::init_schema()
     add_column_if_missing("runbooks", "markdown", "ALTER TABLE runbooks ADD COLUMN markdown TEXT NOT NULL DEFAULT '';");
     add_column_if_missing("alerts", "runbook_url",
                           "ALTER TABLE alerts ADD COLUMN runbook_url TEXT NOT NULL DEFAULT '';");
+}
+
+// Sessions now hold the SHA-256 of their token, so rows written by older
+// versions (raw tokens) can never match a lookup again. They are deleted once,
+// and the marker row is inserted in the same transaction: the marker's
+// presence means "rows are hashed", so a later start never deletes again, and
+// a crash between the two statements rolls both back. A database with no
+// marker yet is either an old one (rows deleted) or a new one (no rows).
+void SqliteStore::migrate_session_tokens()
+{
+    sqlite::Transaction tx(db_);
+    {
+        Stmt st;
+        check(sqlite3_prepare_v2(db_, "INSERT OR IGNORE INTO server_settings(key,value) VALUES(?,'1');", -1, &st.s,
+                                 nullptr),
+              db_, "prepare migrate_session_tokens marker");
+        sqlite3_bind_text(st.s, 1, session_tokens_hashed_setting, -1, SQLITE_STATIC);
+        check(sqlite3_step(st.s), db_, "step migrate_session_tokens marker");
+        if (sqlite3_changes(db_) == 0)
+            return; // already migrated: leave the transaction to roll back (nothing was written)
+    }
+    exec("DELETE FROM sessions;");
+    const auto cleared = sqlite3_changes(db_);
+    tx.commit();
+    if (cleared > 0)
+        LOGF_NOTICE("Session tokens are now stored hashed: cleared %d session(s), users sign in again once", cleared);
 }
 
 void SqliteStore::bootstrap_defaults()
@@ -980,7 +1008,8 @@ void SqliteStore::create_session(const SessionRecord& session)
                              "VALUES(?,?,?,?);",
                              -1, &st.s, nullptr),
           db_, "prepare create_session");
-    sqlite3_bind_text(st.s, 1, session.token.c_str(), -1, SQLITE_TRANSIENT);
+    const auto token_hash = hash_session_token(session.token);
+    sqlite3_bind_text(st.s, 1, token_hash.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_int64(st.s, 2, session.user_id);
     sqlite3_bind_int64(st.s, 3, session.created_at);
     sqlite3_bind_int64(st.s, 4, session.expires_at);
@@ -996,10 +1025,17 @@ std::optional<SessionRecord> SqliteStore::get_session(const std::string& token, 
                              "s.expires_at>? AND u.disabled=0;",
                              -1, &st.s, nullptr),
           db_, "prepare get_session");
-    sqlite3_bind_text(st.s, 1, token.c_str(), -1, SQLITE_TRANSIENT);
+    const auto token_hash = hash_session_token(token);
+    sqlite3_bind_text(st.s, 1, token_hash.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_int64(st.s, 2, now_ms);
     if (step_row(st.s, db_, __func__))
-        return row_to_session(st.s);
+    {
+        // The row holds the hash; the caller's own token goes back out so
+        // that passing it to another store call hashes it only once.
+        auto session = row_to_session(st.s);
+        session.token = token;
+        return session;
+    }
     return std::nullopt;
 }
 
@@ -1008,7 +1044,8 @@ void SqliteStore::delete_session(const std::string& token)
     Stmt st;
     check(sqlite3_prepare_v2(db_, "DELETE FROM sessions WHERE token=?;", -1, &st.s, nullptr), db_,
           "prepare delete_session");
-    sqlite3_bind_text(st.s, 1, token.c_str(), -1, SQLITE_TRANSIENT);
+    const auto token_hash = hash_session_token(token);
+    sqlite3_bind_text(st.s, 1, token_hash.c_str(), -1, SQLITE_TRANSIENT);
     check(sqlite3_step(st.s), db_, "step delete_session");
 }
 
@@ -1018,7 +1055,8 @@ int SqliteStore::delete_sessions_for_user(int64_t user_id, const std::string& ke
     check(sqlite3_prepare_v2(db_, "DELETE FROM sessions WHERE user_id=? AND token<>?;", -1, &st.s, nullptr), db_,
           "prepare delete_sessions_for_user");
     sqlite3_bind_int64(st.s, 1, user_id);
-    sqlite3_bind_text(st.s, 2, keep_token.c_str(), -1, SQLITE_TRANSIENT);
+    const auto kept_hash = hash_kept_session_token(keep_token);
+    sqlite3_bind_text(st.s, 2, kept_hash.c_str(), -1, SQLITE_TRANSIENT);
     check(sqlite3_step(st.s), db_, "step delete_sessions_for_user");
     return sqlite3_changes(db_);
 }
@@ -1043,7 +1081,8 @@ bool SqliteStore::create_session_if_credentials_current(const SessionRecord& ses
                              "SELECT ?,user_id,?,? FROM users WHERE user_id=? AND password_hash=? AND disabled=0;",
                              -1, &st.s, nullptr),
           db_, "prepare create_session_if_credentials_current");
-    sqlite3_bind_text(st.s, 1, session.token.c_str(), -1, SQLITE_TRANSIENT);
+    const auto token_hash = hash_session_token(session.token);
+    sqlite3_bind_text(st.s, 1, token_hash.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_int64(st.s, 2, session.created_at);
     sqlite3_bind_int64(st.s, 3, session.expires_at);
     sqlite3_bind_int64(st.s, 4, session.user_id);

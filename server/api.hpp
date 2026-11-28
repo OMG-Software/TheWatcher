@@ -157,6 +157,20 @@ private:
         int64_t ip_window_ = 0;
     };
 
+    // Why a credential check was refused by the throttle (HTTP 429).
+    struct ThrottleDenial
+    {
+        const char* message;
+        const char* retry_after; // seconds, for the Retry-After header
+    };
+    // Counts one credential check against the three throttle windows, keyed as
+    // login keys them (pair_key = "<ip>|<username>", username, ip), or returns
+    // why it is refused. On admission the slot is armed on `reservation`.
+    // Shared by login and the current-password check of a password change.
+    std::optional<ThrottleDenial> reserve_login_attempt(LoginReservation& reservation, const std::string& pair_key,
+                                                        const std::string& username, const std::string& remote,
+                                                        int64_t now);
+
     // Deletes expired sessions at most once per purge interval.
     void purge_expired_sessions_if_due(int64_t now_ms);
 

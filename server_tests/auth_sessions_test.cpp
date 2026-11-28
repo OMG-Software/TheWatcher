@@ -274,12 +274,214 @@ SCENARIO("Sessions are revoked when a password changes")
         WHEN("the user changes their own password from one session")
         {
             REQUIRE(fx.put(carol_a, "/api/users/" + std::to_string(user_id) + "/password",
-                           R"({"password":"carol-pass-3"})") == 200);
+                           R"({"password":"carol-pass-3","current_password":"carol-pass-1"})") == 200);
 
             THEN("the current session survives and the user's other sessions are revoked")
             {
                 REQUIRE(fx.session_status(carol_a) == 200);
                 REQUIRE(fx.session_status(carol_b) == 401);
+            }
+        }
+    }
+}
+
+SCENARIO("Changing your own password requires the current password")
+{
+    GIVEN("an admin and a second user, each with two live sessions")
+    {
+        CapturedLog log;
+        ApiFixture fx;
+        const auto admin_a = fx.login("thewatcher", "look_at_me");
+        const auto admin_b = fx.login("thewatcher", "look_at_me");
+        REQUIRE_FALSE(admin_a.empty());
+        REQUIRE_FALSE(admin_b.empty());
+        const auto carol_id = fx.create_user(admin_a, "carol", "carol-pass-1");
+        const auto carol_a = fx.login("carol", "carol-pass-1");
+        const auto carol_b = fx.login("carol", "carol-pass-1");
+        REQUIRE_FALSE(carol_a.empty());
+        REQUIRE_FALSE(carol_b.empty());
+        const auto carol_path = "/api/users/" + std::to_string(carol_id) + "/password";
+
+        // Nothing may have changed: the old password still works and no
+        // session of the user was revoked.
+        const auto expect_unchanged = [&] {
+            REQUIRE(fx.session_status(carol_a) == 200);
+            REQUIRE(fx.session_status(carol_b) == 200);
+            REQUIRE_FALSE(fx.login("carol", "carol-pass-1").empty());
+            REQUIRE(fx.login("carol", "carol-pass-new").empty());
+        };
+
+        WHEN("the user omits current_password")
+        {
+            const auto status = fx.put(carol_a, carol_path, R"({"password":"carol-pass-new"})");
+
+            THEN("the request is rejected with 400 and nothing changes")
+            {
+                REQUIRE(status == 400);
+                expect_unchanged();
+            }
+        }
+
+        WHEN("the user sends a current_password that is not a string")
+        {
+            const auto status =
+                fx.put(carol_a, carol_path, R"({"password":"carol-pass-new","current_password":12345})");
+
+            THEN("the request is rejected with 400 and nothing changes")
+            {
+                REQUIRE(status == 400);
+                expect_unchanged();
+            }
+        }
+
+        WHEN("the user sends the wrong current_password")
+        {
+            auto res = fx.client.Put(carol_path,
+                                     {
+                                         {"Cookie", carol_a}
+            },
+                                     R"({"password":"carol-pass-new","current_password":"not-my-password"})",
+                                     "application/json");
+            REQUIRE(res);
+
+            THEN("the request is refused with 403, nothing changes and no session is revoked")
+            {
+                REQUIRE(res->status == 403);
+                REQUIRE(json::parse(res->body).at("error").get<std::string>() == "current password is incorrect");
+                expect_unchanged();
+            }
+
+            THEN("the failure is audited without logging either password")
+            {
+                REQUIRE(log.eventually_contains("event=password_change outcome=failure"));
+                const auto text = log.read();
+                REQUIRE(text.find("not-my-password") == std::string::npos);
+                REQUIRE(text.find("carol-pass-new") == std::string::npos);
+            }
+        }
+
+        WHEN("the user sends the correct current_password")
+        {
+            REQUIRE(fx.put(carol_a, carol_path, R"({"password":"carol-pass-new","current_password":"carol-pass-1"})") ==
+                    200);
+
+            THEN("the password changes, the current session survives and the other is revoked")
+            {
+                REQUIRE(fx.session_status(carol_a) == 200);
+                REQUIRE(fx.session_status(carol_b) == 401);
+                REQUIRE_FALSE(fx.login("carol", "carol-pass-new").empty());
+                REQUIRE(fx.login("carol", "carol-pass-1").empty());
+            }
+        }
+
+        WHEN("a global admin changes their own password without the current one")
+        {
+            const auto status = fx.put(admin_a, "/api/users/1/password", R"({"password":"admin-pass-new"})");
+
+            THEN("the request is rejected with 400 as for any other role")
+            {
+                REQUIRE(status == 400);
+                REQUIRE(fx.session_status(admin_b) == 200);
+                REQUIRE_FALSE(fx.login("thewatcher", "look_at_me").empty());
+            }
+        }
+
+        WHEN("a global admin changes their own password with a wrong current one")
+        {
+            const auto status =
+                fx.put(admin_a, "/api/users/1/password", R"({"password":"admin-pass-new","current_password":"wrong"})");
+
+            THEN("the request is refused with 403 and nothing changes")
+            {
+                REQUIRE(status == 403);
+                REQUIRE(fx.session_status(admin_b) == 200);
+                REQUIRE_FALSE(fx.login("thewatcher", "look_at_me").empty());
+            }
+        }
+
+        WHEN("a global admin changes their own password with the correct current one")
+        {
+            REQUIRE(fx.put(admin_a, "/api/users/1/password",
+                           R"({"password":"admin-pass-new","current_password":"look_at_me"})") == 200);
+
+            THEN("the password changes and the admin's other session is revoked")
+            {
+                REQUIRE(fx.session_status(admin_a) == 200);
+                REQUIRE(fx.session_status(admin_b) == 401);
+                REQUIRE_FALSE(fx.login("thewatcher", "admin-pass-new").empty());
+            }
+        }
+
+        WHEN("a global admin resets another user's password and the body carries a wrong current_password")
+        {
+            const auto status =
+                fx.put(admin_a, carol_path, R"({"password":"carol-pass-new","current_password":"ignored-for-resets"})");
+
+            THEN("the reset succeeds because resets never need the current password")
+            {
+                REQUIRE(status == 200);
+                REQUIRE_FALSE(fx.login("carol", "carol-pass-new").empty());
+            }
+        }
+    }
+}
+
+SCENARIO("Wrong current passwords count against the login throttle")
+{
+    GIVEN("a user with a live session")
+    {
+        ApiFixture fx;
+        const auto admin = fx.login("thewatcher", "look_at_me");
+        const auto carol_id = fx.create_user(admin, "carol", "carol-pass-1");
+        const auto carol = fx.login("carol", "carol-pass-1");
+        REQUIRE_FALSE(carol.empty());
+        const auto path = "/api/users/" + std::to_string(carol_id) + "/password";
+        const std::string wrong = R"({"password":"carol-pass-new","current_password":"guess"})";
+
+        WHEN("the session guesses the current password five times")
+        {
+            for (int i = 0; i < 5; ++i)
+                REQUIRE(fx.put(carol, path, wrong) == 403);
+
+            THEN("the next attempt is throttled even with the correct password")
+            {
+                auto res = fx.client.Put(path,
+                                         {
+                                             {"Cookie", carol}
+                },
+                                         R"({"password":"carol-pass-new","current_password":"carol-pass-1"})",
+                                         "application/json");
+                REQUIRE(res);
+                REQUIRE(res->status == 429);
+                REQUIRE_FALSE(res->get_header_value("Retry-After").empty());
+                REQUIRE(fx.session_status(carol) == 200);
+                REQUIRE(fx.login("carol", "carol-pass-new").empty());
+            }
+
+            THEN("a login for that user from the same address shares the lockout")
+            {
+                auto res = fx.client.Post("/api/login",
+                                          json{
+                                              {"username", "carol"       },
+                                              {"password", "carol-pass-1"}
+                }
+                                              .dump(),
+                                          "application/json");
+                REQUIRE(res);
+                REQUIRE(res->status == 429);
+            }
+        }
+
+        WHEN("the correct current password follows four wrong guesses")
+        {
+            for (int i = 0; i < 4; ++i)
+                REQUIRE(fx.put(carol, path, wrong) == 403);
+            const auto status =
+                fx.put(carol, path, R"({"password":"carol-pass-new","current_password":"carol-pass-1"})");
+
+            THEN("it succeeds")
+            {
+                REQUIRE(status == 200);
             }
         }
     }

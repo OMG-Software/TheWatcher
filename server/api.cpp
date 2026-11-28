@@ -416,6 +416,69 @@ void ApiServer::LoginReservation::release()
     give_back(api_.login_ip_failures_, remote_, ip_window_);
 }
 
+// Admits one credential check or refuses it, in ONE critical section (#154):
+// the limit check and the up-front count of the attempt cannot be split by a
+// concurrent request. Used by login and by the current-password check of a
+// self-service password change (#145), which must share the same keys so a
+// stolen session cannot guess the password more cheaply than a login can.
+// On admission the slot is armed on `reservation`, which gives it back unless
+// the caller keep()s it as a genuine credential failure.
+std::optional<ApiServer::ThrottleDenial> ApiServer::reserve_login_attempt(LoginReservation& reservation,
+                                                                          const std::string& pair_key,
+                                                                          const std::string& username,
+                                                                          const std::string& remote, int64_t now)
+{
+    constexpr int max_failures = 5;
+    constexpr int max_ip_failures = 10;
+    constexpr int max_account_failures = 50;
+
+    std::lock_guard<std::mutex> lk(login_mutex_);
+
+    // Prune expired windows: an entry whose window has elapsed
+    // is removed, which also implements the fixed-window reset.
+    const auto prune = [now](auto& map, int64_t window_ms) {
+        for (auto it = map.begin(); it != map.end();)
+        {
+            if (now - it->second.second >= window_ms)
+                it = map.erase(it);
+            else
+                ++it;
+        }
+    };
+    prune(login_failures_, login_lockout_ms_);
+    prune(login_account_failures_, login_lockout_ms_);
+    prune(login_ip_failures_, login_ip_window_ms_);
+
+    const auto count_of = [](const auto& map, const std::string& key) {
+        const auto it = map.find(key);
+        return it == map.end() ? 0 : it->second.first;
+    };
+
+    if (count_of(login_failures_, pair_key) >= max_failures)
+        return ThrottleDenial{"too many failed login attempts; try again later", "900"};
+    // SEC-12: throttle by source IP across all usernames so a
+    // single host cannot spray many accounts (or lock them out).
+    if (count_of(login_ip_failures_, remote) >= max_ip_failures)
+        return ThrottleDenial{"too many login attempts from this address; try again later", "60"};
+    if (count_of(login_account_failures_, username) >= max_account_failures)
+        return ThrottleDenial{"too many failed login attempts; try again later", "900"};
+
+    // Reserve this attempt; the guard gives the slot back unless the
+    // attempt ends as a genuine credential failure.
+    const auto reserve = [now](auto& map, const std::string& key) {
+        auto& [count, window_start] = map[key];
+        if (count == 0)
+            window_start = now;
+        ++count;
+        return window_start;
+    };
+    const auto pair_window = reserve(login_failures_, pair_key);
+    const auto account_window = reserve(login_account_failures_, username);
+    const auto ip_window = reserve(login_ip_failures_, remote);
+    reservation.arm(pair_window, account_window, ip_window);
+    return std::nullopt;
+}
+
 void ApiServer::drain_commands(std::vector<PendingCommand>& out)
 {
     std::lock_guard<std::mutex> lk(cmd_mutex_);
@@ -1245,75 +1308,20 @@ void ApiServer::setup_routes()
             // reservation) and the counters are released again on success, so
             // concurrent requests cannot all slip past the check while the
             // slow password hash runs.
-            constexpr int max_failures = 5;
-            constexpr int max_ip_failures = 10;
-            constexpr int max_account_failures = 50;
             const auto now = login_clock_ ? login_clock_() : now_ms();
             const std::string remote = client_ip(req);
             const std::string pair_key = remote + "|" + username;
             purge_expired_sessions_if_due(now);
             LoginReservation reservation(*this, pair_key, username, remote);
+            if (const auto denial = reserve_login_attempt(reservation, pair_key, username, remote, now))
             {
-                std::lock_guard<std::mutex> lk(login_mutex_);
-
-                // Prune expired windows: an entry whose window has elapsed
-                // is removed, which also implements the fixed-window reset.
-                const auto prune = [now](auto& map, int64_t window_ms) {
-                    for (auto it = map.begin(); it != map.end();)
-                    {
-                        if (now - it->second.second >= window_ms)
-                            it = map.erase(it);
-                        else
-                            ++it;
-                    }
-                };
-                prune(login_failures_, login_lockout_ms_);
-                prune(login_account_failures_, login_lockout_ms_);
-                prune(login_ip_failures_, login_ip_window_ms_);
-
-                const auto count_of = [](const auto& map, const std::string& key) {
-                    const auto it = map.find(key);
-                    return it == map.end() ? 0 : it->second.first;
-                };
-
-                const char* limit_message = nullptr;
-                const char* retry_after = "900";
-                if (count_of(login_failures_, pair_key) >= max_failures)
-                    limit_message = "too many failed login attempts; try again later";
-                else if (count_of(login_ip_failures_, remote) >= max_ip_failures)
-                {
-                    // SEC-12: throttle by source IP across all usernames so a
-                    // single host cannot spray many accounts (or lock them out).
-                    limit_message = "too many login attempts from this address; try again later";
-                    retry_after = "60";
-                }
-                else if (count_of(login_account_failures_, username) >= max_account_failures)
-                    limit_message = "too many failed login attempts; try again later";
-
-                if (limit_message != nullptr)
-                {
-                    audit("login", "locked_out", username, remote);
-                    res.status = 429;
-                    res.set_header("Retry-After", retry_after);
-                    set_json(res, json{
-                                      {"error", limit_message}
-                    });
-                    return;
-                }
-
-                // Reserve this attempt; the guard gives the slot back unless the
-                // attempt ends as a genuine credential failure.
-                const auto reserve = [now](auto& map, const std::string& key) {
-                    auto& [count, window_start] = map[key];
-                    if (count == 0)
-                        window_start = now;
-                    ++count;
-                    return window_start;
-                };
-                const auto pair_window = reserve(login_failures_, pair_key);
-                const auto account_window = reserve(login_account_failures_, username);
-                const auto ip_window = reserve(login_ip_failures_, remote);
-                reservation.arm(pair_window, account_window, ip_window);
+                audit("login", "locked_out", username, remote);
+                res.status = 429;
+                res.set_header("Retry-After", denial->retry_after);
+                set_json(res, json{
+                                  {"error", denial->message}
+                });
+                return;
             }
 
             if (after_reservation_hook_)
@@ -3053,6 +3061,48 @@ void ApiServer::setup_routes()
                 throw std::runtime_error("password is required");
             if (password.size() > 256)
                 throw std::runtime_error("password must be 256 characters or fewer");
+            const bool self_service = user_id == session->user_id;
+            // Issue #145: changing your own password, whatever your role,
+            // proves knowledge of the current one, so a stolen session cannot
+            // lock the owner out. An admin resetting someone else's needs
+            // none. Wrong guesses count against the login throttle under the
+            // keys login uses, so this route is no cheaper to brute-force than
+            // login. The slot is given back unless the guess was wrong.
+            const auto remote = client_ip(req);
+            const auto pair_key = remote + "|" + session->username;
+            LoginReservation reservation(*this, pair_key, session->username, remote);
+            if (self_service)
+            {
+                const auto current = body.find("current_password");
+                if (current == body.end() || !current->is_string())
+                    throw std::runtime_error("current_password is required");
+                const auto& current_password = current->get_ref<const std::string&>();
+                if (current_password.size() > 256)
+                    throw std::runtime_error("current_password must be 256 characters or fewer");
+                const auto now = login_clock_ ? login_clock_() : now_ms();
+                if (const auto denial = reserve_login_attempt(reservation, pair_key, session->username, remote, now))
+                {
+                    audit("password_change", "locked_out", session->username, remote, target_user->username);
+                    res.status = 429;
+                    res.set_header("Retry-After", denial->retry_after);
+                    set_json(res, json{
+                                      {"error", denial->message}
+                    });
+                    return;
+                }
+                if (crypto_pwhash_str_verify(target_user->password_hash.c_str(), current_password.c_str(),
+                                             current_password.size()) != 0)
+                {
+                    reservation.keep(); // a genuine credential failure stays counted
+                    audit("password_change", "failure", session->username, remote, target_user->username);
+                    res.status = 403;
+                    set_json(res, json{
+                                      {"error", "current password is incorrect"}
+                    });
+                    return;
+                }
+                reservation.release();
+            }
             // Issue #145: a new password invalidates existing logins. On a
             // self-service change the current session is kept (so the user
             // is not logged out of the page that made the change); an admin
@@ -3060,7 +3110,7 @@ void ApiServer::setup_routes()
             // The store applies the new hash and the revocation atomically,
             // so a failure cannot leave the new password set while old
             // sessions stay valid.
-            const auto kept_token = user_id == session->user_id ? cookie_value(req, "tw_session") : std::string{};
+            const auto kept_token = self_service ? cookie_value(req, "tw_session") : std::string{};
             const auto revoked =
                 store_.update_user_password_and_revoke_sessions(user_id, hash_password(password), kept_token);
             // No value: the user was deleted after the lookup above, so

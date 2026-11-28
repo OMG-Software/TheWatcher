@@ -64,7 +64,8 @@ working document for audit, design review, and regression testing.
   immutable first-seen public key for pending records. First approval still
   relies on administrator judgment.
 - Dashboard user spoofing is mitigated by libsodium password hashes and random
-  256-bit session tokens.
+  256-bit session tokens. Only the SHA-256 of a token is stored, so a copy of
+  the database or a backup holds no usable logins.
 
 ### Tampering
 
@@ -159,6 +160,24 @@ working document for audit, design review, and regression testing.
   table cascades). Expired
   sessions are purged at most every five minutes (a failed purge is retried) from login and session
   validation.
+- Changing your own password (any role, including a global admin) needs the
+  current password: a missing or non-string `current_password` is 400 and a
+  wrong one is 403 with nothing changed and no session revoked. An admin reset
+  of another user needs none. A wrong guess takes a slot in the same throttle
+  counters as a failed login, under the same keys (client address plus the
+  caller's username, the username alone, and the address alone), and is
+  audited as `password_change` `failure`. Once a limit is reached the route
+  answers 429 whatever the password. A stolen session therefore cannot
+  brute-force the password any faster than a login can, and cannot lock the
+  owner out by changing it.
+- The `sessions` table stores `SHA-256(token)` as lowercase hex; both stores
+  hash inside every method that takes a token, and `get_session` returns the
+  caller's raw token, so a value read back from the store is never hashed
+  twice. Tokens carry 256 bits of randomness, so an unsalted hash is enough.
+  Upgrading from a version that stored raw tokens deletes all existing
+  sessions once (everyone signs in again), marked by the `session_tokens_hashed`
+  row in `server_settings` that is written in the same transaction as the
+  delete, so the upgrade can neither hash a row twice nor run again.
 - Every ZMQ socket caps inbound message size (`ZMQ_MAXMSGSIZE`: 64 KiB
   enrollment, 4 MiB data plane) and bounds the connection handshake
   (`ZMQ_HANDSHAKE_IVL`); enrollment replies use a send timeout so a stalled
@@ -236,11 +255,13 @@ when webhooks are enabled.
 - Behind a trusted proxy, `X-Real-IP` is believed as sent. A proxy that does
   not overwrite it lets clients choose their throttling bucket, so configure
   the proxy to set it (or strip it and rely on `X-Forwarded-For`).
-- A self-service password change keeps the caller's current session; a stolen
-  session can therefore still change the password. The change endpoint does not
-  yet ask for the current password, and session tokens are stored unhashed in
-  the database. Audit lines share the server log file and are not tamper
-  proof.
+- A self-service password change keeps the caller's current session. A stolen
+  session cannot change the password without the current one, but it can
+  still use the account until it expires or the owner signs out. Audit lines
+  share the server log file and are not tamper proof.
+- During a rolling upgrade on a shared PostgreSQL database, a server still on
+  the old version stores raw tokens that upgraded servers do not recognise;
+  those users sign in again, and the raw rows expire after eight hours.
 - The built-in first-run `thewatcher` account has a documented default password.
   It must be changed or disabled immediately after bootstrap.
 - Hostname webhook SSRF cannot be completely prevented without DNS resolution

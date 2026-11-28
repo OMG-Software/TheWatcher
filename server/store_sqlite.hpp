@@ -126,6 +126,10 @@ private:
     bool column_exists(const std::string& table, const std::string& column);
     void add_column_if_missing(const std::string& table, const std::string& column, const char* ddl);
     void init_schema();
+    // One-time upgrade: sessions are stored as token hashes now, so rows
+    // written by older versions (raw tokens) are deleted once. See
+    // session_tokens_hashed_setting.
+    void migrate_session_tokens();
     void bootstrap_defaults();
 
     sqlite::Connection db_; // owned handle: closed even if the constructor throws

@@ -99,6 +99,25 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - The browser Origin check accepts the loopback exception only for real
   `127.0.0.0/8` addresses; DNS names such as `127.attacker.example` no
   longer match (#164).
+- Changing your own password now requires `current_password` in the
+  `PUT /api/users/:id/password` body, for every role including a global
+  admin. A missing or non-string value is 400; a wrong value is 403 and
+  changes nothing. A global admin resetting another user's password needs no
+  current password. Wrong guesses count against the login throttle under the
+  login keys, so a stolen session cannot brute-force the password, and are
+  audited as `password_change` `failure` (or `locked_out`, 429). The dashboard
+  asks for the current password only on your own account, and now shows the
+  server's reason when a change is refused (#145).
+- Session tokens are stored as their SHA-256 (lowercase hex) instead of raw, so a
+  database copy or backup no longer contains usable logins. The stores hash
+  inside `create_session`, `get_session`, `delete_session`,
+  `delete_sessions_for_user` and `create_session_if_credentials_current`;
+  the `Store` interface is unchanged. **Upgrading signs everyone out once:**
+  on first start the server deletes every existing session and records that in
+  `server_settings` (key `session_tokens_hashed`), in the same transaction,
+  so it never runs again (SQLite and PostgreSQL). During a rolling upgrade of a
+  shared PostgreSQL database, a server still on the old version writes raw
+  tokens that the new version ignores until they expire (#145).
 
 ### Fixed
 
