@@ -1,6 +1,6 @@
 import React from 'react';
 import { SlidersHorizontal } from 'lucide-react';
-import { fetchLogMatches, fetchMetricHistory } from '../api';
+import { errorMessage, fetchLogMatches, fetchMetricHistory } from '../api';
 import { AgentIdentity } from '../components/AgentIdentity';
 import { Sparkline } from '../components/Sparkline';
 import { StatusDot } from '../components/StatusDot';
@@ -11,51 +11,63 @@ import { colorLabel } from '../uiLogic';
 
 export function MonitoringPage({
   agents,
-  error,
   expanded,
   global,
   groupFilter,
   groups,
-  loading,
   setExpanded,
   setGroupFilter,
 }: {
   agents: DashboardAgent[];
-  error: string | null;
   expanded: Set<string>;
   global: boolean;
   groupFilter: OverviewGroupFilter;
   groups: GroupRecord[];
-  loading: boolean;
   setExpanded: React.Dispatch<React.SetStateAction<Set<string>>>;
   setGroupFilter: React.Dispatch<React.SetStateAction<OverviewGroupFilter>>;
 }) {
   const [agentHistory, setAgentHistory] = React.useState<Record<string, MetricsSnapshot[]>>({});
   const [agentLogMatches, setAgentLogMatches] = React.useState<Record<string, LogMatchRecord[]>>({});
+  // History and log matches load separately, so one failing never hides the other.
+  const [historyErrors, setHistoryErrors] = React.useState<Record<string, string>>({});
+  const [logErrors, setLogErrors] = React.useState<Record<string, string>>({});
   const [historyAgent, setHistoryAgent] = React.useState<{ id: string; name: string } | null>(null);
+  const requested = React.useRef(new Set<string>()); // agents whose detail is loaded or loading
 
+  // Load detail once per expanded agent. Each part keeps its own result and error; an error is
+  // shown in the detail row, and the agent is loaded again the next time its row is expanded.
   React.useEffect(() => {
+    const track = <T,>(id: string, load: Promise<T>, onData: (value: T) => void, setErrors: React.Dispatch<React.SetStateAction<Record<string, string>>>, fallback: string) =>
+      load.then(
+        (value) => {
+          onData(value);
+          setErrors((prev) => withoutKey(prev, id));
+          return true;
+        },
+        (err: unknown) => {
+          setErrors((prev) => ({ ...prev, [id]: errorMessage(err, fallback) }));
+          return false;
+        },
+      );
     for (const id of expanded) {
-      if (!agentHistory[id]) {
-        void fetchMetricHistory(id, 20).then((snapshots) => {
-          setAgentHistory((prev) => ({ ...prev, [id]: snapshots }));
-        }).catch(() => undefined);
-        void fetchLogMatches(id, 20).then((rows) => {
-          setAgentLogMatches((prev) => ({ ...prev, [id]: rows }));
-        }).catch(() => undefined);
-      }
+      if (requested.current.has(id)) continue;
+      requested.current.add(id);
+      void Promise.all([
+        track(id, fetchMetricHistory(id, 20), (snapshots) => setAgentHistory((prev) => ({ ...prev, [id]: snapshots })), setHistoryErrors, 'Failed to load history'),
+        track(id, fetchLogMatches(id, 20), (rows) => setAgentLogMatches((prev) => ({ ...prev, [id]: rows })), setLogErrors, 'Failed to load log matches'),
+      ]).then((results) => {
+        if (!results.every(Boolean)) requested.current.delete(id);
+      });
     }
-  }, [expanded, agentHistory]);
+  }, [expanded]);
 
   const overviewGroups = groupOverviewAgents(agents, groups, groupFilter);
   const visibleAgentCount = overviewGroups.reduce((count, group) => count + group.agents.length, 0);
 
   return (
     <main className="table-wrap">
-      {error ? <div className="banner error">API error: {error}</div> : null}
-      {loading ? <div className="banner">Loading dashboard data...</div> : null}
-      {!loading && agents.length === 0 ? <div className="banner">No approved agents are reporting yet.</div> : null}
-      {!loading && agents.length > 0 && visibleAgentCount === 0 ? <div className="banner">No agents match this group filter.</div> : null}
+      {agents.length === 0 ? <div className="banner">No approved agents are reporting yet.</div> : null}
+      {agents.length > 0 && visibleAgentCount === 0 ? <div className="banner">No agents match this group filter.</div> : null}
 
       {global ? (
         <div className="overview-toolbar">
@@ -127,6 +139,8 @@ export function MonitoringPage({
                     <tr className={`detail-row ${expanded.has(agent.id) ? '' : 'hidden'}`}>
                       <td colSpan={4 + COMPONENT_LABELS.length}>
                         <div className="detail-inner">
+                          {historyErrors[agent.id] ? <div className="banner error detail-card-wide" role="alert">Could not load metric history for {agent.name}: {historyErrors[agent.id]}</div> : null}
+                          {logErrors[agent.id] ? <div className="banner error detail-card-wide" role="alert">Could not load log matches for {agent.name}: {logErrors[agent.id]}</div> : null}
                           {agent.components.map((component) => {
                             const history = agentHistory[agent.id];
                             const sparkData = history
@@ -209,6 +223,12 @@ export function MonitoringPage({
       ) : null}
     </main>
   );
+}
+
+function withoutKey(record: Record<string, string>, key: string): Record<string, string> {
+  const rest = { ...record };
+  delete rest[key];
+  return rest;
 }
 
 const COMPONENT_LABELS = ['CPU', 'Memory', 'Disk', 'Network', 'Proc', 'Heartbeat'];

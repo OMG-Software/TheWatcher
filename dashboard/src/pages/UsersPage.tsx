@@ -1,20 +1,21 @@
 import React from 'react';
 import { Pause, Play, Plus, SlidersHorizontal, Trash2, X } from 'lucide-react';
 import { changeUserPassword, createGroup, createUser, deleteUser, disableUser, enableUser } from '../api';
+import { ActionError } from '../components/ActionError';
 import { ActionButton } from '../components/ActionButton';
-import type { RunAction } from '../hooks/useRunAction';
+import { ActionFailureContext, type RunAction } from '../hooks/useRunAction';
 import type { GroupRecord, SessionInfo, UserRecord } from '../models';
 import { canManageGroups, canManageUsers, isGlobal } from '../permissions';
 import { accountTypeLabel } from '../uiLogic';
 
 export function UsersPage({
-  busyAction,
+  isBusy,
   groups,
   runAction,
   session,
   users,
 }: {
-  busyAction: string | null;
+  isBusy: (key: string) => boolean;
   groups: GroupRecord[];
   runAction: RunAction;
   session: SessionInfo;
@@ -27,6 +28,15 @@ export function UsersPage({
   const [groupId, setGroupId] = React.useState<number>(groups[0]?.group_id ?? 0);
   const [pwUserId, setPwUserId] = React.useState<number | null>(null);
   const [pwValue, setPwValue] = React.useState('');
+  const { clear } = React.useContext(ActionFailureContext);
+  const pwKey = `user:${pwUserId}:pw`;
+  const pwBusy = isBusy(pwKey);
+  // The password dialog cannot be dismissed while saving; dismissing drops its old failure.
+  const closePw = () => {
+    if (pwBusy) return;
+    clear(pwKey);
+    setPwUserId(null);
+  };
 
   const admin = canManageUsers(session.role);
   const globalAdmin = session.role === 'global_admin';
@@ -42,11 +52,11 @@ export function UsersPage({
   return (
     <main className="table-wrap management-wrap">
       {pwUserId !== null ? (
-        <div className="modal-backdrop" onClick={() => setPwUserId(null)}>
+        <div className="modal-backdrop" role="presentation" onClick={closePw}>
           <div className="modal-panel" onClick={(e) => e.stopPropagation()}>
             <div className="modal-header">
               <h2>Change Password</h2>
-              <button className="icon-button" onClick={() => setPwUserId(null)}><X size={14} /></button>
+              <button className="icon-button" disabled={pwBusy} onClick={closePw} aria-label="Close"><X size={14} /></button>
             </div>
             <label>
               New password
@@ -57,17 +67,20 @@ export function UsersPage({
                 onChange={(e) => setPwValue(e.target.value)}
               />
             </label>
+            <ActionError actionKey={`user:${pwUserId}:pw`} />
             <div className="button-row modal-actions">
-              <button className="text-button secondary" onClick={() => setPwUserId(null)}>Cancel</button>
+              <button className="text-button secondary" disabled={pwBusy} onClick={closePw}>Cancel</button>
               <button
                 className="text-button"
-                disabled={!pwValue}
+                disabled={!pwValue || isBusy(`user:${pwUserId}:pw`)}
                 onClick={() => {
                   const id = pwUserId;
-                  const pw = pwValue;
-                  setPwUserId(null);
-                  setPwValue('');
-                  void runAction(`user:${id}:pw`, () => changeUserPassword(id, pw));
+                  // Close and clear only once the server accepted the new password.
+                  void runAction(`user:${id}:pw`, () => changeUserPassword(id, pwValue), { inline: true }).then((saved) => {
+                    if (!saved) return;
+                    setPwUserId(null);
+                    setPwValue('');
+                  });
                 }}
               >
                 Save
@@ -77,24 +90,29 @@ export function UsersPage({
         </div>
       ) : null}
       <div className="management-header"><h1>Users & Groups</h1></div>
+      <ActionError actionKey="group:create" />
+      <ActionError actionKey="user:create" />
       <div className="management-grid">
         {canManageGroups(session.role) ? <form
           className="inline-form"
           onSubmit={(event) => {
             event.preventDefault();
             if (!groupName.trim()) return;
-            void runAction('group:create', () => createGroup(groupName.trim())).then(() => setGroupName(''));
+            void runAction('group:create', () => createGroup(groupName.trim()), { inline: true }).then((saved) => {
+              if (saved) setGroupName('');
+            });
           }}
         >
           <input aria-label="Group name" placeholder="Group name" value={groupName} onChange={(event) => setGroupName(event.target.value)} />
-          <ActionButton busy={busyAction === 'group:create'} icon={<Plus size={14} />} label="Group" onClick={() => undefined} type="submit" />
+          <ActionButton busy={isBusy('group:create')} icon={<Plus size={14} />} label="Group" onClick={() => undefined} type="submit" />
         </form> : null}
         {admin ? <form
           className="inline-form user-form"
           onSubmit={(event) => {
             event.preventDefault();
             if (!username.trim() || !password) return;
-            void runAction('user:create', () => createUser(username.trim(), password, role, groupId ? [groupId] : [])).then(() => {
+            void runAction('user:create', () => createUser(username.trim(), password, role, groupId ? [groupId] : []), { inline: true }).then((saved) => {
+              if (!saved) return;
               setUsername('');
               setPassword('');
             });
@@ -116,7 +134,7 @@ export function UsersPage({
               <option key={group.group_id} value={group.group_id}>{group.name}</option>
             ))}
           </select>
-          <ActionButton busy={busyAction === 'user:create'} icon={<Plus size={14} />} label="User" onClick={() => undefined} type="submit" />
+          <ActionButton busy={isBusy('user:create')} icon={<Plus size={14} />} label="User" onClick={() => undefined} type="submit" />
         </form> : null}
       </div>
       <div className="table-container">
@@ -134,7 +152,7 @@ export function UsersPage({
                   <div className="button-row">
                     {canChangePw ? (
                       <ActionButton
-                        busy={busyAction === `user:${user.user_id}:pw`}
+                        busy={isBusy(`user:${user.user_id}:pw`)}
                         icon={<SlidersHorizontal size={14} />}
                         label="Password"
                         onClick={() => { setPwUserId(user.user_id); setPwValue(''); }}
@@ -143,14 +161,14 @@ export function UsersPage({
                     {globalAdmin && !user.built_in ? (
                       user.disabled ? (
                         <ActionButton
-                          busy={busyAction === `user:${user.user_id}:enable`}
+                          busy={isBusy(`user:${user.user_id}:enable`)}
                           icon={<Play size={14} />}
                           label="Enable"
                           onClick={() => runAction(`user:${user.user_id}:enable`, () => enableUser(user.user_id))}
                         />
                       ) : (
                         <ActionButton
-                          busy={busyAction === `user:${user.user_id}:disable`}
+                          busy={isBusy(`user:${user.user_id}:disable`)}
                           icon={<Pause size={14} />}
                           label="Disable"
                           onClick={() => runAction(`user:${user.user_id}:disable`, () => disableUser(user.user_id))}
@@ -159,7 +177,7 @@ export function UsersPage({
                     ) : null}
                     {globalAdmin && !user.built_in ? (
                       <ActionButton
-                        busy={busyAction === `user:${user.user_id}:delete`}
+                        busy={isBusy(`user:${user.user_id}:delete`)}
                         danger
                         icon={<Trash2 size={14} />}
                         label="Delete"

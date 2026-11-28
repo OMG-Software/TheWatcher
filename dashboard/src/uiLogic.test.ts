@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { NAV_ITEMS, accountTypeLabel, colorLabel, parseMarkdownBlocks, parseViewHash, safeMarkdownHref } from './uiLogic';
+import { NAV_ITEMS, accountTypeLabel, colorLabel, isInsecureOrigin, parseMarkdownBlocks, parseViewHash, safeMarkdownHref } from './uiLogic';
 
 describe('GIVEN dashboard navigation rules', () => {
   it('WHEN the nav item list is read THEN it matches the requested top-level order without pending enrollments', () => {
@@ -78,5 +78,19 @@ describe('GIVEN a URL hash that may select a custom view', () => {
     expect(parseViewHash('#view-')).toBeNull();
     expect(parseViewHash('#view-abc')).toBeNull();
     expect(parseViewHash('#view-3-extra')).toBeNull();
+  });
+});
+
+describe('GIVEN the page origin', () => {
+  it.each([
+    ['https:', 'dash.example.com', false],
+    ['http:', 'localhost', false],
+    ['http:', '127.0.0.1', false],
+    ['http:', '[::1]', false],
+    ['http:', 'app.localhost', false],
+    ['http:', '192.168.1.20', true],
+    ['http:', 'dash.example.com', true],
+  ])('WHEN the page is %s//%s THEN the insecure-origin warning is %s', (protocol, hostname, expected) => {
+    expect(isInsecureOrigin({ protocol, hostname })).toBe(expected);
   });
 });
