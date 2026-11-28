@@ -324,8 +324,23 @@ A match that lies entirely after the first 4 KiB of a line produces no log
 match and no alert, and `$` does not match at that 4 KiB cut. Lines are read
 up to 64 KiB, and the reported line is not cut to 4 KiB. A pattern that nests
 groups more than 16 levels deep is skipped with a warning. These limits keep
-the regex engine's stack use bounded (#140). Patterns with heavy backtracking
-can still use a lot of CPU (#169).
+the regex engine's stack use bounded (#140).
+
+Patterns that can backtrack exponentially are rejected (#169): the server
+answers 400 when a collector config is saved with one, and the agent skips it
+with a warning. Refused are back-references (`\1`, `\k`); a repeated group
+that contains a quantifier or an alternation (`(a+)+`, `(\w+\s?)*`,
+`(a|aa)*`); overlapping unbounded quantifiers back to back (`.*.*`, `a*a*`);
+and more than three unbounded quantifiers (`*`, `+`, `{n,}`) in one pattern.
+Ordinary patterns such as `ERROR.*disk.*full`, `(ERROR|WARN) disk` and
+`\d{4}-\d{2}` are accepted.
+
+Each indicator tails its file independently. A monitor starts at the end of an
+existing file, so enabling it does not report old lines; a file that is created
+later is read from its first byte. A line is matched once it ends with a
+newline (a trailing `` is dropped, so CRLF logs work with `$`). If the file
+is replaced, deleted and recreated, or becomes shorter than the read position,
+it is read again from the start (#90).
 
 ## Agent CLI Overrides
 

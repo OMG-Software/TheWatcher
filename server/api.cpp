@@ -3,6 +3,7 @@
 #include "api_json.hpp"
 #include "api_validation.hpp"
 #include "common/SingleLog.hpp"
+#include "common/log_pattern.hpp"
 #include "common/protocol.hpp"
 #include "report_generator.hpp"
 
@@ -321,6 +322,8 @@ namespace
                 throw validation::ValidationError("log path is too long");
             if (log.pattern.empty() || log.pattern.size() > 256)
                 throw validation::ValidationError("log pattern must be 1-256 characters");
+            if (const auto reason = log_pattern_error(log.pattern); !reason.empty())
+                throw validation::ValidationError("log pattern rejected: " + reason);
             if (log.indicator_name.empty() || log.indicator_name.size() > 64)
                 throw validation::ValidationError("log indicator_name must be 1-64 characters");
             if (log.severity != "yellow" && log.severity != "amber" && log.severity != "red")
