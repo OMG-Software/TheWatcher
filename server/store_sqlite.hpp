@@ -69,7 +69,7 @@ public:
                             int count) override;
     void clear_pending_status(const std::string& agent_id, const std::string& indicator) override;
     int64_t insert_alert(const AlertRecord& alert) override;
-    bool insert_heartbeat_alert_if_absent(const AlertRecord& alert) override;
+    int64_t insert_heartbeat_alert_if_absent(const AlertRecord& alert) override;
     std::vector<AlertRecord> list_alerts(bool include_deleted) override;
     std::vector<AlertRecord> list_unacknowledged_alerts() override;
     void acknowledge_alert(int64_t alert_id, const std::string& username, int64_t acknowledged_at,
@@ -82,6 +82,8 @@ public:
     void set_agent_description(const std::string& agent_id, const std::string& description) override;
     void set_agent_runbook(const std::string& agent_id, const std::string& markdown) override;
     std::vector<std::string> get_offline_unalerted_agent_ids() override;
+    bool has_open_alert(const std::string& agent_id, const std::string& indicator,
+                        const std::string& new_status) override;
     void archive_heartbeat_alerts_for_agent(const std::string& agent_id, int64_t deleted_at) override;
     void escalate_old_alerts(int64_t cutoff_ms, int64_t now_ms) override;
     int64_t count_metrics_in_window(const std::string& agent_id, int64_t since_ms, int64_t until_ms) override;

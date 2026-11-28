@@ -430,8 +430,8 @@ SCENARIO("A dead-agent heartbeat alert is created at most once")
 
         WHEN("the alert is inserted twice")
         {
-            const bool first = store.insert_heartbeat_alert_if_absent(alert);
-            const bool second = store.insert_heartbeat_alert_if_absent(alert);
+            const bool first = store.insert_heartbeat_alert_if_absent(alert) > 0;
+            const bool second = store.insert_heartbeat_alert_if_absent(alert) > 0;
 
             THEN("only the first insert creates a row")
             {
@@ -455,6 +455,41 @@ SCENARIO("A dead-agent heartbeat alert is created at most once")
 }
 
 // ── #78: SQLite errors are not "no rows" ─────────────────────────────────────
+
+SCENARIO("The synchronized store forwards the open-alert check")
+{
+    GIVEN("a shared store holding one unacknowledged alert")
+    {
+        auto store = make_store("sqlite", ":memory:");
+        store->upsert_agent(make_agent("a1"));
+        AlertRecord alert;
+        alert.agent_id = "a1";
+        alert.indicator = "cpu";
+        alert.old_status = "green";
+        alert.new_status = "red";
+        alert.created_at = 1000;
+        const auto id = store->insert_alert(alert);
+
+        WHEN("the alert is open")
+        {
+            THEN("has_open_alert sees it only for the matching severity")
+            {
+                CHECK(store->has_open_alert("a1", "cpu", "red"));
+                CHECK_FALSE(store->has_open_alert("a1", "cpu", "amber"));
+            }
+        }
+
+        WHEN("the alert is acknowledged")
+        {
+            store->acknowledge_alert(id, "admin", 2000);
+
+            THEN("it is no longer open")
+            {
+                CHECK_FALSE(store->has_open_alert("a1", "cpu", "red"));
+            }
+        }
+    }
+}
 
 SCENARIO("A read that fails is reported, never treated as an empty result")
 {

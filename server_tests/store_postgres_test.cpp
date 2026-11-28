@@ -466,6 +466,67 @@ SCENARIO("[postgres] Two server nodes racing to raise a dead-agent alert create 
     }
 }
 
+SCENARIO("[postgres] The open-alert check and the heartbeat insert behave as they do on SQLite")
+{
+    test::TestSchema schema;
+    GIVEN("an agent with one unacknowledged cpu alert")
+    {
+        PostgresStore store(schema.dsn());
+        store.upsert_agent(make_agent("a1"));
+        AlertRecord alert;
+        alert.agent_id = "a1";
+        alert.indicator = "cpu";
+        alert.old_status = "green";
+        alert.new_status = "red";
+        alert.created_at = 1000;
+        const auto id = store.insert_alert(alert);
+
+        WHEN("the alert is open")
+        {
+            THEN("has_open_alert matches only the same agent, indicator and severity")
+            {
+                CHECK(store.has_open_alert("a1", "cpu", "red"));
+                CHECK_FALSE(store.has_open_alert("a1", "cpu", "amber"));
+                CHECK_FALSE(store.has_open_alert("a1", "memory", "red"));
+                CHECK_FALSE(store.has_open_alert("a2", "cpu", "red"));
+            }
+        }
+
+        WHEN("the alert is acknowledged")
+        {
+            store.acknowledge_alert(id, "admin", 2000);
+
+            THEN("it is no longer open")
+            {
+                CHECK_FALSE(store.has_open_alert("a1", "cpu", "red"));
+            }
+        }
+
+        WHEN("the alert is deleted")
+        {
+            store.soft_delete_alert(id, 2000);
+
+            THEN("it is no longer open")
+            {
+                CHECK_FALSE(store.has_open_alert("a1", "cpu", "red"));
+            }
+        }
+
+        WHEN("a heartbeat alert is inserted twice")
+        {
+            const auto first = store.insert_heartbeat_alert_if_absent(heartbeat_alert("a1"));
+            const auto second = store.insert_heartbeat_alert_if_absent(heartbeat_alert("a1"));
+
+            THEN("the first returns the new alert id and the second returns 0")
+            {
+                CHECK(first > 0);
+                CHECK(second == 0);
+                CHECK(store.has_open_alert("a1", "Heartbeat", "red"));
+            }
+        }
+    }
+}
+
 // ── Threads ──────────────────────────────────────────────────────────────────
 
 SCENARIO("[postgres] Eight threads can use one synchronized store at the same time")
