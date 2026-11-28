@@ -5,7 +5,7 @@ import { App } from './App';
 import { ConfirmDialog } from './components/ConfirmDialog';
 import { InfoTip } from './components/InfoTip';
 import { Modal } from './components/Modal';
-import { FakeApi, agentRecord, ok } from './testing/fakeApi';
+import { FakeApi, agentRecord, deferred, ok, type FakeReply } from './testing/fakeApi';
 
 async function openDashboard(api: FakeApi) {
   api.install();
@@ -442,5 +442,56 @@ describe('GIVEN the component status dots (review: Sonar S6845)', () => {
     await openDashboard(new FakeApi('global_admin'));
 
     expect(await screen.findByRole('button', { name: /^CPU: / })).toBeInTheDocument();
+  });
+});
+
+describe('GIVEN review fixes on the Monitoring and Alerts pages (PR 190)', () => {
+  it('WHEN a component status dot is clicked THEN the row does not expand or collapse', async () => {
+    await openDashboard(new FakeApi('global_admin'));
+    const dot = await screen.findByRole('button', { name: /^CPU: / });
+
+    fireEvent.click(dot);
+    expect(screen.getByRole('button', { name: 'Expand web-01' })).toHaveAttribute('aria-expanded', 'false');
+
+    fireEvent.click(screen.getByRole('button', { name: 'Expand web-01' }));
+    fireEvent.click(screen.getByRole('button', { name: /^CPU: / }));
+    expect(screen.getByRole('button', { name: 'Collapse web-01' })).toHaveAttribute('aria-expanded', 'true');
+  });
+
+  it('WHEN a filter hides selected alerts and is then cleared THEN the hidden alerts are no longer selected', async () => {
+    const api = new FakeApi('global_admin')
+      .on('GET /api/agents', ok([agentRecord('agent-1', 'web-01'), agentRecord('agent-2', 'db-01')]))
+      .on('GET /api/alerts', ok([alertRow(1, 'agent-1'), alertRow(3, 'agent-2')]));
+    await openDashboard(api);
+    goTo('Alerts');
+    fireEvent.click(await screen.findByRole('button', { name: 'Select all alerts' }));
+    expect(screen.getByRole('button', { name: 'Archive (2)' })).toBeInTheDocument();
+
+    fireEvent.change(screen.getByLabelText('Filter by agent'), { target: { value: 'agent-2' } });
+    fireEvent.change(screen.getByLabelText('Filter by agent'), { target: { value: '' } });
+
+    expect(screen.getByRole('button', { name: 'Archive (1)' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: /Select alert for web-01/ })).toHaveAttribute('aria-pressed', 'false');
+  });
+
+  it('WHEN a row is collapsed THEN its in-flight history and log requests are aborted', async () => {
+    const hold = deferred<FakeReply>();
+    const api = new FakeApi('global_admin')
+      .on('GET /api/metrics/agent-1?limit=20', () => hold.promise)
+      .on('GET /api/agents/agent-1/log-matches?limit=20', () => hold.promise);
+    const fetchMock = api.install();
+    render(<App />);
+    fireEvent.click(await screen.findByRole('button', { name: 'Expand web-01' }));
+    await waitFor(() => expect(api.count('GET /api/metrics/agent-1?limit=20')).toBe(1));
+    await waitFor(() => expect(api.count('GET /api/agents/agent-1/log-matches?limit=20')).toBe(1));
+    const signalOf = (path: string) =>
+      (fetchMock.mock.calls.find(([url]) => url === path)?.[1] as RequestInit | undefined)?.signal;
+    expect(signalOf('/api/metrics/agent-1?limit=20')?.aborted).toBe(false);
+
+    fireEvent.click(screen.getByRole('button', { name: 'Collapse web-01' }));
+
+    expect(signalOf('/api/metrics/agent-1?limit=20')?.aborted).toBe(true);
+    expect(signalOf('/api/agents/agent-1/log-matches?limit=20')?.aborted).toBe(true);
+    hold.resolve(ok([]));
   });
 });

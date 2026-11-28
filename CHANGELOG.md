@@ -249,6 +249,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   matches on the poll interval, with cancellation and per-part errors (#111).
   Archived alerts no longer refetch on every render; the polling hook fixed
   that earlier.
+- Dashboard: clicking a component status dot no longer expands or collapses
+  its row; hidden alerts are dropped from the Alerts selection instead of
+  returning when the filter is cleared; and collapsing a Monitoring row aborts
+  its in-flight history and log requests (`fetchMetricHistory` and
+  `fetchLogMatches` take an optional `signal`) (#190).
 - Dashboard: runbooks render numbered lists, inline code, bold, italic, line
   breaks and links with parentheses in the URL, still without injecting HTML
   (#113).

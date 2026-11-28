@@ -131,8 +131,8 @@ export function MonitoringPage({
                         <td className="dot-cell"><StatusDot color={agent.alertColor} label={agent.alertColor === 'green' ? 'No alerts' : 'Alerts'} /></td>
                         {agent.components.map((component) => (
                           <td className="dot-cell" key={component.key}>
-                            {/* Focusable and named in words, so the status does not depend on colour or hover. */}
-                            <button aria-label={`${component.label}: ${colorLabel(component.color)}, ${component.value}. ${component.detail}`} className="dot-wrap dot-button" type="button">
+                            {/* Focusable and named in words, so the status does not depend on colour or hover. It must not toggle the row it sits in. */}
+                            <button aria-label={`${component.label}: ${colorLabel(component.color)}, ${component.value}. ${component.detail}`} className="dot-wrap dot-button" onClick={(event) => event.stopPropagation()} onKeyDown={(event) => event.stopPropagation()} type="button">
                               <span aria-hidden="true" className={`dot ${component.color}`} />
                               <span aria-hidden="true" className="tooltip">
                                 {component.label}: {colorLabel(component.color)}, {component.value}
@@ -177,8 +177,8 @@ export function MonitoringPage({
  * and a slow response never overtakes a newer one. A row that is not live loads once and has a Refresh button.
  */
 function AgentDetail({ agent, live, onShowHistory }: { agent: DashboardAgent; live: boolean; onShowHistory: () => void }) {
-  const history = usePolling(React.useCallback(() => fetchMetricHistory(agent.id, 20), [agent.id]), { intervalMs: live ? DETAIL_POLL_MS : undefined });
-  const logs = usePolling(React.useCallback(() => fetchLogMatches(agent.id, 20), [agent.id]), { intervalMs: live ? DETAIL_POLL_MS : undefined });
+  const history = usePolling(React.useCallback((signal: AbortSignal) => fetchMetricHistory(agent.id, 20, signal), [agent.id]), { intervalMs: live ? DETAIL_POLL_MS : undefined });
+  const logs = usePolling(React.useCallback((signal: AbortSignal) => fetchLogMatches(agent.id, 20, signal), [agent.id]), { intervalMs: live ? DETAIL_POLL_MS : undefined });
   const logMatches = logs.data ?? [];
 
   return (

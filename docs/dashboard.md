@@ -272,8 +272,10 @@ expanded row loads its metric history and log matches; the three most recently
 opened rows then reload every 5 seconds (and pause while the tab is hidden), so
 expanding many rows cannot flood the API. Older rows keep their last data and have
 a Refresh button. A failed reload keeps the last data and shows the error. A
-response that arrives after a row is closed is ignored; the request itself is not
-aborted.
+response that arrives after a row is closed is ignored, and closing the row
+aborts its in-flight history and log requests (`fetchMetricHistory` and
+`fetchLogMatches` take an optional `signal` that `usePolling` supplies).
+Clicking or pressing a key on a component dot never expands or collapses the row.
 
 A `#view-<id>` filter is dropped, with its hash, once the views have loaded and
 the id is not among them (deleted, or not visible to the user). If the views
@@ -354,7 +356,8 @@ line breaks and safe links (http, https, mailto; URLs may contain parentheses).
 Raw HTML is shown as text, never injected.
 
 Bulk selection only counts alerts that are on screen: changing a filter drops
-hidden alerts from the selection, and the bulk buttons show and act on the
+hidden alerts from the selection itself (clearing the filter does not bring them
+back), and the bulk buttons show and act on the
 visible selection. The agent filter also lists agents that only have archived
 alerts once Show archived is on. The server returns at most 1000 alerts per
 list; when a list reaches that size the page says it is truncated (it does not

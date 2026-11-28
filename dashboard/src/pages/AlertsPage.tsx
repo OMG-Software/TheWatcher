@@ -69,6 +69,9 @@ export function AlertsPage({
   const displayedIds = displayed.map((a) => a.alert_id);
   // Only what is on screen counts: ids selected before a filter hid them are neither counted nor sent.
   const selectedIds = displayedIds.filter((id) => selected.has(id));
+  // A filter, a poll or Show archived can hide selected alerts: drop them from the selection itself, so
+  // they do not come back when the filter is cleared. (Adjusting state while rendering is the React pattern for this.)
+  if (selectedIds.length !== selected.size) setSelected(new Set(selectedIds));
   const allSelected = displayedIds.length > 0 && selectedIds.length === displayedIds.length;
   const truncated = baseAlerts.length >= ALERT_LIST_CAP;
 
