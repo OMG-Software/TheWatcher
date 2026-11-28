@@ -310,6 +310,12 @@ void Server::run_periodic_maintenance(int64_t now_ms)
         LOGF_ERROR("Maintenance reconcile failed: %s", e.what());
     }
 
+    // Expired sessions are also purged from requests; doing it here too means an
+    // idle server (no logins, no dashboard) does not keep them. The API object
+    // spaces the purges five minutes apart and retries after a failure.
+    if (api_)
+        api_->purge_expired_sessions_if_due(now_ms);
+
     constexpr int64_t retention_interval_ms = 3'600'000; // once an hour
     if (now_ms - last_retention_run_ms_ >= retention_interval_ms)
     {

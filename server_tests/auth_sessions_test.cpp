@@ -1,6 +1,7 @@
 // Session revocation, expired-session purging and authentication audit
 // logging (issues #145 and #70).
 #include "../server/api.hpp"
+#include "../server/sqlite_raii.hpp"
 #include "../server/store.hpp"
 #include "../server/zap_handler.hpp"
 #include "common/SingleLog.hpp"
@@ -15,6 +16,7 @@
 #include <chrono>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <memory>
 #include <sstream>
 #include <string>
@@ -64,13 +66,17 @@ SessionRecord make_session(const std::string& token, int64_t user_id, int64_t ex
 // An isolated API server over an in-memory store.
 struct ApiFixture
 {
-    ApiFixture()
+    // `configure` runs before the listener starts (for test hooks); anything its
+    // callbacks capture must outlive the fixture.
+    explicit ApiFixture(const std::function<void(ApiFixture&)>& configure = {})
         : store(thewatcher::server::make_store("sqlite", ":memory:"))
         , api(*store, zap, "127.0.0.1", port)
         , client("http://127.0.0.1:" + std::to_string(port))
     {
         client.set_connection_timeout(5, 0);
         client.set_read_timeout(10, 0);
+        if (configure)
+            configure(*this);
         api.start();
     }
 
@@ -169,6 +175,16 @@ struct CapturedLog
         return ss.str();
     }
 
+    // Blocks until every record written before this call is in the file. The
+    // writer is one FIFO queue, so a marker written now reaches the file after
+    // everything queued earlier; once it shows up, absence checks are sound.
+    void settle()
+    {
+        const auto marker = "test-settle-marker-" + std::to_string(++settle_count);
+        thewatcher::logging::SingleLog::GetInstance().Notice("settle", marker);
+        REQUIRE(eventually_contains(marker));
+    }
+
     // True once the log contains `needle` (the writer thread is asynchronous).
     bool eventually_contains(const std::string& needle) const
     {
@@ -182,6 +198,7 @@ struct CapturedLog
     // `dir` is declared first so it exists when `path` is initialised.
     thewatcher::test::ScopedTempDir dir{"auth-audit"};
     std::filesystem::path path;
+    int settle_count = 0;
 };
 
 } // namespace
@@ -437,6 +454,8 @@ SCENARIO("Wrong current passwords count against the login throttle")
         REQUIRE_FALSE(carol.empty());
         const auto path = "/api/users/" + std::to_string(carol_id) + "/password";
         const std::string wrong = R"({"password":"carol-pass-new","current_password":"guess"})";
+        // Read before any attempt, so the final check does not depend on login.
+        const auto stored_hash_before = fx.store->get_user_by_username("carol")->password_hash;
 
         WHEN("the session guesses the current password five times")
         {
@@ -455,6 +474,7 @@ SCENARIO("Wrong current passwords count against the login throttle")
                 REQUIRE(res->status == 429);
                 REQUIRE_FALSE(res->get_header_value("Retry-After").empty());
                 REQUIRE(fx.session_status(carol) == 200);
+                REQUIRE(fx.store->get_user_by_username("carol")->password_hash == stored_hash_before);
                 REQUIRE(fx.login("carol", "carol-pass-new").empty());
             }
 
@@ -612,6 +632,7 @@ SCENARIO("Authentication events are audit logged")
 
             THEN("no password is ever logged")
             {
+                log.settle(); // the writer is asynchronous: wait for every earlier line
                 const auto text = log.read();
                 REQUIRE(text.find("look_at_me") == std::string::npos);
                 REQUIRE(text.find("erin-pass") == std::string::npos);
@@ -895,27 +916,22 @@ namespace
 // fault trigger that the store under test does not know about.
 struct SideConnection
 {
+    // The RAII connection owns the handle from the moment it opens (it also
+    // installs the busy timeout), so a failed open throws and nothing leaks.
     explicit SideConnection(const std::string& path)
+        : conn(path)
     {
-        REQUIRE(sqlite3_open(path.c_str(), &db) == SQLITE_OK);
-        sqlite3_busy_timeout(db, 5000);
-    }
-    SideConnection(const SideConnection&) = delete;
-    SideConnection& operator=(const SideConnection&) = delete;
-    ~SideConnection()
-    {
-        sqlite3_close(db);
     }
     void exec(const std::string& sql)
     {
         char* err = nullptr;
-        const auto rc = sqlite3_exec(db, sql.c_str(), nullptr, nullptr, &err);
+        const auto rc = sqlite3_exec(conn, sql.c_str(), nullptr, nullptr, &err);
         const std::string message = err != nullptr ? err : "";
         sqlite3_free(err);
         REQUIRE(message.empty());
         REQUIRE(rc == SQLITE_OK);
     }
-    sqlite3* db = nullptr;
+    thewatcher::server::sqlite::Connection conn;
 };
 
 } // namespace
@@ -943,15 +959,20 @@ SCENARIO("A rolled-back password reset never takes other threads' sessions with 
         const auto new_hash = hash_for("new-victim-password");
 
         constexpr int creators = 4;
-        constexpr int creator_budget = 400; // sessions each creator may attempt
-        // Wall-clock cap as well, so a slow disk bounds the loops by time.
-        const auto creator_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        // Creators run until the resets finish; this wall-clock cap bounds the
+        // loops on a slow disk.
+        const auto creator_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
         constexpr int resetters = 3;
         constexpr int resets_each = 40;
         std::atomic<int> reset_throws{0};
         std::atomic<int> create_errors{0};
+        std::atomic<bool> starved{false};
+        std::atomic<int> resets_started{0};
         std::atomic<int> resets_done{0};
         std::atomic<int> acknowledged{0};
+        // Logins acknowledged while the reset phase was under way (some reset
+        // had started and not all had finished).
+        std::atomic<int> acknowledged_during_resets{0};
         std::vector<std::vector<std::string>> created(creators);
 
         WHEN("failing resets run while other users keep logging in")
@@ -962,11 +983,8 @@ SCENARIO("A rolled-back password reset never takes other threads' sessions with 
             for (int c = 0; c < creators; ++c)
             {
                 threads.emplace_back([&, c] {
-                    // Bounded: a fixed budget keeps slow disks from running forever, and
-                    // it still overlaps the resets, which run alongside.
-                    for (int i = 0; i < creator_budget && resets_done.load() < resetters &&
-                                    std::chrono::steady_clock::now() < creator_deadline;
-                         ++i)
+                    for (int i = 0;
+                         resets_done.load() < resetters && std::chrono::steady_clock::now() < creator_deadline; ++i)
                     {
                         const auto token = "other-" + std::to_string(c) + "-" + std::to_string(i);
                         try
@@ -976,6 +994,8 @@ SCENARIO("A rolled-back password reset never takes other threads' sessions with 
                             {
                                 created[c].push_back(token);
                                 ++acknowledged;
+                                if (resets_started.load() > 0 && resets_done.load() < resetters)
+                                    ++acknowledged_during_resets;
                             }
                         }
                         catch (const std::exception&)
@@ -996,6 +1016,8 @@ SCENARIO("A rolled-back password reset never takes other threads' sessions with 
                     // No Catch2 assertions off the main thread.
                     for (int i = 0; i < resets_each; ++i)
                     {
+                        ++resets_started;
+                        const auto before = acknowledged_during_resets.load();
                         try
                         {
                             store->update_user_password_and_revoke_sessions(victim, new_hash);
@@ -1004,6 +1026,18 @@ SCENARIO("A rolled-back password reset never takes other threads' sessions with 
                         {
                             ++reset_throws;
                         }
+                        // Pace the resets: do not start the next one until a
+                        // login was acknowledged since this one began. The
+                        // overlap is therefore guaranteed, and the final check
+                        // fails if the creators never got through.
+                        // After one timeout the creators are starved: stop waiting
+                        // so the failure arrives quickly.
+                        if (!starved.load() && !thewatcher::test::eventually(
+                                                   [&] {
+                                                       return acknowledged_during_resets.load() > before;
+                                                   },
+                                                   2s, 1ms))
+                            starved = true;
                     }
                     ++resets_done;
                 });
@@ -1016,6 +1050,9 @@ SCENARIO("A rolled-back password reset never takes other threads' sessions with 
                 REQUIRE(logins_running);
                 REQUIRE(reset_throws.load() == resetters * resets_each);
                 REQUIRE(create_errors.load() == 0);
+                // The test proves nothing unless logins really completed while
+                // resets were running.
+                REQUIRE(acknowledged_during_resets.load() >= 1);
                 const auto now = now_ms();
                 std::size_t total = 0;
                 for (const auto& tokens : created)
@@ -1057,6 +1094,288 @@ SCENARIO("A password change tells a missing user apart from a user with no sessi
             THEN("the store reports that no user was updated")
             {
                 REQUIRE_FALSE(result.has_value());
+            }
+        }
+    }
+}
+
+SCENARIO("A username containing a NUL byte is rejected before it reaches the throttle or the store")
+{
+    GIVEN("an API server whose admin account is thewatcher")
+    {
+        ApiFixture fx;
+        const auto admin = fx.login("thewatcher", "look_at_me");
+        REQUIRE_FALSE(admin.empty());
+
+        WHEN("logins name the admin with a NUL byte and a different suffix each time, with the right password")
+        {
+            std::vector<int> statuses;
+            for (int i = 0; i < 12; ++i)
+            {
+                const auto name = std::string("thewatcher\0", 11) + std::to_string(i);
+                auto res = fx.client.Post("/api/login",
+                                          json{
+                                              {"username", name        },
+                                              {"password", "look_at_me"}
+                }
+                                              .dump(),
+                                          "application/json");
+                REQUIRE(res);
+                statuses.push_back(res->status);
+                REQUIRE(res->get_header_value("Set-Cookie").empty());
+            }
+
+            THEN("every one is refused as a bad request, never reaching the account or the throttle")
+            {
+                for (const auto status : statuses)
+                    REQUIRE(status == 400);
+                REQUIRE_FALSE(fx.login("thewatcher", "look_at_me").empty());
+            }
+        }
+
+        WHEN("a user is created with a NUL byte in the name")
+        {
+            auto res = fx.client.Post(
+                "/api/users",
+                {
+                    {"Cookie", admin}
+            },
+                json{{"username", std::string("evil\0x", 6)}, {"password", "pw-123456"}, {"role", "global_viewer"}}
+                    .dump(),
+                "application/json");
+            REQUIRE(res);
+
+            THEN("it is rejected and no account exists")
+            {
+                REQUIRE(res->status == 400);
+                REQUIRE_FALSE(fx.store->get_user_by_username("evil").has_value());
+            }
+        }
+    }
+}
+
+SCENARIO("A self-service change applies only to the password hash that was verified")
+{
+    GIVEN("a store with a user who has two sessions")
+    {
+        auto store = thewatcher::server::make_store("sqlite", ":memory:");
+        const auto old_hash = hash_for("old-password");
+        const auto user_id = store->create_user("gina", old_hash, "global_viewer");
+        const int64_t expires = now_ms() + hour_ms;
+        store->create_session(make_session("gina-1", user_id, expires));
+        store->create_session(make_session("gina-2", user_id, expires));
+        using Status = thewatcher::server::PasswordChangeResult::Status;
+
+        WHEN("the change names the hash that is still stored")
+        {
+            const auto result =
+                store->update_user_password_if_current_and_revoke_sessions(user_id, old_hash, "new-hash", "gina-1");
+
+            THEN("the password changes and the other session is revoked")
+            {
+                REQUIRE(result.status == Status::Changed);
+                REQUIRE(result.revoked == 1);
+                REQUIRE(store->get_user_by_username("gina")->password_hash == "new-hash");
+                REQUIRE(store->get_session("gina-1", now_ms()));
+                REQUIRE_FALSE(store->get_session("gina-2", now_ms()));
+            }
+        }
+
+        WHEN("the stored hash was replaced after it was verified")
+        {
+            store->update_user_password(user_id, "reset-by-admin");
+            const auto result =
+                store->update_user_password_if_current_and_revoke_sessions(user_id, old_hash, "new-hash", "gina-1");
+
+            THEN("nothing changes: the reset stays and no session is revoked")
+            {
+                REQUIRE(result.status == Status::PasswordChanged);
+                REQUIRE(result.revoked == 0);
+                REQUIRE(store->get_user_by_username("gina")->password_hash == "reset-by-admin");
+                REQUIRE(store->get_session("gina-1", now_ms()));
+                REQUIRE(store->get_session("gina-2", now_ms()));
+            }
+        }
+
+        WHEN("the user does not exist")
+        {
+            const auto result = store->update_user_password_if_current_and_revoke_sessions(987654, old_hash, "x");
+
+            THEN("the store reports it")
+            {
+                REQUIRE(result.status == Status::UserNotFound);
+            }
+        }
+    }
+}
+
+SCENARIO("An admin reset that lands between verification and update wins over a self-service change")
+{
+    GIVEN("a user who sends the correct current password while an admin reset lands mid-request")
+    {
+        CapturedLog log;
+        std::atomic<bool> armed{false};
+        std::string reset_hash;
+        int64_t carol_id = 0;
+        ApiFixture fx([&](ApiFixture& f) {
+            f.api.set_password_change_test_hook([&armed, &reset_hash, &carol_id, fixture = &f](int64_t user_id) {
+                if (armed.load() && user_id == carol_id)
+                    fixture->store->update_user_password(user_id, reset_hash);
+            });
+        });
+        const auto admin = fx.login("thewatcher", "look_at_me");
+        carol_id = fx.create_user(admin, "carol", "carol-pass-1");
+        const auto carol_a = fx.login("carol", "carol-pass-1");
+        const auto carol_b = fx.login("carol", "carol-pass-1");
+        reset_hash = hash_for("admin-chosen");
+        armed = true;
+
+        WHEN("the change is submitted")
+        {
+            auto res =
+                fx.client.Put("/api/users/" + std::to_string(carol_id) + "/password",
+                              {
+                                  {"Cookie", carol_a}
+            },
+                              R"({"password":"carol-pass-new","current_password":"carol-pass-1"})", "application/json");
+            REQUIRE(res);
+
+            THEN("it is refused with 409, the admin hash stays and no session is revoked")
+            {
+                REQUIRE(res->status == 409);
+                REQUIRE(fx.store->get_user_by_username("carol")->password_hash == reset_hash);
+                REQUIRE(fx.session_status(carol_a) == 200);
+                REQUIRE(fx.session_status(carol_b) == 200);
+            }
+
+            THEN("no success is audited")
+            {
+                log.settle();
+                REQUIRE(log.read().find("event=password_change outcome=success") == std::string::npos);
+            }
+        }
+    }
+}
+
+SCENARIO("Enabling a user revokes leftover sessions only when the user was disabled")
+{
+    GIVEN("a store with a disabled user holding a leftover session and an enabled user holding a session")
+    {
+        auto store = thewatcher::server::make_store("sqlite", ":memory:");
+        const auto disabled = store->create_user("dora", hash_for("pw"), "global_viewer");
+        const auto enabled = store->create_user("eli", hash_for("pw"), "global_viewer");
+        const int64_t expires = now_ms() + hour_ms;
+        store->disable_user(disabled);
+        store->create_session(make_session("dora-old", disabled, expires));
+        store->create_session(make_session("eli-1", enabled, expires));
+
+        WHEN("the disabled user is enabled")
+        {
+            const auto revoked = store->enable_user_and_revoke_sessions(disabled);
+
+            THEN("the user is enabled and the leftover session is gone")
+            {
+                REQUIRE(revoked.has_value());
+                REQUIRE(*revoked == 1);
+                REQUIRE_FALSE(store->get_user_by_username("dora")->disabled);
+                REQUIRE_FALSE(store->get_session("dora-old", now_ms()));
+            }
+
+            AND_WHEN("a session is created and the enable is retried")
+            {
+                store->create_session(make_session("dora-new", disabled, expires));
+                const auto retry = store->enable_user_and_revoke_sessions(disabled);
+
+                THEN("the retry succeeds and the new session survives")
+                {
+                    REQUIRE(retry.has_value());
+                    REQUIRE(*retry == 0);
+                    REQUIRE(store->get_session("dora-new", now_ms()));
+                }
+            }
+        }
+
+        WHEN("an already enabled user is enabled")
+        {
+            const auto revoked = store->enable_user_and_revoke_sessions(enabled);
+
+            THEN("it succeeds without revoking anything")
+            {
+                REQUIRE(revoked.has_value());
+                REQUIRE(*revoked == 0);
+                REQUIRE(store->get_session("eli-1", now_ms()));
+            }
+        }
+
+        WHEN("an unknown user is enabled")
+        {
+            THEN("the store reports no such user")
+            {
+                REQUIRE_FALSE(store->enable_user_and_revoke_sessions(987654).has_value());
+            }
+        }
+    }
+}
+
+SCENARIO("A retried enable over HTTP does not sign the user out again")
+{
+    GIVEN("a disabled user the admin enables, who then signs in")
+    {
+        ApiFixture fx;
+        const auto admin = fx.login("thewatcher", "look_at_me");
+        const auto user_id = fx.create_user(admin, "carol", "carol-pass-1");
+        const auto path = "/api/users/" + std::to_string(user_id);
+        REQUIRE(fx.put(admin, path + "/disable") == 200);
+        REQUIRE(fx.put(admin, path + "/enable") == 200);
+        const auto carol = fx.login("carol", "carol-pass-1");
+        REQUIRE_FALSE(carol.empty());
+
+        WHEN("the admin repeats the enable")
+        {
+            const auto status = fx.put(admin, path + "/enable");
+
+            THEN("it still succeeds and the session created after the first enable survives")
+            {
+                REQUIRE(status == 200);
+                REQUIRE(fx.session_status(carol) == 200);
+            }
+        }
+    }
+}
+
+SCENARIO("A wrong current password is audited once, as a failed password change")
+{
+    GIVEN("a user and a captured audit log")
+    {
+        CapturedLog log;
+        ApiFixture fx;
+        const auto admin = fx.login("thewatcher", "look_at_me");
+        const auto carol_id = fx.create_user(admin, "carol", "carol-pass-1");
+        const auto carol = fx.login("carol", "carol-pass-1");
+
+        WHEN("the user sends a wrong current password")
+        {
+            REQUIRE(fx.put(carol, "/api/users/" + std::to_string(carol_id) + "/password",
+                           R"({"password":"carol-pass-new","current_password":"wrong"})") == 403);
+            log.settle();
+
+            THEN("only the password_change failure line is written, not a permission denial")
+            {
+                const auto text = log.read();
+                REQUIRE(text.find("event=password_change outcome=failure") != std::string::npos);
+                REQUIRE(text.find("event=permission_denied") == std::string::npos);
+            }
+        }
+
+        WHEN("the user tries to change the admin password")
+        {
+            REQUIRE(fx.put(carol, "/api/users/1/password", R"({"password":"x-new-pass","current_password":"x"})") ==
+                    403);
+            log.settle();
+
+            THEN("the real authorization denial is still audited")
+            {
+                REQUIRE(log.read().find("event=permission_denied") != std::string::npos);
             }
         }
     }

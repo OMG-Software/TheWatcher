@@ -80,6 +80,19 @@ struct SessionRecord
     int64_t expires_at = 0;
 };
 
+// Outcome of Store::update_user_password_if_current_and_revoke_sessions.
+struct PasswordChangeResult
+{
+    enum class Status
+    {
+        Changed,         // hash replaced, sessions revoked
+        UserNotFound,    // no such user
+        PasswordChanged, // the stored hash is no longer the expected one; nothing changed
+    };
+    Status status = Status::UserNotFound;
+    int revoked = 0; // sessions revoked, meaningful for Changed
+};
+
 struct StatusHistoryRow
 {
     int64_t id = 0;
@@ -192,8 +205,10 @@ struct AgentConfigUpdate
 //  - Implementations are not thread safe. make_store() returns a store wrapped
 //    in SynchronizedStore, which holds one mutex for every call, so callers on
 //    any thread (HTTP workers, the server thread, the status engine) can share
-//    it. Every new virtual method must be forwarded there; the compiler
-//    enforces it because SynchronizedStore implements this interface.
+//    it. Every new virtual method must be forwarded there. The compiler
+//    enforces that only for PURE virtual methods (a missing override leaves
+//    SynchronizedStore abstract); a virtual with a default implementation
+//    would silently run unlocked, so declare new methods pure (= 0).
 //  - A method that writes more than one row or statement must be atomic: wrap
 //    it in the backend's RAII transaction guard.
 //  - Read paths throw on database errors; "no rows" is only ever a successful,
@@ -273,6 +288,20 @@ public:
     virtual std::optional<int> update_user_password_and_revoke_sessions(int64_t user_id,
                                                                         const std::string& password_hash,
                                                                         const std::string& keep_token = "") = 0;
+    // Self-service password change: replaces the hash and revokes the user's
+    // sessions except keep_token (empty keeps none) in one transaction, but
+    // only while the stored hash still equals expected_hash (the hash the
+    // caller verified the current password against). If an admin reset landed
+    // in between, nothing is changed or revoked and PasswordChanged is
+    // returned. UserNotFound: no such user. Atomic.
+    virtual PasswordChangeResult update_user_password_if_current_and_revoke_sessions(
+        int64_t user_id, const std::string& expected_hash, const std::string& new_hash,
+        const std::string& keep_token = "") = 0;
+    // Enables the user and, only when that is a real disabled-to-enabled
+    // change, revokes every leftover session of the user, in one transaction.
+    // Returns the number of sessions revoked (0 for an already enabled user,
+    // which is not an error), or nullopt when the user does not exist.
+    virtual std::optional<int> enable_user_and_revoke_sessions(int64_t user_id) = 0;
     // Disables the user and revokes all of their sessions as one atomic
     // operation, so re-enabling cannot revive old sessions. Returns the number
     // of users affected (0: unknown id or built-in; nothing is revoked then).

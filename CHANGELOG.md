@@ -108,6 +108,23 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   audited as `password_change` `failure` (or `locked_out`, 429). The dashboard
   asks for the current password only on your own account, and now shows the
   server's reason when a change is refused (#145).
+- Review follow-ups on the password change and sessions (#145): a username
+  containing a NUL byte is rejected at login and user creation (it bypassed the
+  login throttle keys); a self-service password change is applied only if the
+  stored hash is still the one that was verified, in one transaction with the
+  revocation, and an admin reset that landed first makes it fail with 409 (new
+  Store method `update_user_password_if_current_and_revoke_sessions`);
+  enabling a user revokes leftover sessions only on a real disabled-to-enabled
+  change and a repeated enable is harmless (new Store method
+  `enable_user_and_revoke_sessions`); a wrong current password is audited only
+  as `password_change` `failure`; expired sessions are also purged by the
+  server's periodic job; the SQLite session transactions use the RAII guard so a
+  failing ROLLBACK cannot mask the original error; on PostgreSQL
+  `set_agent_groups` and `set_user_groups` lock the parent row first, so two
+  concurrent replacements cannot leave the union of both sets. The dashboard
+  keeps the Change Password form open and shows the server's reason when a
+  change is refused, hides the Password button on other users' rows unless you
+  are a global admin, and stops waiting for an error body after two seconds.
 - Session tokens are stored as their SHA-256 (lowercase hex) instead of raw, so a
   database copy or backup no longer contains usable logins. The stores hash
   inside `create_session`, `get_session`, `delete_session`,

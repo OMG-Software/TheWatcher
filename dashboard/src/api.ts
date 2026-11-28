@@ -23,14 +23,23 @@ async function fetchJson<T>(path: string): Promise<T> {
   return response.json() as Promise<T>;
 }
 
-/** Status line plus the server's `error` text when the body has one, so a refusal says why (e.g. wrong current password). */
+/** How long a refused request waits for its error body before falling back to the status line alone. */
+const ERROR_BODY_WAIT_MS = 2000;
+
+/** Status line plus the server's `error` text when the body arrives in time, so a refusal says why (e.g. wrong current password). */
 async function failureMessage(response: Response): Promise<string> {
   const status = `${response.status} ${response.statusText}`;
+  let timer: ReturnType<typeof setTimeout> | undefined;
   try {
-    const body = (await response.json()) as { error?: unknown };
-    return typeof body.error === 'string' && body.error ? `${status}: ${body.error}` : status;
+    const stalled = new Promise<null>((resolve) => {
+      timer = setTimeout(() => resolve(null), ERROR_BODY_WAIT_MS);
+    });
+    const body = (await Promise.race([response.json() as Promise<{ error?: unknown }>, stalled])) as { error?: unknown } | null;
+    return body && typeof body.error === 'string' && body.error ? `${status}: ${body.error}` : status;
   } catch {
     return status;
+  } finally {
+    clearTimeout(timer);
   }
 }
 

@@ -65,7 +65,9 @@ working document for audit, design review, and regression testing.
   relies on administrator judgment.
 - Dashboard user spoofing is mitigated by libsodium password hashes and random
   256-bit session tokens. Only the SHA-256 of a token is stored, so a copy of
-  the database or a backup holds no usable logins.
+  the database or a backup holds no usable logins, once no writer of raw
+  tokens remains: an old server during a rolling PostgreSQL upgrade still
+  stores raw tokens until it is upgraded (they expire within eight hours).
 
 ### Tampering
 
@@ -157,9 +159,25 @@ working document for audit, design review, and regression testing.
   sessions; enabling also drops any leftover sessions; on PostgreSQL the login
   locks the user row with FOR SHARE and the change runs UPDATE then DELETE as
   two statements in one transaction) or deleted (the sessions
-  table cascades). Expired
-  sessions are purged at most every five minutes (a failed purge is retried) from login and session
-  validation.
+  table cascades). Enabling a user drops leftover sessions only on a real
+  disabled-to-enabled change, in the same transaction; a repeated enable of an
+  enabled user succeeds and revokes nothing. Expired sessions are purged at
+  most every five minutes (a failed purge is retried) from login and session
+  validation, and from the server's periodic job, so an idle server purges
+  too.
+- A username containing a NUL byte is rejected (400) at login and user
+  creation, before the throttle keys are built. The stores bind names as C
+  strings, so otherwise `admin\0x` would reach `admin` under fresh throttle
+  keys and sidestep the per-pair and per-username limits.
+- A self-service password change is applied only while the stored hash is
+  still the one the current password was verified against, in the same
+  transaction that revokes sessions. An admin reset that lands in between wins:
+  the change is refused with 409, nothing is revoked and no success is audited
+  (`password_change` `conflict`).
+- A wrong current password is audited once, as `password_change` `failure`.
+  Handlers that audit their own 403 mark the response, and the post-routing
+  hook then skips its generic `permission_denied` line; every other 403 is
+  still audited there.
 - Changing your own password (any role, including a global admin) needs the
   current password: a missing or non-string `current_password` is 400 and a
   wrong one is 403 with nothing changed and no session revoked. An admin reset
@@ -197,8 +215,9 @@ working document for audit, design review, and regression testing.
 - An hourly retention job prunes metrics, status history, handled alerts, log
   matches, expired silences and ended maintenance windows, independent of
   agent traffic, so a flapping indicator or noisy log watch cannot grow the
-  database without bound. Retention periods are configurable; sessions are not
-  yet pruned.
+  database without bound. Retention periods are configurable. Expired sessions
+  are purged by the server's periodic job as well as from requests, so an idle
+  server does not keep them.
 
 ### Elevation Of Privilege
 
@@ -260,8 +279,12 @@ when webhooks are enabled.
   the proxy to set it (or strip it and rely on `X-Forwarded-For`).
 - A self-service password change keeps the caller's current session. A stolen
   session cannot change the password without the current one, but it can
-  still use the account until it expires or the owner signs out. Audit lines
-  share the server log file and are not tamper proof.
+  still use the account until it expires. Signing out ends only the current
+  session; other sessions of the account end when the password is changed
+  (self-service keeps only the session that changed it), when an admin resets
+  the password, or when an admin disables the account. There is no "sign out
+  everywhere" action. Audit lines share the server log file and are not tamper
+  proof.
 - During a rolling upgrade on a shared PostgreSQL database, a server still on
   the old version stores raw tokens that upgraded servers do not recognise;
   those users sign in again, and the raw rows expire after eight hours.

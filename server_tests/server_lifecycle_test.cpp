@@ -1,11 +1,20 @@
+#include "../server/sqlite_raii.hpp"
+#include "../server/store_sqlite.hpp"
 #include "test_support/enrollment_client.hpp"
 #include "test_support/server_runner.hpp"
+#include "test_support/temp_dir.hpp"
+#include "test_support/timing.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <chrono>
+#include <string>
+
+#include <sqlite3.h>
 #include <zmq.h>
 
 using namespace thewatcher::test;
+using namespace std::chrono_literals;
 
 SCENARIO("The server build provides ZeroMQ CURVE support")
 {
@@ -69,6 +78,55 @@ SCENARIO("Server startup failures are reported before foreground mode is declare
             AND_THEN("the failure message is available to the foreground runner")
             {
                 REQUIRE_FALSE(result.message.empty());
+            }
+        }
+    }
+}
+
+namespace
+{
+// Counts the rows of the sessions table through its own connection.
+int stored_session_count(const std::string& path)
+{
+    thewatcher::server::sqlite::Connection conn(path);
+    thewatcher::server::sqlite::Stmt st;
+    REQUIRE(sqlite3_prepare_v2(conn, "SELECT COUNT(*) FROM sessions;", -1, &st.s, nullptr) == SQLITE_OK);
+    REQUIRE(sqlite3_step(st.s) == SQLITE_ROW);
+    return sqlite3_column_int(st.s, 0);
+}
+} // namespace
+
+SCENARIO("An idle server purges expired sessions on its own")
+{
+    GIVEN("a database holding an expired session and a server that receives no requests")
+    {
+        ScopedTempDir dir{"idle-purge"};
+        const auto db_path = (dir / "idle.db").string();
+        {
+            thewatcher::server::SqliteStore store(db_path);
+            thewatcher::server::SessionRecord session;
+            session.token = "long-expired";
+            session.user_id = 1; // the bootstrapped admin
+            session.created_at = 1;
+            session.expires_at = 2; // long past
+            store.create_session(session);
+        }
+        REQUIRE(stored_session_count(db_path) == 1);
+        auto config = make_in_memory_server_config();
+        config.db_path = db_path;
+
+        WHEN("the server runs with no login or session request")
+        {
+            ServerRunner runner(config);
+            REQUIRE(runner.startup.wait().started);
+
+            THEN("the periodic maintenance removes the expired session")
+            {
+                REQUIRE(eventually(
+                    [&] {
+                        return stored_session_count(db_path) == 0;
+                    },
+                    10s, 100ms));
             }
         }
     }

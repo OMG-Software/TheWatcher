@@ -266,6 +266,16 @@ void ApiServer::set_login_test_hooks(std::function<int64_t()> clock,
     after_reservation_hook_ = std::move(after_reservation);
 }
 
+void ApiServer::set_password_change_test_hook(std::function<void(int64_t)> after_current_password_verified)
+{
+    password_change_hook_ = std::move(after_current_password_verified);
+}
+
+// Marks a response whose handler already wrote its own audit line, so the
+// post-routing hook does not add a permission_denied line for it. The header
+// is internal: the hook removes it before the response is sent.
+constexpr const char* audited_header = "X-TW-Audited";
+
 // Returns the address used for login throttling. The TCP peer is used unless
 // it is a trusted proxy. For a trusted proxy the single X-Real-IP value wins
 // (the proxy must set or overwrite it); otherwise every X-Forwarded-For line
@@ -351,9 +361,10 @@ void ApiServer::audit(const char* event, const char* outcome, const std::string&
 }
 
 // Purges expired sessions at most once every five minutes. Called from login
-// and session validation; could move to the server maintenance tick later.
-// The interval only restarts after a successful purge, so a failure is
-// retried, and one flag keeps concurrent requests from purging together.
+// and session validation, and from the server's periodic job so an idle server
+// purges too. The interval only restarts after a successful purge, so a
+// failure is retried, and one flag keeps concurrent callers from purging
+// together.
 void ApiServer::purge_expired_sessions_if_due(int64_t now_ms)
 {
     constexpr int64_t purge_interval_ms = 5LL * 60LL * 1000LL;
@@ -1250,7 +1261,11 @@ void ApiServer::setup_routes()
         apply_browser_origin_headers(req, res);
         // Issue #70: every 403 is an authorization failure. Handling it here
         // covers all routes without touching each handler.
-        if (res.status == 403)
+        if (res.has_header(audited_header))
+        {
+            res.headers.erase(audited_header); // internal marker, never sent
+        }
+        else if (res.status == 403)
         {
             std::string user = "-";
             try
@@ -1282,11 +1297,14 @@ void ApiServer::setup_routes()
             const auto password = body.at("password").get<std::string>();
 
             // M-2: Reject absurdly long credentials before hashing.
-            if (username.size() > 64 || password.size() > 256)
+            // A NUL byte would pass the throttle as its own key but be cut off
+            // where the store binds the name as a C string, so the same account
+            // would be guessed under fresh keys. Refuse it like any bad name.
+            if (username.size() > 64 || password.size() > 256 || username.find('\0') != std::string::npos)
             {
                 res.status = 400;
                 set_json(res, json{
-                                  {"error", "username or password too long"}
+                                  {"error", "username or password invalid"}
                 });
                 return;
             }
@@ -1533,6 +1551,8 @@ void ApiServer::setup_routes()
                 throw std::runtime_error("username and password are required");
             if (username.size() > 64)
                 throw std::runtime_error("username must be 64 characters or fewer");
+            if (username.find('\0') != std::string::npos)
+                throw std::runtime_error("username must not contain NUL bytes");
             if (password.size() > 256)
                 throw std::runtime_error("password must be 256 characters or fewer");
             if (!is_valid_role(role))
@@ -2963,12 +2983,12 @@ void ApiServer::setup_routes()
         try
         {
             const auto user_id = std::stoll(req.path_params.at("id"));
-            // Defence in depth: disabling already revoked the sessions; drop any
-            // that exist before the account becomes usable again.
-            store_.delete_sessions_for_user(user_id);
-            // One UPDATE reports whether a row matched, so a concurrent delete
-            // cannot slip between an existence check and the update.
-            if (store_.enable_user(user_id) == 0)
+            // Defence in depth: disabling already revoked the sessions, so drop
+            // any leftover only on a real disabled-to-enabled change, in the
+            // same transaction. A retried enable of an enabled user succeeds
+            // and must not sign out sessions created since.
+            const auto enabled = store_.enable_user_and_revoke_sessions(user_id);
+            if (!enabled)
             {
                 res.status = 404;
                 set_json(res, json{
@@ -3096,6 +3116,7 @@ void ApiServer::setup_routes()
                 if (const auto denial = reserve_login_attempt(reservation, pair_key, session->username, remote, now))
                 {
                     audit("password_change", "locked_out", session->username, remote, target_user->username);
+                    res.set_header(audited_header, "1");
                     res.status = 429;
                     res.set_header("Retry-After", denial->retry_after);
                     set_json(res, json{
@@ -3108,6 +3129,9 @@ void ApiServer::setup_routes()
                 {
                     reservation.keep(); // a genuine credential failure stays counted
                     audit("password_change", "failure", session->username, remote, target_user->username);
+                    // Already audited as a failed password change; the post-routing
+                    // hook must not add a permission_denied line for the same 403.
+                    res.set_header(audited_header, "1");
                     res.status = 403;
                     set_json(res, json{
                                       {"error", "current password is incorrect"}
@@ -3123,9 +3147,37 @@ void ApiServer::setup_routes()
             // The store applies the new hash and the revocation atomically,
             // so a failure cannot leave the new password set while old
             // sessions stay valid.
-            const auto kept_token = self_service ? cookie_value(req, "tw_session") : std::string{};
-            const auto revoked =
-                store_.update_user_password_and_revoke_sessions(user_id, hash_password(password), kept_token);
+            const auto new_hash = hash_password(password);
+            std::optional<int> revoked;
+            if (self_service)
+            {
+                if (password_change_hook_)
+                    password_change_hook_(user_id);
+                // Applied only while the hash the current password was verified
+                // against is still the stored one. If an admin reset landed in
+                // between, the reset wins: 409 Conflict (the request is valid
+                // but clashes with the account's new state), nothing changed,
+                // no session revoked and no success audited. The user can retry
+                // with the new password the admin chose.
+                const auto outcome = store_.update_user_password_if_current_and_revoke_sessions(
+                    user_id, target_user->password_hash, new_hash, cookie_value(req, "tw_session"));
+                if (outcome.status == PasswordChangeResult::Status::PasswordChanged)
+                {
+                    audit("password_change", "conflict", session->username, remote, target_user->username);
+                    res.status = 409;
+                    set_json(res,
+                             json{
+                                 {"error", "password was changed by someone else; sign in again with the new one"}
+                    });
+                    return;
+                }
+                if (outcome.status == PasswordChangeResult::Status::Changed)
+                    revoked = outcome.revoked;
+            }
+            else
+            {
+                revoked = store_.update_user_password_and_revoke_sessions(user_id, new_hash, std::string{});
+            }
             // No value: the user was deleted after the lookup above, so
             // nothing changed and nothing is audited as a success.
             if (!revoked)

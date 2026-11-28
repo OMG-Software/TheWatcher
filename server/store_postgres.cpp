@@ -914,6 +914,15 @@ std::vector<int64_t> PostgresStore::get_agent_groups(const std::string& agent_id
 
 void PostgresStore::replace_agent_groups(const std::string& agent_id, const std::vector<int64_t>& group_ids)
 {
+    // Lock the parent row first. Without it two connections replacing an empty
+    // membership set both delete nothing, both insert, and the union survives.
+    // With it the second one waits for the first to commit, then deletes what
+    // the first inserted, so the result is always one of the requested sets.
+    // The caller holds the transaction that keeps the lock until commit.
+    const char* lock_params[] = {agent_id.c_str()};
+    Res lock(PQexecParams(conn_, "SELECT 1 FROM agents WHERE agent_id=$1 FOR UPDATE;", 1, nullptr, lock_params, nullptr,
+                          nullptr, 0));
+    check_res(lock.r, "set_agent_groups lock");
     const char* del_params[] = {agent_id.c_str()};
     Res del(PQexecParams(conn_, "DELETE FROM agent_groups WHERE agent_id=$1;", 1, nullptr, del_params, nullptr, nullptr,
                          0));
@@ -977,6 +986,11 @@ void PostgresStore::set_user_groups(int64_t user_id, const std::vector<int64_t>&
 {
     postgres::Transaction tx(conn_); // atomic: see set_agent_groups
     const auto p_uid = s(user_id);
+    // Lock the parent row first, for the reason given in replace_agent_groups.
+    const char* lock_params[] = {p_uid.c_str()};
+    Res lock(PQexecParams(conn_, "SELECT 1 FROM users WHERE user_id=$1::bigint FOR UPDATE;", 1, nullptr, lock_params,
+                          nullptr, nullptr, 0));
+    check_res(lock.r, "set_user_groups lock");
     const char* del_params[] = {p_uid.c_str()};
     Res del(
         PQexecParams(conn_, "DELETE FROM user_groups WHERE user_id=$1;", 1, nullptr, del_params, nullptr, nullptr, 0));
@@ -1183,6 +1197,70 @@ std::optional<int> PostgresStore::update_user_password_and_revoke_sessions(int64
     const int revoked = affected != nullptr ? std::atoi(affected) : 0;
     tx.commit();
     return revoked;
+}
+
+PasswordChangeResult PostgresStore::update_user_password_if_current_and_revoke_sessions(
+    int64_t user_id, const std::string& expected_hash, const std::string& new_hash, const std::string& keep_token)
+{
+    const auto p_uid = s(user_id);
+    postgres::Transaction tx(conn_);
+    // The comparison and the update are one statement. If an admin reset holds
+    // the row lock, this waits for it and re-evaluates the WHERE against the
+    // committed row (READ COMMITTED), so a changed hash updates nothing.
+    const char* upd_params[] = {new_hash.c_str(), p_uid.c_str(), expected_hash.c_str()};
+    Res upd(PQexecParams(conn_, "UPDATE users SET password_hash=$1 WHERE user_id=$2::bigint AND password_hash=$3;", 3,
+                         nullptr, upd_params, nullptr, nullptr, 0));
+    check_res(upd.r, "update_user_password_if_current update");
+    const char* changed = PQcmdTuples(upd.r);
+    if (changed == nullptr || std::atoi(changed) == 0)
+    {
+        // Nothing written; the guard rolls back. Tell a missing user from a
+        // hash that is no longer the expected one.
+        const char* exists_params[] = {p_uid.c_str()};
+        Res exists(PQexecParams(conn_, "SELECT 1 FROM users WHERE user_id=$1::bigint;", 1, nullptr, exists_params,
+                                nullptr, nullptr, 0));
+        check_res(exists.r, "update_user_password_if_current exists");
+        return {PQntuples(exists.r) > 0 ? PasswordChangeResult::Status::PasswordChanged
+                                        : PasswordChangeResult::Status::UserNotFound,
+                0};
+    }
+    const auto kept_hash = hash_kept_session_token(keep_token);
+    const char* del_params[] = {p_uid.c_str(), kept_hash.c_str()};
+    Res del(PQexecParams(conn_, "DELETE FROM sessions WHERE user_id=$1::bigint AND token<>$2;", 2, nullptr, del_params,
+                         nullptr, nullptr, 0));
+    check_res(del.r, "update_user_password_if_current delete");
+    const char* affected = PQcmdTuples(del.r);
+    const int revoked = affected != nullptr ? std::atoi(affected) : 0;
+    tx.commit();
+    return {PasswordChangeResult::Status::Changed, revoked};
+}
+
+std::optional<int> PostgresStore::enable_user_and_revoke_sessions(int64_t user_id)
+{
+    const auto p_uid = s(user_id);
+    postgres::Transaction tx(conn_);
+    const char* params[] = {p_uid.c_str()};
+    // Only a disabled user changes, so a retried enable is not a transition.
+    Res upd(PQexecParams(conn_, "UPDATE users SET disabled=FALSE WHERE user_id=$1::bigint AND disabled=TRUE;", 1,
+                         nullptr, params, nullptr, nullptr, 0));
+    check_res(upd.r, "enable_user_and_revoke_sessions update");
+    const char* changed = PQcmdTuples(upd.r);
+    if (changed != nullptr && std::atoi(changed) > 0)
+    {
+        Res del(PQexecParams(conn_, "DELETE FROM sessions WHERE user_id=$1::bigint;", 1, nullptr, params, nullptr,
+                             nullptr, 0));
+        check_res(del.r, "enable_user_and_revoke_sessions delete");
+        const char* affected = PQcmdTuples(del.r);
+        const int revoked = affected != nullptr ? std::atoi(affected) : 0;
+        tx.commit();
+        return revoked;
+    }
+    Res exists(
+        PQexecParams(conn_, "SELECT 1 FROM users WHERE user_id=$1::bigint;", 1, nullptr, params, nullptr, nullptr, 0));
+    check_res(exists.r, "enable_user_and_revoke_sessions exists");
+    if (PQntuples(exists.r) == 0)
+        return std::nullopt;
+    return 0; // already enabled: success, nothing revoked, nothing written
 }
 
 int PostgresStore::disable_user_and_revoke_sessions(int64_t user_id)

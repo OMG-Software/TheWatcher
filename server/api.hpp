@@ -82,6 +82,18 @@ public:
     void set_login_test_hooks(std::function<int64_t()> clock,
                               std::function<void(const std::string&)> after_reservation);
 
+    // Test seam, call before start(): runs on the request thread with the
+    // user id after a self-service password change verified the current
+    // password and before the store applies the change, so a test can land an
+    // admin reset exactly in that window. Empty in production.
+    void set_password_change_test_hook(std::function<void(int64_t)> after_current_password_verified);
+
+    // Deletes expired sessions when at least five minutes passed since the last
+    // successful purge (a failed purge is retried on the next call). Safe to
+    // call from any thread. Requests call it opportunistically; the server's
+    // periodic job calls it too, so an idle server still purges.
+    void purge_expired_sessions_if_due(int64_t now_ms);
+
     // Decides whether an agent can receive a command right now. Without a
     // check the persisted `connected` flag is used. The server installs a
     // check backed by its live routes, because after a restart an agent can
@@ -171,9 +183,6 @@ private:
                                                         const std::string& username, const std::string& remote,
                                                         int64_t now);
 
-    // Deletes expired sessions at most once per purge interval.
-    void purge_expired_sessions_if_due(int64_t now_ms);
-
     Store& store_;
     ZapHandler& zap_;
     std::string host_;
@@ -204,6 +213,7 @@ private:
     std::atomic<bool> session_purge_running_{false}; // at most one purge in flight
     std::function<int64_t()> login_clock_;
     std::function<void(const std::string&)> after_reservation_hook_;
+    std::function<void(int64_t)> password_change_hook_;
 };
 
 } // namespace thewatcher::server

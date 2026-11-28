@@ -369,6 +369,29 @@ describe('GIVEN agent management API actions', () => {
     await expect(changeUserPassword(5, 'newpass123', 'wrong')).rejects.toThrow('current password is incorrect');
   });
 
+  it('WHEN the error body never arrives THEN the request still rejects with the status line after the wait', async () => {
+    vi.useFakeTimers();
+    try {
+      const fetchMock = vi.fn().mockResolvedValue({
+        ok: false,
+        status: 403,
+        statusText: 'Forbidden',
+        json: () => new Promise(() => undefined),
+      });
+      vi.stubGlobal('fetch', fetchMock);
+
+      const outcome = changeUserPassword(5, 'newpass123', 'wrong').then(
+        () => 'resolved',
+        (err: Error) => err.message,
+      );
+      await vi.advanceTimersByTimeAsync(2500);
+
+      await expect(outcome).resolves.toBe('403 Forbidden');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('WHEN setMaintenance is called THEN the correct payload is sent to the agent endpoint', async () => {
     const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: async () => ({ ok: true }) });
     vi.stubGlobal('fetch', fetchMock);

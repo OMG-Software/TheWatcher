@@ -249,8 +249,12 @@ Files: `server/store_synchronized.hpp`, `server/sqlite_raii.hpp`,
   at a time. `make_store()` wraps the backend in `SynchronizedStore`, which
   holds a single mutex for the whole of every public call. A transaction
   lives inside one call, so no other call can run inside it. The wrapper
-  implements the full `Store` interface: a new virtual method that is not
-  forwarded there does not compile, so the lock cannot be forgotten.
+  implements the full `Store` interface: a new pure virtual method that is
+  not forwarded there does not compile, so the lock cannot be forgotten. The
+  compiler enforces this only for pure virtuals (`= 0`); a virtual with a
+  default implementation would not need an override and would run unlocked,
+  so every `Store` method is declared pure (today none has a default body)
+  and new ones must be too.
   Backends never call back into the wrapper. Tests that construct
   `SqliteStore` or `PostgresStore` directly are single-threaded.
 - A method that writes more than one row or statement is atomic. Use the

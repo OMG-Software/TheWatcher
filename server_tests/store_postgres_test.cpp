@@ -9,10 +9,12 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdlib>
 #include <functional>
 #include <future>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <thread>
@@ -46,14 +48,11 @@ bool postgres_is_available()
     if (!checked)
     {
         checked = true;
-        try
-        {
-            PostgresStore store(test_dsn());
-            available = true;
-        }
-        catch (...)
-        {
-        }
+        // A plain connection: only "no server reachable" skips the suite. Once
+        // connected, a store-initialisation or migration error in a test fails it.
+        PGconn* conn = PQconnectdb(test_dsn());
+        available = PQstatus(conn) == CONNECTION_OK;
+        PQfinish(conn);
     }
     return available;
 }
@@ -1000,6 +999,25 @@ private:
     std::thread thread_;
 };
 
+// Polls (bounded) until some backend is waiting on a lock held by another,
+// using a third connection. Returns false if nothing ever waited, so a call
+// that finished without blocking on the fixture's lock fails the overlap case.
+bool wait_until_a_backend_is_blocked(PGconn* observer)
+{
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (std::chrono::steady_clock::now() < deadline)
+    {
+        PGresult* res = PQexec(observer, "SELECT count(*) FROM pg_stat_activity WHERE datname=current_database() "
+                                         "AND pid<>pg_backend_pid() AND cardinality(pg_blocking_pids(pid))>0");
+        const bool blocked = PQresultStatus(res) == PGRES_TUPLES_OK && std::atoi(PQgetvalue(res, 0, 0)) > 0;
+        PQclear(res);
+        if (blocked)
+            return true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    return false;
+}
+
 } // namespace
 
 SCENARIO("[postgres] A login waits for a concurrent credential change instead of creating a session")
@@ -1022,7 +1040,9 @@ SCENARIO("[postgres] A login waits for a concurrent credential change instead of
         // releases its lock) first if an assertion fails.
         BackgroundCall<bool> login;
         PgSideConnection side;
+        PgSideConnection observer;
         REQUIRE(PQstatus(side.conn) == CONNECTION_OK);
+        REQUIRE(PQstatus(observer.conn) == CONNECTION_OK);
         side.run("BEGIN");
 
         WHEN("the password is changed and not yet committed")
@@ -1032,8 +1052,7 @@ SCENARIO("[postgres] A login waits for a concurrent credential change instead of
             login.start([&] {
                 return store.create_session_if_credentials_current(session, old_hash);
             });
-            std::this_thread::sleep_for(std::chrono::milliseconds(500));
-            const bool blocked = login.running();
+            const bool blocked = wait_until_a_backend_is_blocked(observer.conn) && login.running();
             side.run("COMMIT");
             const bool created = login.get();
 
@@ -1051,8 +1070,7 @@ SCENARIO("[postgres] A login waits for a concurrent credential change instead of
             login.start([&] {
                 return store.create_session_if_credentials_current(session, old_hash);
             });
-            std::this_thread::sleep_for(std::chrono::milliseconds(500));
-            const bool blocked = login.running();
+            const bool blocked = wait_until_a_backend_is_blocked(observer.conn) && login.running();
             side.run("COMMIT");
             const bool created = login.get();
 
@@ -1142,7 +1160,9 @@ SCENARIO("[postgres] A password reset or disable revokes a session a login commi
         BackgroundCall<std::optional<int>> reset;
         BackgroundCall<int> disable;
         PgSideConnection login_tx;
+        PgSideConnection observer;
         REQUIRE(PQstatus(login_tx.conn) == CONNECTION_OK);
+        REQUIRE(PQstatus(observer.conn) == CONNECTION_OK);
         // The same lock-then-insert a login performs, but left open so the
         // change can start while the login is still in flight.
         const std::string held_login = "WITH u AS (SELECT user_id FROM users WHERE user_id=" + uid +
@@ -1183,8 +1203,7 @@ SCENARIO("[postgres] A password reset or disable revokes a session a login commi
             reset.start([&] {
                 return change_store.update_user_password_and_revoke_sessions(user_id, "new-" + suffix);
             });
-            std::this_thread::sleep_for(std::chrono::milliseconds(500));
-            const bool blocked = reset.running();
+            const bool blocked = wait_until_a_backend_is_blocked(observer.conn) && reset.running();
             login_tx.run("COMMIT");
             const auto revoked = reset.get();
 
@@ -1205,8 +1224,7 @@ SCENARIO("[postgres] A password reset or disable revokes a session a login commi
             disable.start([&] {
                 return change_store.disable_user_and_revoke_sessions(user_id);
             });
-            std::this_thread::sleep_for(std::chrono::milliseconds(500));
-            const bool blocked = disable.running();
+            const bool blocked = wait_until_a_backend_is_blocked(observer.conn) && disable.running();
             login_tx.run("COMMIT");
             const auto affected = disable.get();
 
@@ -1434,6 +1452,191 @@ SCENARIO("[postgres] Upgrading clears sessions stored as raw tokens, exactly onc
 
         PostgresStore cleanup(test_dsn());
         cleanup.delete_user(user_id);
+    }
+}
+
+// ── Concurrent membership replacement ─────────────────────────────────────────
+
+namespace
+{
+// Releases `parties` threads at the same moment so two replacements really
+// start together.
+class StartGate
+{
+public:
+    explicit StartGate(int parties)
+        : remaining_(parties)
+    {
+    }
+    void arrive_and_wait()
+    {
+        std::unique_lock<std::mutex> lock(mutex_);
+        if (--remaining_ == 0)
+            cv_.notify_all();
+        else
+            cv_.wait(lock, [this] {
+                return remaining_ == 0;
+            });
+    }
+
+private:
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    int remaining_;
+};
+} // namespace
+
+SCENARIO("[postgres] Two connections replacing an empty membership set never end with the union")
+{
+    if (!postgres_is_available())
+        SKIP("PostgreSQL not available");
+    GIVEN("an agent and a user with no groups, and two connections")
+    {
+        PostgresStore first(test_dsn());
+        PostgresStore second(test_dsn());
+        const auto suffix = std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
+        const std::string agent_id = "pg-union-" + suffix;
+        first.upsert_agent(make_agent(agent_id));
+        const auto user_id = first.create_user("union-" + suffix, "hash", "global_viewer");
+        const auto group_a = first.create_group("union-A-" + suffix);
+        const auto group_b = first.create_group("union-B-" + suffix);
+
+        WHEN("each connection replaces the memberships with a different set, many times in lock step")
+        {
+            int unions = 0;
+            std::atomic<int> errors{0};
+            for (int round = 0; round < 150; ++round)
+            {
+                first.set_agent_groups(agent_id, {});
+                first.set_user_groups(user_id, {});
+                StartGate gate(2);
+                const auto run = [&](PostgresStore& store, int64_t group) {
+                    try
+                    {
+                        gate.arrive_and_wait();
+                        store.set_agent_groups(agent_id, {group});
+                        store.set_user_groups(user_id, {group});
+                    }
+                    catch (...)
+                    {
+                        ++errors;
+                    }
+                };
+                std::thread t1(run, std::ref(first), group_a);
+                std::thread t2(run, std::ref(second), group_b);
+                t1.join();
+                t2.join();
+                if (first.get_agent_groups(agent_id).size() != 1 || first.get_user_groups(user_id).size() != 1)
+                    ++unions;
+            }
+
+            THEN("every round ends with exactly one of the requested sets")
+            {
+                CHECK(errors == 0);
+                CHECK(unions == 0);
+            }
+        }
+        first.delete_agent(agent_id);
+        first.delete_user(user_id);
+    }
+}
+
+// ── Self-service password change and enable (#145) ───────────────────────────
+
+SCENARIO("[postgres] A self-service change applies only to the hash that was verified")
+{
+    if (!postgres_is_available())
+        SKIP("PostgreSQL not available");
+    GIVEN("a user with two sessions")
+    {
+        PostgresStore store(test_dsn());
+        const auto suffix = unique_suffix();
+        const auto old_hash = "old-" + suffix;
+        const auto user_id = store.create_user("own-" + suffix, old_hash, "global_viewer");
+        const auto keep = "own-keep-" + suffix;
+        const auto other = "own-other-" + suffix;
+        store.create_session(make_pg_session(user_id, keep));
+        store.create_session(make_pg_session(user_id, other));
+        using Status = PasswordChangeResult::Status;
+
+        WHEN("the change names the stored hash")
+        {
+            const auto result =
+                store.update_user_password_if_current_and_revoke_sessions(user_id, old_hash, "new-" + suffix, keep);
+
+            THEN("the hash changes and only the other session is revoked")
+            {
+                CHECK(result.status == Status::Changed);
+                CHECK(result.revoked == 1);
+                CHECK(store.get_session(keep, 5000).has_value());
+                CHECK_FALSE(store.get_session(other, 5000).has_value());
+            }
+        }
+
+        WHEN("an admin reset replaced the hash after it was verified")
+        {
+            store.update_user_password(user_id, "reset-" + suffix);
+            const auto result =
+                store.update_user_password_if_current_and_revoke_sessions(user_id, old_hash, "new-" + suffix, keep);
+
+            THEN("the change is refused and nothing is revoked")
+            {
+                CHECK(result.status == Status::PasswordChanged);
+                CHECK(store.get_user_by_username("own-" + suffix)->password_hash == "reset-" + suffix);
+                CHECK(store.get_session(keep, 5000).has_value());
+                CHECK(store.get_session(other, 5000).has_value());
+            }
+        }
+
+        WHEN("the user does not exist")
+        {
+            THEN("the store reports it")
+            {
+                CHECK(store.update_user_password_if_current_and_revoke_sessions(-1, "x", "y").status ==
+                      Status::UserNotFound);
+            }
+        }
+        store.delete_user(user_id);
+    }
+}
+
+SCENARIO("[postgres] Enabling revokes leftover sessions only on a real disabled-to-enabled change")
+{
+    if (!postgres_is_available())
+        SKIP("PostgreSQL not available");
+    GIVEN("a disabled user holding a leftover session")
+    {
+        PostgresStore store(test_dsn());
+        const auto suffix = unique_suffix();
+        const auto user_id = store.create_user("en-" + suffix, "hash", "global_viewer");
+        store.disable_user(user_id);
+        store.create_session(make_pg_session(user_id, "en-old-" + suffix));
+
+        WHEN("the user is enabled, a session is created and the enable is retried")
+        {
+            const auto first = store.enable_user_and_revoke_sessions(user_id);
+            store.create_session(make_pg_session(user_id, "en-new-" + suffix));
+            const auto retry = store.enable_user_and_revoke_sessions(user_id);
+
+            THEN("the first revokes the leftover, the retry revokes nothing and the new session survives")
+            {
+                REQUIRE(first.has_value());
+                CHECK(*first == 1);
+                REQUIRE(retry.has_value());
+                CHECK(*retry == 0);
+                CHECK_FALSE(store.get_session("en-old-" + suffix, 5000).has_value());
+                CHECK(store.get_session("en-new-" + suffix, 5000).has_value());
+            }
+        }
+
+        WHEN("an unknown user is enabled")
+        {
+            THEN("the store reports no such user")
+            {
+                CHECK_FALSE(store.enable_user_and_revoke_sessions(-1).has_value());
+            }
+        }
+        store.delete_user(user_id);
     }
 }
 #endif // HAVE_LIBPQ

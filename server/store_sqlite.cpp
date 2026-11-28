@@ -1104,42 +1104,97 @@ std::optional<int> SqliteStore::update_user_password_and_revoke_sessions(int64_t
                                                                          const std::string& password_hash,
                                                                          const std::string& keep_token)
 {
-    exec("BEGIN IMMEDIATE;");
-    try
+    // The guard rolls back on any exit but commit() and never throws from the
+    // destructor, so a failing ROLLBACK cannot mask the error being unwound.
+    sqlite::Transaction tx(db_);
+    update_user_password(user_id, password_hash);
+    // Zero rows changed means the user does not exist (or was deleted a
+    // moment ago): nothing to revoke and nothing to report as changed.
+    const bool found = sqlite3_changes(db_) > 0;
+    const auto revoked = found ? delete_sessions_for_user(user_id, keep_token) : 0;
+    tx.commit();
+    if (!found)
+        return std::nullopt;
+    return revoked;
+}
+
+namespace
+{
+    // True when a users row with this id exists. Caller holds a transaction.
+    bool user_row_exists(sqlite3* db, int64_t user_id)
     {
-        update_user_password(user_id, password_hash);
-        // Zero rows changed means the user does not exist (or was deleted a
-        // moment ago): nothing to revoke and nothing to report as changed.
-        const bool found = sqlite3_changes(db_) > 0;
-        const auto revoked = found ? delete_sessions_for_user(user_id, keep_token) : 0;
-        exec("COMMIT;");
-        if (!found)
-            return std::nullopt;
+        Stmt st;
+        check(sqlite3_prepare_v2(db, "SELECT 1 FROM users WHERE user_id=?;", -1, &st.s, nullptr), db,
+              "prepare user_row_exists");
+        sqlite3_bind_int64(st.s, 1, user_id);
+        return step_row(st.s, db, __func__);
+    }
+} // namespace
+
+PasswordChangeResult SqliteStore::update_user_password_if_current_and_revoke_sessions(int64_t user_id,
+                                                                                      const std::string& expected_hash,
+                                                                                      const std::string& new_hash,
+                                                                                      const std::string& keep_token)
+{
+    sqlite::Transaction tx(db_);
+    {
+        // The hash comparison and the update are one statement, so an admin
+        // reset cannot slip in between them.
+        Stmt st;
+        check(sqlite3_prepare_v2(db_, "UPDATE users SET password_hash=? WHERE user_id=? AND password_hash=?;", -1,
+                                 &st.s, nullptr),
+              db_, "prepare update_user_password_if_current");
+        sqlite3_bind_text(st.s, 1, new_hash.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(st.s, 2, user_id);
+        sqlite3_bind_text(st.s, 3, expected_hash.c_str(), -1, SQLITE_TRANSIENT);
+        check(sqlite3_step(st.s), db_, "step update_user_password_if_current");
+    }
+    if (sqlite3_changes(db_) == 0)
+    {
+        // Nothing written: the guard rolls back. Tell a missing user from a
+        // hash that is no longer the expected one.
+        const auto status = user_row_exists(db_, user_id) ? PasswordChangeResult::Status::PasswordChanged
+                                                          : PasswordChangeResult::Status::UserNotFound;
+        return {status, 0};
+    }
+    const auto revoked = delete_sessions_for_user(user_id, keep_token);
+    tx.commit();
+    return {PasswordChangeResult::Status::Changed, revoked};
+}
+
+std::optional<int> SqliteStore::enable_user_and_revoke_sessions(int64_t user_id)
+{
+    sqlite::Transaction tx(db_);
+    int changed = 0;
+    {
+        // Only a disabled user changes, so a retried enable is not a transition.
+        Stmt st;
+        check(
+            sqlite3_prepare_v2(db_, "UPDATE users SET disabled=0 WHERE user_id=? AND disabled<>0;", -1, &st.s, nullptr),
+            db_, "prepare enable_user_and_revoke_sessions");
+        sqlite3_bind_int64(st.s, 1, user_id);
+        check(sqlite3_step(st.s), db_, "step enable_user_and_revoke_sessions");
+        changed = sqlite3_changes(db_);
+    }
+    if (changed > 0)
+    {
+        const auto revoked = delete_sessions_for_user(user_id);
+        tx.commit();
         return revoked;
     }
-    catch (...)
-    {
-        exec("ROLLBACK;");
-        throw;
-    }
+    if (!user_row_exists(db_, user_id))
+        return std::nullopt;
+    return 0; // already enabled: success, nothing revoked, nothing written
 }
 
 int SqliteStore::disable_user_and_revoke_sessions(int64_t user_id)
 {
-    exec("BEGIN IMMEDIATE;");
-    try
-    {
-        const auto affected = disable_user(user_id);
-        if (affected > 0)
-            delete_sessions_for_user(user_id);
-        exec("COMMIT;");
-        return affected;
-    }
-    catch (...)
-    {
-        exec("ROLLBACK;");
-        throw;
-    }
+    sqlite::Transaction tx(db_);
+    const auto affected = disable_user(user_id);
+    if (affected > 0)
+        delete_sessions_for_user(user_id);
+    tx.commit();
+    return affected;
 }
 
 void SqliteStore::insert_metrics(const MetricsRow& row)
