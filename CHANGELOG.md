@@ -220,8 +220,9 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   polling guard and hidden-tab pause, Settings after a failed load, and forms
   after a failed save (#118).
 - `GET /api/agents` returns `indicator_status`, the status engine's latest
-  status per indicator, so the dashboard can show what alerting acted on
-  (#114).
+  status per indicator (the newest row of each, however long ago it
+  changed), so the dashboard can show what alerting acted on (#114). Adds
+  `Store::latest_status_per_indicator`.
 - Dashboard Settings: status history, alerts and log matches retention fields
   (enabled when the server reports them), and a notice when an Alerts list
   reaches the server's 1000-alert cap.
