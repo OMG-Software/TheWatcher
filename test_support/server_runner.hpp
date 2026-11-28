@@ -37,7 +37,7 @@ public:
         : config(std::move(cfg))
         , server(config)
     {
-        thread = std::thread([this] {
+        thread = std::jthread([this] {
             try
             {
                 server.run(&startup);
@@ -79,7 +79,7 @@ public:
     thewatcher::server::Server server;
     thewatcher::server::StartupSignal startup;
     std::exception_ptr error;
-    std::thread thread;
+    std::jthread thread;
 };
 
 } // namespace thewatcher::test

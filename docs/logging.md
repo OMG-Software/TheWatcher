@@ -30,14 +30,45 @@ C:\ProgramData\TheWatcher\TheWatcherAgent.log
 Each binary configures its own logging before runtime work begins:
 
 - console logging at `INFO`;
-- file logging at `TRACE`;
+- file logging at `INFO` by default, set with `LOG_LEVEL` in the config or
+  `--log-level <level>` on the command line (the command line wins). Levels
+  are `trace`, `debug`, `info`, `notice`, `warning`, `error`, `critical` and
+  `off`. `TRACE` writes an entry for every function and every heartbeat, so use
+  it only while diagnosing a problem;
 - live file flushing every 100 trace, debug, or info file entries;
 - immediate file flushing for notice, warning, error, and critical entries.
 
-`TheWatcherServer` and `TheWatcherAgent` call
-`SingleLog::GetInstance().SetConsoleLogLevel(...)`,
-`SetFileLogLevel(...)`, and `SetLogFilePath(...)` directly from their
-`main.cpp` files.
+Until the config file is read, the file level is `INFO` (or the
+`--log-level` value). The config's `LOG_*` values apply as soon as it loads.
+
+`TheWatcherServer` and `TheWatcherAgent` build a
+`thewatcher::logging::LogSettings` (`common/log_settings.hpp`) from the config
+and call `SetFileLogLevel(...)`, `SetLogRotation(...)` and
+`SetLogFilePath(...)` on `SingleLog::GetInstance()` from their `main.cpp`
+files.
+
+## Append And Rotation
+
+The log file is opened in append mode, so restarting a process, including after
+a crash, keeps the earlier entries.
+
+The file is rotated by size. When the next entry would take it above
+`LOG_MAX_SIZE_MB`, `<log>` becomes `<log>.1`, `<log>.1` becomes `<log>.2`, and
+so on up to `LOG_MAX_FILES`; the oldest file is deleted. Entries are never
+split across files. Defaults are 10 MiB and 5 backups, so the log uses at most
+about 60 MiB per binary. Set `LOG_MAX_SIZE_MB=0` to turn rotation off, and
+`LOG_MAX_FILES=0` to keep no backups (the file is emptied at the limit).
+If a rotation fails (for example the directory does not allow renaming the
+file), the live log is never truncated: the logger keeps appending, writes a
+`Log rotation failed` warning, and retries after another full size limit has
+been written.
+Example:
+
+```text
+LOG_LEVEL=info
+LOG_MAX_SIZE_MB=10
+LOG_MAX_FILES=5
+```
 
 ## Macros
 

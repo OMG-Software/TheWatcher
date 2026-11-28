@@ -4,6 +4,7 @@
 #include "common/crypto.hpp"
 #include "common/protocol.hpp"
 #include "common/zmq_limits.hpp"
+#include "common/zmq_retry.hpp"
 #include "config.hpp"
 
 #include <chrono>
@@ -172,7 +173,9 @@ namespace
             req.send(zmq::message_t(encoded.data(), encoded.size()), zmq::send_flags::none);
 
             zmq::message_t resp;
-            if (!req.recv(resp, zmq::recv_flags::none))
+            if (!thewatcher::zmqutil::retry_on_eintr([&] {
+                    return req.recv(resp, zmq::recv_flags::none);
+                }))
             {
                 LOG_DEBUG("Enrollment response timed out");
                 return std::nullopt;

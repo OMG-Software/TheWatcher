@@ -4,6 +4,7 @@ common_sources = [
   # that return "only available on Windows" on Linux/BSD so the
   # server/agent main.cpp call sites still link.
   'windows_service.cpp',
+  'signal_guard.cpp',
 ]
 
 # nlohmann_json comes in via collector_config.hpp's REST-side macros

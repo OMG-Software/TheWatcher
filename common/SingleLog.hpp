@@ -6,6 +6,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -15,6 +16,7 @@
 #include <cstdio>
 #include <ctime>
 #include <deque>
+#include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <memory>
@@ -140,21 +142,28 @@ namespace logging
         }
 
         /**
-         * Set the path to the log file
+         * Set the path to the log file. Existing content is kept and new
+         * entries are appended, so a restart never erases earlier evidence.
          */
         void SetLogFilePath(const std::string& filePath)
         {
             std::lock_guard<std::mutex> lock(m_fstreamLock);
             m_filePath = filePath;
-            if (m_fileOut.is_open())
-            {
-                m_fileOut.close();
-            }
-            m_fileOut.open(m_filePath, std::ios_base::out);
-            if (m_fileOut.is_open())
-            {
-                m_fileOut.rdbuf()->pubsetbuf(m_writeBuffer.data(), LoggerInternalBufferSize);
-            }
+            OpenFileLocked(false);
+        }
+
+        /**
+         * Enable size-based rotation of the log file. When a write would take
+         * the file above maxBytes, the file becomes "<path>.1", older backups
+         * shift up to "<path>.<maxBackups>" and the oldest is deleted. maxBytes
+         * of 0 disables rotation. maxBackups of 0 discards the old content
+         * instead of keeping a backup.
+         */
+        void SetLogRotation(std::uintmax_t maxBytes, unsigned maxBackups)
+        {
+            std::lock_guard<std::mutex> lock(m_fstreamLock);
+            m_maxFileBytes = maxBytes;
+            m_maxBackups = maxBackups;
         }
 
         /**
@@ -439,6 +448,101 @@ namespace logging
             return ToNarrow(ss.str());
         }
 
+        // Bytes the message occupies in the file. A text-mode stream on Windows
+        // writes each LF as CR LF.
+        static std::uintmax_t OnDiskSize(const std::string& message)
+        {
+#ifdef _WIN32
+            return message.size() + static_cast<std::uintmax_t>(std::count(message.begin(), message.end(), '\n'));
+#else
+            return message.size();
+#endif
+        }
+
+        // Opens the log file for appending (or truncating after a rotation) and
+        // records its current size. Caller holds m_fstreamLock.
+        void OpenFileLocked(bool truncate)
+        {
+            if (m_fileOut.is_open())
+            {
+                m_fileOut.close();
+            }
+            m_fileOut.clear();
+            m_fileOut.open(m_filePath, truncate ? std::ios_base::out | std::ios_base::trunc
+                                                : std::ios_base::out | std::ios_base::app);
+            m_fileBytes = 0;
+            if (m_fileOut.is_open())
+            {
+                m_fileOut.rdbuf()->pubsetbuf(m_writeBuffer.data(), LoggerInternalBufferSize);
+                std::error_code ec;
+                const auto size = std::filesystem::file_size(m_filePath, ec);
+                if (!ec)
+                {
+                    m_fileBytes = size;
+                }
+            }
+        }
+
+        // Shifts "<path>.N-1" to "<path>.N" and so on, moves the live file to
+        // "<path>.1" and starts a fresh file. Caller holds m_fstreamLock.
+        void RotateLocked()
+        {
+            m_fileOut.close();
+            std::error_code ec;
+            std::string failure;
+            if (m_maxBackups == 0)
+            {
+                std::filesystem::remove(m_filePath, ec);
+                if (ec)
+                {
+                    failure = "remove " + m_filePath + ": " + ec.message();
+                }
+            }
+            else
+            {
+                const auto backup = [this](unsigned index) {
+                    return m_filePath + "." + std::to_string(index);
+                };
+                // remove() reports a missing file as success (false), so an error
+                // here is a real failure. Stop at the first one: the live file
+                // has not been touched yet.
+                std::filesystem::remove(backup(m_maxBackups), ec);
+                for (unsigned i = m_maxBackups - 1; failure.empty() && ec.value() == 0 && i >= 1; --i)
+                {
+                    if (std::filesystem::exists(backup(i), ec) && !ec)
+                    {
+                        std::filesystem::rename(backup(i), backup(i + 1), ec);
+                    }
+                }
+                if (!ec)
+                {
+                    std::filesystem::rename(m_filePath, backup(1), ec);
+                }
+                if (ec)
+                {
+                    failure = "rename " + m_filePath + ": " + ec.message();
+                }
+            }
+            if (failure.empty())
+            {
+                m_rotationRetryBytes = 0;
+                OpenFileLocked(true);
+                return;
+            }
+            // The live file was not moved aside, so never truncate it. Keep
+            // appending, note the failure in the log, and try again only once
+            // another full limit has been written.
+            OpenFileLocked(false);
+            m_rotationRetryBytes = m_fileBytes + m_maxFileBytes;
+            if (m_fileOut.is_open())
+            {
+                const std::string line = MakeLogLine("WARNING", "SingleLog", "Log rotation failed: " + failure);
+                m_fileOut << line;
+                m_fileOut.flush();
+                m_fileBytes += OnDiskSize(line);
+            }
+        }
+
         void ConsoleLog(const std::string& s, bool flush)
         {
             {
@@ -509,7 +613,17 @@ namespace logging
                 std::lock_guard<std::mutex> lock(m_fstreamLock);
                 if (m_fileOut.is_open())
                 {
+                    if (m_maxFileBytes > 0 && m_fileBytes > 0 &&
+                        m_fileBytes + OnDiskSize(entry.message) > m_maxFileBytes && m_fileBytes >= m_rotationRetryBytes)
+                    {
+                        RotateLocked();
+                    }
+                    if (!m_fileOut.is_open())
+                    {
+                        continue;
+                    }
                     m_fileOut << entry.message;
+                    m_fileBytes += OnDiskSize(entry.message);
                     if (entry.flush)
                     {
                         m_fileOut.flush();
@@ -528,6 +642,10 @@ namespace logging
         std::atomic<LogLevel> m_fileLogLevel{LogLevel::L_TRACE};
         std::ofstream m_fileOut{};
         std::string m_filePath{};
+        std::uintmax_t m_fileBytes{0};
+        std::uintmax_t m_maxFileBytes{0};
+        std::uintmax_t m_rotationRetryBytes{0}; // after a failed rotation, retry at this size
+        unsigned m_maxBackups{0};
         std::array<char, LoggerInternalBufferSize> m_writeBuffer{};
 
         std::mutex m_consoleLogDequeLock{};

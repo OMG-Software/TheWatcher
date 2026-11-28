@@ -3,6 +3,7 @@
 #include "common/SingleLog.hpp"
 #include "common/metrics.hpp"
 #include "common/protocol.hpp"
+#include "setting_parse.hpp"
 
 #include <nlohmann/json.hpp>
 
@@ -126,8 +127,8 @@ void StatusEngine::evaluate_metrics(const std::string& agent_id, const SystemMet
     if (timestamp_ms - last_prune_ms_ >= prune_interval_ms)
     {
         last_prune_ms_ = timestamp_ms;
-        const auto retention_days_str = store_.get_setting("metrics_retention_days", "30");
-        const int retention_days = std::max(1, std::stoi(retention_days_str));
+        const int retention_days = std::max(
+            1, parse_int_setting(store_.get_setting("metrics_retention_days", "30"), 30, "metrics_retention_days"));
         const int64_t cutoff_ms = timestamp_ms - static_cast<int64_t>(retention_days) * 86'400'000LL;
         store_.prune_metrics_before(cutoff_ms);
         LOGF_DEBUG("Pruned metrics older than %d days", retention_days);

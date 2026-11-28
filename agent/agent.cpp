@@ -8,6 +8,7 @@
 #include "collectors/process_collector.hpp"
 #include "common/SingleLog.hpp"
 #include "common/zmq_limits.hpp"
+#include "common/zmq_retry.hpp"
 #include "enrollment.hpp"
 
 #include <chrono>
@@ -144,7 +145,8 @@ void Agent::start()
 {
     LOG_FUNCTION_TRACE
     {
-        enrollment_stop_.store(false);
+        // enrollment_stop_ is not reset here: a stop() that arrived before
+        // start() (for example a service Stop during startup) must stay in effect.
         LOGF_INFO("Starting enrollment with %s", config_.enrollment_address.c_str());
         enroll(config_, ctx_, enrollment_stop_);
         if (enrollment_stop_.load())
@@ -235,17 +237,27 @@ void Agent::io_loop(std::stop_token st)
                     LOGF_WARNING("Sending undecodable queued frame encoded_size=%zu error=%s", payload.size(),
                                  e.what());
                 }
-                dealer_.send(zmq::message_t{}, zmq::send_flags::sndmore);
-                dealer_.send(zmq::message_t(payload.data(), payload.size()), zmq::send_flags::none);
+                thewatcher::zmqutil::retry_on_eintr([&] {
+                    return dealer_.send(zmq::message_t{}, zmq::send_flags::sndmore);
+                });
+                thewatcher::zmqutil::retry_on_eintr([&] {
+                    return dealer_.send(zmq::message_t(payload.data(), payload.size()), zmq::send_flags::none);
+                });
             }
         }
 
-        zmq::poll(items, 1, std::chrono::milliseconds{100});
+        thewatcher::zmqutil::retry_on_eintr([&] {
+            return zmq::poll(items, 1, std::chrono::milliseconds{100});
+        });
         if (items[0].revents & ZMQ_POLLIN)
         {
             zmq::message_t delim, payload;
-            const auto delim_size = dealer_.recv(delim, zmq::recv_flags::none);
-            const auto payload_size = dealer_.recv(payload, zmq::recv_flags::none);
+            const auto delim_size = thewatcher::zmqutil::retry_on_eintr([&] {
+                return dealer_.recv(delim, zmq::recv_flags::none);
+            });
+            const auto payload_size = thewatcher::zmqutil::retry_on_eintr([&] {
+                return dealer_.recv(payload, zmq::recv_flags::none);
+            });
             if (!delim_size || !payload_size)
             {
                 LOG_WARNING("Agent failed to receive a complete server frame");
@@ -448,8 +460,12 @@ void Agent::handle_command(const CommandMessage& cmd)
                 .count();
         f.payload = proto::pack(ack_msg);
         auto encoded = proto::encode_frame(f);
-        dealer_.send(zmq::message_t{}, zmq::send_flags::sndmore);
-        dealer_.send(zmq::message_t(encoded.data(), encoded.size()), zmq::send_flags::none);
+        thewatcher::zmqutil::retry_on_eintr([&] {
+            return dealer_.send(zmq::message_t{}, zmq::send_flags::sndmore);
+        });
+        thewatcher::zmqutil::retry_on_eintr([&] {
+            return dealer_.send(zmq::message_t(encoded.data(), encoded.size()), zmq::send_flags::none);
+        });
         LOGF_DEBUG("Sent immediate ACK command_id=%s ok=%d message=%s", cmd.command_id.c_str(), ok ? 1 : 0,
                    msg.c_str());
     };

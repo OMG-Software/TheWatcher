@@ -131,6 +131,12 @@ namespace
             cfg.enrollment_token = it->second;
         if (auto it = values.find("TRUSTED_PROXIES"); it != values.end())
             cfg.trusted_proxies = split_csv(it->second);
+        if (auto it = values.find("LOG_LEVEL"); it != values.end())
+            cfg.log.set_level(it->second);
+        if (auto it = values.find("LOG_MAX_SIZE_MB"); it != values.end())
+            cfg.log.set_max_size_mib(it->second);
+        if (auto it = values.find("LOG_MAX_FILES"); it != values.end())
+            cfg.log.set_max_files(it->second);
     }
 
     // Returns a normalised sqlite path. An empty db_path means "thewatcher.db".
@@ -272,6 +278,9 @@ void ServerConfig::save(const fs::path& path) const
     out << "DB_TYPE=" << db_type << '\n';
     out << "POSTGRES_DSN=" << postgres_dsn << '\n';
     out << "OFFLINE_AFTER_SECONDS=" << offline_after_seconds << '\n';
+    out << "LOG_LEVEL=" << thewatcher::logging::LogSettings::level_name(log.level) << '\n';
+    out << "LOG_MAX_SIZE_MB=" << log.max_size_mib << '\n';
+    out << "LOG_MAX_FILES=" << log.max_files << '\n';
     out << "SERVER_PUBLIC_KEY=" << server_public_key << '\n';
     out << "SERVER_SECRET_KEY=" << server_secret_key << '\n';
     if (!enrollment_token.empty())

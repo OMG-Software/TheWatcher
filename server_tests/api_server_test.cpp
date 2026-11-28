@@ -9,12 +9,15 @@
 #include "../server/store.hpp"
 #include "../server/zap_handler.hpp"
 #include "common/crypto.hpp"
+#include "test_support/background_call.hpp"
 #include "test_support/net_helpers.hpp"
 #include "test_support/server_fixture.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 #include <nlohmann/json.hpp>
 
+#include <chrono>
+#include <future>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -298,6 +301,30 @@ SCENARIO("Only real loopback addresses get the loopback origin exception (issue 
     }
 }
 
+SCENARIO("ApiServer::stop returns promptly when called right after start (issue #50)")
+{
+    GIVEN("an API server that has just been started")
+    {
+        zmq::context_t ctx{1};
+        auto store = thewatcher::server::make_store("sqlite", ":memory:");
+        thewatcher::server::ZapHandler zap{ctx};
+        ApiServer api(*store, zap, "127.0.0.1", free_http_port());
+        api.start();
+
+        WHEN("stop() is called before the accept loop has had time to run")
+        {
+            thewatcher::test::BackgroundCall stopped([&] {
+                api.stop();
+            });
+
+            THEN("stop() returns instead of waiting on a listener that never ends")
+            {
+                REQUIRE(stopped.wait_for(std::chrono::seconds(10)) == std::future_status::ready);
+            }
+        }
+    }
+}
+
 SCENARIO("Commands for agents that are not connected are refused (issue #54)")
 {
     GIVEN("an approved agent that is offline and one that is connected")
@@ -349,6 +376,25 @@ SCENARIO("Commands for agents that are not connected are refused (issue #54)")
                 fx.api.drain_commands(queued);
                 REQUIRE(queued.size() == 1);
                 REQUIRE(queued[0].agent_id == "agent-online");
+            }
+        }
+    }
+}
+
+SCENARIO("ApiServer::stop without start is harmless (issue #50)")
+{
+    GIVEN("an API server that was never started")
+    {
+        zmq::context_t ctx{1};
+        auto store = thewatcher::server::make_store("sqlite", ":memory:");
+        thewatcher::server::ZapHandler zap{ctx};
+        ApiServer api(*store, zap, "127.0.0.1", free_http_port());
+
+        WHEN("stop() is called")
+        {
+            THEN("it returns without error")
+            {
+                REQUIRE_NOTHROW(api.stop());
             }
         }
     }

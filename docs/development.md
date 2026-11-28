@@ -18,6 +18,8 @@ plans/              dev-task-planner task plans.
 scripts/            Cross-platform build-environment setup scripts.
 server/             Server runtime, API, storage, ZAP auth, config.
 server_tests/       Store, lifecycle, and ZAP tests.
+test_support/       Header-only helpers shared by the test suites (fixtures,
+                    free ports, timing, background calls).
 subprojects/        Meson wrap files and packagefile overlays for libsodium,
                     libzmq, libcbor, and WrapDB-tracked dependencies.
 ```
@@ -64,6 +66,12 @@ npm.cmd test
 - Prefer structured types in `common/metrics.hpp`, `common/protocol.hpp`, and
   `common/commands.hpp` over ad hoc strings.
 - Use BDD-style tests with `GIVEN`, `WHEN`, and `THEN`.
+- To check that a call such as `stop()` or `run()` returns within a deadline,
+  run it with `thewatcher::test::BackgroundCall` from
+  `test_support/background_call.hpp`, not `std::async`. It runs the call on a
+  `std::jthread` and rethrows the call's exception from `get()`. Destruction
+  joins the thread, so a test that stops waiting must first make the call
+  return.
 - Add tests before behavior changes.
 - Update docs for every behavior or workflow change.
 - For security-sensitive changes, update [Threat Model](threat-model.md) with

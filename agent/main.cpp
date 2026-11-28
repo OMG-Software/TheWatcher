@@ -1,11 +1,12 @@
 #include "agent.hpp"
 #include "common/SingleLog.hpp"
 #include "common/crypto.hpp"
+#include "common/signal_guard.hpp"
+#include "common/stop_relay.hpp"
 #include "common/windows_service.hpp"
 #include "config.hpp"
 
 #include <atomic>
-#include <csignal>
 #include <cstring>
 #include <filesystem>
 #include <iostream>
@@ -16,12 +17,6 @@
 
 namespace
 {
-volatile std::sig_atomic_t g_stop = 0;
-void handle_signal(int)
-{
-    g_stop = 1;
-}
-
 std::filesystem::path log_path_for_config(const std::filesystem::path& config_path, const char* filename)
 {
     auto directory = config_path.has_parent_path() ? config_path.parent_path() : std::filesystem::current_path();
@@ -41,6 +36,8 @@ static void print_usage(const char* prog)
               << "  --insecure        Allow enrollment replies without a server key pin\n"
               << "                    (data plane runs unencrypted; use only on\n"
               << "                    trusted networks)\n"
+              << "  --log-level <l>   Log file level: trace, debug, info, notice, warning, error,\n"
+              << "                    critical or off (overrides LOG_LEVEL in the config)\n"
               << "  --genkey          Generate a CURVE keypair and print it, then exit\n"
               << "  --service         Run under Windows Service Control Manager\n"
               << "  --service-name <n> Service name (default: TheWatcherAgent)\n"
@@ -58,10 +55,15 @@ int main(int argc, char* argv[])
     namespace fs = std::filesystem;
     using namespace thewatcher::agent;
 
+    // First, before any thread exists, so every later thread inherits the
+    // blocked SIGINT/SIGTERM mask (issue #84).
+    thewatcher::process::SignalGuard signals;
+
     std::string config_path;
     std::string override_server;
     std::string override_enrollment;
     std::string override_server_key;
+    std::string cli_log_level;
     std::string service_name = "TheWatcherAgent";
     bool do_genkey = false;
     bool allow_insecure = false;
@@ -96,6 +98,10 @@ int main(int argc, char* argv[])
         else if (arg == "--service-name" && i + 1 < argc)
         {
             service_name = argv[++i];
+        }
+        else if (arg == "--log-level" && i + 1 < argc)
+        {
+            cli_log_level = argv[++i];
         }
         else if (arg == "--config" && i + 1 < argc)
         {
@@ -138,7 +144,19 @@ int main(int argc, char* argv[])
     auto log_path = log_path_for_config(cfg_path, "TheWatcherAgent.log");
     auto& logger = thewatcher::logging::SingleLog::GetInstance();
     logger.SetConsoleLogLevel(thewatcher::logging::LogLevel::L_INFO);
-    logger.SetFileLogLevel(thewatcher::logging::LogLevel::L_TRACE);
+    // Defaults until the config is read; --log-level also applies from here on.
+    thewatcher::logging::LogSettings log_settings;
+    try
+    {
+        if (!cli_log_level.empty())
+            log_settings.set_level(cli_log_level);
+    }
+    catch (const std::exception& e)
+    {
+        std::cerr << e.what() << "\n";
+        return 1;
+    }
+    log_settings.apply(logger);
     logger.SetLogFilePath(log_path.string());
 
     if (install_service)
@@ -153,6 +171,11 @@ int main(int argc, char* argv[])
         {
             service_args.push_back("--config");
             service_args.push_back(config_path);
+        }
+        if (!cli_log_level.empty())
+        {
+            service_args.push_back("--log-level");
+            service_args.push_back(cli_log_level);
         }
         if (!override_server.empty())
         {
@@ -205,6 +228,12 @@ int main(int argc, char* argv[])
         return 1;
     }
 
+    // The config's log settings take effect now; --log-level still wins.
+    log_settings = config.log;
+    if (!cli_log_level.empty())
+        log_settings.set_level(cli_log_level);
+    log_settings.apply(logger);
+
     // Issue #150: overrides apply to this process only and are not saved.
     if (!override_server.empty())
         LOGF_DEBUG("Overriding server address from CLI: %s", override_server.c_str());
@@ -228,49 +257,51 @@ int main(int argc, char* argv[])
     LOGF_DEBUG("Initial collection interval=%d heartbeat_interval=%d process_limit=%d", config.collection_interval,
                config.heartbeat_interval, config.process_limit);
 
-    std::signal(SIGINT, handle_signal);
-    std::signal(SIGTERM, handle_signal);
-
     try
     {
         if (service_mode)
         {
             LOGF_INFO("Starting Windows service mode as %s", service_name.c_str());
-            std::atomic<bool> service_stop{false};
-            std::shared_ptr<Agent> agent;
+            // The SCM calls the stop callback on its own thread, possibly while
+            // the worker is still building the agent; the relay keeps that request.
+            thewatcher::process::StopRelay stop_relay;
             return thewatcher::service::run_windows_service(
                 service_name,
                 [&] {
                     LOG_DEBUG("Service worker constructing agent");
-                    agent = std::make_shared<Agent>(std::move(config));
+                    Agent service_agent(std::move(config));
+                    // Detached again before service_agent is destroyed.
+                    const auto attachment = stop_relay.attach_scoped([&] {
+                        service_agent.stop();
+                    });
                     LOG_DEBUG("Service worker starting agent");
-                    agent->start();
-                    while (!service_stop.load())
+                    service_agent.start();
+                    while (!stop_relay.stop_requested())
                         std::this_thread::sleep_for(std::chrono::milliseconds(200));
                     LOG_DEBUG("Service worker stopping agent");
-                    agent->stop();
+                    service_agent.stop();
                 },
                 [&] {
                     LOG_DEBUG("Service stop callback received");
-                    service_stop.store(true);
-                    if (agent)
-                        agent->stop();
+                    stop_relay.request_stop();
                 });
         }
 
         Agent agent(std::move(config));
         LOG_DEBUG("Starting foreground agent");
-        std::jthread signal_watchdog([&agent](std::stop_token st) {
-            while (!st.stop_requested() && !g_stop)
-                std::this_thread::sleep_for(std::chrono::milliseconds(100));
-            if (g_stop)
+        std::jthread signal_watchdog([&agent, &signals](std::stop_token st) {
+            while (!st.stop_requested() && !signals.wait_for(std::chrono::milliseconds(100)))
+            {
+            }
+            if (signals.stop_requested())
                 agent.stop();
         });
         agent.start();
 
         LOG_INFO("Running. Press Ctrl+C to stop.");
-        while (!g_stop)
-            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        while (!signals.wait_for(std::chrono::milliseconds(200)))
+        {
+        }
 
         LOG_INFO("Shutting down...");
         signal_watchdog.request_stop();

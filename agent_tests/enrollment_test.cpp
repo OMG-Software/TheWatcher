@@ -1,13 +1,16 @@
+#include "../agent/agent.hpp"
 #include "../agent/config.hpp"
 #include "../agent/enrollment.hpp"
 #include "common/crypto.hpp"
 #include "common/protocol.hpp"
+#include "test_support/background_call.hpp"
 #include "test_support/enroll_reply_server.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
 #include <atomic>
 #include <chrono>
+#include <future>
 #include <string>
 #include <thread>
 #include <utility>
@@ -342,6 +345,37 @@ SCENARIO("Enrollment keeps asking while the server answers pending (issue #86)")
             {
                 REQUIRE(server.requests() == 3);
                 REQUIRE(cfg.server_public_key == server_kp.public_key_z85);
+            }
+        }
+    }
+}
+
+SCENARIO("A stop requested before Agent::start is not cleared by start (issue #84)")
+{
+    GIVEN("an agent that is told to stop before it starts, with no server to enroll with")
+    {
+        thewatcher::crypto::init();
+        const auto kp = thewatcher::crypto::generate_curve_keypair();
+        AgentConfig cfg;
+        cfg.agent_id = "early-stop-agent";
+        cfg.agent_public_key = kp.public_key_z85;
+        cfg.agent_secret_key = kp.secret_key_z85;
+        cfg.enrollment_address = "tcp://127.0.0.1:1";
+        Agent agent(cfg);
+        agent.stop();
+
+        WHEN("start() is called afterwards")
+        {
+            thewatcher::test::BackgroundCall finished([&] {
+                agent.start();
+            });
+            const auto status = finished.wait_for(std::chrono::seconds(5));
+            if (status != std::future_status::ready)
+                agent.stop(); // make start() return so the worker thread can be joined
+
+            THEN("start() returns instead of retrying enrollment forever")
+            {
+                REQUIRE(status == std::future_status::ready);
             }
         }
     }

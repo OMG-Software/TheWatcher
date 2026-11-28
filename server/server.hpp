@@ -130,7 +130,9 @@ private:
     // milder rate limit keyed by connection source instead of the
     // attacker-chosen agent_id.
     std::unordered_map<std::string, int64_t> enrollment_peer_last_request_ms_;
-    std::atomic<bool> running_{false};
+    // Set by stop() and never cleared, so a stop that arrives before or during
+    // startup is not lost.
+    std::atomic<bool> stop_requested_{false};
     // Scheduled digest delivery state (#49). The last-sent time itself is
     // persisted in the reports.last_sent_ms setting.
     bool report_in_flight_ = false;
