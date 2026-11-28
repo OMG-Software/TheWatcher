@@ -140,6 +140,34 @@ SCENARIO("Collector-config log entries are validated and admin-restricted")
                 require_status(res, 400);
             }
         }
+
+        WHEN("the admin submits patterns that can backtrack exponentially or use back-references")
+        {
+            for (const std::string bad : {"(a+)+$", "(a|aa)*c", R"((\w+\s?)*$)", ".*.*.*z", R"((a)\1)"})
+            {
+                auto entry = valid_log_entry();
+                entry["pattern"] = bad;
+                auto res = post_collector_config(fx.client, "cfg-sec-agent", json::array({entry}));
+
+                THEN("each is rejected with 400 and the reason (#169): " + bad)
+                {
+                    require_status(res, 400);
+                    REQUIRE(res->body.find("log pattern rejected") != std::string::npos);
+                }
+            }
+        }
+
+        WHEN("the admin submits an ordinary pattern with two wildcards")
+        {
+            auto entry = valid_log_entry();
+            entry["pattern"] = "ERROR.*disk.*full";
+            auto res = post_collector_config(fx.client, "cfg-sec-agent", json::array({entry}));
+
+            THEN("it is accepted")
+            {
+                require_status(res, 200);
+            }
+        }
     }
 }
 
