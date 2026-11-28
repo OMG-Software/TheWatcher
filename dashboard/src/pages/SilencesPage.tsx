@@ -1,23 +1,25 @@
 import React from 'react';
 import { Plus, Trash2 } from 'lucide-react';
-import { createSilence, deleteSilence } from '../api';
+import { createSilence, deleteSilence, fetchIndicatorKinds } from '../api';
 import { ActionError } from '../components/ActionError';
 import { ActionButton } from '../components/ActionButton';
+import { LoadFailed } from '../components/LoadFailed';
+import { usePolling } from '../hooks/usePolling';
 import type { RunAction } from '../hooks/useRunAction';
 import type { DashboardAgent, SilenceRecord } from '../models';
 
 export function SilencesPage({
   agents,
-  isBusy,
   global,
+  isBusy,
   loadFailed = false,
   operator,
   runAction,
   silences,
 }: {
   agents: DashboardAgent[];
-  isBusy: (key: string) => boolean;
   global: boolean;
+  isBusy: (key: string) => boolean;
   loadFailed?: boolean;
   operator: boolean;
   runAction: RunAction;
@@ -25,6 +27,11 @@ export function SilencesPage({
 }) {
   const [agentId, setAgentId] = React.useState('*');
   const [indicator, setIndicator] = React.useState('*');
+  const [qualifier, setQualifier] = React.useState('');
+  // The indicator names come from the server, which is what raises the alerts.
+  const kinds = usePolling(fetchIndicatorKinds);
+  const kindList = kinds.data ?? [];
+  const selectedKind = kindList.find((kind) => kind.name === indicator);
   const [reason, setReason] = React.useState('');
   const [hours, setHours] = React.useState(1);
 
@@ -41,7 +48,7 @@ export function SilencesPage({
           onSubmit={(event) => {
             event.preventDefault();
             const untilMs = Date.now() + hours * 3_600_000;
-            void runAction('silence:create', () => createSilence(agentId, indicator, reason, untilMs), { inline: true }).then((saved) => {
+            void runAction('silence:create', () => createSilence(agentId, qualifier.trim() && selectedKind?.qualifier ? `${indicator}:${qualifier.trim()}` : indicator, reason, untilMs), { inline: true }).then((saved) => {
               // Keep what the user typed when the save failed.
               if (saved) setReason('');
             });
@@ -59,16 +66,19 @@ export function SilencesPage({
             </label>
             <label>
               Indicator
-              <select value={indicator} onChange={(e) => setIndicator(e.target.value)}>
+              <select value={indicator} onChange={(e) => { setIndicator(e.target.value); setQualifier(''); }}>
                 <option value="*">All indicators</option>
-                <option value="cpu">cpu</option>
-                <option value="memory">memory</option>
-                <option value="disk">disk</option>
-                <option value="network">network</option>
-                <option value="processes">processes</option>
-                <option value="heartbeat">heartbeat</option>
+                {kindList.map((kind) => (
+                  <option key={kind.name} value={kind.name}>{kind.name}</option>
+                ))}
               </select>
             </label>
+            {selectedKind?.qualifier ? (
+              <label>
+                {`${selectedKind.qualifier.charAt(0).toUpperCase()}${selectedKind.qualifier.slice(1)} (optional, blank for all)`}
+                <input value={qualifier} onChange={(e) => setQualifier(e.target.value)} />
+              </label>
+            ) : null}
             <label>
               Duration (hours)
               <input min={1} max={168} step={1} type="number" value={hours} onChange={(e) => setHours(Number(e.target.value))} />
@@ -78,6 +88,7 @@ export function SilencesPage({
               <input placeholder="Planned maintenance…" value={reason} onChange={(e) => setReason(e.target.value)} />
             </label>
           </div>
+          {kinds.error ? <LoadFailed what="indicator names" message={kinds.error} onRetry={() => void kinds.refresh()} stale={kinds.data !== null} /> : null}
           <ActionError actionKey="silence:create" />
           <div className="button-row">
             <button className="text-button" disabled={isBusy('silence:create')} type="submit">

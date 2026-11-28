@@ -105,7 +105,7 @@ struct AlertRecord
     int64_t deleted_at = 0;
     std::string note;
     int64_t escalated_at = 0;
-    std::string runbook_url; // populated from runbooks table when alert is created
+    std::string runbook_url; // resolved from the runbooks table (see get_runbook) when the alert is created
     std::string runbook_markdown;
 };
 
@@ -277,10 +277,18 @@ public:
     virtual std::vector<RunbookRecord> list_runbooks() = 0;
     virtual void delete_runbook(int64_t runbook_id) = 0;
     // Returns the best runbook for an alert on `agent_id`: only that agent's
-    // runbooks or generic ones (empty agent_id) match (SEC-11). Order: exact
-    // indicator > '*', then agent-specific > generic, then newest.
+    // runbooks or generic ones (empty agent_id) match (SEC-11). Precedence
+    // (#53): the agent's own runbook beats a generic one; within each, the exact
+    // indicator ("disk:/") beats its kind ("disk"), which beats '*'; then the
+    // newest wins.
     virtual std::optional<RunbookRecord> get_runbook(const std::string& agent_id, const std::string& indicator,
                                                      const std::string& status) = 0;
+    // Every runbook that matches, best first (same order as get_runbook, which
+    // returns the first). Lets the caller skip a stored URL that fails
+    // validation and fall back to the next match. The kind ("disk") only
+    // counts for the built-in kinds (indicators::is_known_kind).
+    virtual std::vector<RunbookRecord> get_runbook_candidates(const std::string& agent_id, const std::string& indicator,
+                                                              const std::string& status) = 0;
 };
 
 std::unique_ptr<Store> make_store(const std::string& db_type, const std::string& db_path_or_dsn);

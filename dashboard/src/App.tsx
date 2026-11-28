@@ -17,6 +17,7 @@ import { AlertsPage } from './pages/AlertsPage';
 import { LoginPage } from './pages/LoginPage';
 import { MaintenancePage } from './pages/MaintenancePage';
 import { MonitoringPage } from './pages/MonitoringPage';
+import { RunbooksPage } from './pages/RunbooksPage';
 import { SettingsPage } from './pages/SettingsPage';
 import { SilencesPage } from './pages/SilencesPage';
 import { UsersPage } from './pages/UsersPage';
@@ -235,6 +236,7 @@ function Dashboard({
           <SilencesPage agents={agents} isBusy={isBusy} global={global} loadFailed={Boolean(sectionErrors.silences)} operator={operator} runAction={runAction} silences={silences} />
         </>
       ) : null}
+      {!unloaded && view === 'runbooks' ? <RunbooksPage agents={agents} global={global} isBusy={isBusy} runAction={runAction} /> : null}
       {!unloaded && view === 'users' ? (
         <>
           {sectionErrors.users ? <LoadFailed what="users" message={sectionErrors.users} onRetry={retry} /> : null}

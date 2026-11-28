@@ -53,6 +53,24 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 
+- Silences on `disk`, `network` and `process` never matched real alerts, which
+  are named `disk:<mount>`, `network:<interface>` and `process:<name>`. A
+  silence on a kind now covers all its indicators, indicator names live in one
+  header (`server/indicators.hpp`) that a test checks against the status engine,
+  and the old `heartbeat` and `processes` spellings still match (#151).
+- Runbook URLs are validated (http and https only) when created and again before
+  they are attached to an alert, so `javascript:` links cannot be stored or
+  rendered. The check parses the scheme and authority (host, optional port, no
+  userinfo) instead of matching a prefix (#11).
+- A stored runbook URL that fails validation no longer hides a valid lower-
+  precedence runbook, and a custom indicator such as `Auth` no longer matches
+  `Auth:Failure` (only built-in kinds match by prefix) (#53).
+- Offline (`Heartbeat`) and log-match alerts now get their runbook link; webhook
+  delivery for them is #52 (#53). The alert pipeline resolves the link for
+  every alert with the same precedence and URL validation, applies silences by
+  indicator kind in its single silence check, and the webhook payload carries
+  the agent's `runbook_markdown`.
+
 - All alerts now go through one pipeline that applies maintenance, silences,
   severity validation, de-duplication, the runbook link and the webhook.
   Log-match alerts no longer fire during maintenance, offline and log-match
@@ -263,6 +281,16 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   optional `signal` (#187, #190).
 
 ### Changed
+
+- Alert runbook links now follow a documented precedence: an agent's own
+  runbook beats a global one, and within each the exact indicator beats its
+  kind (`disk` for `disk:/`), which beats `*`. Alerts and webhook payloads carry
+  the matched `runbook_url`, and webhook payloads also carry the agent's
+  `runbook_markdown`. Operators can create and delete runbook links for agents in
+  their groups; global links stay admin-only. The runbooks table is kept as the
+  link store, so existing rows keep working (#53, #11).
+- The dashboard has a Runbooks page, shows an alert's runbook link, and builds
+  the Silences indicator picker from the new `GET /api/indicators` (#53, #11, #151).
 
 - Documentation: PostgreSQL is documented as an implemented backend selected
   with `DB_TYPE=postgres` / `POSTGRES_DSN` (build-time support required), the

@@ -210,13 +210,19 @@ Every alert kind (metric transitions from `StatusEngine`, the offline-agent
 
 1. rejects a severity other than `yellow`, `amber` or `red`;
 2. skips the alert while the agent is in maintenance;
-3. skips it when a silence matches the agent and indicator;
+3. skips it when a silence matches the agent and indicator. This is the only
+   silence check: a rule for an indicator kind (`disk`) also covers its
+   per-item indicators (`disk:/`), see `indicators.hpp`;
 4. optionally de-duplicates: log-match and offline alerts are skipped while an
    unacknowledged alert with the same agent, indicator and severity is open,
    so 100 matching log lines leave one open alert (metric alerts are already
    limited to worsening transitions);
-5. attaches the matching runbook URL, stores the alert and queues the
-   `notifications.webhook_url` webhook.
+5. attaches the matching runbook URL through the one resolver,
+   `resolve_runbook_url` (`server/runbook.cpp`): the agent's own runbook beats a
+   generic one, an exact indicator beats its kind beats `*`, and a stored URL
+   that is not valid http(s) is skipped. It then stores the alert and queues the
+   `notifications.webhook_url` webhook, whose payload also carries the agent's
+   `runbook_markdown`.
 
 A new alert source builds an `AlertRequest` and calls `raise`; behaviour that
 applies to every alert (for example another notification channel or extra

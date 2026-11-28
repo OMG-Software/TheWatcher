@@ -3,6 +3,7 @@
 #include "common/SingleLog.hpp"
 #include "common/metrics.hpp"
 #include "common/protocol.hpp"
+#include "indicators.hpp"
 
 #include <nlohmann/json.hpp>
 
@@ -143,7 +144,7 @@ void StatusEngine::evaluate_metrics(const std::string& agent_id, const SystemMet
     const auto config = agent ? agent->collector_config : default_collector_config();
 
     {
-        const auto indicator = std::string("cpu");
+        const auto indicator = std::string(indicators::kCpu);
         const auto raw = classify_percent(metrics.cpu.usage_percent, config.cpu);
         const auto previous_row = store_.latest_status_for_indicator(agent_id, indicator);
         const auto previous = previous_row ? status_from_string(previous_row->new_status) : IndicatorStatus::Grey;
@@ -157,7 +158,7 @@ void StatusEngine::evaluate_metrics(const std::string& agent_id, const SystemMet
     }
 
     {
-        const auto indicator = std::string("memory");
+        const auto indicator = std::string(indicators::kMemory);
         const auto raw = classify_percent(metrics.memory.usage_percent, config.memory);
         const auto previous_row = store_.latest_status_for_indicator(agent_id, indicator);
         const auto previous = previous_row ? status_from_string(previous_row->new_status) : IndicatorStatus::Grey;
@@ -182,7 +183,7 @@ void StatusEngine::evaluate_metrics(const std::string& agent_id, const SystemMet
         const auto thresholds = disk_config ? disk_config->thresholds : PercentThresholds{};
         const AnomalyConfig no_anomaly{};
         const auto& anomaly_cfg = disk_config ? disk_config->anomaly : no_anomaly;
-        const auto indicator = "disk:" + disk.mount_point;
+        const auto indicator = indicators::make(indicators::kDisk, disk.mount_point);
         const auto raw = classify_percent(disk.usage_percent, thresholds);
         const auto previous_row = store_.latest_status_for_indicator(agent_id, indicator);
         const auto previous = previous_row ? status_from_string(previous_row->new_status) : IndicatorStatus::Grey;
@@ -214,7 +215,7 @@ void StatusEngine::evaluate_metrics(const std::string& agent_id, const SystemMet
         if (!network.is_up)
             raw = IndicatorStatus::Red;
 
-        const auto indicator = "network:" + network.interface_name;
+        const auto indicator = indicators::make(indicators::kNetwork, network.interface_name);
         const auto previous_row = store_.latest_status_for_indicator(agent_id, indicator);
         const auto previous = previous_row ? status_from_string(previous_row->new_status) : IndicatorStatus::Grey;
         const auto confirmed = confirm_numeric_status(agent_id, indicator, previous, raw, config.network_readings);
@@ -241,7 +242,7 @@ void StatusEngine::evaluate_metrics(const std::string& agent_id, const SystemMet
                 ++seen;
         }
 
-        const auto indicator = "process:" + watch.name;
+        const auto indicator = indicators::make(indicators::kProcess, watch.name);
         IndicatorStatus next = IndicatorStatus::Green;
         if (seen < watch.expected_count)
         {

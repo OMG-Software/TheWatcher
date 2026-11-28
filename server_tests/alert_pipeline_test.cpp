@@ -287,3 +287,48 @@ SCENARIO("An operator disconnect does not raise an offline alert (issue #156)")
         }
     }
 }
+
+SCENARIO("A webhook alert carries the runbook link and the agent's markdown runbook (issue #53)")
+{
+    GIVEN("a configured webhook, an agent with a markdown runbook and a global runbook for a log indicator")
+    {
+        SqliteStore store(":memory:");
+        AgentRecord agent;
+        agent.agent_id = "a1";
+        agent.hostname = "a1-host";
+        agent.platform = "linux";
+        agent.approved = true;
+        agent.first_seen = 1;
+        agent.last_seen = 1000;
+        agent.runbook_markdown = "# App errors\nRestart the app";
+        store.upsert_agent(agent);
+        RunbookRecord runbook;
+        runbook.indicator = "app-errors";
+        runbook.status = "red";
+        runbook.url = "https://wiki/app-errors";
+        store.create_runbook(runbook);
+        store.set_setting("notifications.webhook_url", "http://hooks.example.net/alert");
+        Capture capture;
+        NotificationWorker worker({}, [&](const Notification& n) {
+            return capture.record(n);
+        });
+        AlertPipeline pipeline(store, worker);
+
+        WHEN("a log-match alert is raised")
+        {
+            REQUIRE(pipeline.raise(log_alert("a1")) == AlertOutcome::Raised);
+
+            THEN("the stored alert and the webhook payload both carry the runbook")
+            {
+                REQUIRE(eventually(
+                    [&] {
+                        return capture.size() == 1;
+                    },
+                    5s, 10ms));
+                REQUIRE(capture.bodies[0]["runbook_url"] == "https://wiki/app-errors");
+                REQUIRE(capture.bodies[0]["runbook_markdown"] == "# App errors\nRestart the app");
+                REQUIRE(store.list_alerts(true).at(0).runbook_url == "https://wiki/app-errors");
+            }
+        }
+    }
+}

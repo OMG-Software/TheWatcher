@@ -599,8 +599,8 @@ void Server::handle_router_frame(zmq::socket_t& router)
             // Raise an alert on the named indicator so it shows up on the
             // dashboard. The pipeline applies maintenance, silences, severity
             // validation, de-duplication and the webhook (#52).
-            alerts_->raise({agent_id, match.indicator_name, "green", match.severity,
-                            "Log match in " + match.path + ": " + match.matched_line.substr(0, 200), server_now, true});
+            alerts_->raise(log_match_request(agent_id, match.indicator_name, match.severity, match.path,
+                                             match.matched_line, server_now));
         }
         catch (const std::exception& e)
         {

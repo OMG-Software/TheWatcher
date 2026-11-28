@@ -22,6 +22,14 @@ status_engine_test = executable(
 )
 test('status_engine', status_engine_test)
 
+runbook_indicator_test = executable(
+  'runbook_indicator_test',
+  ['runbook_indicator_test.cpp'],
+  include_directories: root_inc,
+  dependencies: [server_store_dep, catch2_dep, cbor_dep, sqlite_dep, platform_deps],
+)
+test('runbook_indicator', runbook_indicator_test)
+
 webhook_security_test = executable(
   'webhook_security_test',
   ['webhook_security_test.cpp'],

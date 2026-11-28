@@ -7,6 +7,7 @@ export type DashboardView =
   | 'users'
   | 'maintenance'
   | 'silences'
+  | 'runbooks'
   | 'settings'
   | 'views';
 
@@ -23,6 +24,7 @@ export const NAV_ITEMS: NavItem[] = [
   { view: 'alerts', label: 'Alerts' },
   { view: 'silences', label: 'Silences', requiresOperator: true },
   { view: 'maintenance', label: 'Maintenance', requiresOperator: true },
+  { view: 'runbooks', label: 'Runbooks', requiresOperator: true },
   { view: 'agents', label: 'Agents' },
   { view: 'users', label: 'Users' },
   { view: 'settings', label: 'Settings', requiresGlobalOperator: true },
@@ -114,6 +116,12 @@ export function parseMarkdownBlocks(markdown: string): MarkdownBlock[] {
   flushParagraph();
   flushList();
   return blocks;
+}
+
+/** A runbook URL that is safe to use as a link target: http or https only, otherwise null. */
+export function safeRunbookUrl(url: string | undefined): string | null {
+  const trimmed = (url ?? '').trim();
+  return /^https?:\/\/[^\s/?#]/i.test(trimmed) ? trimmed : null;
 }
 
 export function safeMarkdownHref(href: string): string | null {

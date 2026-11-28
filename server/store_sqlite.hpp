@@ -104,6 +104,8 @@ public:
     void delete_runbook(int64_t runbook_id) override;
     std::optional<RunbookRecord> get_runbook(const std::string& agent_id, const std::string& indicator,
                                              const std::string& status) override;
+    std::vector<RunbookRecord> get_runbook_candidates(const std::string& agent_id, const std::string& indicator,
+                                                      const std::string& status) override;
 
 private:
     void exec(const char* sql);

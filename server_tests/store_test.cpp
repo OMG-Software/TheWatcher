@@ -2992,3 +2992,49 @@ SCENARIO("get_runbook never returns another agent's runbook")
         }
     }
 }
+
+SCENARIO("get_runbook_candidates lists every match best first and only uses built-in kinds")
+{
+    GIVEN("agent, global, kind, exact and wildcard runbooks plus a custom 'Auth' runbook")
+    {
+        SqliteStore store(unique_store_path("runbook-candidates.db").string());
+        auto add = [&](const std::string& agent, const std::string& indicator, const std::string& url) {
+            RunbookRecord rb;
+            rb.agent_id = agent;
+            rb.indicator = indicator;
+            rb.status = "red";
+            rb.url = url;
+            rb.created_at = 1000;
+            store.create_runbook(rb);
+        };
+        add("", "*", "https://w/global-any");
+        add("", "disk", "https://w/global-disk");
+        add("a1", "disk:/", "https://w/agent-exact");
+        add("", "Auth", "https://w/auth");
+
+        WHEN("the candidates for agent a1 and disk:/ are requested")
+        {
+            const auto found = store.get_runbook_candidates("a1", "disk:/", "red");
+
+            THEN("they are ordered agent exact, global kind, global wildcard")
+            {
+                REQUIRE(found.size() == 3);
+                CHECK(found[0].url == "https://w/agent-exact");
+                CHECK(found[1].url == "https://w/global-disk");
+                CHECK(found[2].url == "https://w/global-any");
+                CHECK(store.get_runbook("a1", "disk:/", "red")->url == "https://w/agent-exact");
+            }
+        }
+
+        WHEN("the candidates for the alert indicator Auth:Failure are requested")
+        {
+            const auto found = store.get_runbook_candidates("a1", "Auth:Failure", "red");
+
+            THEN("the custom Auth runbook is not among them")
+            {
+                REQUIRE(found.size() == 1);
+                CHECK(found[0].url == "https://w/global-any");
+            }
+        }
+    }
+}

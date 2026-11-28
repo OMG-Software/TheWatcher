@@ -9,6 +9,7 @@ describe('GIVEN dashboard navigation rules', () => {
       'Alerts',
       'Silences',
       'Maintenance',
+      'Runbooks',
       'Agents',
       'Users',
       'Settings',

@@ -1,6 +1,7 @@
 libpq_dep = dependency('libpq', required: false, static: false)
 
 server_store_sources = [
+  'runbook.cpp',
   'alert_pipeline.cpp',
   'notification_worker.cpp',
   'offline_alerts.cpp',
