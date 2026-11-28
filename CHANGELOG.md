@@ -28,8 +28,6 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   4 KiB of a line is no longer reported, and `$` does not match at the cut.
   A pattern that nests groups more than 16 levels deep is skipped with a
   warning; 100 nested groups overflowed the 64 MB stack.
-  Patterns with exponential backtracking can still use a lot of CPU
-  (#169).
 - **Behaviour change:** the data plane no longer trusts the ROUTER routing
   id. Agents no longer set it (libzmq generates one), and the server sends
   commands only to the connection that last sent an authenticated frame for
@@ -60,6 +58,21 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   UTF-8. They are UTF-8 again, and a new test fails whenever any file under
   `dashboard/src` is not valid UTF-8, since vitest decodes such files without
   complaint.
+- Log tailing (#90): each indicator keeps its own read offset, so two
+  indicators on one file both match; a monitor starts at the end of an
+  existing file instead of replaying its history as new alerts (a file that
+  appears later is read from its first byte); a line the writer has not
+  finished is matched whole once it ends; the carriage return of CRLF lines is
+  dropped so `$`-anchored patterns match; a replaced, deleted or truncated
+  file is read again from its start. A regex engine failure on one line (for
+  example MSVC `error_stack`) skips that line and is logged once per poll,
+  instead of stalling the file.
+- Log patterns that can backtrack exponentially are rejected (#169). The
+  server answers 400 when a collector config is saved with one and the agent
+  skips it with a warning. Refused: back-references; a repeated group that
+  contains a quantifier or alternation, such as `(a+)+` or `(a|aa)*`;
+  overlapping unbounded quantifiers back to back, such as `.*.*`; and more
+  than three unbounded quantifiers (`*`, `+`, `{n,}`) in one pattern.
 - Dashboard: `tsc` no longer writes `.js`/`.d.ts` files into `dashboard/src`
   (`noEmit`), the 21 committed compiled twins are removed, and vitest runs
   only `*.test.ts(x)`. Before, Vite served the stale twins and every test ran
@@ -87,6 +100,59 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   unprivileged writers, and root-reserved blocks count as used (#158).
 - Encoding a frame with an empty payload no longer passes a null pointer to
   libcbor (undefined behaviour reported by UBSan on every heartbeat) (#162).
+- The Windows installer registers the server service with
+  `TheWatcherServer.conf`, the file the server actually reads, instead of a
+  non-existent `server.json`; the docs name the same file and
+  `OFFLINE_AFTER_SECONDS` key (#131). On upgrade the installer stops the
+  services (aborting if one cannot be stopped), copies a KEY=VALUE
+  `server.json` whose `SERVER_PUBLIC_KEY` and `SERVER_SECRET_KEY` are both
+  40-character Z85 keys to `TheWatcherServer.conf` without overwriting an
+  existing one, and re-registers the service, so agents keep the same server
+  identity. A `server.json` that cannot be converted (either key missing,
+  empty or malformed), with no `TheWatcherServer.conf` beside it, makes the
+  installer refuse to run before it stops or changes anything, so the server
+  never starts without its keypair or without CURVE. The copy is checked again
+  and removed if it is incomplete. Config preparation and migration run in
+  `PrepareToInstall` and abort the install on failure. Services that were
+  running before the upgrade are started again in every outcome: on a
+  preparation failure, when the file copy fails or is cancelled, and on the
+  new registrations once the install finishes (installers used to leave them
+  stopped until they were started by hand or the host rebooted). Service
+  registration checks exit codes and retries while the old service is marked
+  for deletion; a registration or restart failure shows what to run by hand
+  and makes setup exit with code 10 (#131).
+- Disk collector (Linux): LVM/device-mapper volumes now report I/O rates
+  (`/dev/mapper/<name>` is mapped to its `dm-N` node, and symlinks such as
+  `/dev/disk/by-uuid/...` are resolved); loop, snap (squashfs), pseudo and
+  bind-mounted duplicates are no longer reported; octal escapes such as
+  `\040` in mount paths are decoded so those disks are no longer dropped
+  (#96).
+- Disk collector (Linux): loop-device filtering, de-duplication and the
+  `/proc/diskstats` lookup now all use the device resolved once through
+  symlinks, so a `/dev/disk/by-id/...` alias of a loop device is excluded and
+  two aliases of one volume are reported once; the reported `device` stays the
+  string from the mount table (#96).
+- Disk collector (BSD): every real mount is reported through `getmntinfo`
+  instead of only `/` (FreeBSD, OpenBSD, NetBSD; not yet compiled on
+  OpenBSD or NetBSD) (#93, part of).
+- Process collector: a watch longer than 15 characters now matches on Linux
+  through the executable basename (`/proc/<pid>/exe`, falling back to
+  `argv[0]`); matching is case-insensitive on Windows; a matched process is
+  reported under the watch name (#95).
+- Process CPU is now percent of one core on every OS (Windows was divided by
+  the core count, and Linux/BSD values were clamped to 100); a process using
+  two cores reports about 200 (#95).
+- Windows process collection opens each process with
+  `PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ`, the rights
+  `GetProcessMemoryInfo` documents. If that is denied (protected processes,
+  other users' processes) it reopens with `PROCESS_QUERY_LIMITED_INFORMATION`
+  only: the process stays listed with its name and CPU and its memory is
+  reported as 0 (#95).
+- The Toolhelp snapshot, process handles and the Linux `/proc` `DIR*` are now
+  RAII-owned (#100, part of).
+- Process collector (BSD): FreeBSD owner comes from the uid, not the login
+  name; OpenBSD (`struct kinfo_proc`, `p_*`) and NetBSD (`kinfo_proc2`) now
+  have their own readers instead of the FreeBSD layout (#93).
 - The CPU collector reports a real usage value on its first `update()` and
   after a collector restart. The constructor takes a baseline and the first
   update waits until it is at least 100 ms old. Calls closer than 100 ms to
@@ -182,6 +248,17 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Changed
 
+- Documentation: PostgreSQL is documented as an implemented backend selected
+  with `DB_TYPE=postgres` / `POSTGRES_DSN` (build-time support required), the
+  HA guide uses the real `TheWatcherServer.conf` KEY=VALUE format with its
+  failover and single-writer caveats, and architecture, configuration, README
+  and tracker match (#130).
+- Documentation: the new-collector checklists point at the real files
+  (`common/metrics.hpp` for the struct and CBOR, `server/api_json.hpp` for the
+  JSON mapping), and the nonexistent `dashboard_tests/` directory and
+  temperature collector references are gone (#133).
+- Agent and server metric log lines no longer print a `temperatures=` count
+  (#133).
 - The server config save now uses the shared `common::write_private_file_atomic`
   helper (atomic, owner-only write) that the agent config also uses; the
   duplicated code in `server/config.cpp` is removed. No behaviour change (#149).

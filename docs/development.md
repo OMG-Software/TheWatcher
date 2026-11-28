@@ -7,12 +7,11 @@ work required to extend TheWatcher end to end.
 
 ```text
 agent/              Agent runtime, config, enrollment, collectors.
-agent/collectors/   CPU, memory, disk, temperature, process, network collectors.
+agent/collectors/   CPU, memory, disk, process, network and log collectors.
 agent_tests/        Agent config and collector contract tests.
 common/             Shared protocol, commands, metrics, crypto, logging, service helpers.
 common_tests/       Tests for shared helpers.
 dashboard/          React + TypeScript + Vite dashboard.
-dashboard_tests/    Dashboard test helpers or future browser tests.
 docs/               Operator and developer documentation.
 integration_tests/  End-to-end server-agent lifecycle tests.
 plans/              dev-task-planner task plans.
@@ -91,15 +90,43 @@ npm.cmd test      # Vitest + jsdom + React Testing Library UI tests; see docs/da
 Use this checklist when adding a metric family such as GPU, filesystem inode
 usage, services, packages, or custom application health.
 
-1. Define the metric shape in `common/metrics.hpp`.
+1. Define the metric shape in `common/metrics.hpp` and `server/api_json.hpp`.
 
-   Add a struct with stable field names and a
-   `NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE` mapping. Add the struct to
-   `SystemMetrics`.
+   In `common/metrics.hpp`, add a struct with stable field names, add it to
+   `SystemMetrics`, and add `to_cbor` / `from_cbor` specialisations for the
+   struct. Agents send metrics to the server as CBOR (the `cbor` helpers live
+   in `common/protocol.hpp`), and `SystemMetrics` is encoded as a fixed-length
+   positional array. Today `from_cbor<SystemMetrics>` accepts exactly 11
+   elements and there is no protocol version negotiation. The server decodes
+   agent frames (`server/server.cpp`) and also re-decodes stored
+   `metrics_cbor` rows, which are never rewritten (`server/api.cpp`,
+   `server/status_engine.cpp`). Changing the exact-length check therefore
+   breaks every existing 11-element frame and stored row. A new
+   `SystemMetrics` field must keep decoding the previous layouts: the decoder
+   must reject arrays shorter than the oldest supported length, read the new
+   indices only when present, and default the field otherwise (protocol
+   versioning work in #57 and #102 covers the mechanism). Do not add a field
+   until the decoder does that, or you accept a coordinated upgrade of server
+   and all agents with old stored rows no longer decoding.
+
+   To add the field itself, in `common/metrics.hpp`: (a) in
+   `to_cbor<SystemMetrics>`, `push` the new value (build it first, as the
+   other members are, and `release()` it into the array) at the
+   position you choose and raise `cbor_new_definite_array(11)` to the new
+   count (this is the length new agents send); (b) in `from_cbor<SystemMetrics>`,
+   append the field at the end (inserting in the middle shifts the indices of
+   old frames), and replace the `cbor_array_size(item) != 11` equality check
+   with a minimum-length check that still accepts every older count, reading
+   `array_get(item, <index>)` for the new field only when
+   `cbor_array_size(item)` is large enough and leaving its default otherwise.
+   The indices must match in both functions. The REST API serialises the same structs as JSON; add the
+   `NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT` mapping for the new
+   struct, and the new `SystemMetrics` field, in `server/api_json.hpp`.
 
 2. Add wire/API compatibility tests.
 
-   Update or add tests that serialize and inspect `SystemMetrics`. If the new
+   Update or add tests that round-trip `SystemMetrics` through CBOR
+   (`common_tests/protocol_test.cpp`) and check its JSON form. If the new
    metric affects integration behavior, extend
    `integration_tests/server_agent_integration_test.cpp`.
 

@@ -96,14 +96,58 @@ only for collector snapshots; heartbeat interval is configured separately.
 `collector_config` is defined in `common/collector_config.hpp`. CPU, memory,
 and disk thresholds are absolute percentages. Network thresholds are combined
 receive plus transmit megabits per second per interface. Process watches use
-exact executable names and expected instance counts; `ProcessCollector` always
+executable names (see "Disk And Process Collector Semantics") and expected instance counts; `ProcessCollector` always
 includes matching watched processes in `metrics.top_processes`, even when they
 are outside the normal top-N sample.
 
+## Disk And Process Collector Semantics
+
+**Disks.** `free_bytes` is the space available to unprivileged writers (as
+`df` reports it) and `usage_percent = used / (used + available)`.
+Reported mounts exclude pseudo filesystems (proc, sysfs, tmpfs, devtmpfs,
+overlay, ...), `squashfs` (snap packages are always 100% used), loop
+devices, and repeat mounts of a device already reported (bind mounts, btrfs
+subvolumes; the first mount in the mount table wins). Loop filtering and
+de-duplication use the device after resolving symlinks (so
+`/dev/disk/by-id/...` aliases are handled); `device` in the metric stays the
+string from the mount table.
+
+- Linux reads `/proc/self/mounts` and decodes octal escapes (`\040` is a
+  space). I/O rates come from `/proc/diskstats`; the mount's device is
+  resolved through symlinks, and `/dev/mapper/<name>` aliases are mapped to
+  their `dm-N` node through `/sys/block/dm-N/dm/name`.
+- Windows reports fixed drives, capacity only (no I/O rates).
+- BSD enumerates mounts with `getmntinfo` (`statfs`; `statvfs` on NetBSD),
+  filtered as above, and reports no I/O rates.
+
+**Processes.** `cpu_percent` means percent of **one core** on every
+platform: 100 is one core fully busy and a process using two cores reports
+about 200. It is not clamped to 100 and not divided by the core count. A
+process seen for the first time reports 0 until the next sample.
+
+A watch matches a process when its name equals the process's short name or
+its executable basename. On Linux the short name (`/proc/<pid>/comm`) is cut
+to 15 characters, so for names that long the executable basename from
+`/proc/<pid>/exe` is used, falling back to `argv[0]` of `/proc/<pid>/cmdline`
+when the link is unreadable. Windows compares names case-insensitively.
+FreeBSD `ki_comm` is cut to 19 characters and has no fallback. A matched
+process is reported under the watch's configured name. Process readers on
+FreeBSD, OpenBSD and NetBSD use `sysctl(KERN_PROC)`; OpenBSD does not report
+thread counts (always 1); DragonFly BSD reports no processes.
+
+On Windows each process is opened with `PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ`,
+the rights `GetProcessMemoryInfo` documents. When that is denied (protected
+processes such as `System`, and other users' processes) it is reopened with
+`PROCESS_QUERY_LIMITED_INFORMATION` only: the process is still listed with its
+name and CPU, and `memory_rss_bytes` and `memory_vms_bytes` are 0.
+
 ## Adding A Collector
 
-1. Add the metric struct and JSON mapping to `common/metrics.hpp`.
-2. Add the field to `SystemMetrics`.
+1. Add the metric struct to `common/metrics.hpp` with `to_cbor` / `from_cbor`
+   specialisations (the CBOR wire format), and add the field to
+   `SystemMetrics`.
+2. Add the JSON mapping for the struct and the new `SystemMetrics` field to
+   `server/api_json.hpp` (the REST API form).
 3. Add collector source/header files under `agent/collectors/`.
 4. Add the files to `agent/collectors/meson.build`.
 5. Register the collector in `Agent::Agent()` in `agent/agent.cpp`.

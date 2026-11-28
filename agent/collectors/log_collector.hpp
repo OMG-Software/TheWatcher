@@ -60,7 +60,9 @@ public:
 private:
     struct FileState
     {
-        int64_t inode = -1; // file identity (inode / NTFS file index); -1 = file not yet seen
+        // True until the watch has met its file. -1 inode with fresh=false: the file was missing when last polled.
+        bool fresh = true;
+        int64_t inode = -1; // file identity (inode / NTFS file index)
         int64_t offset = 0; // start of the first byte not yet fully processed
         // True while the rest of an over-long line is being dropped: the
         // truncated prefix was already evaluated, so only skip to the next '\n'.
@@ -69,6 +71,7 @@ private:
 
     std::vector<LogMonitorConfig> configs_;
     std::vector<std::filesystem::path> allowed_dirs_;
+    // One entry per watch (path + indicator + pattern), not per path.
     std::unordered_map<std::string, FileState> file_states_;
     std::vector<proto::LogMatch> pending_;
     std::mutex mutex_;

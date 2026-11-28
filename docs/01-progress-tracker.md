@@ -70,8 +70,9 @@ Status: planned.
 
 ### TODO
 
-- Validate PostgreSQL storage support or explicitly defer it from the beta
-  scope.
+- Validate the PostgreSQL store (`PostgresStore`) against the SQLite store
+  behaviour. It is implemented and selectable with `DB_TYPE=postgres`, but it
+  is only built when libpq is available and has less test coverage.
 - Provide a supported production dashboard hosting model, either through the
   server or documented reverse-proxy/static-hosting guidance.
 - Add upgrade, downgrade, backup, and restore procedures for server data.
