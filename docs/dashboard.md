@@ -151,7 +151,11 @@ server) over HTTPS, because the session cookie is `Secure`. Set
   poll pauses while the tab is hidden and refreshes as soon as it is visible
   again. `useDashboardData` polls every 5 s with it. `refresh()` resolves to
   the load error message of a load that started after the call (null on
-  success) and never rejects. `runAction` stays busy until the mutation and
+  success) and never rejects. `runAction` tracks every running action by key: a
+  key that is already running is refused (resolves `false`, no request), and
+  finishing removes only its own key. `isBusy(key)` tells whether one runs;
+  `busyAction` is the most recently started running key, kept for
+  compatibility. `runAction` stays busy until the mutation and
   its refresh have both settled, so a control guarded by `busyAction` cannot
   repeat the change while the result loads, and it uses the refresh result to
   report a failed post-action refresh. An optional `merge(next, previous)`
