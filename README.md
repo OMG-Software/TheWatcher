@@ -5,7 +5,7 @@
 TheWatcher is a platform agnostic server/endpoint monitoring platform trying to be better than the complex and ugly solutions that are currently out there.
 
 It's been created in C++20 with deployable user-space
-agents, a ZeroMQ/LibSodium data plane, a SQLite-backed server (PostgreSQL to come), and a React dashboard.
+agents, a ZeroMQ/LibSodium data plane, a server that stores its data in SQLite or PostgreSQL, and a React dashboard.
 
 Agents initiate all network connections. They enroll with the server, submit
 metrics periodically, send heartbeats, and request current runtime config after
@@ -29,7 +29,7 @@ On BSD: `./scripts/setup-build-env-bsd.sh` and the same meson commands.)
 Start the server in foreground mode:
 
 ```powershell
-.\builddir-release\server\TheWatcherServer.exe --config C:\ProgramData\TheWatcher\server.json
+.\builddir-release\server\TheWatcherServer.exe --config C:\ProgramData\TheWatcher\TheWatcherServer.conf
 ```
 
 Create or edit the agent config:

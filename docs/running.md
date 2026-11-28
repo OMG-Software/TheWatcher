@@ -6,13 +6,13 @@ dashboard.
 ## Start The Server In Foreground Mode
 
 ```powershell
-.\builddir-release\server\TheWatcherServer.exe --config C:\ProgramData\TheWatcher\server.json
+.\builddir-release\server\TheWatcherServer.exe --config C:\ProgramData\TheWatcher\TheWatcherServer.conf
 ```
 
 Expected log lines include:
 
 ```text
-Config: C:\ProgramData\TheWatcher\server.json
+Config: C:\ProgramData\TheWatcher\TheWatcherServer.conf
 Log: C:\ProgramData\TheWatcher\TheWatcherServer.log
 Public key: <server-public-key>
 Running. Press Ctrl+C to stop.
@@ -136,7 +136,7 @@ the server, disconnects the agent, and shuts down.
 
 The server updates `last_seen` for every inbound agent frame. Approved connected
 agents are marked disconnected when the server has not seen them for more than
-`offline_after_seconds` from `server.json`.
+`OFFLINE_AFTER_SECONDS` from `TheWatcherServer.conf`.
 
 Explicit disconnect still marks an agent disconnected immediately when the agent
 ACKs the command.

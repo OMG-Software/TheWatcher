@@ -143,8 +143,11 @@ name and CPU, and `memory_rss_bytes` and `memory_vms_bytes` are 0.
 
 ## Adding A Collector
 
-1. Add the metric struct and JSON mapping to `common/metrics.hpp`.
-2. Add the field to `SystemMetrics`.
+1. Add the metric struct to `common/metrics.hpp` with `to_cbor` / `from_cbor`
+   specialisations (the CBOR wire format), and add the field to
+   `SystemMetrics`.
+2. Add the JSON mapping for the struct and the new `SystemMetrics` field to
+   `server/api_json.hpp` (the REST API form).
 3. Add collector source/header files under `agent/collectors/`.
 4. Add the files to `agent/collectors/meson.build`.
 5. Register the collector in `Agent::Agent()` in `agent/agent.cpp`.
