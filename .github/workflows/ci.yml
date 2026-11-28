@@ -40,6 +40,23 @@ jobs:
           git ls-files '*.cpp' '*.hpp' '*.h' ':!:subprojects/**' \
             | xargs ~/.local/bin/clang-format --dry-run --Werror
 
+  # ── RAII locks ─────────────────────────────────────────────────────────────
+  # Every lock is held through an RAII wrapper (docs/development.md). A bare
+  # lock()/unlock()/try_lock() or OS lock call fails this job unless it carries
+  # a '// raii-lock-exception: <reason>' comment. The same check also runs as
+  # the meson tests raii_locks_checker and raii_locks in every build job.
+  raii-locks:
+    name: RAII locks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Test the checker
+        run: python3 scripts/check_raii_locks_test.py
+
+      - name: Check for bare lock calls
+        run: python3 scripts/check_raii_locks.py .
+
   # ── Dashboard ──────────────────────────────────────────────────────────────
   dashboard:
     name: dashboard (lint, build, test)

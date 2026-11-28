@@ -250,7 +250,16 @@ Files: `server/store_synchronized.hpp`, `server/sqlite_raii.hpp`,
   holds a single mutex for the whole of every public call. A transaction
   lives inside one call, so no other call can run inside it. The wrapper
   implements the full `Store` interface: a new virtual method that is not
-  forwarded there does not compile, so the lock cannot be forgotten.
+  forwarded there does not compile, so the lock cannot be forgotten. Each
+  forwarder takes the lock with `const auto lock = lock_for_call(__func__);`,
+  and new ones must too. Tests can install a lock observer
+  (`set_lock_observer`) that is told, with the method's name, when a call has
+  to wait for the lock and when it takes it; race tests use it to prove that
+  two calls really overlapped instead of inferring it from sleeps. Production
+  installs none and takes the same path without the reports: `lock_for_call`
+  tries the lock and, if another call holds it, blocks on a new
+  `std::unique_lock`. The mutex is only ever held by a `unique_lock`, never by
+  a bare `lock()` or `unlock()`, so it is released however the call ends.
   Backends never call back into the wrapper. Tests that construct
   `SqliteStore` or `PostgresStore` directly are single-threaded.
 - A method that writes more than one row or statement is atomic. Use the

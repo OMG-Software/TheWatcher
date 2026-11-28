@@ -273,6 +273,17 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Changed
 
+- `SynchronizedStore` forwarders take the store's lock through
+  `lock_for_call(__func__)`, which holds the mutex only through a
+  `std::unique_lock`: it tries the lock and, if another call holds it, blocks
+  by constructing a new one, never by a bare `lock()`. A test seam,
+  `set_lock_observer`, is told with the method's name when a call waits for
+  the lock and when it takes it, so race tests can prove that two calls
+  overlapped instead of inferring it from sleeps. Production installs no
+  observer and takes the same path without the reports. `store_concurrency`
+  checks the events exactly: `Acquired` alone for an uncontended call,
+  `Waiting` then `Acquired` for a call that arrives while another holds the
+  lock.
 - Documentation: PostgreSQL is documented as an implemented backend selected
   with `DB_TYPE=postgres` / `POSTGRES_DSN` (build-time support required), the
   HA guide uses the real `TheWatcherServer.conf` KEY=VALUE format with its
@@ -319,6 +330,17 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+- A lock rule check: every lock must be held through an RAII wrapper
+  (`std::scoped_lock`, `std::lock_guard`, `std::unique_lock`,
+  `std::shared_lock` or a project RAII type). `scripts/check_raii_locks.py`
+  fails on a bare `lock()`, `unlock()`, `try_lock()` or `lock_shared()` call
+  (and their variants), `std::lock`/`std::try_lock`, or an OS lock function
+  such as `pthread_mutex_lock` or `EnterCriticalSection`. Comments and string
+  literals are ignored. An exceptional case passes only with a
+  `// raii-lock-exception: <reason>` comment on the same line or a
+  comment-only line above. It runs as the `RAII locks` CI job and as the
+  meson `lint` tests `raii_locks_checker` and `raii_locks`, so every platform
+  build checks it too (docs/development.md).
 - Dashboard: ESLint (flat config, `typescript-eslint`, `react-hooks`) with
   `npm run lint`, and a `dashboard` CI job running
   `npm ci --ignore-scripts` (no package install scripts), lint, build, tests

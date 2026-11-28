@@ -2,15 +2,21 @@
 // #79, #51 and the store part of #100).
 #include "../server/sqlite_raii.hpp"
 #include "../server/store_sqlite.hpp"
+#include "../server/store_synchronized.hpp"
 #include "test_support/temp_dir.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <filesystem>
+#include <memory>
+#include <mutex>
 #include <string>
+#include <string_view>
 #include <thread>
+#include <utility>
 #include <vector>
 
 using namespace thewatcher;
@@ -51,6 +57,29 @@ std::string db_file(thewatcher::test::ScopedTempDir& dir)
     return (dir.path() / "store.db").string();
 }
 
+// Joins a worker thread when the scope ends, including when a failed REQUIRE
+// unwinds it; destroying a joinable std::thread would call std::terminate.
+// `stop`, when given, is set first so a looping worker can exit.
+struct JoinOnExit
+{
+    std::thread& worker;
+    std::atomic<bool>* stop;
+
+    explicit JoinOnExit(std::thread& w, std::atomic<bool>* stop_flag = nullptr)
+        : worker(w)
+        , stop(stop_flag)
+    {
+    }
+    JoinOnExit(const JoinOnExit&) = delete;
+    JoinOnExit& operator=(const JoinOnExit&) = delete;
+    ~JoinOnExit()
+    {
+        if (stop != nullptr)
+            *stop = true;
+        if (worker.joinable())
+            worker.join();
+    }
+};
 } // namespace
 
 // ── #100: RAII helpers ───────────────────────────────────────────────────────
@@ -611,6 +640,92 @@ SCENARIO("Eight threads can use one store at the same time")
                 const auto groups = store->get_agent_groups("a1");
                 REQUIRE((groups == std::vector<int64_t>{group_a} || groups == std::vector<int64_t>{group_a, group_b}));
                 REQUIRE(store->get_user_groups(user) == std::vector<int64_t>{group_b});
+            }
+        }
+    }
+}
+
+// ── SynchronizedStore lock observer (test seam) ──────────────────────────────
+
+// The observer is how other tests prove that two calls really overlapped, so
+// its events must be exact: Acquired alone for a call that found the lock
+// free, Waiting and then Acquired for one that found it held.
+SCENARIO("SynchronizedStore tells its lock observer when a call waits and when it takes the lock")
+{
+    GIVEN("a synchronized store whose observer records every lock event")
+    {
+        using LockEvent = SynchronizedStore::LockEvent;
+        using Event = std::pair<std::string, LockEvent>;
+        constexpr auto patience = std::chrono::seconds(10); // only a broken lock runs out of it
+
+        // Read by the observer, so declared before the store that owns it.
+        std::mutex events_mutex;
+        std::condition_variable events_changed;
+        std::vector<Event> events;
+        std::atomic<bool> hold_first_call{false};
+        const auto recorded = [&](std::string_view method, LockEvent event) {
+            for (const auto& [m, e] : events)
+                if (m == method && e == event)
+                    return true;
+            return false;
+        };
+
+        SynchronizedStore store(std::make_unique<SqliteStore>(":memory:"));
+        store.upsert_agent(make_agent("a1"));
+        store.set_lock_observer([&](const char* method, LockEvent event) {
+            std::unique_lock<std::mutex> lk(events_mutex);
+            events.emplace_back(method, event);
+            events_changed.notify_all();
+            // Acquired runs with the store's lock held, so waiting here keeps
+            // get_agent holding it until list_alerts reports that it waits.
+            if (hold_first_call.load() && event == LockEvent::Acquired && std::string_view(method) == "get_agent")
+                events_changed.wait_for(lk, patience, [&] {
+                    return recorded("list_alerts", LockEvent::Waiting);
+                });
+        });
+
+        WHEN("one call runs with no other call in progress")
+        {
+            const auto agent = store.get_agent("a1");
+
+            THEN("the call ran and the observer heard only that it took the lock")
+            {
+                REQUIRE(agent.has_value());
+                const std::lock_guard<std::mutex> lk(events_mutex);
+                REQUIRE(events == std::vector<Event>{
+                                      {"get_agent", LockEvent::Acquired}
+                });
+            }
+        }
+
+        WHEN("a second call arrives while the first one holds the lock")
+        {
+            hold_first_call = true;
+            std::thread first([&] {
+                (void)store.get_agent("a1");
+            });
+            JoinOnExit join_first(first);
+            {
+                std::unique_lock<std::mutex> lk(events_mutex);
+                REQUIRE(events_changed.wait_for(lk, patience, [&] {
+                    return recorded("get_agent", LockEvent::Acquired);
+                }));
+            }
+            std::thread second([&] {
+                (void)store.list_alerts(false);
+            });
+            JoinOnExit join_second(second);
+            second.join();
+            first.join();
+
+            THEN("the second call is reported waiting, then taking the lock after the first call")
+            {
+                const std::lock_guard<std::mutex> lk(events_mutex);
+                REQUIRE(events == std::vector<Event>{
+                                      {"get_agent",   LockEvent::Acquired},
+                                      {"list_alerts", LockEvent::Waiting },
+                                      {"list_alerts", LockEvent::Acquired}
+                });
             }
         }
     }
