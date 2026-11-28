@@ -21,8 +21,10 @@ namespace thewatcher::server
 // - PAUSE: the agent enters command maintenance with no expiry.
 // - RESUME: the agent leaves maintenance.
 // Every other type (SET_INTERVAL, SET_PROCESS_LIMIT, RESTART_COLLECTORS,
-// GET_STATUS) leaves the row untouched, in particular an operator's
-// maintenance window, its reason and its expiry.
+// GET_STATUS) is left alone here, in particular an operator's maintenance
+// window, its reason and its expiry. (Before this runs, the frame handler has
+// already recorded the ACK frame as traffic, like any inbound frame: last_seen
+// and connected=true.)
 //
 // The updates are narrow (touch_agent, set_agent_maintenance) instead of a
 // whole-row rewrite from a snapshot, which would revert an operator save made
