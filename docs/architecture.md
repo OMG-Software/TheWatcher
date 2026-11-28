@@ -153,8 +153,8 @@ Important endpoints:
 | `POST /api/login` | Create a SQLite-backed authenticated session. |
 | `POST /api/logout` | Delete the current session. |
 | `GET /api/session` | Return the current session. |
-| `GET /api/agents` | List approved agents and runtime state. |
-| `GET /api/pending-enrollments` | List pending enrollment records. |
+| `GET /api/agents` | List approved agents and runtime state, including `ip_address`. |
+| `GET /api/pending-enrollments` | List pending enrollment records, including `ip_address`. |
 | `POST /api/agents/:id/approve` | Approve enrollment, assign groups, and add the agent key to ZAP. |
 | `POST /api/agents/:id/reject` | Reject enrollment and remove the key from ZAP. |
 | `POST /api/agents/:id/groups` | Replace an approved agent's group memberships. |
@@ -163,6 +163,8 @@ Important endpoints:
 | `POST /api/groups` | Create a group. |
 | `GET /api/users` | List users. |
 | `POST /api/users` | Create a user with role and groups. |
+| `PUT /api/users/:id` | Change a user's role and/or groups (`{"role": ..., "group_ids": [...]}`; send only what changes). |
+| `PUT /api/users/:id/disable`, `PUT /api/users/:id/enable`, `DELETE /api/users/:id` | Disable, re-enable or delete a user. |
 | `GET /api/alerts` | List active alerts. |
 | `GET /api/alerts/unacknowledged` | List active unacknowledged alerts. |
 | `POST /api/alerts/:id/ack` | Acknowledge an alert. |

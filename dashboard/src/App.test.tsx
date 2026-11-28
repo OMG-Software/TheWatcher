@@ -212,6 +212,83 @@ describe('GIVEN a form whose save fails', () => {
     expect(screen.getByLabelText('New password')).toHaveValue('abc');
   });
 
+  it('WHEN a global admin edits a user THEN only the changed role is sent and the dialog closes', async () => {
+    const api = new FakeApi('global_admin')
+      .on('GET /api/groups', ok([{ group_id: 1, name: 'Ops', built_in: false }]))
+      .on('GET /api/users', ok([{ user_id: 2, username: 'bob', role: 'group_viewer', group_ids: [1], disabled: false, built_in: false }]))
+      .on('PUT /api/users/2', ok());
+    await openDashboard(api);
+    goTo('Users');
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Edit' }));
+    fireEvent.change(within(screen.getByRole('dialog', { name: 'Edit bob' })).getByLabelText('Account type'), { target: { value: 'group_operator' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+
+    await waitFor(() => expect(screen.queryByRole('dialog', { name: 'Edit bob' })).toBeNull());
+    expect(api.calls.find((call) => call.method === 'PUT' && call.path === '/api/users/2')?.body).toEqual({ role: 'group_operator' });
+  });
+
+  it('WHEN the edit dialog is open THEN Cancel and the click-away button both close it', async () => {
+    const api = new FakeApi('global_admin')
+      .on('GET /api/users', ok([{ user_id: 2, username: 'bob', role: 'group_viewer', group_ids: [], disabled: false, built_in: false }]));
+    await openDashboard(api);
+    goTo('Users');
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Edit' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Close dialog' }));
+    expect(screen.queryByRole('dialog', { name: 'Edit bob' })).toBeNull();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Edit' }));
+    fireEvent.click(within(screen.getByRole('dialog', { name: 'Edit bob' })).getByRole('button', { name: 'Cancel' }));
+    expect(screen.queryByRole('dialog', { name: 'Edit bob' })).toBeNull();
+  });
+
+  it('WHEN the server refuses to demote the last global admin THEN the dialog stays open with the message', async () => {
+    const api = new FakeApi('global_admin')
+      .on('GET /api/users', ok([{ user_id: 2, username: 'bob', role: 'global_admin', group_ids: [], disabled: false, built_in: false }]))
+      .on('PUT /api/users/2', fail(409, 'cannot remove or demote the last global admin'));
+    await openDashboard(api);
+    goTo('Users');
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Edit' }));
+    fireEvent.change(within(screen.getByRole('dialog', { name: 'Edit bob' })).getByLabelText('Account type'), { target: { value: 'group_viewer' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Save' }));
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('cannot remove or demote the last global admin');
+    expect(screen.getByRole('dialog', { name: 'Edit bob' })).toBeInTheDocument();
+  });
+
+  it('WHEN a group admin views users THEN controls appear only for users inside their groups', async () => {
+    const user = (id: number, name: string, role: string, group_ids: number[]) => ({ user_id: id, username: name, role, group_ids, disabled: false, built_in: false });
+    const api = new FakeApi('group_admin')
+      .on('GET /api/groups', ok([{ group_id: 1, name: 'Ops', built_in: false }]))
+      .on('GET /api/users', ok([
+        user(1, 'tester', 'group_admin', [1]),
+        user(2, 'inside', 'group_viewer', [1]),
+        user(3, 'shared', 'group_viewer', [1, 2]),
+        user(4, 'global', 'global_operator', [1]),
+      ]));
+    await openDashboard(api);
+    goTo('Users');
+
+    const rowFor = async (name: string) => (await screen.findByText(name)).closest('tr') as HTMLElement;
+    const inside = within(await rowFor('inside'));
+    expect(inside.getByRole('button', { name: 'Edit' })).toBeInTheDocument();
+    expect(inside.getByRole('button', { name: 'Disable' })).toBeInTheDocument();
+    expect(inside.getByRole('button', { name: 'Delete' })).toBeInTheDocument();
+    // The server only lets a global admin or the user change a password.
+    expect(inside.queryByRole('button', { name: 'Password' })).toBeNull();
+
+    const shared = within(await rowFor('shared'));
+    expect(shared.getByRole('button', { name: 'Edit' })).toBeInTheDocument();
+    expect(shared.queryByRole('button', { name: 'Disable' })).toBeNull();
+    expect(shared.queryByRole('button', { name: 'Delete' })).toBeNull();
+
+    const global = within(await rowFor('global'));
+    expect(global.queryByRole('button', { name: 'Edit' })).toBeNull();
+    expect(global.queryByRole('button', { name: 'Disable' })).toBeNull();
+  });
+
   it('WHEN acknowledging an alert fails THEN the dialog stays open with the typed note', async () => {
     const alert = { alert_id: 9, agent_id: 'agent-1', indicator: 'cpu', old_status: 'green', new_status: 'red', message: 'cpu high', created_at: 1000, acknowledged_by: '', acknowledged_at: 0, deleted_at: 0, note: '', escalated_at: 0 };
     const api = new FakeApi('global_admin')

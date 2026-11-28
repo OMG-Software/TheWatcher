@@ -209,6 +209,7 @@ namespace
             {"hostname",             a.hostname                          },
             {"platform",             a.platform                          },
             {"curve_public_key_z85", a.curve_public_key_z85              },
+            {"ip_address",           a.ip_address                        },
             {"approved",             a.approved                          },
             {"rejected",             a.rejected                          },
             {"connected",            a.connected                         },
@@ -765,6 +766,53 @@ namespace
         for (const auto group_id : store.get_user_groups(user_id))
             groups.insert(group_id);
         return groups;
+    }
+
+    // ── User management scope (issue #64) ─────────────────────────────────────
+    // A global admin manages every user. A group admin manages only the users
+    // of their own groups, and never a user who holds a global role.
+
+    std::optional<UserRecord> find_user_by_id(Store& store, int64_t user_id)
+    {
+        for (auto& user : store.list_users())
+        {
+            if (user.user_id == user_id)
+                return std::move(user);
+        }
+        return std::nullopt;
+    }
+
+    // What the store must enforce for this session: nothing for a global admin,
+    // the session's own groups for a group admin. The store re-reads the target
+    // inside the write transaction, so the API does no scope check of its own.
+    UserScope scope_for(Store& store, const SessionRecord& session)
+    {
+        UserScope scope;
+        if (normalize_role(session.role) != "global_admin")
+        {
+            scope.restricted = true;
+            scope.group_ids = store.get_user_groups(session.user_id);
+        }
+        return scope;
+    }
+
+    // The answer for a store result that means "refused": writes the response
+    // and returns true for kOutOfScope and kLastGlobalAdmin.
+    bool write_refusal(int result, httplib::Response& res)
+    {
+        if (result == kOutOfScope)
+        {
+            res.status = 403;
+            res.set_content(R"({"error":"user is outside the user's groups"})", "application/json");
+            return true;
+        }
+        if (result == kLastGlobalAdmin)
+        {
+            res.status = 409;
+            res.set_content(R"({"error":"cannot remove or demote the last global admin"})", "application/json");
+            return true;
+        }
+        return false;
     }
 
     bool group_visible_to_session(Store& store, const SessionRecord& session, int64_t group_id)
@@ -2582,12 +2630,18 @@ void ApiServer::setup_routes()
         set_json(res, out);
     });
 
-    // PUT /api/users/:id/disable — disable a user account (admin only, not built-in)
-    http_->Put("/api/users/:id/disable", [this](const httplib::Request& req, httplib::Response& res) {
+    // PUT /api/users/:id — change a user's role and/or group membership (issue #64).
+    // A global admin may set any role and any groups. A group admin may only
+    // act on group-scoped users who share one of their groups: roles are limited
+    // to group roles, a role change needs every group of the target to be the
+    // admin's own, and the groups field replaces only the target's membership
+    // of the admin's own groups. Sessions need no revocation: they hold only the
+    // user id, so the next request already sees the new role and groups.
+    http_->Put("/api/users/:id", [this](const httplib::Request& req, httplib::Response& res) {
         auto session = require_role(req, res, "viewer");
         if (!session)
             return;
-        if (normalize_role(session->role) != "global_admin")
+        if (!can_administer_users(session->role))
         {
             res.status = 403;
             set_json(res, json{
@@ -2597,19 +2651,75 @@ void ApiServer::setup_routes()
         }
         try
         {
-            const auto user_id = std::stoll(req.path_params.at("id"));
-            const auto affected = store_.disable_user(user_id);
-            if (affected == 0)
+            if (!is_json_content_type(req))
             {
-                // SEC-14: unknown id or the built_in guard refused the change;
-                // a silent {"ok":true} hid both cases.
+                res.status = 415;
+                set_json(res, json{
+                                  {"error", "Content-Type must be application/json"}
+                });
+                return;
+            }
+            const auto user_id = std::stoll(req.path_params.at("id"));
+            const auto body = json::parse(req.body);
+            if (!body.is_object())
+                throw std::runtime_error("request body must be a JSON object");
+
+            const auto target = find_user_by_id(store_, user_id);
+            if (!target)
+            {
+                res.status = 404;
+                set_json(res, json{
+                                  {"error", "user not found"}
+                });
+                return;
+            }
+            if (target->built_in)
+            {
+                res.status = 409;
+                set_json(res, json{
+                                  {"error", "the built-in user cannot be modified"}
+                });
+                return;
+            }
+
+            std::optional<std::string> role;
+            if (body.contains("role"))
+            {
+                role = normalize_role(body.at("role").get<std::string>());
+                if (!is_valid_role(*role))
+                    throw std::runtime_error("invalid role");
+            }
+            std::optional<std::vector<int64_t>> group_ids;
+            if (body.contains("group_ids"))
+            {
+                group_ids = body.at("group_ids").get<std::vector<int64_t>>();
+                const auto known = store_.list_groups();
+                for (const auto group_id : *group_ids)
+                {
+                    if (std::none_of(known.begin(), known.end(), [&](const GroupRecord& g) {
+                            return g.group_id == group_id;
+                        }))
+                        throw std::runtime_error("unknown group");
+                }
+            }
+            if (!body.contains("role") && !body.contains("group_ids"))
+                throw std::runtime_error("role or group_ids is required");
+
+            // The scope check, the merge of a group admin's memberships and the
+            // write all happen in one store transaction.
+            const auto changed = store_.update_user_access(user_id, role, group_ids, scope_for(store_, *session));
+            if (write_refusal(changed, res))
+                return;
+            if (changed == 0)
+            {
                 res.status = 404;
                 set_json(res, json{
                                   {"error", "user not found or built-in"}
                 });
                 return;
             }
-            LOGF_INFO("Disabled user user_id=%lld", static_cast<long long>(user_id));
+            LOGF_INFO("Updated user access user_id=%lld by=%s role_changed=%d groups_changed=%d",
+                      static_cast<long long>(user_id), session->username.c_str(), role ? 1 : 0, group_ids ? 1 : 0);
             set_json(res, json{
                               {"ok", true}
             });
@@ -2623,76 +2733,69 @@ void ApiServer::setup_routes()
         }
     });
 
-    // PUT /api/users/:id/enable — re-enable a user account (admin only)
-    http_->Put("/api/users/:id/enable", [this](const httplib::Request& req, httplib::Response& res) {
-        auto session = require_role(req, res, "viewer");
-        if (!session)
-            return;
-        if (normalize_role(session->role) != "global_admin")
-        {
-            res.status = 403;
-            set_json(res, json{
-                              {"error", "permission denied"}
-            });
-            return;
-        }
-        try
-        {
-            const auto user_id = std::stoll(req.path_params.at("id"));
-            store_.enable_user(user_id);
-            LOGF_INFO("Enabled user user_id=%lld", static_cast<long long>(user_id));
-            set_json(res, json{
-                              {"ok", true}
-            });
-        }
-        catch (const std::exception& e)
-        {
-            res.status = 400;
-            set_json(res, json{
-                              {"error", e.what()}
-            });
-        }
-    });
-
-    // DELETE /api/users/:id — delete a user (admin only, not built-in)
-    http_->Delete("/api/users/:id", [this](const httplib::Request& req, httplib::Response& res) {
-        auto session = require_role(req, res, "viewer");
-        if (!session)
-            return;
-        if (normalize_role(session->role) != "global_admin")
-        {
-            res.status = 403;
-            set_json(res, json{
-                              {"error", "permission denied"}
-            });
-            return;
-        }
-        try
-        {
-            const auto user_id = std::stoll(req.path_params.at("id"));
-            const auto affected = store_.delete_user(user_id);
-            if (affected == 0)
+    // Disable, enable and delete share one handler shape (issue #64): a global
+    // admin may act on anyone, a group admin on users wholly inside their own
+    // groups. The scope check runs inside the store write; the built-in user
+    // and the last global admin are refused there too. `operation` returns the
+    // store's row count or one of its refusal codes.
+    const auto user_account_action = [this](const char* past_tense, auto operation) {
+        return [this, past_tense, operation](const httplib::Request& req, httplib::Response& res) {
+            auto session = require_role(req, res, "viewer");
+            if (!session)
+                return;
+            if (!can_administer_users(session->role))
             {
-                // SEC-14: unknown id or the built_in guard refused the change.
-                res.status = 404;
+                res.status = 403;
                 set_json(res, json{
-                                  {"error", "user not found or built-in"}
+                                  {"error", "permission denied"}
                 });
                 return;
             }
-            LOGF_INFO("Deleted user user_id=%lld", static_cast<long long>(user_id));
-            set_json(res, json{
-                              {"ok", true}
-            });
-        }
-        catch (const std::exception& e)
-        {
-            res.status = 400;
-            set_json(res, json{
-                              {"error", e.what()}
-            });
-        }
-    });
+            try
+            {
+                const auto user_id = std::stoll(req.path_params.at("id"));
+                const auto affected = operation(user_id, scope_for(store_, *session));
+                if (write_refusal(affected, res))
+                    return;
+                if (affected == 0)
+                {
+                    // SEC-14: unknown id or the built_in guard refused the change;
+                    // a silent {"ok":true} hid both cases.
+                    res.status = 404;
+                    set_json(res, json{
+                                      {"error", "user not found or built-in"}
+                    });
+                    return;
+                }
+                LOGF_INFO("%s user user_id=%lld", past_tense, static_cast<long long>(user_id));
+                set_json(res, json{
+                                  {"ok", true}
+                });
+            }
+            catch (const std::exception& e)
+            {
+                res.status = 400;
+                set_json(res, json{
+                                  {"error", e.what()}
+                });
+            }
+        };
+    };
+
+    // PUT /api/users/:id/disable — disable a user account (not built-in)
+    http_->Put("/api/users/:id/disable", user_account_action("Disabled", [this](int64_t id, const UserScope& scope) {
+                   return store_.disable_user(id, scope);
+               }));
+
+    // PUT /api/users/:id/enable — re-enable a user account
+    http_->Put("/api/users/:id/enable", user_account_action("Enabled", [this](int64_t id, const UserScope& scope) {
+                   return store_.enable_user(id, scope);
+               }));
+
+    // DELETE /api/users/:id — delete a user (not built-in)
+    http_->Delete("/api/users/:id", user_account_action("Deleted", [this](int64_t id, const UserScope& scope) {
+                      return store_.delete_user(id, scope);
+                  }));
 
     // PUT /api/users/:id/password — change a user's password (admin changes any, user changes own)
     http_->Put("/api/users/:id/password", [this](const httplib::Request& req, httplib::Response& res) {

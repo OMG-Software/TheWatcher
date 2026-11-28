@@ -5,7 +5,10 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cstdlib>
+#include <string>
 
 using namespace thewatcher;
 using namespace thewatcher::server;
@@ -22,6 +25,15 @@ const char* test_dsn()
     if (env && *env)
         return env;
     return "host=localhost dbname=thewatcher_test user=thewatcher_test password=thewatcher_test";
+}
+
+// A name that is unique across runs: a per-process counter plus the clock.
+// Uniqueness is all the tests need, so there is no random source.
+std::string unique_name(const std::string& prefix)
+{
+    static std::atomic<unsigned> counter{0};
+    const auto ticks = std::chrono::steady_clock::now().time_since_epoch().count();
+    return prefix + std::to_string(ticks) + "-" + std::to_string(counter++);
 }
 
 // Returns true if a PostgreSQL server is reachable at the test DSN.
@@ -641,6 +653,111 @@ SCENARIO("[postgres] Silence rules can be created, listed, deleted, and matched"
                 CHECK_FALSE(store.is_silenced("pg-silence-agent", "cpu", 5000));
             }
         }
+    }
+}
+
+// ── User access and agent address (issues #64, #65) ──────────────────────────
+
+SCENARIO("[postgres] A user's role and groups are edited in one step and the built-in admin is refused")
+{
+    if (!postgres_is_available())
+        SKIP("PostgreSQL not available");
+    GIVEN("a PostgresStore, a fresh group and a fresh group viewer")
+    {
+        PostgresStore store(test_dsn());
+        const auto group = store.create_group(unique_name("pg-access-group-"));
+        const auto username = unique_name("pg-access-user-");
+        const auto id = store.create_user(username, "hash", "group_viewer");
+
+        WHEN("role and groups are updated together")
+        {
+            REQUIRE(store.update_user_access(id, std::string("group_operator"), std::vector<int64_t>{group}) == 1);
+
+            THEN("both are stored")
+            {
+                CHECK(store.get_user_by_username(username)->role == "group_operator");
+                CHECK(store.get_user_groups(id) == std::vector<int64_t>{group});
+            }
+        }
+
+        WHEN("the groups include one that does not exist")
+        {
+            THEN("the update throws and the role is unchanged")
+            {
+                CHECK_THROWS(store.update_user_access(id, std::string("group_operator"), std::vector<int64_t>{-5}));
+                CHECK(store.get_user_by_username(username)->role == "group_viewer");
+            }
+        }
+
+        WHEN("the built-in admin's role is changed")
+        {
+            const auto built_in = store.get_user_by_username("thewatcher");
+            REQUIRE(built_in);
+
+            THEN("nothing changes")
+            {
+                CHECK(store.update_user_access(built_in->user_id, std::string("group_viewer"), std::nullopt) == 0);
+                CHECK(store.get_user_by_username("thewatcher")->role == "global_admin");
+            }
+        }
+
+        WHEN("an extra global admin is created and removed")
+        {
+            const auto extra = store.create_user(username + "-admin", "hash", "global_admin");
+
+            THEN("it can be demoted or deleted because the built-in admin remains enabled")
+            {
+                CHECK(store.update_user_access(extra, std::string("group_viewer"), std::nullopt) == 1);
+                CHECK(store.delete_user(extra) == 1);
+            }
+        }
+
+        store.delete_user(id);
+    }
+}
+
+SCENARIO("[postgres] The agent IP address is stored and not blanked by a later update")
+{
+    if (!postgres_is_available())
+        SKIP("PostgreSQL not available");
+    GIVEN("a PostgresStore and an agent with an address")
+    {
+        PostgresStore store(test_dsn());
+        const std::string id = "pg-test-agent-ip";
+        try
+        {
+            store.delete_agent(id);
+        }
+        catch (...)
+        {
+        }
+        auto rec = make_agent(id);
+        rec.ip_address = "203.0.113.9";
+        store.upsert_agent(rec);
+
+        WHEN("an update carries no address")
+        {
+            rec.ip_address.clear();
+            store.upsert_agent(rec);
+
+            THEN("the last known address is kept")
+            {
+                CHECK(store.get_agent(id)->ip_address == "203.0.113.9");
+            }
+        }
+
+        WHEN("the agent connects from a new address")
+        {
+            rec.ip_address = "198.51.100.2";
+            store.upsert_agent(rec);
+
+            THEN("the new address replaces the old one")
+            {
+                CHECK(store.get_agent(id)->ip_address == "198.51.100.2");
+            }
+        }
+
+        store.delete_agent(id);
     }
 }
 

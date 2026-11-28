@@ -8,6 +8,8 @@ export interface AgentRecord {
   hostname: string;
   platform: string;
   curve_public_key_z85: string;
+  /** Address the server saw the agent connect from (the NAT or proxy address when one sits between). */
+  ip_address?: string;
   approved: boolean;
   rejected: boolean;
   connected: boolean;

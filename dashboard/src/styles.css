@@ -1265,7 +1265,21 @@ td {
 
 /* ── Acknowledge modal ──────────────────────────────────────────────────── */
 
+/* Click-away target behind a dialog panel; a real button so it is a native control. */
+.modal-dismiss {
+  position: absolute;
+  inset: 0;
+  border: 0;
+  background: transparent;
+  cursor: default;
+}
+
+.modal-dismiss:disabled {
+  cursor: progress;
+}
+
 .modal-panel {
+  position: relative;
   display: grid;
   gap: 0;
   width: min(480px, 100%);

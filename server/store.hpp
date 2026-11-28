@@ -3,6 +3,7 @@
 #include "common/collector_config.hpp"
 #include "common/metrics.hpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -18,6 +19,9 @@ struct AgentRecord
     std::string hostname;
     std::string platform;
     std::string curve_public_key_z85;
+    // Address the server last saw this agent connect from (the TCP peer, so
+    // the NAT or proxy address when one sits in between). Empty until known.
+    std::string ip_address;
     bool approved = false;
     bool rejected = false;
     bool connected = false;
@@ -175,6 +179,138 @@ struct ViewRecord
     int64_t created_at = 0;
 };
 
+// Returned by disable_user, delete_user and update_user_access when the change
+// would leave the system without an enabled global admin. Distinct from 0
+// (unknown or built-in user).
+constexpr int kLastGlobalAdmin = -1;
+
+// Returned when a scoped change targets a user the actor may not touch.
+constexpr int kOutOfScope = -2;
+
+// Who is acting, as far as the store must enforce it. A global admin passes the
+// default (unrestricted). A group admin passes restricted = true with their own
+// group ids, and the store re-reads the target's role and groups inside the
+// write transaction, so the check cannot go stale between a read and the write:
+//  - account actions (role change, disable, enable, delete) need a group-scoped
+//    target whose groups are all in group_ids;
+//  - a membership change needs a group-scoped target sharing a group with
+//    group_ids, may only assign groups from group_ids, and keeps the target's
+//    memberships outside group_ids.
+struct UserScope
+{
+    bool restricted = false;
+    std::vector<int64_t> group_ids;
+};
+
+// What a scoped change needs from the target (see UserScope).
+enum class ScopeKind
+{
+    Account,   // role change, disable, enable, delete
+    Membership // group membership edit
+};
+
+// The legacy role names (admin, operator, viewer) are the global roles.
+inline std::string normalized_role_name(const std::string& role)
+{
+    if (role == "admin")
+        return "global_admin";
+    if (role == "operator")
+        return "global_operator";
+    if (role == "viewer")
+        return "global_viewer";
+    return role;
+}
+
+inline bool is_global_role_name(const std::string& role)
+{
+    const auto normalized = normalized_role_name(role);
+    return normalized == "global_admin" || normalized == "global_operator" || normalized == "global_viewer";
+}
+
+// May a restricted scope act on a target with this role and these groups? An
+// unrestricted scope always may. Both stores call this with the target's state
+// read inside the write transaction.
+inline bool within_scope(const UserScope& scope, const std::string& target_role,
+                         const std::vector<int64_t>& target_groups, ScopeKind kind)
+{
+    if (!scope.restricted)
+        return true;
+    if (is_global_role_name(target_role))
+        return false;
+    const auto in_scope = [&](int64_t id) {
+        return std::find(scope.group_ids.begin(), scope.group_ids.end(), id) != scope.group_ids.end();
+    };
+    if (kind == ScopeKind::Membership)
+        return std::any_of(target_groups.begin(), target_groups.end(), in_scope);
+    return !target_groups.empty() && std::all_of(target_groups.begin(), target_groups.end(), in_scope);
+}
+
+// The target's new memberships for a scoped edit: the groups it holds outside
+// the scope stay, and `requested` replaces the ones inside it. `requested`
+// must already be a subset of the scope.
+inline std::vector<int64_t> merge_scoped_memberships(const UserScope& scope, const std::vector<int64_t>& current,
+                                                     const std::vector<int64_t>& requested)
+{
+    std::vector<int64_t> merged = requested;
+    for (const auto id : current)
+    {
+        if (std::find(scope.group_ids.begin(), scope.group_ids.end(), id) == scope.group_ids.end())
+            merged.push_back(id);
+    }
+    std::sort(merged.begin(), merged.end());
+    merged.erase(std::unique(merged.begin(), merged.end()), merged.end());
+    return merged;
+}
+
+// True when every id is in the scope.
+inline bool all_in_scope(const UserScope& scope, const std::vector<int64_t>& ids)
+{
+    return std::all_of(ids.begin(), ids.end(), [&](int64_t id) {
+        return std::find(scope.group_ids.begin(), scope.group_ids.end(), id) != scope.group_ids.end();
+    });
+}
+
+// What update_user_access should do once the target's current state is known.
+struct AccessPlan
+{
+    int verdict = 1;                            // 1 = go ahead, kOutOfScope = refuse
+    std::optional<std::string> role;            // set only when the role really changes
+    std::optional<std::vector<int64_t>> groups; // the final memberships to store
+};
+
+// Both stores call this inside the write transaction with the target's role and
+// groups read there, so the scope rules live in one place.
+inline AccessPlan plan_access_update(const UserScope& scope, const std::optional<std::string>& role,
+                                     const std::optional<std::vector<int64_t>>& group_ids,
+                                     const std::string& target_role, const std::vector<int64_t>& target_groups)
+{
+    AccessPlan plan;
+    // Re-sending the current role is not a role change.
+    if (role && normalized_role_name(*role) != normalized_role_name(target_role))
+        plan.role = role;
+    plan.groups = group_ids;
+    if (!scope.restricted)
+        return plan;
+
+    // A role change reaches every group of the user and may only pick a group
+    // role; a membership change only needs the target to share a group.
+    const bool allowed = plan.role ? !is_global_role_name(*plan.role) &&
+                                         within_scope(scope, target_role, target_groups, ScopeKind::Account)
+                                   : within_scope(scope, target_role, target_groups, ScopeKind::Membership);
+    if (!allowed || (group_ids && !all_in_scope(scope, *group_ids)))
+        plan.verdict = kOutOfScope;
+    else if (group_ids)
+        plan.groups = merge_scoped_memberships(scope, target_groups, *group_ids);
+    return plan;
+}
+
+// Keeping an admin role cannot remove the last admin, so only a demotion needs
+// the last-admin guard.
+inline bool keeps_admin_role(const std::string& role)
+{
+    return role == "global_admin" || role == "admin";
+}
+
 class Store
 {
 public:
@@ -204,12 +340,21 @@ public:
                                 const std::string& role) = 0;
     virtual void set_user_groups(int64_t user_id, const std::vector<int64_t>& group_ids) = 0;
     virtual std::vector<int64_t> get_user_groups(int64_t user_id) = 0;
-    // disable_user/delete_user return the number of affected rows: 0 means
-    // the id was unknown or the built_in guard refused the change, which
-    // the API layer maps to 404.
-    virtual int disable_user(int64_t user_id) = 0;
-    virtual void enable_user(int64_t user_id) = 0;
-    virtual int delete_user(int64_t user_id) = 0;
+    // disable_user/enable_user/delete_user/update_user_access return the number
+    // of affected rows: 0 means the id was unknown or the built_in guard refused
+    // the change (the API layer maps that to 404), kOutOfScope means a
+    // restricted scope may not touch the target (403), and kLastGlobalAdmin means
+    // the change would leave no enabled global admin. The last-admin check
+    // runs inside the same statement or transaction as the write, so two
+    // concurrent requests cannot both pass it.
+    virtual int disable_user(int64_t user_id, const UserScope& scope = {}) = 0;
+    virtual int enable_user(int64_t user_id, const UserScope& scope = {}) = 0;
+    virtual int delete_user(int64_t user_id, const UserScope& scope = {}) = 0;
+    // Sets a user's role and/or group membership in one transaction; an empty
+    // optional leaves that part unchanged. The built-in user is refused (0).
+    virtual int update_user_access(int64_t user_id, const std::optional<std::string>& role,
+                                   const std::optional<std::vector<int64_t>>& group_ids,
+                                   const UserScope& scope = {}) = 0;
     virtual void update_user_password(int64_t user_id, const std::string& password_hash) = 0;
     virtual void create_session(const SessionRecord& session) = 0;
     // Returns the session for token, or nullopt when the token is unknown,

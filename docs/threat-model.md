@@ -154,6 +154,23 @@ working document for audit, design review, and regression testing.
 - The built-in first-run admin account cannot be disabled or deleted on either
   storage backend, and no-op disable/delete requests return an error instead
   of `{"ok":true}`.
+- User management is scoped. A group admin can edit, disable, enable and delete
+  only group-scoped users in their own groups, can set only group roles, and
+  can only assign their own groups (`PUT /api/users/:id`, #64). An account
+  change reaches every group of the user, so it needs all of them to be the
+  admin's own; a group edit touches only the admin's own memberships. The scope
+  check is not done by the API: the actor's group ids are passed to the store,
+  which re-reads the target's role and groups inside the write transaction
+  (`BEGIN IMMEDIATE` on SQLite; row locks plus the user-admin advisory lock on
+  PostgreSQL) and answers out-of-scope with 403. A target moved to another group
+  between the request and the write is therefore refused, and a membership merge
+  never overwrites a group added concurrently. The actor's own group list is
+  still read when the request starts.
+- The last enabled global admin cannot be disabled, deleted or demoted. The
+  check runs inside the same SQL statement (SQLite) or a transaction holding an
+  advisory lock (PostgreSQL) as the write, so two concurrent requests cannot
+  both pass it; the API answers 409. Sessions hold only the user id, so a role
+  or group change applies to the user's live sessions on their next request.
 
 ## Webhook SSRF Controls
 
@@ -184,6 +201,12 @@ when webhooks are enabled.
 - An attacker who can reach the login endpoint can repeatedly lock a single
   username out for 15 minutes at a time; per-source-IP throttling slows this
   but cannot prevent it from a distributed position.
+- The agent IP address shown on the dashboard is the peer address the server
+  saw (ZeroMQ `Peer-Address`). Behind a NAT or proxy it is that device's
+  address, and an agent can be reached from several addresses over time (the
+  last one wins). It is only parsed as an IPv4 or IPv6 literal before it is
+  stored, logged or put in JSON (#65); it is a display aid, never used for
+  authentication or access control.
 - The built-in first-run `thewatcher` account has a documented default password.
   It must be changed or disabled immediately after bootstrap.
 - Hostname webhook SSRF cannot be completely prevented without DNS resolution

@@ -356,7 +356,8 @@ export function toDashboardAgents(
         alertColor: unacked.has(agent.agent_id) ? 'red' : 'green',
         components,
         metrics,
-        ipAddress: primaryIpAddress(metrics),
+        // An interface address the agent reported wins; otherwise the address the server saw.
+        ipAddress: primaryIpAddress(metrics) || agent.ip_address || '',
         description: agent.description ?? '',
         runbookMarkdown: agent.runbook_markdown ?? '',
       };

@@ -150,3 +150,20 @@ if libpq_dep.found()
     env: ['THEWATCHER_POSTGRES_TEST_DSN=host=localhost dbname=thewatcher_test user=thewatcher_test password=thewatcher_test'],
   )
 endif
+
+user_management_test = executable(
+  'user_management_test',
+  ['user_management_test.cpp'],
+  include_directories: root_inc,
+  dependencies: [server_dep, common_dep, catch2_dep, http_dep, cppzmq_dep, sqlite_dep, sodium_dep, platform_deps],
+)
+# Each leaf of the file-backed scenarios reopens a database, which is slow under WSL.
+test('user_management', user_management_test, timeout: 120, is_parallel: false)
+
+peer_address_test = executable(
+  'peer_address_test',
+  ['peer_address_test.cpp'],
+  include_directories: root_inc,
+  dependencies: [server_dep, common_dep, catch2_dep, http_dep, cppzmq_dep, sqlite_dep, sodium_dep, platform_deps],
+)
+test('peer_address', peer_address_test, is_parallel: false)
