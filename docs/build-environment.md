@@ -6,7 +6,9 @@ and [Running](running.md).
 
 TheWatcher is built with Meson + Ninja on every platform. ZeroMQ and libsodium
 are built as local static subprojects from `subprojects/*.wrap` plus
-`subprojects/packagefiles/`; system or vcpkg packages are not used.
+`subprojects/packagefiles/`; system or vcpkg packages are not used by default.
+The one opt-in exception is `-Dsystem_zeromq=true` (see
+[Build options](#build-options)).
 
 ## Requirements
 
@@ -17,7 +19,9 @@ are built as local static subprojects from `subprojects/*.wrap` plus
 - `winget` from Microsoft App Installer.
 - Git for Windows.
 - Python 3.10+ (used to install Meson and to run a small header-copy step).
-- Visual Studio 2022 Build Tools with the C++ workload and Windows SDK.
+- Visual Studio 2022 or newer (Build Tools are enough) with the C++ x64 tools
+  and Windows SDK. `meson-build.cmd` finds it with `vswhere.exe`, so the
+  Visual Studio major version and install path do not matter.
 - CMake on PATH (Meson drives the libzmq subproject via CMake).
 - Meson 1.4+ and Ninja, installed by the setup script via `pip install`.
 
@@ -42,8 +46,11 @@ The Linux setup script supports Debian/Ubuntu (apt), Fedora/RHEL/Rocky/Alma
 ```
 
 It installs the C++20 toolchain (gcc or clang), CMake, Ninja, pkg-config,
-Python 3 + pip, Node.js, and then `pip install --user meson ninja` to
-guarantee Meson 1.4+.
+Python 3 + pip, the libpq development package (PostgreSQL support), Node.js,
+and then Meson and Ninja (Meson 1.4+) through `pipx` when available, falling
+back to a managed virtual environment and finally to
+`pip --break-system-packages`. `pip install --user` is not used directly
+because current distributions mark the system Python as externally managed.
 
 ### BSD
 
@@ -54,8 +61,11 @@ NetBSD (pkgin):
 ./scripts/setup-build-env-bsd.sh
 ```
 
-It installs the C++20 toolchain, CMake, Ninja, pkg-config, Python 3 + pip,
-Node.js, and `pip --user`-installs Meson and Ninja.
+It installs the C++20 toolchain, CMake, Ninja, pkg-config, Python 3, the libpq
+client library (newest `postgresql*-client` the repository offers), Node.js and
+Meson. Package names are unversioned wherever the BSD offers an unversioned
+name, so the script does not break when a repository drops an old version.
+Pass `--skip-postgres` to omit libpq.
 
 ### Optional WSL
 
@@ -78,7 +88,10 @@ visible.
 
 On Windows, run the Meson commands from a Visual Studio developer prompt so
 `cl`, `link`, CMake, and Ninja are all on `PATH`. The repository also
-provides a helper that always uses the release configuration:
+provides a helper that always uses the release configuration. It uses the
+compiler already on `PATH` when there is one, otherwise it locates Visual
+Studio with `vswhere.exe` and loads `vcvars64.bat`. It stops with a non-zero
+exit code on the first failing step:
 
 ```powershell
 .\meson-build.cmd
@@ -89,18 +102,86 @@ Equivalent direct invocation, identical on every platform:
 ```bash
 meson setup builddir-release --buildtype=release --default-library=static
 meson compile -C builddir-release
-meson test    -C builddir-release --print-errorlogs
+meson test    -C builddir-release --suite thewatcher --print-errorlogs
 ```
+
+`--suite thewatcher` selects TheWatcher's own tests. Dependency subprojects
+(Catch2, cppzmq) have their test suites disabled in `meson.build`, so a bare
+`meson test` runs the same set; the wrapper scripts and CI pass the suite
+explicitly so a future subproject cannot slip in. List the test names with
+`meson test -C builddir-release --list`; they differ from the executable
+target names (`server_config`, not `server_config_test`).
 
 The root Meson project builds TheWatcher code with `warning_level=3` and
 `werror=true`. Meson fallback dependencies are configured separately with
 `warning_level=0` and `werror=false` so third-party warnings do not fail local
 or CI builds.
 
+## Build options
+
+| Option | Default | Meaning |
+|---|---|---|
+| `-Dpostgres=auto`, `enabled` or `disabled` | `auto` | PostgreSQL storage backend. `auto` builds it when libpq is found, `enabled` fails `meson setup` when libpq is missing, `disabled` omits it. |
+| `-Dsystem_zeromq=true` | `false` | Use pkg-config `libzmq` (>= 4.3.2) and `libsodium` (>= 1.0.18) instead of the local static subprojects. Fails when they are missing. `cppzmq` always comes from its wrap. For distribution packaging only; CI covers the default. |
+
+PostgreSQL needs the libpq client library and headers at build time:
+
+| Platform | Package |
+|---|---|
+| Debian / Ubuntu | `libpq-dev` |
+| Fedora / RHEL | `libpq-devel` |
+| Arch | `postgresql-libs` |
+| openSUSE | `postgresql-devel` |
+| Alpine | `libpq-dev` |
+| FreeBSD | `postgresql<N>-client` (newest available) |
+| OpenBSD | `postgresql-client` |
+| NetBSD | `postgresql<N>-client` |
+| Windows | not built by default; install PostgreSQL's client SDK and make `libpq.pc` visible to pkg-config to enable it |
+
+The setup scripts install libpq. Without it a default (`auto`) build silently
+omits PostgreSQL and `DB_TYPE=postgres` fails at startup, so release builds
+should pass `-Dpostgres=enabled`. `TheWatcherServer --version` prints
+`PostgreSQL support: enabled` or `disabled` for the binary you have.
+
+## Versioning
+
+`meson.build` (`project(... version: ...)`) is the single source of truth. It
+is passed to every C++ target as `THEWATCHER_VERSION` (see `common/version.hpp`)
+and `TheWatcherServer --version` / `TheWatcherAgent --version` print it.
+`dashboard/package.json`, `dashboard/package-lock.json`,
+`packaging/windows/TheWatcher.iss` and the newest `CHANGELOG.md` section must
+carry the same number. `scripts/check_version_consistency.py` verifies this; it
+runs as the `version_consistency` Meson test and in a CI job. Bump all of them
+together.
+
+## Sanitizer and debug builds
+
+CI has a Linux job that builds with AddressSanitizer and
+UndefinedBehaviorSanitizer in a debug configuration (assertions enabled) and
+runs the whole suite. The bundled libsodium is deliberately not instrumented
+(Argon2 under ASan makes every password hash take seconds) and Meson timeouts
+are scaled by 5. Tests that assert wall-clock windows are also in the `timing`
+suite (today only `login_rate_limit`): the job runs
+`--suite thewatcher --no-suite timing` as the blocking step and
+`--suite timing` as a separate informational step, because the sanitizer
+slowdown can outrun those windows. Put any new wall-clock test in the
+`timing` suite too (`suite: 'timing'` on its `test()`). Run it locally with:
+
+```bash
+meson setup builddir-asan --buildtype=debug -Db_sanitize=address,undefined -Db_lundef=false
+meson compile -C builddir-asan
+# Blocking step: everything except the wall-clock tests
+ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 \
+  meson test -C builddir-asan --suite thewatcher --no-suite timing --timeout-multiplier 5 --print-errorlogs
+# Informational step: the wall-clock tests, which may fail under the slowdown
+ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 \
+  meson test -C builddir-asan --suite timing --timeout-multiplier 5 --print-errorlogs
+```
+
 Run the full server-agent integration path directly with:
 
 ```bash
-meson test -C builddir-release server_agent_integration_test --print-errorlogs
+meson test -C builddir-release server_agent_integration --print-errorlogs
 ```
 
 That test starts the server, enrolls and approves an agent, verifies collected
@@ -108,6 +189,11 @@ metrics reach the server, sends a disconnect command, and shuts both sides
 down.
 
 ## CI Build Artifacts
+
+CI runs these jobs: `clang-format`, `version-consistency`, `Linux`, `Linux
+(ASan + UBSan, debug)`, `Windows`, and `FreeBSD`. The platform and sanitizer
+jobs run `meson compile` (which builds every target, including
+`TheWatcherServer` and `TheWatcherAgent`) and then the `thewatcher` test suite.
 
 Each CI platform job archives its `builddir-release/` directory as a GitHub
 Actions artifact, even when the build or tests fail. The Linux, Windows, and
@@ -144,8 +230,11 @@ packagefile overlays:
 - `libzmq` from `subprojects/libzmq.wrap` and
   `subprojects/packagefiles/libzmq`, with CURVE enabled and linked to the
   local static libsodium build.
-- `cppzmq`, `libcbor`, `sqlite3`, `nlohmann_json`, `cpp-httplib`, and
-  `catch2` from WrapDB.
+- `libcbor` from its upstream GitHub release archive
+  (`subprojects/libcbor.wrap`), built with the local Meson overlay in
+  `subprojects/packagefiles/libcbor` (`patch_directory`).
+- `cppzmq`, `sqlite3`, `nlohmann_json`, `cpp-httplib`, and `catch2` from
+  WrapDB.
 
 ## Troubleshooting
 
@@ -157,8 +246,11 @@ the `--user` flag).
 
 ### Visual C++ compiler not detected (Windows)
 
-Rerun `setup-build-env.cmd`. If Visual Studio Build Tools was just installed,
-reboot or open a new Visual Studio developer PowerShell before building.
+Rerun `setup-build-env.cmd`. `meson-build.cmd` reports "No Visual Studio 2022+
+installation with the C++ x64 tools was found" when `vswhere.exe` sees no
+install with the `VC.Tools.x86.x64` component. If Visual Studio Build Tools was
+just installed, reboot or open a new Visual Studio developer PowerShell before
+building.
 
 ### CMake cannot find a generator
 

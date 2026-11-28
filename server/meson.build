@@ -1,4 +1,6 @@
-libpq_dep = dependency('libpq', required: false, static: false)
+# `postgres` is a feature option: auto builds PostgreSQL support when libpq is
+# found, enabled fails the configure step without it, disabled omits it.
+libpq_dep = dependency('libpq', required: get_option('postgres'), static: false)
 
 server_store_sources = [
   'alert_pipeline.cpp',
@@ -18,7 +20,9 @@ if libpq_dep.found()
   server_store_extra_deps += [libpq_dep]
   message('PostgreSQL support enabled (libpq found)')
 else
-  message('PostgreSQL support disabled (libpq not found)')
+  message('PostgreSQL support disabled (-Dpostgres=@0@, libpq @1@)'.format(
+    get_option('postgres'),
+    get_option('postgres').disabled() ? 'ignored' : 'not found'))
 endif
 
 server_config_lib = static_library(
@@ -114,7 +118,7 @@ server_dep = declare_dependency(
   ],
 )
 
-executable(
+server_exe = executable(
   'TheWatcherServer',
   'main.cpp',
   dependencies: server_dep,

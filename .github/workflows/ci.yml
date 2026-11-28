@@ -40,6 +40,105 @@ jobs:
           git ls-files '*.cpp' '*.hpp' '*.h' ':!:subprojects/**' \
             | xargs ~/.local/bin/clang-format --dry-run --Werror
 
+  # -- Version consistency ----------------------------------------------------
+  # meson.build is the source of truth; the dashboard, installer script and
+  # changelog must carry the same version (#127).
+  version-consistency:
+    name: Version consistency
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check versions against meson.build
+        run: python3 scripts/check_version_consistency.py
+
+  # -- Linux sanitizers -------------------------------------------------------
+  # Debug build (assertions on) with AddressSanitizer + UBSan over the whole
+  # `thewatcher` suite, including the PostgreSQL tests (#122).
+  linux-sanitizers:
+    name: Linux (ASan + UBSan, debug)
+    runs-on: ubuntu-24.04
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_PASSWORD: postgres
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build python3-pip python3-venv libpq-dev postgresql-client
+          # Ubuntu 24.04's system Python is externally managed (PEP 668):
+          # install into a venv instead and put it first on PATH.
+          python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" install --quiet --only-binary :all: meson==1.11.1
+          echo "$RUNNER_TEMP/venv/bin" >> "$GITHUB_PATH"
+
+      - name: Create PostgreSQL test database
+        env:
+          PGPASSWORD: postgres
+        run: |
+          psql -h 127.0.0.1 -U postgres \
+            -c "CREATE USER thewatcher_test WITH PASSWORD 'thewatcher_test';"
+          psql -h 127.0.0.1 -U postgres \
+            -c "CREATE DATABASE thewatcher_test OWNER thewatcher_test;"
+
+      - name: Cache Meson subproject downloads
+        uses: actions/cache@v4
+        with:
+          path: subprojects/packagecache
+          key: meson-wrap-linux-san-${{ hashFiles('subprojects/*.wrap') }}
+
+      - name: Configure
+        # -Db_lundef=false: sanitizer runtimes leave undefined symbols that
+        # Meson's default --no-undefined link flag would reject.
+        run: >-
+          meson setup builddir-asan --buildtype=debug
+          -Db_sanitize=address,undefined -Db_lundef=false
+          -Dpostgres=enabled
+
+      - name: Compile
+        run: meson compile -C builddir-asan
+
+      - name: Test
+        env:
+          ASAN_OPTIONS: detect_leaks=1:strict_string_checks=1
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+          THEWATCHER_POSTGRES_TEST_DSN: >-
+            host=127.0.0.1 dbname=thewatcher_test
+            user=thewatcher_test password=thewatcher_test
+        # Sanitized binaries run several times slower; scale Meson's timeouts.
+        # Tests in the 'timing' suite (login_rate_limit) assert wall-clock
+        # rate-limit windows that slow sanitized password hashing outruns; they
+        # run in their own step below. Select by suite, not by parsing
+        # `meson test --list`, whose name format changes between Meson versions.
+        run: >-
+          meson test -C builddir-asan --no-rebuild --timeout-multiplier 5
+          --suite thewatcher --no-suite timing --print-errorlogs
+
+      - name: Test (timing-sensitive, informational)
+        # TODO: remove continue-on-error once login_rate_limit is robust under
+        # sanitizer slowdown (owned by the API auth branch, #153/#154).
+        continue-on-error: true
+        env:
+          ASAN_OPTIONS: detect_leaks=1:strict_string_checks=1
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+        run: >-
+          meson test -C builddir-asan --no-rebuild --timeout-multiplier 5
+          --suite timing --print-errorlogs
+
   # ── Dashboard ──────────────────────────────────────────────────────────────
   dashboard:
     name: dashboard (lint, build, test)
@@ -100,7 +199,7 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends \
             cmake ninja-build python3-pip libpq-dev
-          pip3 install --quiet meson
+          pip3 install --quiet --only-binary :all: meson==1.11.1
 
       - name: Create PostgreSQL test database
         env:
@@ -122,7 +221,9 @@ jobs:
           THEWATCHER_POSTGRES_TEST_DSN: >-
             host=127.0.0.1 dbname=thewatcher_test
             user=thewatcher_test password=thewatcher_test
-        run: ./meson-build-linux.sh
+        # -Dpostgres=enabled fails the build if libpq is missing instead of
+        # silently dropping PostgreSQL support.
+        run: ./meson-build-linux.sh -Dpostgres=enabled
 
       - name: Archive build output
         id: upload-linux-build
@@ -161,7 +262,8 @@ jobs:
           arch: amd64
 
       - name: Install Meson and Ninja
-        run: pip install meson ninja
+        run: |
+          pip install --only-binary :all: meson==1.11.1 ninja==1.13.2
 
       - name: Cache Meson subproject downloads
         uses: actions/cache@v4
@@ -170,9 +272,9 @@ jobs:
           key: meson-wrap-windows-${{ hashFiles('subprojects/*.wrap') }}
 
       - name: Build and test (meson-build.cmd)
-        # meson test builds only the test-target objects it needs; it does
-        # not attempt to link TheWatcherServer / TheWatcherAgent whose
-        # platform-service entry points are intentionally Windows-only.
+        # meson-build.cmd runs `meson compile`, which builds every target
+        # including TheWatcherServer and TheWatcherAgent, then the
+        # `thewatcher` test suite.
         run: .\meson-build.cmd
         shell: cmd
 

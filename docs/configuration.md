@@ -309,8 +309,11 @@ Agent command-line options override loaded config values for that process:
 --install-service
 --uninstall-service
 --genkey
+--version
 --help
 ```
+
+`--version` prints the agent version and exits.
 
 `--server`, `--enrollment` and `--server-key` are not written to the config
 file: when the agent saves its config after enrollment, it keeps the file's
@@ -347,10 +350,12 @@ fails enrollment unless the agent runs with `--insecure` / `ALLOW_INSECURE=1`.
 --install-service
 --uninstall-service
 --genkey
+--version
 --help
 ```
 
-`--genkey` prints a new CURVE keypair and exits.
+`--genkey` prints a new CURVE keypair and exits. `--version` prints the server
+version and whether PostgreSQL support was compiled in, then exits.
 
 ## Runtime Settings Flow
 

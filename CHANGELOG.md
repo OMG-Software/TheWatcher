@@ -53,6 +53,26 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 
+- Docs: the local sanitizer command in `docs/build-environment.md` now
+  excludes the `timing` suite like CI's blocking step, and the informational
+  `--suite timing` command is listed separately.
+- Tests: test servers no longer take their ports from a probe-and-release
+  helper. That picked a port, freed it and let the server bind it later, so
+  two draws in one process could match, test processes could pick the same
+  port, and on FreeBSD (default ephemeral range from 10000) an outgoing
+  connection could take it; the server then failed with "Failed to listen"
+  (seen on FreeBSD CI in `server_enrollment_security`). `ServerFixture`,
+  `ServerRunner` and the API tests now bind OS-assigned ports
+  (`tcp://127.0.0.1:*`, API port 0) that the server holds from the bind on, and
+  read the actual ones back. `Server` gained `router_endpoint()`,
+  `enrollment_endpoint()` and `api_port()`, `ApiServer` gained `port()` and
+  accepts port 0, and the server logs the endpoints it actually bound. The
+  config file loader is unchanged. `free_zmq_endpoint()` / `free_http_port()`
+  remain for code that still calls them, but now take an OS-assigned port
+  instead of walking the fixed 20000-32767 range (which overlaps the FreeBSD
+  and OpenBSD ephemeral ranges), and remember what they handed out so a
+  process never gets the same port twice. Nothing in the tree calls them
+  besides the `net_helpers` test.
 - All alerts now go through one pipeline that applies maintenance, silences,
   severity validation, de-duplication, the runbook link and the webhook.
   Log-match alerts no longer fire during maintenance, offline and log-match
@@ -123,6 +143,29 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   unprivileged writers, and root-reserved blocks count as used (#158).
 - Encoding a frame with an empty payload no longer passes a null pointer to
   libcbor (undefined behaviour reported by UBSan on every heartbeat) (#162).
+- `meson-build.cmd` locates Visual Studio 2022 or newer with `vswhere.exe`
+  instead of a hard-coded "18" BuildTools path, uses an already-available
+  `cl.exe`, and says what to install when none is found. Its failure
+  handling was broken: `|| exit /b %ERRORLEVEL%` expands the stale value
+  while the line is parsed, so a failed `meson setup` still exited 0. Every
+  step is now followed by `if errorlevel 1 exit /b %ERRORLEVEL%` on its own
+  line, which reports the real exit code (#124).
+  The wrappers only pass `--reconfigure` to an already-configured build
+  directory.
+- The documented `meson test` names were executable targets, not test names
+  (`config_test`, `store_test`, `server_agent_integration_test`); README.md
+  and the docs now use the real names (`server_config`, `store`,
+  `server_agent_integration`, ...) (#132).
+- Build and CI descriptions match the scripts and wraps: Windows CI comment,
+  Linux Meson install via pipx/venv, libcbor sourced from GitHub with a
+  local overlay (#136).
+- The BSD setup script no longer pins package versions that go stale
+  (`py39-pip`, `gcc%11`, `autoconf-2.71`, `python311`); it uses unversioned
+  names, picks the newest libpq client, and installs the rest of the
+  optional packages one by one (#129).
+- `meson.build` no longer silently prefers system libzmq/libsodium over the
+  documented local static subprojects; a wrongly wired `cppzmq` on that
+  path is gone too (#125).
 - The Windows installer registers the server service with
   `TheWatcherServer.conf`, the file the server actually reads, instead of a
   non-existent `server.json`; the docs name the same file and
@@ -232,6 +275,20 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   history. `*.cmd`/`*.bat` are checked out with CRLF (#128).
 - Version bumped to 0.9.0 in `meson.build`, `dashboard/package.json` and
   the Windows installer.
+- `-Dsystem_zeromq=true` opts in to pkg-config libzmq (>= 4.3.2) and
+  libsodium (>= 1.0.18); it fails when they are missing, and cppzmq always
+  comes from its wrap (#125).
+- Every pip install in CI and in the BSD setup script is binary-only
+  (`--only-binary :all:`) and pinned (`meson==1.11.1`, plus `ninja==1.13.2` in the Windows CI job). The BSD
+  setup script pip-installs only Meson, because PyPI has no BSD wheels for
+  Ninja, and the sanitizer job installs Meson into a venv (PEP 668). The
+  version checks no longer take paths from the command line:
+  `check_version_consistency.py` derives the repository root from its own
+  location and `check_binary_version.py` receives fixed names (`server`,
+  `agent`) resolved against the Meson build root (#122, #127).
+- Catch2 and cppzmq test suites are disabled, and the wrappers and CI run
+  `meson test --suite thewatcher`, so third-party suites no longer run with
+  ours (#126).
 - Dashboard: `main.tsx` is split into `App.tsx`, `pages/`, `components/`,
   `hooks/` and `permissions.ts` (role helpers, now unit tested); inline
   styles moved into `styles.css`. No behaviour change (#117).
@@ -246,6 +303,25 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+- `-Dpostgres=auto|enabled|disabled` Meson feature option (default `auto`);
+  `enabled` fails configuration without libpq. The setup scripts install
+  libpq, the docs list the package per platform, and CI builds with
+  `-Dpostgres=enabled` (#123).
+- `TheWatcherServer --version` and `TheWatcherAgent --version`. The version
+  comes from `meson.build` through `common/version.hpp`; the server also
+  reports whether PostgreSQL support is compiled in. A `version_consistency`
+  test and a CI job check `dashboard/package.json`, `package-lock.json`,
+  `packaging/windows/TheWatcher.iss` and `CHANGELOG.md` against it (#127).
+- CI job `Linux (ASan + UBSan, debug)` runs the whole suite with
+  AddressSanitizer and UndefinedBehaviorSanitizer in a debug build. The
+  bundled libsodium is not instrumented (Argon2 under ASan made password
+  hashing take seconds) and Meson timeouts are scaled; no sanitizer finding
+  was reported by the existing suite. `login_rate_limit` assumes real-time
+  windows and fails under the slowdown, so it is also in a `timing` Meson
+  suite: the job runs `--suite thewatcher --no-suite timing`, then
+  `--suite timing` as a separate informational step (#122). Selecting by
+  suite replaces filtering `meson test --list` output, whose name format
+  changed in Meson 1.11 and let the test back into the blocking step.
 - Dashboard: ESLint (flat config, `typescript-eslint`, `react-hooks`) with
   `npm run lint`, and a `dashboard` CI job running
   `npm ci --ignore-scripts` (no package install scripts), lint, build, tests

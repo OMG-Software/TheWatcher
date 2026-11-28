@@ -121,6 +121,8 @@ install_packages_debian() {
         unzip zip curl ca-certificates \
         python3 python3-pip python3-venv \
         gawk
+    # libpq headers: without them the server builds without PostgreSQL.
+    $SUDO apt-get install -y libpq-dev || log_warn "libpq-dev unavailable; the server will build without PostgreSQL."
     # pipx is shipped on Debian 12+ / Ubuntu 22.04+; best-effort.
     $SUDO apt-get install -y pipx || log_warn "pipx package unavailable; will fall back to a managed venv for meson/ninja."
     if [ "$SKIP_NODE" -eq 0 ]; then
@@ -142,6 +144,7 @@ install_packages_rhel() {
         unzip zip curl ca-certificates \
         python3 python3-pip \
         gawk
+    $PKG libpq-devel || log_warn "libpq-devel unavailable; the server will build without PostgreSQL."
     $PKG pipx || log_warn "pipx package unavailable; will fall back to a managed venv for meson/ninja."
     if [ "$SKIP_NODE" -eq 0 ]; then
         $PKG nodejs npm
@@ -155,7 +158,7 @@ install_packages_arch() {
         autoconf automake libtool make cmake ninja \
         unzip zip curl ca-certificates \
         python python-pip python-pipx \
-        gawk
+        gawk postgresql-libs
     if [ "$SKIP_NODE" -eq 0 ]; then
         $SUDO pacman -S --noconfirm --needed nodejs npm
     fi
@@ -169,6 +172,8 @@ install_packages_suse() {
         unzip zip curl ca-certificates \
         python3 python3-pip \
         gawk
+    $SUDO zypper --non-interactive install -y postgresql-devel \
+        || log_warn "postgresql-devel unavailable; the server will build without PostgreSQL."
     $SUDO zypper --non-interactive install -y python3-pipx \
         || log_warn "python3-pipx package unavailable; will fall back to a managed venv for meson/ninja."
     if [ "$SKIP_NODE" -eq 0 ]; then
@@ -183,7 +188,7 @@ install_packages_alpine() {
         autoconf automake libtool make cmake samurai \
         unzip zip curl ca-certificates \
         bash python3 py3-pip \
-        gawk linux-headers
+        gawk linux-headers libpq-dev
     $SUDO apk add --no-cache pipx || log_warn "pipx package unavailable; will fall back to a managed venv for meson/ninja."
     if [ "$SKIP_NODE" -eq 0 ]; then
         $SUDO apk add --no-cache nodejs npm

@@ -42,6 +42,25 @@ public:
     void run(StartupSignal* startup = nullptr);
     void stop();
 
+    // The endpoints the sockets actually bound, e.g. "tcp://127.0.0.1:41873"
+    // when the config said "tcp://127.0.0.1:*". Valid once run() has called
+    // startup->succeed(): they are written before that call, so waiting on the
+    // StartupSignal gives the happens-before. Empty before then.
+    const std::string& router_endpoint() const
+    {
+        return router_endpoint_;
+    }
+    const std::string& enrollment_endpoint() const
+    {
+        return enrollment_endpoint_;
+    }
+    // The port the REST API listens on (the OS-assigned one when the config
+    // said 0). Valid on the same terms as the endpoints; 0 before then.
+    int api_port() const
+    {
+        return api_->port();
+    }
+
 private:
     // A command dispatched to a specific agent, awaiting its ACK.
     // SEC-04: target_agent_id lets the server verify that the ACK really
@@ -94,6 +113,10 @@ private:
     void maybe_send_report(int64_t now_ms);
 
     ServerConfig config_;
+    // Actual bound endpoints (see router_endpoint()); written by run() before
+    // it signals startup.
+    std::string router_endpoint_;
+    std::string enrollment_endpoint_;
     zmq::context_t ctx_{2}; // 2 IO threads
     // Outbound webhooks and report digests run on this worker's own thread so
     // a slow endpoint cannot stall the data plane (#48). Declared before the

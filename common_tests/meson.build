@@ -29,3 +29,11 @@ singlelog_test = executable(
   dependencies: [common_dep, catch2_dep, platform_deps],
 )
 test('singlelog', singlelog_test)
+
+version_test = executable(
+  'version_test',
+  ['version_test.cpp'],
+  include_directories: root_inc,
+  dependencies: [catch2_dep, platform_deps],
+)
+test('version', version_test)

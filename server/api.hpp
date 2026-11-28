@@ -53,7 +53,17 @@ public:
     // Non-blocking start. Binds the port before returning, then runs the accept
     // loop on a worker thread. Throws std::runtime_error if the bind fails, so
     // Server::run() reports a startup failure instead of a running server.
+    // Port 0 binds an OS-assigned port, which stays held by the listening
+    // socket from the bind on, so nothing else can take it.
     void start();
+
+    // The port being listened on: the constructor's port, or the OS-assigned
+    // one when that was 0. Set by start() before the accept thread runs, so
+    // read it after start() returns (or, via Server, after startup succeeds).
+    int port() const
+    {
+        return port_;
+    }
 
     void stop();
 

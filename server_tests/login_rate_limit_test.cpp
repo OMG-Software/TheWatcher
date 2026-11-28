@@ -25,7 +25,6 @@
 
 using namespace std::chrono_literals;
 using json = nlohmann::json;
-using thewatcher::test::free_http_port;
 
 namespace
 {
@@ -38,13 +37,11 @@ struct ApiFixture
 {
     explicit ApiFixture(int64_t window_ms = 3000, std::vector<std::string> trusted_proxies = {})
         : store(thewatcher::server::make_store("sqlite", ":memory:"))
-        , api(*store, zap, "127.0.0.1", port, window_ms, window_ms)
-        , client("http://127.0.0.1:" + std::to_string(port))
+        , api(*store, zap, "127.0.0.1", 0, window_ms, window_ms)
+        , client(start(api, std::move(trusted_proxies)))
     {
         client.set_connection_timeout(5, 0);
         client.set_read_timeout(5, 0);
-        api.set_trusted_proxies(std::move(trusted_proxies));
-        api.start();
     }
 
     ~ApiFixture()
@@ -52,13 +49,22 @@ struct ApiFixture
         api.stop();
     }
 
-    // Declared first so it is initialised before `api` uses it.
-    int port = free_http_port();
     zmq::context_t ctx{1};
     std::unique_ptr<thewatcher::server::Store> store;
     thewatcher::server::ZapHandler zap{ctx};
     thewatcher::server::ApiServer api;
     httplib::Client client;
+
+private:
+    // Starts `api` on its OS-assigned port (held from the bind on, so no other
+    // process can take it) and returns the base URL of that port, which the
+    // client member is built from.
+    static std::string start(thewatcher::server::ApiServer& api, std::vector<std::string> trusted_proxies)
+    {
+        api.set_trusted_proxies(std::move(trusted_proxies));
+        api.start();
+        return "http://127.0.0.1:" + std::to_string(api.port());
+    }
 };
 
 int attempt_login(httplib::Client& client, const std::string& username, const std::string& password,

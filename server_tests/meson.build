@@ -110,7 +110,17 @@ login_rate_limit_test = executable(
   include_directories: root_inc,
   dependencies: [server_dep, common_dep, catch2_dep, http_dep, cppzmq_dep, sqlite_dep, platform_deps],
 )
-test('login_rate_limit', login_rate_limit_test, is_parallel: false)
+# Also in the 'timing' suite: it asserts wall-clock rate-limit windows, so the
+# sanitizer CI job runs it separately (--no-suite timing / --suite timing).
+test('login_rate_limit', login_rate_limit_test, is_parallel: false, suite: 'timing')
+
+net_helpers_test = executable(
+  'net_helpers_test',
+  ['net_helpers_test.cpp'],
+  include_directories: root_inc,
+  dependencies: [catch2_dep, cppzmq_dep, platform_deps],
+)
+test('net_helpers', net_helpers_test)
 
 api_server_test = executable(
   'api_server_test',

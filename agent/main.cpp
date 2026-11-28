@@ -1,6 +1,7 @@
 #include "agent.hpp"
 #include "common/SingleLog.hpp"
 #include "common/crypto.hpp"
+#include "common/version.hpp"
 #include "common/windows_service.hpp"
 #include "config.hpp"
 
@@ -46,6 +47,7 @@ static void print_usage(const char* prog)
               << "  --service-name <n> Service name (default: TheWatcherAgent)\n"
               << "  --install-service Install the Windows service and exit\n"
               << "  --uninstall-service Remove the Windows service and exit\n"
+              << "  --version         Print the version and exit\n"
               << "  --help            Show this help\n";
 }
 
@@ -75,6 +77,11 @@ int main(int argc, char* argv[])
         if (arg == "--help" || arg == "-h")
         {
             print_usage(argv[0]);
+            return 0;
+        }
+        else if (arg == "--version")
+        {
+            std::cout << "TheWatcherAgent " << thewatcher::kVersion << '\n';
             return 0;
         }
         else if (arg == "--genkey")

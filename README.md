@@ -85,8 +85,8 @@ the agent writes back to `TheWatcherAgent.conf`.
 
 ```powershell
 meson compile -C builddir-release TheWatcherServer TheWatcherAgent
-meson test    -C builddir-release config_test store_test
-meson test    -C builddir-release server_agent_integration_test
+meson test    -C builddir-release server_config store
+meson test    -C builddir-release server_agent_integration
 ```
 
 The dashboard is built with npm:
