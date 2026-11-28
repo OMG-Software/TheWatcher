@@ -260,6 +260,33 @@ SCENARIO("Runbook URLs accept only http and https")
             REQUIRE_FALSE(is_valid_runbook_url(""));
         }
 
+        THEN("malformed authorities are rejected")
+        {
+            REQUIRE_FALSE(is_valid_runbook_url("https://:"));
+            REQUIRE_FALSE(is_valid_runbook_url("https://@x"));
+            REQUIRE_FALSE(is_valid_runbook_url("https://u:p@host"));
+            REQUIRE_FALSE(is_valid_runbook_url("https://?bad"));
+            REQUIRE_FALSE(is_valid_runbook_url("https://host:0"));
+            REQUIRE_FALSE(is_valid_runbook_url("https://host:65536"));
+            REQUIRE_FALSE(is_valid_runbook_url("https://host:"));
+            REQUIRE_FALSE(is_valid_runbook_url("https://host:80a"));
+            REQUIRE_FALSE(is_valid_runbook_url("https://[::1"));
+            REQUIRE_FALSE(is_valid_runbook_url("https://[]/x"));
+            REQUIRE_FALSE(is_valid_runbook_url("https://ho_st%/x"));
+            REQUIRE_FALSE(is_valid_runbook_url("httpx://host/x"));
+            REQUIRE_FALSE(is_valid_runbook_url("https:/host/x"));
+        }
+
+        THEN("hosts with ports, IPv4 and bracketed IPv6 are valid")
+        {
+            REQUIRE(is_valid_runbook_url("HTTPS://Host/x"));
+            REQUIRE(is_valid_runbook_url("http://wiki.local/p"));
+            REQUIRE(is_valid_runbook_url("https://host:65535/x"));
+            REQUIRE(is_valid_runbook_url("http://10.0.0.5:8080"));
+            REQUIRE(is_valid_runbook_url("https://[::1]:8443/x"));
+            REQUIRE(is_valid_runbook_url("https://wiki.example.com?q=1"));
+        }
+
         THEN("URLs without a host, with whitespace or control characters, or too long are rejected")
         {
             REQUIRE_FALSE(is_valid_runbook_url("https://"));
@@ -326,6 +353,32 @@ SCENARIO("An alert's runbook link follows a documented precedence")
             {
                 REQUIRE(resolve_runbook_url(store, "agent-a", "cpu", "yellow").empty());
             }
+        }
+    }
+
+    GIVEN("an invalid agent-specific exact URL and a valid global wildcard")
+    {
+        SqliteStore store(":memory:");
+        insert_agent(store, "agent-a");
+        add_runbook(store, "agent-a", "cpu", "red", "javascript:alert(1)");
+        add_runbook(store, "", "*", "red", "https://wiki/global-wildcard");
+
+        THEN("the invalid higher-precedence URL is skipped and the wildcard is used")
+        {
+            REQUIRE(resolve_runbook_url(store, "agent-a", "cpu", "red") == "https://wiki/global-wildcard");
+        }
+    }
+
+    GIVEN("a runbook for a custom indicator named like a prefix of another")
+    {
+        SqliteStore store(":memory:");
+        insert_agent(store, "agent-a");
+        add_runbook(store, "", "Auth", "red", "https://wiki/auth");
+
+        THEN("it does not match the alert indicator Auth:Failure")
+        {
+            REQUIRE(resolve_runbook_url(store, "agent-a", "Auth:Failure", "red").empty());
+            REQUIRE(resolve_runbook_url(store, "agent-a", "Auth", "red") == "https://wiki/auth");
         }
     }
 
@@ -402,6 +455,67 @@ SCENARIO("Alerts carry the per-agent runbook and the matching link")
             const auto payload = build_webhook_payload(store, alert, 1);
             REQUIRE(payload.at("runbook_url") == "");
             REQUIRE(payload.at("runbook_markdown") == "");
+        }
+    }
+}
+
+SCENARIO("Offline and log-match alerts carry the matching runbook link")
+{
+    GIVEN("an agent with runbooks for Heartbeat and for a log indicator")
+    {
+        SqliteStore store(":memory:");
+        insert_agent(store, "agent-x");
+        add_runbook(store, "agent-x", "Heartbeat", "red", "https://wiki/offline");
+        add_runbook(store, "", "syslog", "amber", "https://wiki/syslog");
+
+        WHEN("the offline alert is built")
+        {
+            const auto alert = make_offline_alert(store, "agent-x", 5000);
+
+            THEN("it is a red Heartbeat alert with the agent's runbook link")
+            {
+                REQUIRE(alert.agent_id == "agent-x");
+                REQUIRE(alert.indicator == "Heartbeat");
+                REQUIRE(alert.old_status == "green");
+                REQUIRE(alert.new_status == "red");
+                REQUIRE(alert.created_at == 5000);
+                REQUIRE(alert.runbook_url == "https://wiki/offline");
+            }
+        }
+
+        WHEN("a log-match alert is built for the matching indicator and severity")
+        {
+            const auto alert =
+                make_log_match_alert(store, "agent-x", "syslog", "amber", "/var/log/syslog", "oops", 6000);
+
+            THEN("it carries the log runbook link and the message")
+            {
+                REQUIRE(alert.indicator == "syslog");
+                REQUIRE(alert.new_status == "amber");
+                REQUIRE(alert.runbook_url == "https://wiki/syslog");
+                REQUIRE(alert.message == "Log match in /var/log/syslog: oops");
+            }
+        }
+
+        WHEN("a log-match alert has a severity no runbook covers")
+        {
+            const auto alert = make_log_match_alert(store, "agent-x", "syslog", "red", "/p", "x", 6000);
+
+            THEN("the link is empty")
+            {
+                REQUIRE(alert.runbook_url.empty());
+            }
+        }
+
+        WHEN("the matched line is longer than 200 characters")
+        {
+            const auto alert =
+                make_log_match_alert(store, "agent-x", "syslog", "amber", "/p", std::string(500, 'z'), 6000);
+
+            THEN("only the first 200 characters are kept")
+            {
+                REQUIRE(alert.message == "Log match in /p: " + std::string(200, 'z'));
+            }
         }
     }
 }

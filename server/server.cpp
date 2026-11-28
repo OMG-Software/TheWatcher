@@ -5,8 +5,8 @@
 #include "common/crypto.hpp"
 #include "common/metrics.hpp"
 #include "common/zmq_limits.hpp"
-#include "indicators.hpp"
 #include "report_generator.hpp"
+#include "runbook.hpp"
 #include "status_engine.hpp"
 
 #include <chrono>
@@ -248,14 +248,7 @@ void Server::run(StartupSignal* startup)
                 const auto ts = now_ms();
                 for (const auto& agent_id : store_->get_offline_unalerted_agent_ids())
                 {
-                    AlertRecord alert;
-                    alert.agent_id = agent_id;
-                    alert.indicator = std::string(indicators::kHeartbeat);
-                    alert.old_status = "green";
-                    alert.new_status = "red";
-                    alert.message = "Agent has gone offline (no heartbeat received)";
-                    alert.created_at = ts;
-                    store_->insert_alert(alert);
+                    store_->insert_alert(make_offline_alert(*store_, agent_id, ts));
                     LOGF_INFO("Created dead-agent alert for agent_id=%s", agent_id.c_str());
                 }
             }
@@ -596,14 +589,8 @@ void Server::handle_router_frame(zmq::socket_t& router)
             // Raise an alert on the named indicator so it shows up on the dashboard.
             if (!is_alert_silenced(*store_, agent_id, match.indicator_name, server_now))
             {
-                AlertRecord alert;
-                alert.agent_id = agent_id;
-                alert.indicator = match.indicator_name;
-                alert.old_status = "green";
-                alert.new_status = match.severity;
-                alert.message = "Log match in " + match.path + ": " + match.matched_line.substr(0, 200);
-                alert.created_at = server_now;
-                store_->insert_alert(alert);
+                store_->insert_alert(make_log_match_alert(*store_, agent_id, match.indicator_name, match.severity,
+                                                          match.path, match.matched_line, server_now));
                 LOGF_INFO("Log match alert agent_id=%s indicator=%s severity=%s path=%s", agent_id.c_str(),
                           match.indicator_name.c_str(), match.severity.c_str(), match.path.c_str());
             }

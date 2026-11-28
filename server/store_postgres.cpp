@@ -1649,35 +1649,48 @@ void PostgresStore::delete_runbook(int64_t runbook_id)
     check_res(res.r, "delete_runbook");
 }
 
-std::optional<RunbookRecord> PostgresStore::get_runbook(const std::string& agent_id, const std::string& indicator,
-                                                        const std::string& status)
+std::vector<RunbookRecord> PostgresStore::get_runbook_candidates(const std::string& agent_id,
+                                                                 const std::string& indicator,
+                                                                 const std::string& status)
 {
-    // SEC-11 and #53: same selection rules as SqliteStore::get_runbook.
+    // SEC-11 and #53: same selection rules as SqliteStore::get_runbook_candidates.
     const auto kind = indicators::kind_of(indicator);
-    const char* params[] = {agent_id.c_str(), indicator.c_str(), kind.c_str(), status.c_str()};
+    const auto kind_param = indicators::is_known_kind(kind) ? kind : indicator;
+    const char* params[] = {agent_id.c_str(), indicator.c_str(), kind_param.c_str(), status.c_str()};
     Res res(PQexecParams(conn_, R"(
         SELECT runbook_id,agent_id,indicator,status,url,markdown,notes,created_by,created_at
         FROM runbooks
         WHERE (agent_id=$1 OR agent_id='') AND (indicator=$2 OR indicator=$3 OR indicator='*') AND status=$4
         ORDER BY CASE WHEN agent_id='' THEN 1 ELSE 0 END,
-                 CASE WHEN indicator=$2 THEN 0 WHEN indicator=$3 THEN 1 ELSE 2 END, runbook_id DESC
-        LIMIT 1;
+                 CASE WHEN indicator=$2 THEN 0 WHEN indicator=$3 THEN 1 ELSE 2 END, runbook_id DESC;
     )",
                          4, nullptr, params, nullptr, nullptr, 0));
-    check_res(res.r, "get_runbook");
-    if (PQntuples(res.r) == 0)
+    check_res(res.r, "get_runbook_candidates");
+    std::vector<RunbookRecord> out;
+    for (int i = 0; i < PQntuples(res.r); ++i)
+    {
+        RunbookRecord r;
+        r.runbook_id = col_int64(res.r, i, 0);
+        r.agent_id = col(res.r, i, 1);
+        r.indicator = col(res.r, i, 2);
+        r.status = col(res.r, i, 3);
+        r.url = col(res.r, i, 4);
+        r.markdown = col(res.r, i, 5);
+        r.notes = col(res.r, i, 6);
+        r.created_by = col(res.r, i, 7);
+        r.created_at = col_int64(res.r, i, 8);
+        out.push_back(std::move(r));
+    }
+    return out;
+}
+
+std::optional<RunbookRecord> PostgresStore::get_runbook(const std::string& agent_id, const std::string& indicator,
+                                                        const std::string& status)
+{
+    auto candidates = get_runbook_candidates(agent_id, indicator, status);
+    if (candidates.empty())
         return std::nullopt;
-    RunbookRecord r;
-    r.runbook_id = col_int64(res.r, 0, 0);
-    r.agent_id = col(res.r, 0, 1);
-    r.indicator = col(res.r, 0, 2);
-    r.status = col(res.r, 0, 3);
-    r.url = col(res.r, 0, 4);
-    r.markdown = col(res.r, 0, 5);
-    r.notes = col(res.r, 0, 6);
-    r.created_by = col(res.r, 0, 7);
-    r.created_at = col_int64(res.r, 0, 8);
-    return r;
+    return std::move(candidates.front());
 }
 
 } // namespace thewatcher::server

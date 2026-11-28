@@ -353,8 +353,15 @@ groups) is returned as `runbook_markdown` on alerts and in webhook payloads.
 The legacy global `runbooks` table is kept as the store for these links: it
 already holds the indicator/status/URL data the issue asks for, existing rows
 keep working unchanged, and per-agent rows use its `agent_id` column.
-URLs must be absolute `http://` or `https://` URLs without whitespace, at most
-2048 bytes; `javascript:`, `data:` and other schemes are rejected.
+The kind step applies only to the built-in kinds (`cpu`, `memory`, `disk`,
+`network`, `process`, `Heartbeat`): a custom log indicator `Auth` does not match
+`Auth:Failure`. A stored URL that fails validation is skipped and the next match
+is used. Offline (`Heartbeat`) and log-match alerts get their link the same way.
+URLs are parsed, not just prefix-checked: the scheme must be `http` or `https`
+(plain http is allowed because internal wikis often use it and the server never
+fetches the URL), followed by `//` and a host (name, IPv4 or `[IPv6]`) with an
+optional port of 1-65535, no `user:pass@`, no whitespace or control characters,
+at most 2048 bytes. `javascript:`, `data:` and other schemes are rejected.
 
 ### Maintenance
 

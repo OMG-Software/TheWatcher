@@ -62,7 +62,13 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   and the old `heartbeat` and `processes` spellings still match (#151).
 - Runbook URLs are validated (http and https only) when created and again before
   they are attached to an alert, so `javascript:` links cannot be stored or
-  rendered (#11).
+  rendered. The check parses the scheme and authority (host, optional port, no
+  userinfo) instead of matching a prefix (#11).
+- A stored runbook URL that fails validation no longer hides a valid lower-
+  precedence runbook, and a custom indicator such as `Auth` no longer matches
+  `Auth:Failure` (only built-in kinds match by prefix) (#53).
+- Offline (`Heartbeat`) and log-match alerts now get their runbook link; webhook
+  delivery for them is #52 (#53).
 
 - Dashboard: `tsc` no longer writes `.js`/`.d.ts` files into `dashboard/src`
   (`noEmit`), the 21 committed compiled twins are removed, and vitest runs

@@ -279,6 +279,12 @@ public:
     // newest wins.
     virtual std::optional<RunbookRecord> get_runbook(const std::string& agent_id, const std::string& indicator,
                                                      const std::string& status) = 0;
+    // Every runbook that matches, best first (same order as get_runbook, which
+    // returns the first). Lets the caller skip a stored URL that fails
+    // validation and fall back to the next match. The kind ("disk") only
+    // counts for the built-in kinds (indicators::is_known_kind).
+    virtual std::vector<RunbookRecord> get_runbook_candidates(const std::string& agent_id, const std::string& indicator,
+                                                              const std::string& status) = 0;
 };
 
 std::unique_ptr<Store> make_store(const std::string& db_type, const std::string& db_path_or_dsn);
