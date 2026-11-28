@@ -146,6 +146,16 @@ working document for audit, design review, and regression testing.
 - Log-monitor paths make an agent read local files and surface their contents
   on the dashboard, so configuring them requires `global_admin`; the agent
   additionally only reads regular files inside its local `LOG_ALLOWED_DIRS`.
+- A log-monitor pattern that backtracks exponentially (`(a+)+$`, `(a|aa)*c`,
+  `.*.*.*z`) would block the agent collection thread while it holds the
+  collector lock (#169). `common/log_pattern.hpp` refuses back-references,
+  repeated groups that contain a quantifier or alternation, back-to-back
+  overlapping unbounded quantifiers and more than three unbounded
+  quantifiers; the server rejects such a pattern with 400 when the config is
+  saved and the agent refuses it again. Residual risk: the check is
+  structural and conservative, so an unusual pattern that it accepts could
+  still be slow on a 4 KiB line; a linear-time engine such as RE2 would remove
+  that risk.
 - The built-in first-run admin account cannot be disabled or deleted on either
   storage backend, and no-op disable/delete requests return an error instead
   of `{"ok":true}`.

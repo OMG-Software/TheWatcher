@@ -1,6 +1,7 @@
 #include "log_collector.hpp"
 
 #include "common/SingleLog.hpp"
+#include "common/log_pattern.hpp"
 
 #include <algorithm>
 #include <array>
@@ -12,6 +13,8 @@
 #include <regex>
 #include <string>
 #include <system_error>
+#include <tuple>
+#include <utility>
 
 #include <sys/stat.h>
 
@@ -60,54 +63,25 @@ namespace
     //    (reserved, not committed, so unused pages cost no memory).
     // 64 MB / 4 KiB leaves ~16 KB of stack per character, far above the worst
     // usage measured with libstdc++ (~0.5 KB). Patterns with exponential
-    // backtracking (e.g. "(a|aa)*c") can still burn CPU; only global admins
+    // backtracking are refused by log_pattern_error (#169); only global admins
     // can configure patterns (SEC-10).
     constexpr std::size_t max_match_len = 4 * 1024;
     constexpr std::size_t match_stack_bytes = 64 * 1024 * 1024;
-    // Stack use per character also grows with group nesting: 100 nested
-    // groups overflowed 64 MB on a 4 KiB line, 50 did not. 16 levels keeps a
-    // wide margin; real log patterns rarely nest more than 2 or 3 levels.
-    // Patterns with exponential backtracking are a CPU problem (#169).
-    constexpr int max_group_depth = 16;
+    // Stack use per character also grows with group nesting, and patterns with
+    // nested or overlapping quantifiers backtrack exponentially (#169). Both
+    // are refused up front by log_pattern_error (common/log_pattern.hpp), the
+    // same check the server applies when a collector config is saved.
 
-    // Returns the deepest group nesting in an ECMAScript pattern: "(" that is
-    // not escaped and not inside a [...] class. Unbalanced ")" is ignored here;
-    // std::regex rejects it when the pattern is compiled.
-    int group_depth(const std::string& pattern)
+    // Identifies one watch. The same file may feed several indicators, and
+    // each keeps its own read position.
+    std::string watch_key(const LogMonitorConfig& cfg)
     {
-        int depth = 0;
-        int deepest = 0;
-        bool in_class = false;
-        for (std::size_t i = 0; i < pattern.size(); ++i)
-        {
-            const char ch = pattern[i];
-            if (ch == '\\')
-            {
-                ++i; // the next character is literal
-                continue;
-            }
-            if (in_class)
-            {
-                if (ch == ']')
-                    in_class = false;
-                continue;
-            }
-            if (ch == '[')
-            {
-                // ECMAScript: a "]" right after "[" or "[^" closes the class
-                // ("[]" matches nothing), so no POSIX-style special case.
-                in_class = true;
-            }
-            else if (ch == '(')
-            {
-                deepest = std::max(deepest, ++depth);
-            }
-            else if (ch == ')' && depth > 0)
-            {
-                --depth;
-            }
-        }
-        return deepest;
+        std::string key = cfg.path;
+        key.push_back('\0');
+        key += cfg.indicator_name;
+        key.push_back('\0');
+        key += cfg.pattern;
+        return key;
     }
 
     // Runs fn on a new thread with a stack of stack_bytes and waits for it.
@@ -449,6 +423,28 @@ namespace
     }
 
 #endif
+    // Where a watch that meets an existing file for the first time starts
+    // reading, and whether it is inside an over-long line (so the rest of that
+    // line is dropped). This is the end of the file, moved back to the start of
+    // an unterminated last line so that line is matched whole once it ends.
+    std::pair<int64_t, bool> initial_position(const ReadOnlyFile& file)
+    {
+        const int64_t size = file.size();
+        if (size <= 0)
+            return {0, false};
+        const auto tail_len = static_cast<std::size_t>(std::min<int64_t>(size, static_cast<int64_t>(max_line_len)));
+        std::string tail(tail_len, '\0');
+        const int64_t n = file.read_at(size - static_cast<int64_t>(tail_len), tail.data(), tail_len);
+        if (n != static_cast<int64_t>(tail_len))
+            return {size, false}; // cannot look: start at the end
+        const auto newline = tail.rfind('\n');
+        if (newline != std::string::npos)
+            return {size - static_cast<int64_t>(tail_len - newline - 1), false};
+        // No newline in the last max_line_len bytes. A short file is one
+        // unterminated line; otherwise this is the middle of an over-long line.
+        return static_cast<int64_t>(tail_len) == size ? std::pair<int64_t, bool>{0, false}
+                                                      : std::pair<int64_t, bool>{size, true};
+    }
 
 } // namespace
 
@@ -506,18 +502,12 @@ void LogCollector::set_configs(std::vector<LogMonitorConfig> configs)
 {
     std::lock_guard<std::mutex> lock(mutex_);
     configs_ = std::move(configs);
-    // Remove file states for paths that are no longer configured.
+    // Remove read state for watches that are no longer configured.
     for (auto it = file_states_.begin(); it != file_states_.end();)
     {
-        bool found = false;
-        for (const auto& cfg : configs_)
-        {
-            if (cfg.path == it->first)
-            {
-                found = true;
-                break;
-            }
-        }
+        const bool found = std::any_of(configs_.begin(), configs_.end(), [&](const auto& cfg) {
+            return watch_key(cfg) == it->first;
+        });
         it = found ? std::next(it) : file_states_.erase(it);
     }
 }
@@ -572,10 +562,9 @@ void LogCollector::tick()
             LOGF_WARNING("LogCollector pattern too long path=%s pattern_len=%zu", cfg.path.c_str(), cfg.pattern.size());
             continue;
         }
-        if (const auto depth = group_depth(cfg.pattern); depth > max_group_depth)
+        if (const auto error = log_pattern_error(cfg.pattern); !error.empty())
         {
-            LOGF_WARNING("LogCollector pattern nests groups too deeply path=%s depth=%d max=%d", cfg.path.c_str(),
-                         depth, max_group_depth);
+            LOGF_WARNING("LogCollector pattern refused path=%s reason=%s", cfg.path.c_str(), error.c_str());
             continue;
         }
         try
@@ -600,25 +589,29 @@ std::vector<proto::LogMatch> LogCollector::take_matches()
     return std::exchange(pending_, {});
 }
 
-// Reads new complete lines from one file and queues pattern matches. The caller
-// holds mutex_. Resets the file's state and returns when the path does not
-// resolve, is outside the allowlist, is missing or is not a regular file. Reads
-// are capped per tick. An invalid regex is logged and the file is skipped.
+// Reads new complete lines from one file for one watch and queues pattern
+// matches. The caller holds mutex_. Forgets the watch's state and returns when the
+// path does not resolve, is outside the allowlist or is not a regular file; a
+// missing file is remembered so that it is read from its first byte once it
+// appears. A watch seen for the first time starts at the end of an existing file
+// (history is not replayed). Reads are capped per tick. An invalid regex is
+// logged and the file is skipped.
 void LogCollector::tail_file(const LogMonitorConfig& cfg)
 {
+    const auto key = watch_key(cfg);
     // SEC-10: resolve symlinks and require the real location to sit inside
     // a locally allowlisted directory. The server cannot extend this list.
     std::error_code resolve_ec;
     const auto resolved = std::filesystem::weakly_canonical(cfg.path, resolve_ec);
     if (resolve_ec)
     {
-        file_states_.erase(cfg.path);
+        file_states_.erase(key);
         return;
     }
     if (!is_allowed(resolved, allowed_dirs_))
     {
         LOGF_WARNING("LogCollector path outside LOG_ALLOWED_DIRS path=%s", cfg.path.c_str());
-        file_states_.erase(cfg.path);
+        file_states_.erase(key);
         return;
     }
 
@@ -632,17 +625,18 @@ void LogCollector::tail_file(const LogMonitorConfig& cfg)
     case ReadOnlyFile::Status::ok:
         break;
     case ReadOnlyFile::Status::missing:
-        // File doesn't exist yet; reset state so we start from byte 0 when it appears.
-        file_states_.erase(cfg.path);
+        // Not there yet: remember that, so the file is read from its first byte
+        // when it appears (it is new content, not history).
+        file_states_[key] = FileState{.fresh = false};
         return;
     case ReadOnlyFile::Status::not_regular:
         // Directories, devices, fifos and symlinks are rejected outright.
         LOGF_WARNING("LogCollector path is not a regular file path=%s", cfg.path.c_str());
-        file_states_.erase(cfg.path);
+        file_states_.erase(key);
         return;
     case ReadOnlyFile::Status::failed:
         LOGF_WARNING("LogCollector open path=%s error=%s", cfg.path.c_str(), open_error.c_str());
-        file_states_.erase(cfg.path);
+        file_states_.erase(key);
         return;
     }
 
@@ -652,15 +646,33 @@ void LogCollector::tail_file(const LogMonitorConfig& cfg)
     if (const auto& opened_path = file.real_path(); !opened_path.empty() && !is_allowed(opened_path, allowed_dirs_))
     {
         LOGF_WARNING("LogCollector opened file outside LOG_ALLOWED_DIRS path=%s", cfg.path.c_str());
-        file_states_.erase(cfg.path);
+        file_states_.erase(key);
         return;
     }
 
-    auto& state = file_states_[cfg.path];
+    auto& state = file_states_[key];
 
-    // Detect rotation: inode changed or file is shorter than our saved offset.
-    if (state.inode != file.id() || file.size() < state.offset)
+    if (state.fresh)
     {
+        // First sight of an already existing file: start where the writer is
+        // now so enabling a monitor does not replay history as new alerts.
+        // An unterminated last line is the writer's current line, so begin at
+        // its start and match it once it completes.
+        state.fresh = false;
+        state.inode = file.id();
+        std::tie(state.offset, state.discarding) = initial_position(file);
+    }
+    else if (state.inode < 0)
+    {
+        // The file did not exist when last polled; it was created after
+        // monitoring began, so everything in it is new.
+        state.inode = file.id();
+        state.offset = 0;
+        state.discarding = false;
+    }
+    else if (state.inode != file.id() || file.size() < state.offset)
+    {
+        // Rotation: the file was replaced (new identity) or truncated.
         LOGF_DEBUG("LogCollector rotation detected path=%s", cfg.path.c_str());
         state.inode = file.id();
         state.offset = 0;
@@ -682,6 +694,7 @@ void LogCollector::tail_file(const LogMonitorConfig& cfg)
     }
 
     std::size_t matches = 0;
+    bool regex_failure_logged = false;
     const auto emit_if_match = [&](const std::string& text) {
         // Issue #140: bound the recursion depth of std::regex. When the line
         // is cut, match_not_eol stops "$" from matching at the cut, which is
@@ -689,7 +702,22 @@ void LogCollector::tail_file(const LogMonitorConfig& cfg)
         const bool cut = text.size() > max_match_len;
         const auto match_end = cut ? text.begin() + static_cast<std::ptrdiff_t>(max_match_len) : text.end();
         const auto flags = cut ? std::regex_constants::match_not_eol : std::regex_constants::match_default;
-        if (text.empty() || !std::regex_search(text.begin(), match_end, pattern, flags))
+        bool found = false;
+        try
+        {
+            found = !text.empty() && std::regex_search(text.begin(), match_end, pattern, flags);
+        }
+        catch (const std::regex_error& e)
+        {
+            // The engine gave up on this line (MSVC error_stack, error_complexity).
+            // Skip the line, not the file: the offset still advances. Logged once
+            // per tick and watch to keep a pathological log from flooding ours.
+            if (!regex_failure_logged)
+                LOGF_WARNING("LogCollector regex failed on a line, skipping it path=%s indicator=%s error=%s",
+                             cfg.path.c_str(), cfg.indicator_name.c_str(), e.what());
+            regex_failure_logged = true;
+        }
+        if (!found)
             return;
         proto::LogMatch m;
         m.indicator_name = cfg.indicator_name;
@@ -733,6 +761,9 @@ void LogCollector::tail_file(const LogMonitorConfig& cfg)
             ++bytes_read;
             if (c == '\n')
             {
+                // CRLF logs: the carriage return belongs to the line ending, not the line.
+                if (!line.empty() && line.back() == '\r')
+                    line.pop_back();
                 if (!discarding)
                     emit_if_match(line);
                 line.clear();
