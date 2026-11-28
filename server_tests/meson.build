@@ -139,18 +139,28 @@ server_config_permissions_test = executable(
 test('server_config_permissions', server_config_permissions_test)
 
 if libpq_dep.found()
+  # PostgreSQL tests pick the server from THEWATCHER_POSTGRES_TEST_DSN in the
+  # environment `meson test` runs in (see docs/development.md). With no server
+  # they exit 77, which meson reports as SKIP; THEWATCHER_REQUIRE_POSTGRES=1
+  # turns an unreachable server into a failure (CI sets it).
   store_postgres_test = executable(
     'store_postgres_test',
-    ['store_postgres_test.cpp'],
+    ['store_postgres_test.cpp', 'postgres_test_main.cpp'],
     cpp_args: ['-DHAVE_LIBPQ'],
     include_directories: root_inc,
     dependencies: [server_store_dep, catch2_dep, platform_deps],
   )
-  test(
-    'store_postgres',
-    store_postgres_test,
-    env: ['THEWATCHER_POSTGRES_TEST_DSN=host=localhost dbname=thewatcher_test user=thewatcher_test password=thewatcher_test'],
+  test('store_postgres', store_postgres_test, timeout: 300)
+
+  # store_test.cpp again, with every TestStore a PostgresStore in its own schema.
+  store_postgres_suite_test = executable(
+    'store_postgres_suite_test',
+    ['store_test.cpp', 'postgres_test_main.cpp'],
+    cpp_args: ['-DHAVE_LIBPQ', '-DTHEWATCHER_STORE_TEST_POSTGRES'],
+    include_directories: root_inc,
+    dependencies: [server_store_dep, catch2_dep, sqlite_dep, platform_deps],
   )
+  test('store_postgres_suite', store_postgres_suite_test, timeout: 600)
 endif
 
 store_concurrency_test = executable(
@@ -160,6 +170,14 @@ store_concurrency_test = executable(
   dependencies: [server_store_dep, catch2_dep, sqlite_dep, platform_deps],
 )
 test('store_concurrency', store_concurrency_test)
+
+dsn_redaction_test = executable(
+  'dsn_redaction_test',
+  ['dsn_redaction_test.cpp'],
+  include_directories: root_inc,
+  dependencies: [catch2_dep, platform_deps],
+)
+test('dsn_redaction', dsn_redaction_test)
 
 command_ack_test = executable(
   'command_ack_test',

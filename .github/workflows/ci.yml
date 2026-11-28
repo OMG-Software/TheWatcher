@@ -119,6 +119,8 @@ jobs:
 
       - name: Build and test (meson-build-linux.sh)
         env:
+          # A missing PostgreSQL service must fail the job, not skip the tests.
+          THEWATCHER_REQUIRE_POSTGRES: "1"
           THEWATCHER_POSTGRES_TEST_DSN: >-
             host=127.0.0.1 dbname=thewatcher_test
             user=thewatcher_test password=thewatcher_test

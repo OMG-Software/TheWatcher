@@ -3,6 +3,7 @@
 #include "store_postgres.hpp"
 
 #include "common/SingleLog.hpp"
+#include "dsn_redaction.hpp"
 
 #include <nlohmann/json.hpp>
 
@@ -147,21 +148,6 @@ namespace
         return v ? "true" : "false";
     }
 
-    // Strip the password value from a libpq connection string so it is safe
-    // to include in log output.
-    std::string redact_dsn(const std::string& dsn)
-    {
-        std::string out = dsn;
-        const auto kw = out.find("password=");
-        if (kw != std::string::npos)
-        {
-            const auto val_start = kw + 9;
-            const auto val_end = out.find(' ', val_start);
-            out.replace(val_start, val_end == std::string::npos ? std::string::npos : val_end - val_start, "***");
-        }
-        return out;
-    }
-
     AgentRecord row_to_agent(PGresult* r, int row)
     {
         AgentRecord a;
@@ -241,6 +227,12 @@ namespace
 
 // ── Construction ──────────────────────────────────────────────────────────────
 
+namespace
+{
+    // Arbitrary application-wide key for the schema migration advisory lock.
+    constexpr int64_t kMigrationLockKey = 0x7477'6D69'6772'6174LL;
+} // namespace
+
 PostgresStore::PostgresStore(const std::string& dsn)
     : conn_(dsn) // owns the handle from here on, so a throw below cannot leak it
 {
@@ -248,8 +240,23 @@ PostgresStore::PostgresStore(const std::string& dsn)
     LOGF_DEBUG("Opened PostgreSQL store dsn=%s", redact_dsn(dsn).c_str());
     if (sodium_init() < 0)
         throw std::runtime_error("libsodium initialization failed");
+    // Several server nodes may start together (HA pair, rolling restart). One
+    // transaction holds a transaction-scoped advisory lock while it migrates
+    // and bootstraps, so the second node waits for the first instead of racing
+    // it on CREATE or on the admin user, and a failed start leaves nothing half
+    // done. The lock is transaction-scoped so it also works behind pgBouncer in
+    // transaction pooling mode, where a session lock would not.
+    postgres::Transaction tx(conn_);
+    {
+        const auto key = s(kMigrationLockKey);
+        const char* params[] = {key.c_str()};
+        Res lock(
+            conn_.exec_params("SELECT pg_advisory_xact_lock($1::bigint)", 1, nullptr, params, nullptr, nullptr, 0));
+        check_res(lock.r, "migration lock");
+    }
     init_schema();
     bootstrap_defaults();
+    tx.commit();
 }
 
 PostgresStore::~PostgresStore()
@@ -261,17 +268,16 @@ PostgresStore::~PostgresStore()
 void PostgresStore::exec(const char* sql)
 {
     LOGF_TRACE("Executing SQL prefix=%.80s", sql);
-    Res res(PQexec(conn_, sql));
+    Res res(conn_.exec(sql));
     check_res(res.r, "exec");
 }
 
 bool PostgresStore::column_exists(const std::string& table, const std::string& column)
 {
     const char* params[2] = {table.c_str(), column.c_str()};
-    Res res(PQexecParams(conn_,
-                         "SELECT 1 FROM information_schema.columns "
-                         "WHERE table_name=$1 AND column_name=$2 AND table_schema='public';",
-                         2, nullptr, params, nullptr, nullptr, 0));
+    Res res(conn_.exec_params("SELECT 1 FROM information_schema.columns "
+                              "WHERE table_name=$1 AND column_name=$2 AND table_schema=current_schema();",
+                              2, nullptr, params, nullptr, nullptr, 0));
     check_res(res.r, "column_exists");
     return PQntuples(res.r) > 0;
 }
@@ -320,27 +326,47 @@ void PostgresStore::init_schema()
         );
     )");
     add_column_if_missing("agents", "rejected",
-                          "ALTER TABLE agents ADD COLUMN rejected BOOLEAN NOT NULL DEFAULT FALSE;");
+                          "ALTER TABLE agents ADD COLUMN IF NOT EXISTS rejected BOOLEAN NOT NULL DEFAULT FALSE;");
     add_column_if_missing("agents", "description",
-                          "ALTER TABLE agents ADD COLUMN description TEXT NOT NULL DEFAULT '';");
+                          "ALTER TABLE agents ADD COLUMN IF NOT EXISTS description TEXT NOT NULL DEFAULT '';");
     add_column_if_missing("agents", "connected",
-                          "ALTER TABLE agents ADD COLUMN connected BOOLEAN NOT NULL DEFAULT FALSE;");
+                          "ALTER TABLE agents ADD COLUMN IF NOT EXISTS connected BOOLEAN NOT NULL DEFAULT FALSE;");
     add_column_if_missing("agents", "maintenance",
-                          "ALTER TABLE agents ADD COLUMN maintenance BOOLEAN NOT NULL DEFAULT FALSE;");
+                          "ALTER TABLE agents ADD COLUMN IF NOT EXISTS maintenance BOOLEAN NOT NULL DEFAULT FALSE;");
     add_column_if_missing("agents", "maintenance_reason",
-                          "ALTER TABLE agents ADD COLUMN maintenance_reason TEXT NOT NULL DEFAULT '';");
+                          "ALTER TABLE agents ADD COLUMN IF NOT EXISTS maintenance_reason TEXT NOT NULL DEFAULT '';");
     add_column_if_missing("agents", "maintenance_until",
-                          "ALTER TABLE agents ADD COLUMN maintenance_until BIGINT NOT NULL DEFAULT 0;");
-    add_column_if_missing("agents", "collection_interval",
-                          "ALTER TABLE agents ADD COLUMN collection_interval INTEGER NOT NULL DEFAULT 30;");
+                          "ALTER TABLE agents ADD COLUMN IF NOT EXISTS maintenance_until BIGINT NOT NULL DEFAULT 0;");
+    add_column_if_missing(
+        "agents", "collection_interval",
+        "ALTER TABLE agents ADD COLUMN IF NOT EXISTS collection_interval INTEGER NOT NULL DEFAULT 30;");
     add_column_if_missing("agents", "process_limit",
-                          "ALTER TABLE agents ADD COLUMN process_limit INTEGER NOT NULL DEFAULT 25;");
-    add_column_if_missing("agents", "collector_config_json",
-                          "ALTER TABLE agents ADD COLUMN collector_config_json TEXT NOT NULL DEFAULT '';");
+                          "ALTER TABLE agents ADD COLUMN IF NOT EXISTS process_limit INTEGER NOT NULL DEFAULT 25;");
+    // Threshold columns: a database from before they existed must gain them,
+    // exactly as SqliteStore migrates its agents table.
+    for (const char* indicator : {"cpu", "memory", "disk", "network"})
+    {
+        const std::string name = indicator;
+        add_column_if_missing("agents", name + "_warning_pct_of_avg",
+                              ("ALTER TABLE agents ADD COLUMN IF NOT EXISTS " + name +
+                               "_warning_pct_of_avg DOUBLE PRECISION NOT NULL DEFAULT 125.0;")
+                                  .c_str());
+        add_column_if_missing("agents", name + "_degraded_pct_of_avg",
+                              ("ALTER TABLE agents ADD COLUMN IF NOT EXISTS " + name +
+                               "_degraded_pct_of_avg DOUBLE PRECISION NOT NULL DEFAULT 150.0;")
+                                  .c_str());
+        add_column_if_missing("agents", name + "_critical_pct_of_avg",
+                              ("ALTER TABLE agents ADD COLUMN IF NOT EXISTS " + name +
+                               "_critical_pct_of_avg DOUBLE PRECISION NOT NULL DEFAULT 200.0;")
+                                  .c_str());
+    }
+    add_column_if_missing(
+        "agents", "collector_config_json",
+        "ALTER TABLE agents ADD COLUMN IF NOT EXISTS collector_config_json TEXT NOT NULL DEFAULT '';");
     add_column_if_missing("agents", "heartbeat_interval",
-                          "ALTER TABLE agents ADD COLUMN heartbeat_interval INTEGER NOT NULL DEFAULT 5;");
+                          "ALTER TABLE agents ADD COLUMN IF NOT EXISTS heartbeat_interval INTEGER NOT NULL DEFAULT 5;");
     add_column_if_missing("agents", "runbook_markdown",
-                          "ALTER TABLE agents ADD COLUMN runbook_markdown TEXT NOT NULL DEFAULT '';");
+                          "ALTER TABLE agents ADD COLUMN IF NOT EXISTS runbook_markdown TEXT NOT NULL DEFAULT '';");
     exec(R"(
         CREATE TABLE IF NOT EXISTS metrics (
             id           BIGSERIAL PRIMARY KEY,
@@ -350,6 +376,8 @@ void PostgresStore::init_schema()
         );
     )");
     exec("CREATE INDEX IF NOT EXISTS idx_metrics_agent_ts ON metrics(agent_id, timestamp_ms DESC);");
+    // The retention prune filters on timestamp alone, across all agents.
+    exec("CREATE INDEX IF NOT EXISTS idx_metrics_ts ON metrics(timestamp_ms);");
     exec(R"(
         CREATE TABLE IF NOT EXISTS groups (
             group_id BIGSERIAL PRIMARY KEY,
@@ -428,13 +456,21 @@ void PostgresStore::init_schema()
             runbook_url     TEXT NOT NULL DEFAULT ''
         );
     )");
-    add_column_if_missing("alerts", "note", "ALTER TABLE alerts ADD COLUMN note TEXT NOT NULL DEFAULT '';");
+    add_column_if_missing("alerts", "note",
+                          "ALTER TABLE alerts ADD COLUMN IF NOT EXISTS note TEXT NOT NULL DEFAULT '';");
     add_column_if_missing("alerts", "escalated_at",
-                          "ALTER TABLE alerts ADD COLUMN escalated_at BIGINT NOT NULL DEFAULT 0;");
+                          "ALTER TABLE alerts ADD COLUMN IF NOT EXISTS escalated_at BIGINT NOT NULL DEFAULT 0;");
     add_column_if_missing("alerts", "runbook_url",
-                          "ALTER TABLE alerts ADD COLUMN runbook_url TEXT NOT NULL DEFAULT '';");
+                          "ALTER TABLE alerts ADD COLUMN IF NOT EXISTS runbook_url TEXT NOT NULL DEFAULT '';");
     exec("CREATE INDEX IF NOT EXISTS idx_alerts_active "
          "ON alerts(deleted_at, acknowledged_at, created_at DESC);");
+    // Indexes for the hot paths (#77): the offline/heartbeat alert lookups,
+    // the ON DELETE CASCADE from groups, and session expiry/revocation.
+    exec("CREATE INDEX IF NOT EXISTS idx_alerts_agent_indicator ON alerts(agent_id, indicator, deleted_at);");
+    exec("CREATE INDEX IF NOT EXISTS idx_agent_groups_group ON agent_groups(group_id);");
+    exec("CREATE INDEX IF NOT EXISTS idx_user_groups_group ON user_groups(group_id);");
+    exec("CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at);");
+    exec("CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);");
     exec(R"(
         CREATE TABLE IF NOT EXISTS maintenance_windows (
             window_id  BIGSERIAL PRIMARY KEY,
@@ -490,7 +526,8 @@ void PostgresStore::init_schema()
             created_at    BIGINT NOT NULL
         );
     )");
-    add_column_if_missing("views", "group_id", "ALTER TABLE views ADD COLUMN group_id BIGINT NOT NULL DEFAULT 0;");
+    add_column_if_missing("views", "group_id",
+                          "ALTER TABLE views ADD COLUMN IF NOT EXISTS group_id BIGINT NOT NULL DEFAULT 0;");
     exec(R"(
         CREATE TABLE IF NOT EXISTS runbooks (
             runbook_id BIGSERIAL PRIMARY KEY,
@@ -504,29 +541,30 @@ void PostgresStore::init_schema()
             created_at BIGINT NOT NULL DEFAULT 0
         );
     )");
-    add_column_if_missing("runbooks", "agent_id", "ALTER TABLE runbooks ADD COLUMN agent_id TEXT NOT NULL DEFAULT '';");
-    add_column_if_missing("runbooks", "markdown", "ALTER TABLE runbooks ADD COLUMN markdown TEXT NOT NULL DEFAULT '';");
+    add_column_if_missing("runbooks", "agent_id",
+                          "ALTER TABLE runbooks ADD COLUMN IF NOT EXISTS agent_id TEXT NOT NULL DEFAULT '';");
+    add_column_if_missing("runbooks", "markdown",
+                          "ALTER TABLE runbooks ADD COLUMN IF NOT EXISTS markdown TEXT NOT NULL DEFAULT '';");
 }
 
 void PostgresStore::bootstrap_defaults()
 {
     LOG_FUNCTION_TRACE
-    // create_group is idempotent via INSERT … ON CONFLICT DO NOTHING
-    create_group("Admins");
-    const char* check_sql = "SELECT user_id FROM users WHERE username='thewatcher';";
-    Res res(PQexec(conn_, check_sql));
+    // Runs inside the constructor's migration transaction, so no other node can
+    // bootstrap at the same time and a failure leaves no half-created admin.
+    // create_group is idempotent via INSERT ... ON CONFLICT
+    const auto admin_group = create_group("Admins");
+    Res res(conn_.exec("SELECT user_id FROM users WHERE username='thewatcher';"));
     check_res(res.r, "bootstrap check admin");
     if (PQntuples(res.r) == 0)
     {
         const auto admin_id = create_user("thewatcher", hash_default_password(), "global_admin");
-        // Find admins group id
-        Res gres(PQexec(conn_, "SELECT group_id FROM groups WHERE name='Admins';"));
-        check_res(gres.r, "find Admins group");
-        if (PQntuples(gres.r) > 0)
-        {
-            const auto group_id = col_int64(gres.r, 0, 0);
-            set_user_groups(admin_id, {group_id});
-        }
+        const auto p_uid = s(admin_id);
+        const auto p_gid = s(admin_group);
+        const char* params[] = {p_uid.c_str(), p_gid.c_str()};
+        Res link(conn_.exec_params("INSERT INTO user_groups(user_id,group_id) VALUES($1,$2);", 2, nullptr, params,
+                                   nullptr, nullptr, 0));
+        check_res(link.r, "bootstrap admin group");
         exec("UPDATE users SET built_in=TRUE WHERE username='thewatcher';");
         LOG_INFO("Bootstrapped default admin user thewatcher");
     }
@@ -593,7 +631,7 @@ void PostgresStore::upsert_agent(const AgentRecord& rec)
         p_hi.c_str(),
         rec.runbook_markdown.c_str(),
     };
-    Res res(PQexecParams(conn_, R"(
+    Res res(conn_.exec_params(R"(
         INSERT INTO agents(agent_id,hostname,platform,curve_public_key_z85,approved,rejected,connected,
             maintenance,maintenance_reason,maintenance_until,collection_interval,process_limit,
             first_seen,last_seen,cpu_warning_pct_of_avg,cpu_degraded_pct_of_avg,cpu_critical_pct_of_avg,
@@ -618,7 +656,7 @@ void PostgresStore::upsert_agent(const AgentRecord& rec)
             runbook_markdown=EXCLUDED.runbook_markdown,
             last_seen=EXCLUDED.last_seen;
     )",
-                         30, nullptr, params, nullptr, nullptr, 0));
+                              30, nullptr, params, nullptr, nullptr, 0));
     check_res(res.r, "upsert_agent");
 }
 
@@ -637,8 +675,8 @@ namespace
 std::optional<AgentRecord> PostgresStore::get_agent(const std::string& agent_id)
 {
     const char* params[] = {agent_id.c_str()};
-    Res res(PQexecParams(conn_, (std::string(AGENT_SELECT) + " WHERE agent_id=$1;").c_str(), 1, nullptr, params,
-                         nullptr, nullptr, 0));
+    Res res(conn_.exec_params((std::string(AGENT_SELECT) + " WHERE agent_id=$1;").c_str(), 1, nullptr, params, nullptr,
+                              nullptr, 0));
     check_res(res.r, "get_agent");
     if (PQntuples(res.r) == 0)
         return std::nullopt;
@@ -647,7 +685,7 @@ std::optional<AgentRecord> PostgresStore::get_agent(const std::string& agent_id)
 
 std::vector<AgentRecord> PostgresStore::list_agents()
 {
-    Res res(PQexec(conn_, (std::string(AGENT_SELECT) + " ORDER BY last_seen DESC;").c_str()));
+    Res res(conn_.exec((std::string(AGENT_SELECT) + " ORDER BY last_seen DESC,agent_id;").c_str()));
     check_res(res.r, "list_agents");
     std::vector<AgentRecord> out;
     for (int i = 0; i < PQntuples(res.r); ++i)
@@ -657,9 +695,9 @@ std::vector<AgentRecord> PostgresStore::list_agents()
 
 std::vector<AgentRecord> PostgresStore::list_approved_agents()
 {
-    Res res(PQexec(
-        conn_,
-        (std::string(AGENT_SELECT) + " WHERE approved=TRUE AND rejected=FALSE ORDER BY last_seen DESC;").c_str()));
+    Res res(conn_.exec(
+        (std::string(AGENT_SELECT) + " WHERE approved=TRUE AND rejected=FALSE ORDER BY last_seen DESC,agent_id;")
+            .c_str()));
     check_res(res.r, "list_approved_agents");
     std::vector<AgentRecord> out;
     for (int i = 0; i < PQntuples(res.r); ++i)
@@ -669,9 +707,9 @@ std::vector<AgentRecord> PostgresStore::list_approved_agents()
 
 std::vector<AgentRecord> PostgresStore::list_pending_agents()
 {
-    Res res(PQexec(
-        conn_,
-        (std::string(AGENT_SELECT) + " WHERE approved=FALSE AND rejected=FALSE ORDER BY first_seen DESC;").c_str()));
+    Res res(conn_.exec(
+        (std::string(AGENT_SELECT) + " WHERE approved=FALSE AND rejected=FALSE ORDER BY first_seen DESC,agent_id;")
+            .c_str()));
     check_res(res.r, "list_pending_agents");
     std::vector<AgentRecord> out;
     for (int i = 0; i < PQntuples(res.r); ++i)
@@ -682,23 +720,23 @@ std::vector<AgentRecord> PostgresStore::list_pending_agents()
 void PostgresStore::approve_agent(const std::string& agent_id)
 {
     const char* params[] = {agent_id.c_str()};
-    Res res(PQexecParams(conn_, "UPDATE agents SET approved=TRUE,rejected=FALSE WHERE agent_id=$1;", 1, nullptr, params,
-                         nullptr, nullptr, 0));
+    Res res(conn_.exec_params("UPDATE agents SET approved=TRUE,rejected=FALSE WHERE agent_id=$1;", 1, nullptr, params,
+                              nullptr, nullptr, 0));
     check_res(res.r, "approve_agent");
 }
 
 void PostgresStore::reject_agent(const std::string& agent_id)
 {
     const char* params[] = {agent_id.c_str()};
-    Res res(PQexecParams(conn_, "UPDATE agents SET approved=FALSE,rejected=TRUE WHERE agent_id=$1;", 1, nullptr, params,
-                         nullptr, nullptr, 0));
+    Res res(conn_.exec_params("UPDATE agents SET approved=FALSE,rejected=TRUE WHERE agent_id=$1;", 1, nullptr, params,
+                              nullptr, nullptr, 0));
     check_res(res.r, "reject_agent");
 }
 
 void PostgresStore::delete_agent(const std::string& agent_id)
 {
     const char* params[] = {agent_id.c_str()};
-    Res res(PQexecParams(conn_, "DELETE FROM agents WHERE agent_id=$1;", 1, nullptr, params, nullptr, nullptr, 0));
+    Res res(conn_.exec_params("DELETE FROM agents WHERE agent_id=$1;", 1, nullptr, params, nullptr, nullptr, 0));
     check_res(res.r, "delete_agent");
 }
 
@@ -706,10 +744,9 @@ void PostgresStore::mark_agents_offline_before(int64_t cutoff_ms)
 {
     const auto p_cutoff = s(cutoff_ms);
     const char* params[] = {p_cutoff.c_str()};
-    Res res(PQexecParams(conn_,
-                         "UPDATE agents SET connected=FALSE WHERE approved=TRUE AND connected=TRUE "
-                         "AND last_seen>0 AND last_seen<$1 AND maintenance=FALSE;",
-                         1, nullptr, params, nullptr, nullptr, 0));
+    Res res(conn_.exec_params("UPDATE agents SET connected=FALSE WHERE approved=TRUE AND connected=TRUE "
+                              "AND last_seen>0 AND last_seen<$1 AND maintenance=FALSE;",
+                              1, nullptr, params, nullptr, nullptr, 0));
     check_res(res.r, "mark_agents_offline_before");
 }
 
@@ -719,8 +756,7 @@ void PostgresStore::set_agent_maintenance(const std::string& agent_id, bool main
     const auto p_maint = s(maintenance);
     const auto p_until = s(until_ms);
     const char* params[] = {p_maint.c_str(), reason.c_str(), p_until.c_str(), agent_id.c_str()};
-    Res res(PQexecParams(
-        conn_,
+    Res res(conn_.exec_params(
         "UPDATE agents SET maintenance=$1::boolean,maintenance_reason=$2,maintenance_until=$3 WHERE agent_id=$4;", 4,
         nullptr, params, nullptr, nullptr, 0));
     check_res(res.r, "set_agent_maintenance");
@@ -743,7 +779,7 @@ void PostgresStore::set_agent_thresholds(const AgentRecord& rec)
     const char* params[] = {p1.c_str(),  p2.c_str(),  p3.c_str(),          p4.c_str(), p5.c_str(),
                             p6.c_str(),  p7.c_str(),  p8.c_str(),          p9.c_str(), p10.c_str(),
                             p11.c_str(), p12.c_str(), rec.agent_id.c_str()};
-    Res res(PQexecParams(conn_, R"(
+    Res res(conn_.exec_params(R"(
         UPDATE agents SET
             cpu_warning_pct_of_avg=$1,cpu_degraded_pct_of_avg=$2,cpu_critical_pct_of_avg=$3,
             memory_warning_pct_of_avg=$4,memory_degraded_pct_of_avg=$5,memory_critical_pct_of_avg=$6,
@@ -751,7 +787,7 @@ void PostgresStore::set_agent_thresholds(const AgentRecord& rec)
             network_warning_pct_of_avg=$10,network_degraded_pct_of_avg=$11,network_critical_pct_of_avg=$12
         WHERE agent_id=$13;
     )",
-                         13, nullptr, params, nullptr, nullptr, 0));
+                              13, nullptr, params, nullptr, nullptr, 0));
     check_res(res.r, "set_agent_thresholds");
 }
 
@@ -759,8 +795,8 @@ void PostgresStore::set_agent_collector_config(const std::string& agent_id, cons
 {
     const auto cfg_json = nlohmann::json(config).dump();
     const char* params[] = {cfg_json.c_str(), agent_id.c_str()};
-    Res res(PQexecParams(conn_, "UPDATE agents SET collector_config_json=$1 WHERE agent_id=$2;", 2, nullptr, params,
-                         nullptr, nullptr, 0));
+    Res res(conn_.exec_params("UPDATE agents SET collector_config_json=$1 WHERE agent_id=$2;", 2, nullptr, params,
+                              nullptr, nullptr, 0));
     check_res(res.r, "set_agent_collector_config");
 }
 
@@ -768,8 +804,8 @@ void PostgresStore::touch_agent(const std::string& agent_id, int64_t last_seen_m
 {
     const auto p_ls = s(last_seen_ms);
     const char* params[] = {p_ls.c_str(), connected ? "true" : "false", agent_id.c_str()};
-    Res res(PQexecParams(conn_, "UPDATE agents SET last_seen=$1,connected=$2::boolean WHERE agent_id=$3;", 3, nullptr,
-                         params, nullptr, nullptr, 0));
+    Res res(conn_.exec_params("UPDATE agents SET last_seen=$1,connected=$2::boolean WHERE agent_id=$3;", 3, nullptr,
+                              params, nullptr, nullptr, 0));
     check_res(res.r, "touch_agent");
 }
 
@@ -777,7 +813,7 @@ void PostgresStore::update_agent_int(const char* sql, const char* ctx, const std
 {
     const auto p_value = s(value);
     const char* params[] = {p_value.c_str(), agent_id.c_str()};
-    Res res(PQexecParams(conn_, sql, 2, nullptr, params, nullptr, nullptr, 0));
+    Res res(conn_.exec_params(sql, 2, nullptr, params, nullptr, nullptr, 0));
     check_res(res.r, ctx);
 }
 
@@ -810,11 +846,10 @@ bool PostgresStore::save_agent_configuration(const std::string& agent_id, const 
     const char* runbook = update.runbook_markdown ? update.runbook_markdown->c_str() : nullptr;
     const char* params[] = {p_ci.c_str(), p_hi.c_str(), p_pl.c_str(), cfg_json.c_str(), runbook, agent_id.c_str()};
     {
-        Res res(PQexecParams(conn_,
-                             "UPDATE agents SET collection_interval=$1,heartbeat_interval=$2,process_limit=$3,"
-                             "collector_config_json=$4,runbook_markdown=COALESCE($5::text,runbook_markdown) "
-                             "WHERE agent_id=$6;",
-                             6, nullptr, params, nullptr, nullptr, 0));
+        Res res(conn_.exec_params("UPDATE agents SET collection_interval=$1,heartbeat_interval=$2,process_limit=$3,"
+                                  "collector_config_json=$4,runbook_markdown=COALESCE($5::text,runbook_markdown) "
+                                  "WHERE agent_id=$6;",
+                                  6, nullptr, params, nullptr, nullptr, 0));
         check_res(res.r, "save_agent_configuration");
         if (std::string(PQcmdTuples(res.r)) == "0")
             return false; // unknown agent: the guard rolls back the empty transaction
@@ -828,8 +863,8 @@ bool PostgresStore::save_agent_configuration(const std::string& agent_id, const 
 void PostgresStore::set_agent_description(const std::string& agent_id, const std::string& description)
 {
     const char* params[] = {description.c_str(), agent_id.c_str()};
-    Res res(PQexecParams(conn_, "UPDATE agents SET description=$1 WHERE agent_id=$2;", 2, nullptr, params, nullptr,
-                         nullptr, 0));
+    Res res(conn_.exec_params("UPDATE agents SET description=$1 WHERE agent_id=$2;", 2, nullptr, params, nullptr,
+                              nullptr, 0));
     check_res(res.r, "set_agent_description");
 }
 
@@ -838,14 +873,14 @@ void PostgresStore::set_agent_description(const std::string& agent_id, const std
 void PostgresStore::set_agent_runbook(const std::string& agent_id, const std::string& markdown)
 {
     const char* params[] = {markdown.c_str(), agent_id.c_str()};
-    Res res(PQexecParams(conn_, "UPDATE agents SET runbook_markdown=$1 WHERE agent_id=$2;", 2, nullptr, params, nullptr,
-                         nullptr, 0));
+    Res res(conn_.exec_params("UPDATE agents SET runbook_markdown=$1 WHERE agent_id=$2;", 2, nullptr, params, nullptr,
+                              nullptr, 0));
     check_res(res.r, "set_agent_runbook");
 }
 
 std::vector<GroupRecord> PostgresStore::list_groups()
 {
-    Res res(PQexec(conn_, "SELECT group_id,name,built_in FROM groups ORDER BY group_id;"));
+    Res res(conn_.exec("SELECT group_id,name,built_in FROM groups ORDER BY name COLLATE \"C\";"));
     check_res(res.r, "list_groups");
     std::vector<GroupRecord> out;
     for (int i = 0; i < PQntuples(res.r); ++i)
@@ -856,8 +891,7 @@ std::vector<GroupRecord> PostgresStore::list_groups()
 int64_t PostgresStore::create_group(const std::string& name)
 {
     const char* params[] = {name.c_str()};
-    Res res(PQexecParams(
-        conn_,
+    Res res(conn_.exec_params(
         "INSERT INTO groups(name) VALUES($1) ON CONFLICT(name) DO UPDATE SET name=EXCLUDED.name RETURNING group_id;", 1,
         nullptr, params, nullptr, nullptr, 0));
     check_res(res.r, "create_group");
@@ -867,8 +901,8 @@ int64_t PostgresStore::create_group(const std::string& name)
 std::vector<int64_t> PostgresStore::get_agent_groups(const std::string& agent_id)
 {
     const char* params[] = {agent_id.c_str()};
-    Res res(PQexecParams(conn_, "SELECT group_id FROM agent_groups WHERE agent_id=$1 ORDER BY group_id;", 1, nullptr,
-                         params, nullptr, nullptr, 0));
+    Res res(conn_.exec_params("SELECT group_id FROM agent_groups WHERE agent_id=$1 ORDER BY group_id;", 1, nullptr,
+                              params, nullptr, nullptr, 0));
     check_res(res.r, "get_agent_groups");
     std::vector<int64_t> out;
     for (int i = 0; i < PQntuples(res.r); ++i)
@@ -879,15 +913,15 @@ std::vector<int64_t> PostgresStore::get_agent_groups(const std::string& agent_id
 void PostgresStore::replace_agent_groups(const std::string& agent_id, const std::vector<int64_t>& group_ids)
 {
     const char* del_params[] = {agent_id.c_str()};
-    Res del(PQexecParams(conn_, "DELETE FROM agent_groups WHERE agent_id=$1;", 1, nullptr, del_params, nullptr, nullptr,
-                         0));
+    Res del(
+        conn_.exec_params("DELETE FROM agent_groups WHERE agent_id=$1;", 1, nullptr, del_params, nullptr, nullptr, 0));
     check_res(del.r, "set_agent_groups delete");
     for (auto gid : group_ids)
     {
         const auto p_gid = s(gid);
         const char* params[] = {agent_id.c_str(), p_gid.c_str()};
-        Res ins(PQexecParams(conn_, "INSERT INTO agent_groups(agent_id,group_id) VALUES($1,$2) ON CONFLICT DO NOTHING;",
-                             2, nullptr, params, nullptr, nullptr, 0));
+        Res ins(conn_.exec_params("INSERT INTO agent_groups(agent_id,group_id) VALUES($1,$2) ON CONFLICT DO NOTHING;",
+                                  2, nullptr, params, nullptr, nullptr, 0));
         check_res(ins.r, "set_agent_groups insert");
     }
 }
@@ -906,9 +940,9 @@ void PostgresStore::set_agent_groups(const std::string& agent_id, const std::vec
 std::optional<UserRecord> PostgresStore::get_user_by_username(const std::string& username)
 {
     const char* params[] = {username.c_str()};
-    Res res(PQexecParams(conn_,
-                         "SELECT user_id,username,password_hash,role,built_in,disabled FROM users WHERE username=$1;",
-                         1, nullptr, params, nullptr, nullptr, 0));
+    Res res(
+        conn_.exec_params("SELECT user_id,username,password_hash,role,built_in,disabled FROM users WHERE username=$1;",
+                          1, nullptr, params, nullptr, nullptr, 0));
     check_res(res.r, "get_user_by_username");
     if (PQntuples(res.r) == 0)
         return std::nullopt;
@@ -918,7 +952,8 @@ std::optional<UserRecord> PostgresStore::get_user_by_username(const std::string&
 
 std::vector<UserRecord> PostgresStore::list_users()
 {
-    Res res(PQexec(conn_, "SELECT user_id,username,password_hash,role,built_in,disabled FROM users ORDER BY user_id;"));
+    Res res(conn_.exec(
+        "SELECT user_id,username,password_hash,role,built_in,disabled FROM users ORDER BY username COLLATE \"C\";"));
     check_res(res.r, "list_users");
     std::vector<UserRecord> out;
     for (int i = 0; i < PQntuples(res.r); ++i)
@@ -931,8 +966,8 @@ int64_t PostgresStore::create_user(const std::string& username, const std::strin
                                    const std::string& role)
 {
     const char* params[] = {username.c_str(), password_hash.c_str(), role.c_str()};
-    Res res(PQexecParams(conn_, "INSERT INTO users(username,password_hash,role) VALUES($1,$2,$3) RETURNING user_id;", 3,
-                         nullptr, params, nullptr, nullptr, 0));
+    Res res(conn_.exec_params("INSERT INTO users(username,password_hash,role) VALUES($1,$2,$3) RETURNING user_id;", 3,
+                              nullptr, params, nullptr, nullptr, 0));
     check_res(res.r, "create_user");
     return col_int64(res.r, 0, 0);
 }
@@ -943,14 +978,14 @@ void PostgresStore::set_user_groups(int64_t user_id, const std::vector<int64_t>&
     const auto p_uid = s(user_id);
     const char* del_params[] = {p_uid.c_str()};
     Res del(
-        PQexecParams(conn_, "DELETE FROM user_groups WHERE user_id=$1;", 1, nullptr, del_params, nullptr, nullptr, 0));
+        conn_.exec_params("DELETE FROM user_groups WHERE user_id=$1;", 1, nullptr, del_params, nullptr, nullptr, 0));
     check_res(del.r, "set_user_groups delete");
     for (auto gid : group_ids)
     {
         const auto p_gid = s(gid);
         const char* params[] = {p_uid.c_str(), p_gid.c_str()};
-        Res ins(PQexecParams(conn_, "INSERT INTO user_groups(user_id,group_id) VALUES($1,$2) ON CONFLICT DO NOTHING;",
-                             2, nullptr, params, nullptr, nullptr, 0));
+        Res ins(conn_.exec_params("INSERT INTO user_groups(user_id,group_id) VALUES($1,$2) ON CONFLICT DO NOTHING;", 2,
+                                  nullptr, params, nullptr, nullptr, 0));
         check_res(ins.r, "set_user_groups insert");
     }
     tx.commit();
@@ -960,8 +995,8 @@ std::vector<int64_t> PostgresStore::get_user_groups(int64_t user_id)
 {
     const auto p_uid = s(user_id);
     const char* params[] = {p_uid.c_str()};
-    Res res(PQexecParams(conn_, "SELECT group_id FROM user_groups WHERE user_id=$1 ORDER BY group_id;", 1, nullptr,
-                         params, nullptr, nullptr, 0));
+    Res res(conn_.exec_params("SELECT group_id FROM user_groups WHERE user_id=$1 ORDER BY group_id;", 1, nullptr,
+                              params, nullptr, nullptr, 0));
     check_res(res.r, "get_user_groups");
     std::vector<int64_t> out;
     for (int i = 0; i < PQntuples(res.r); ++i)
@@ -977,8 +1012,8 @@ int PostgresStore::disable_user(int64_t user_id)
     const char* params[] = {p.c_str()};
     // SEC-14: the built-in admin must not be disableable — deleting it would
     // let the next bootstrap recreate it with the public default password.
-    Res res(PQexecParams(conn_, "UPDATE users SET disabled=TRUE WHERE user_id=$1 AND built_in=FALSE;", 1, nullptr,
-                         params, nullptr, nullptr, 0));
+    Res res(conn_.exec_params("UPDATE users SET disabled=TRUE WHERE user_id=$1 AND built_in=FALSE;", 1, nullptr, params,
+                              nullptr, nullptr, 0));
     check_res(res.r, "disable_user");
     const char* affected = PQcmdTuples(res.r);
     return affected != nullptr ? std::atoi(affected) : 0;
@@ -988,8 +1023,8 @@ void PostgresStore::enable_user(int64_t user_id)
 {
     const auto p = s(user_id);
     const char* params[] = {p.c_str()};
-    Res res(PQexecParams(conn_, "UPDATE users SET disabled=FALSE WHERE user_id=$1;", 1, nullptr, params, nullptr,
-                         nullptr, 0));
+    Res res(conn_.exec_params("UPDATE users SET disabled=FALSE WHERE user_id=$1;", 1, nullptr, params, nullptr, nullptr,
+                              0));
     check_res(res.r, "enable_user");
 }
 
@@ -1000,8 +1035,8 @@ int PostgresStore::delete_user(int64_t user_id)
     const auto p = s(user_id);
     const char* params[] = {p.c_str()};
     // SEC-14: same built_in guard as SQLite — never delete the bootstrap admin.
-    Res res(PQexecParams(conn_, "DELETE FROM users WHERE user_id=$1 AND built_in=FALSE;", 1, nullptr, params, nullptr,
-                         nullptr, 0));
+    Res res(conn_.exec_params("DELETE FROM users WHERE user_id=$1 AND built_in=FALSE;", 1, nullptr, params, nullptr,
+                              nullptr, 0));
     check_res(res.r, "delete_user");
     const char* affected = PQcmdTuples(res.r);
     return affected != nullptr ? std::atoi(affected) : 0;
@@ -1011,8 +1046,8 @@ void PostgresStore::update_user_password(int64_t user_id, const std::string& pas
 {
     const auto p_uid = s(user_id);
     const char* params[] = {password_hash.c_str(), p_uid.c_str()};
-    Res res(PQexecParams(conn_, "UPDATE users SET password_hash=$1 WHERE user_id=$2;", 2, nullptr, params, nullptr,
-                         nullptr, 0));
+    Res res(conn_.exec_params("UPDATE users SET password_hash=$1 WHERE user_id=$2;", 2, nullptr, params, nullptr,
+                              nullptr, 0));
     check_res(res.r, "update_user_password");
 }
 
@@ -1024,9 +1059,11 @@ void PostgresStore::create_session(const SessionRecord& session)
     const auto p_cat = s(session.created_at);
     const auto p_eat = s(session.expires_at);
     const char* params[] = {session.token.c_str(), p_uid.c_str(), p_cat.c_str(), p_eat.c_str()};
-    Res res(PQexecParams(
-        conn_, "INSERT INTO sessions(token,user_id,created_at,expires_at) VALUES($1,$2,$3,$4) ON CONFLICT DO NOTHING;",
-        4, nullptr, params, nullptr, nullptr, 0));
+    Res res(
+        conn_.exec_params("INSERT INTO sessions(token,user_id,created_at,expires_at) VALUES($1,$2,$3,$4) "
+                          "ON CONFLICT(token) DO UPDATE SET user_id=EXCLUDED.user_id,created_at=EXCLUDED.created_at,"
+                          "expires_at=EXCLUDED.expires_at;",
+                          4, nullptr, params, nullptr, nullptr, 0));
     check_res(res.r, "create_session");
 }
 
@@ -1036,12 +1073,12 @@ std::optional<SessionRecord> PostgresStore::get_session(const std::string& token
 {
     const auto p_now = s(now_ms);
     const char* params[] = {token.c_str(), p_now.c_str()};
-    Res res(PQexecParams(conn_, R"(
+    Res res(conn_.exec_params(R"(
         SELECT s.token,s.user_id,u.username,u.role,s.created_at,s.expires_at
         FROM sessions s JOIN users u ON u.user_id=s.user_id
         WHERE s.token=$1 AND s.expires_at>$2 AND u.disabled=FALSE;
     )",
-                         2, nullptr, params, nullptr, nullptr, 0));
+                              2, nullptr, params, nullptr, nullptr, 0));
     check_res(res.r, "get_session");
     if (PQntuples(res.r) == 0)
         return std::nullopt;
@@ -1052,7 +1089,7 @@ std::optional<SessionRecord> PostgresStore::get_session(const std::string& token
 void PostgresStore::delete_session(const std::string& token)
 {
     const char* params[] = {token.c_str()};
-    Res res(PQexecParams(conn_, "DELETE FROM sessions WHERE token=$1;", 1, nullptr, params, nullptr, nullptr, 0));
+    Res res(conn_.exec_params("DELETE FROM sessions WHERE token=$1;", 1, nullptr, params, nullptr, nullptr, 0));
     check_res(res.r, "delete_session");
 }
 
@@ -1063,19 +1100,20 @@ void PostgresStore::insert_metrics(const MetricsRow& row)
     const auto hex = to_bytea_hex(row.metrics_cbor);
     const auto p_ts = s(row.timestamp_ms);
     const char* params[] = {row.agent_id.c_str(), p_ts.c_str(), hex.c_str()};
-    Res res(PQexecParams(conn_, "INSERT INTO metrics(agent_id,timestamp_ms,metrics_cbor) VALUES($1,$2,$3);", 3, nullptr,
-                         params, nullptr, nullptr, 0));
+    Res res(conn_.exec_params("INSERT INTO metrics(agent_id,timestamp_ms,metrics_cbor) VALUES($1,$2,$3);", 3, nullptr,
+                              params, nullptr, nullptr, 0));
     check_res(res.r, "insert_metrics");
 }
 
 std::vector<MetricsRow> PostgresStore::get_metrics(const std::string& agent_id, int limit)
 {
+    if (limit <= 0)
+        return {}; // same on every backend: a non-positive limit returns nothing
     const auto p_lim = s(limit);
     const char* params[] = {agent_id.c_str(), p_lim.c_str()};
-    Res res(PQexecParams(conn_,
-                         "SELECT agent_id,timestamp_ms,metrics_cbor FROM metrics WHERE agent_id=$1 "
-                         "ORDER BY timestamp_ms DESC LIMIT $2;",
-                         2, nullptr, params, nullptr, nullptr, 0));
+    Res res(conn_.exec_params("SELECT agent_id,timestamp_ms,metrics_cbor FROM metrics WHERE agent_id=$1 "
+                              "ORDER BY timestamp_ms DESC,id DESC LIMIT $2;",
+                              2, nullptr, params, nullptr, nullptr, 0));
     check_res(res.r, "get_metrics");
     std::vector<MetricsRow> out;
     for (int i = 0; i < PQntuples(res.r); ++i)
@@ -1090,15 +1128,22 @@ std::vector<MetricsRow> PostgresStore::get_metrics(const std::string& agent_id, 
 }
 
 std::vector<MetricsRow> PostgresStore::get_metrics_in_window(const std::string& agent_id, int64_t since_ms,
-                                                             int64_t until_ms)
+                                                             int64_t until_ms, int limit)
 {
+    if (limit <= 0)
+        return {};
+    // The newest `limit` rows (a baseline built from stale data is wrong),
+    // returned oldest first: identical to SqliteStore.
     const auto p_since = s(since_ms);
     const auto p_until = s(until_ms);
-    const char* params[] = {agent_id.c_str(), p_since.c_str(), p_until.c_str()};
-    Res res(PQexecParams(conn_,
-                         "SELECT agent_id,timestamp_ms,metrics_cbor FROM metrics "
-                         "WHERE agent_id=$1 AND timestamp_ms>=$2 AND timestamp_ms<=$3 ORDER BY timestamp_ms ASC;",
-                         3, nullptr, params, nullptr, nullptr, 0));
+    const auto p_lim = s(limit);
+    const char* params[] = {agent_id.c_str(), p_since.c_str(), p_until.c_str(), p_lim.c_str()};
+    Res res(conn_.exec_params("SELECT agent_id,timestamp_ms,metrics_cbor FROM ("
+                              "SELECT id,agent_id,timestamp_ms,metrics_cbor FROM metrics "
+                              "WHERE agent_id=$1 AND timestamp_ms>=$2 AND timestamp_ms<=$3 "
+                              "ORDER BY timestamp_ms DESC,id DESC LIMIT $4) newest "
+                              "ORDER BY timestamp_ms ASC,id ASC;",
+                              4, nullptr, params, nullptr, nullptr, 0));
     check_res(res.r, "get_metrics_in_window");
     std::vector<MetricsRow> out;
     for (int i = 0; i < PQntuples(res.r); ++i)
@@ -1114,10 +1159,13 @@ std::vector<MetricsRow> PostgresStore::get_metrics_in_window(const std::string& 
 
 std::vector<MetricsRow> PostgresStore::latest_metrics()
 {
-    Res res(PQexec(conn_, R"(
-        SELECT DISTINCT ON (m.agent_id) m.agent_id, m.timestamp_ms, m.metrics_cbor
-        FROM metrics m
-        ORDER BY m.agent_id, m.timestamp_ms DESC;
+    Res res(conn_.exec(R"(
+        SELECT agent_id, timestamp_ms, metrics_cbor FROM (
+            SELECT DISTINCT ON (m.agent_id) m.agent_id, m.timestamp_ms, m.metrics_cbor
+            FROM metrics m
+            ORDER BY m.agent_id, m.timestamp_ms DESC, m.id DESC
+        ) latest
+        ORDER BY agent_id COLLATE "C";
     )"));
     check_res(res.r, "latest_metrics");
     std::vector<MetricsRow> out;
@@ -1134,10 +1182,19 @@ std::vector<MetricsRow> PostgresStore::latest_metrics()
 
 void PostgresStore::prune_metrics_before(int64_t cutoff_ms)
 {
+    // Batches keep each statement (and its locks and WAL) bounded on a large table.
     const auto p = s(cutoff_ms);
-    const char* params[] = {p.c_str()};
-    Res res(PQexecParams(conn_, "DELETE FROM metrics WHERE timestamp_ms<$1;", 1, nullptr, params, nullptr, nullptr, 0));
-    check_res(res.r, "prune_metrics_before");
+    const auto p_batch = s(kPruneBatchRows);
+    const char* params[] = {p.c_str(), p_batch.c_str()};
+    for (;;)
+    {
+        Res res(conn_.exec_params("DELETE FROM metrics WHERE id IN "
+                                  "(SELECT id FROM metrics WHERE timestamp_ms<$1 LIMIT $2);",
+                                  2, nullptr, params, nullptr, nullptr, 0));
+        check_res(res.r, "prune_metrics_before");
+        if (std::atoi(PQcmdTuples(res.r)) < kPruneBatchRows)
+            return;
+    }
 }
 
 int64_t PostgresStore::count_metrics_in_window(const std::string& agent_id, int64_t since_ms, int64_t until_ms)
@@ -1145,9 +1202,9 @@ int64_t PostgresStore::count_metrics_in_window(const std::string& agent_id, int6
     const auto p_since = s(since_ms);
     const auto p_until = s(until_ms);
     const char* params[] = {agent_id.c_str(), p_since.c_str(), p_until.c_str()};
-    Res res(PQexecParams(conn_,
-                         "SELECT COUNT(*) FROM metrics WHERE agent_id=$1 AND timestamp_ms>=$2 AND timestamp_ms<=$3;", 3,
-                         nullptr, params, nullptr, nullptr, 0));
+    Res res(
+        conn_.exec_params("SELECT COUNT(*) FROM metrics WHERE agent_id=$1 AND timestamp_ms>=$2 AND timestamp_ms<=$3;",
+                          3, nullptr, params, nullptr, nullptr, 0));
     check_res(res.r, "count_metrics_in_window");
     return col_int64(res.r, 0, 0);
 }
@@ -1159,10 +1216,9 @@ void PostgresStore::insert_status_history(const StatusHistoryRow& row)
     const auto p_cat = s(row.created_at);
     const char* params[] = {row.agent_id.c_str(),   row.indicator.c_str(), row.old_status.c_str(),
                             row.new_status.c_str(), row.message.c_str(),   p_cat.c_str()};
-    Res res(PQexecParams(conn_,
-                         "INSERT INTO status_history(agent_id,indicator,old_status,new_status,message,created_at) "
-                         "VALUES($1,$2,$3,$4,$5,$6);",
-                         6, nullptr, params, nullptr, nullptr, 0));
+    Res res(conn_.exec_params("INSERT INTO status_history(agent_id,indicator,old_status,new_status,message,created_at) "
+                              "VALUES($1,$2,$3,$4,$5,$6);",
+                              6, nullptr, params, nullptr, nullptr, 0));
     check_res(res.r, "insert_status_history");
 }
 
@@ -1170,10 +1226,10 @@ std::optional<StatusHistoryRow> PostgresStore::latest_status_for_indicator(const
                                                                            const std::string& indicator)
 {
     const char* params[] = {agent_id.c_str(), indicator.c_str()};
-    Res res(PQexecParams(conn_,
-                         "SELECT id,agent_id,indicator,old_status,new_status,message,created_at "
-                         "FROM status_history WHERE agent_id=$1 AND indicator=$2 ORDER BY created_at DESC LIMIT 1;",
-                         2, nullptr, params, nullptr, nullptr, 0));
+    Res res(conn_.exec_params(
+        "SELECT id,agent_id,indicator,old_status,new_status,message,created_at "
+        "FROM status_history WHERE agent_id=$1 AND indicator=$2 ORDER BY created_at DESC,id DESC LIMIT 1;",
+        2, nullptr, params, nullptr, nullptr, 0));
     check_res(res.r, "latest_status_for_indicator");
     if (PQntuples(res.r) == 0)
         return std::nullopt;
@@ -1183,12 +1239,13 @@ std::optional<StatusHistoryRow> PostgresStore::latest_status_for_indicator(const
 
 std::vector<StatusHistoryRow> PostgresStore::list_status_history(const std::string& agent_id, int limit)
 {
+    if (limit <= 0)
+        return {};
     const auto p_lim = s(limit);
     const char* params[] = {agent_id.c_str(), p_lim.c_str()};
-    Res res(PQexecParams(conn_,
-                         "SELECT id,agent_id,indicator,old_status,new_status,message,created_at "
-                         "FROM status_history WHERE agent_id=$1 ORDER BY created_at DESC LIMIT $2;",
-                         2, nullptr, params, nullptr, nullptr, 0));
+    Res res(conn_.exec_params("SELECT id,agent_id,indicator,old_status,new_status,message,created_at "
+                              "FROM status_history WHERE agent_id=$1 ORDER BY created_at DESC,id DESC LIMIT $2;",
+                              2, nullptr, params, nullptr, nullptr, 0));
     check_res(res.r, "list_status_history");
     std::vector<StatusHistoryRow> out;
     for (int i = 0; i < PQntuples(res.r); ++i)
@@ -1203,9 +1260,9 @@ std::optional<PendingStatusRecord> PostgresStore::get_pending_status(const std::
                                                                      const std::string& indicator)
 {
     const char* params[] = {agent_id.c_str(), indicator.c_str()};
-    Res res(PQexecParams(
-        conn_, "SELECT agent_id,indicator,target_status,count FROM pending_status WHERE agent_id=$1 AND indicator=$2;",
-        2, nullptr, params, nullptr, nullptr, 0));
+    Res res(conn_.exec_params(
+        "SELECT agent_id,indicator,target_status,count FROM pending_status WHERE agent_id=$1 AND indicator=$2;", 2,
+        nullptr, params, nullptr, nullptr, 0));
     check_res(res.r, "get_pending_status");
     if (PQntuples(res.r) == 0)
         return std::nullopt;
@@ -1217,20 +1274,20 @@ void PostgresStore::set_pending_status(const std::string& agent_id, const std::s
 {
     const auto p_count = s(count);
     const char* params[] = {agent_id.c_str(), indicator.c_str(), target_status.c_str(), p_count.c_str()};
-    Res res(PQexecParams(conn_, R"(
+    Res res(conn_.exec_params(R"(
         INSERT INTO pending_status(agent_id,indicator,target_status,count)
         VALUES($1,$2,$3,$4)
         ON CONFLICT(agent_id,indicator) DO UPDATE SET target_status=$3,count=$4;
     )",
-                         4, nullptr, params, nullptr, nullptr, 0));
+                              4, nullptr, params, nullptr, nullptr, 0));
     check_res(res.r, "set_pending_status");
 }
 
 void PostgresStore::clear_pending_status(const std::string& agent_id, const std::string& indicator)
 {
     const char* params[] = {agent_id.c_str(), indicator.c_str()};
-    Res res(PQexecParams(conn_, "DELETE FROM pending_status WHERE agent_id=$1 AND indicator=$2;", 2, nullptr, params,
-                         nullptr, nullptr, 0));
+    Res res(conn_.exec_params("DELETE FROM pending_status WHERE agent_id=$1 AND indicator=$2;", 2, nullptr, params,
+                              nullptr, nullptr, 0));
     check_res(res.r, "clear_pending_status");
 }
 
@@ -1254,13 +1311,13 @@ int64_t PostgresStore::insert_alert(const AlertRecord& alert)
                             alert.note.c_str(),
                             p_eat.c_str(),
                             alert.runbook_url.c_str()};
-    Res res(PQexecParams(conn_, R"(
+    Res res(conn_.exec_params(R"(
         INSERT INTO alerts(agent_id,indicator,old_status,new_status,message,created_at,
             acknowledged_by,acknowledged_at,deleted_at,note,escalated_at,runbook_url)
         VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
         RETURNING alert_id;
     )",
-                         12, nullptr, params, nullptr, nullptr, 0));
+                              12, nullptr, params, nullptr, nullptr, 0));
     check_res(res.r, "insert_alert");
     return col_int64(res.r, 0, 0);
 }
@@ -1277,8 +1334,8 @@ int64_t PostgresStore::insert_heartbeat_alert_if_absent(const AlertRecord& alert
     {
         const std::string lock_key = "thewatcher:heartbeat:" + alert.agent_id;
         const char* lock_params[] = {lock_key.c_str()};
-        Res lock(PQexecParams(conn_, "SELECT pg_advisory_xact_lock(hashtext($1));", 1, nullptr, lock_params, nullptr,
-                              nullptr, 0));
+        Res lock(conn_.exec_params("SELECT pg_advisory_xact_lock(hashtext($1));", 1, nullptr, lock_params, nullptr,
+                                   nullptr, 0));
         check_res(lock.r, "insert_heartbeat_alert_if_absent lock");
     }
     const auto p_cat = s(alert.created_at);
@@ -1296,7 +1353,7 @@ int64_t PostgresStore::insert_heartbeat_alert_if_absent(const AlertRecord& alert
                             alert.note.c_str(),
                             p_eat.c_str(),
                             alert.runbook_url.c_str()};
-    Res res(PQexecParams(conn_, R"(
+    Res res(conn_.exec_params(R"(
         INSERT INTO alerts(agent_id,indicator,old_status,new_status,message,created_at,
             acknowledged_by,acknowledged_at,deleted_at,note,escalated_at,runbook_url)
         SELECT $1::text,'Heartbeat',$2,$3,$4,$5::bigint,$6,$7::bigint,$8::bigint,$9,$10::bigint,$11
@@ -1305,7 +1362,7 @@ int64_t PostgresStore::insert_heartbeat_alert_if_absent(const AlertRecord& alert
         )
         RETURNING alert_id;
     )",
-                         11, nullptr, params, nullptr, nullptr, 0));
+                              11, nullptr, params, nullptr, nullptr, 0));
     check_res(res.r, "insert_heartbeat_alert_if_absent");
     const int64_t alert_id = PQntuples(res.r) > 0 ? col_int64(res.r, 0, 0) : 0;
     tx.commit();
@@ -1327,7 +1384,7 @@ std::vector<AlertRecord> PostgresStore::list_alerts(bool include_deleted)
                                       : "SELECT alert_id,agent_id,indicator,old_status,new_status,message,created_at,"
                                         "acknowledged_by,acknowledged_at,deleted_at,note,escalated_at,runbook_url "
                                         "FROM alerts WHERE deleted_at=0 ORDER BY created_at DESC,alert_id DESC;";
-    Res res(PQexec(conn_, sql));
+    Res res(conn_.exec(sql));
     check_res(res.r, "list_alerts");
     std::vector<AlertRecord> out;
     for (int i = 0; i < PQntuples(res.r); ++i)
@@ -1337,10 +1394,9 @@ std::vector<AlertRecord> PostgresStore::list_alerts(bool include_deleted)
 
 std::vector<AlertRecord> PostgresStore::list_unacknowledged_alerts()
 {
-    Res res(PQexec(conn_,
-                   "SELECT alert_id,agent_id,indicator,old_status,new_status,message,created_at,"
-                   "acknowledged_by,acknowledged_at,deleted_at,note,escalated_at,runbook_url "
-                   "FROM alerts WHERE deleted_at=0 AND acknowledged_at=0 ORDER BY created_at DESC,alert_id DESC;"));
+    Res res(conn_.exec("SELECT alert_id,agent_id,indicator,old_status,new_status,message,created_at,"
+                       "acknowledged_by,acknowledged_at,deleted_at,note,escalated_at,runbook_url "
+                       "FROM alerts WHERE deleted_at=0 AND acknowledged_at=0 ORDER BY created_at DESC,alert_id DESC;"));
     check_res(res.r, "list_unacknowledged_alerts");
     std::vector<AlertRecord> out;
     for (int i = 0; i < PQntuples(res.r); ++i)
@@ -1354,8 +1410,8 @@ void PostgresStore::acknowledge_alert(int64_t alert_id, const std::string& usern
     const auto p_id = s(alert_id);
     const auto p_aat = s(acknowledged_at);
     const char* params[] = {username.c_str(), p_aat.c_str(), note.c_str(), p_id.c_str()};
-    Res res(PQexecParams(
-        conn_, "UPDATE alerts SET acknowledged_by=$1,acknowledged_at=$2,note=$3 WHERE alert_id=$4 AND deleted_at=0;", 4,
+    Res res(conn_.exec_params(
+        "UPDATE alerts SET acknowledged_by=$1,acknowledged_at=$2,note=$3 WHERE alert_id=$4 AND deleted_at=0;", 4,
         nullptr, params, nullptr, nullptr, 0));
     check_res(res.r, "acknowledge_alert");
 }
@@ -1375,8 +1431,8 @@ void PostgresStore::soft_delete_alert(int64_t alert_id, int64_t deleted_at)
     const auto p_id = s(alert_id);
     const auto p_dat = s(deleted_at);
     const char* params[] = {p_dat.c_str(), p_id.c_str()};
-    Res res(PQexecParams(conn_, "UPDATE alerts SET deleted_at=$1 WHERE alert_id=$2;", 2, nullptr, params, nullptr,
-                         nullptr, 0));
+    Res res(conn_.exec_params("UPDATE alerts SET deleted_at=$1 WHERE alert_id=$2;", 2, nullptr, params, nullptr,
+                              nullptr, 0));
     check_res(res.r, "soft_delete_alert");
 }
 
@@ -1392,16 +1448,15 @@ void PostgresStore::clear_active_alerts_for_agent(const std::string& agent_id, i
 {
     const auto p_cat = s(cleared_at);
     const char* params[] = {p_cat.c_str(), agent_id.c_str()};
-    Res res(PQexecParams(conn_,
-                         "UPDATE alerts SET acknowledged_by='maintenance',acknowledged_at=$1 "
-                         "WHERE agent_id=$2 AND acknowledged_at=0 AND deleted_at=0;",
-                         2, nullptr, params, nullptr, nullptr, 0));
+    Res res(conn_.exec_params("UPDATE alerts SET acknowledged_by='maintenance',acknowledged_at=$1 "
+                              "WHERE agent_id=$2 AND acknowledged_at=0 AND deleted_at=0;",
+                              2, nullptr, params, nullptr, nullptr, 0));
     check_res(res.r, "clear_active_alerts_for_agent");
 }
 
 std::vector<std::string> PostgresStore::get_offline_unalerted_agent_ids()
 {
-    Res res(PQexec(conn_, R"(
+    Res res(conn_.exec(R"(
         SELECT a.agent_id FROM agents a WHERE a.approved=TRUE AND a.connected=FALSE
         AND a.maintenance=FALSE AND a.last_seen>0
         AND NOT EXISTS (
@@ -1432,9 +1487,9 @@ void PostgresStore::archive_heartbeat_alerts_for_agent(const std::string& agent_
 {
     const auto p_dat = s(deleted_at);
     const char* params[] = {p_dat.c_str(), agent_id.c_str()};
-    Res res(PQexecParams(
-        conn_, "UPDATE alerts SET deleted_at=$1 WHERE agent_id=$2 AND indicator='Heartbeat' AND deleted_at=0;", 2,
-        nullptr, params, nullptr, nullptr, 0));
+    Res res(conn_.exec_params(
+        "UPDATE alerts SET deleted_at=$1 WHERE agent_id=$2 AND indicator='Heartbeat' AND deleted_at=0;", 2, nullptr,
+        params, nullptr, nullptr, 0));
     check_res(res.r, "archive_heartbeat_alerts_for_agent");
 }
 
@@ -1443,10 +1498,9 @@ void PostgresStore::escalate_old_alerts(int64_t cutoff_ms, int64_t now_ms)
     const auto p_now = s(now_ms);
     const auto p_cutoff = s(cutoff_ms);
     const char* params[] = {p_now.c_str(), p_cutoff.c_str()};
-    Res res(PQexecParams(conn_,
-                         "UPDATE alerts SET escalated_at=$1 WHERE deleted_at=0 AND acknowledged_at=0 "
-                         "AND escalated_at=0 AND created_at<$2;",
-                         2, nullptr, params, nullptr, nullptr, 0));
+    Res res(conn_.exec_params("UPDATE alerts SET escalated_at=$1 WHERE deleted_at=0 AND acknowledged_at=0 "
+                              "AND escalated_at=0 AND created_at<$2;",
+                              2, nullptr, params, nullptr, nullptr, 0));
     check_res(res.r, "escalate_old_alerts");
 }
 
@@ -1459,18 +1513,17 @@ int64_t PostgresStore::create_maintenance_window(const MaintenanceWindowRecord& 
     const auto p_cat = s(rec.created_at);
     const char* params[] = {rec.agent_id.c_str(), p_start.c_str(),        p_end.c_str(),
                             rec.reason.c_str(),   rec.created_by.c_str(), p_cat.c_str()};
-    Res res(PQexecParams(conn_,
-                         "INSERT INTO maintenance_windows(agent_id,start_ms,end_ms,reason,created_by,created_at) "
-                         "VALUES($1,$2,$3,$4,$5,$6) RETURNING window_id;",
-                         6, nullptr, params, nullptr, nullptr, 0));
+    Res res(conn_.exec_params("INSERT INTO maintenance_windows(agent_id,start_ms,end_ms,reason,created_by,created_at) "
+                              "VALUES($1,$2,$3,$4,$5,$6) RETURNING window_id;",
+                              6, nullptr, params, nullptr, nullptr, 0));
     check_res(res.r, "create_maintenance_window");
     return col_int64(res.r, 0, 0);
 }
 
 std::vector<MaintenanceWindowRecord> PostgresStore::list_maintenance_windows()
 {
-    Res res(PQexec(conn_, "SELECT window_id,agent_id,start_ms,end_ms,reason,created_by,created_at "
-                          "FROM maintenance_windows ORDER BY start_ms DESC;"));
+    Res res(conn_.exec("SELECT window_id,agent_id,start_ms,end_ms,reason,created_by,created_at "
+                       "FROM maintenance_windows ORDER BY start_ms DESC,window_id DESC;"));
     check_res(res.r, "list_maintenance_windows");
     std::vector<MaintenanceWindowRecord> out;
     for (int i = 0; i < PQntuples(res.r); ++i)
@@ -1483,8 +1536,8 @@ void PostgresStore::delete_maintenance_window(int64_t window_id)
 {
     const auto p = s(window_id);
     const char* params[] = {p.c_str()};
-    Res res(PQexecParams(conn_, "DELETE FROM maintenance_windows WHERE window_id=$1;", 1, nullptr, params, nullptr,
-                         nullptr, 0));
+    Res res(conn_.exec_params("DELETE FROM maintenance_windows WHERE window_id=$1;", 1, nullptr, params, nullptr,
+                              nullptr, 0));
     check_res(res.r, "delete_maintenance_window");
 }
 
@@ -1492,10 +1545,10 @@ std::vector<MaintenanceWindowRecord> PostgresStore::active_maintenance_windows(i
 {
     const auto p = s(now_ms);
     const char* params[] = {p.c_str()};
-    Res res(PQexecParams(conn_,
-                         "SELECT window_id,agent_id,start_ms,end_ms,reason,created_by,created_at "
-                         "FROM maintenance_windows WHERE start_ms<=$1 AND end_ms>$1;",
-                         1, nullptr, params, nullptr, nullptr, 0));
+    Res res(conn_.exec_params(
+        "SELECT window_id,agent_id,start_ms,end_ms,reason,created_by,created_at "
+        "FROM maintenance_windows WHERE start_ms<=$1 AND end_ms>$1 ORDER BY start_ms DESC,window_id DESC;",
+        1, nullptr, params, nullptr, nullptr, 0));
     check_res(res.r, "active_maintenance_windows");
     std::vector<MaintenanceWindowRecord> out;
     for (int i = 0; i < PQntuples(res.r); ++i)
@@ -1509,8 +1562,8 @@ std::vector<MaintenanceWindowRecord> PostgresStore::active_maintenance_windows(i
 std::string PostgresStore::get_setting(const std::string& key, const std::string& fallback)
 {
     const char* params[] = {key.c_str()};
-    Res res(PQexecParams(conn_, "SELECT value FROM server_settings WHERE key=$1;", 1, nullptr, params, nullptr, nullptr,
-                         0));
+    Res res(
+        conn_.exec_params("SELECT value FROM server_settings WHERE key=$1;", 1, nullptr, params, nullptr, nullptr, 0));
     check_res(res.r, "get_setting");
     if (PQntuples(res.r) == 0)
         return fallback;
@@ -1520,10 +1573,9 @@ std::string PostgresStore::get_setting(const std::string& key, const std::string
 void PostgresStore::set_setting(const std::string& key, const std::string& value)
 {
     const char* params[] = {key.c_str(), value.c_str()};
-    Res res(PQexecParams(conn_,
-                         "INSERT INTO server_settings(key,value) VALUES($1,$2) "
-                         "ON CONFLICT(key) DO UPDATE SET value=$2;",
-                         2, nullptr, params, nullptr, nullptr, 0));
+    Res res(conn_.exec_params("INSERT INTO server_settings(key,value) VALUES($1,$2) "
+                              "ON CONFLICT(key) DO UPDATE SET value=$2;",
+                              2, nullptr, params, nullptr, nullptr, 0));
     check_res(res.r, "set_setting");
 }
 
@@ -1535,18 +1587,17 @@ int64_t PostgresStore::create_silence(const SilenceRecord& rec)
     const auto p_cat = s(rec.created_at);
     const char* params[] = {rec.agent_id.c_str(), rec.indicator.c_str(),  rec.reason.c_str(),
                             p_until.c_str(),      rec.created_by.c_str(), p_cat.c_str()};
-    Res res(PQexecParams(conn_,
-                         "INSERT INTO silences(agent_id,indicator,reason,until_ms,created_by,created_at) "
-                         "VALUES($1,$2,$3,$4,$5,$6) RETURNING silence_id;",
-                         6, nullptr, params, nullptr, nullptr, 0));
+    Res res(conn_.exec_params("INSERT INTO silences(agent_id,indicator,reason,until_ms,created_by,created_at) "
+                              "VALUES($1,$2,$3,$4,$5,$6) RETURNING silence_id;",
+                              6, nullptr, params, nullptr, nullptr, 0));
     check_res(res.r, "create_silence");
     return col_int64(res.r, 0, 0);
 }
 
 std::vector<SilenceRecord> PostgresStore::list_silences()
 {
-    Res res(PQexec(conn_, "SELECT silence_id,agent_id,indicator,reason,until_ms,created_by,created_at "
-                          "FROM silences ORDER BY created_at DESC;"));
+    Res res(conn_.exec("SELECT silence_id,agent_id,indicator,reason,until_ms,created_by,created_at "
+                       "FROM silences ORDER BY created_at DESC,silence_id DESC;"));
     check_res(res.r, "list_silences");
     std::vector<SilenceRecord> out;
     for (int i = 0; i < PQntuples(res.r); ++i)
@@ -1559,7 +1610,7 @@ void PostgresStore::delete_silence(int64_t silence_id)
 {
     const auto p = s(silence_id);
     const char* params[] = {p.c_str()};
-    Res res(PQexecParams(conn_, "DELETE FROM silences WHERE silence_id=$1;", 1, nullptr, params, nullptr, nullptr, 0));
+    Res res(conn_.exec_params("DELETE FROM silences WHERE silence_id=$1;", 1, nullptr, params, nullptr, nullptr, 0));
     check_res(res.r, "delete_silence");
 }
 
@@ -1567,14 +1618,14 @@ bool PostgresStore::is_silenced(const std::string& agent_id, const std::string& 
 {
     const auto p_now = s(now_ms);
     const char* params[] = {agent_id.c_str(), indicator.c_str(), p_now.c_str()};
-    Res res(PQexecParams(conn_, R"(
+    Res res(conn_.exec_params(R"(
         SELECT 1 FROM silences
         WHERE (agent_id=$1 OR agent_id='*')
           AND (indicator=$2 OR indicator='*')
           AND until_ms>$3
         LIMIT 1;
     )",
-                         3, nullptr, params, nullptr, nullptr, 0));
+                              3, nullptr, params, nullptr, nullptr, 0));
     check_res(res.r, "is_silenced");
     return PQntuples(res.r) > 0;
 }
@@ -1586,21 +1637,21 @@ void PostgresStore::insert_log_match(const LogMatchRecord& rec)
     const auto p_cat = s(rec.created_at);
     const char* params[] = {rec.agent_id.c_str(),     rec.indicator_name.c_str(), rec.path.c_str(),
                             rec.matched_line.c_str(), rec.severity.c_str(),       p_cat.c_str()};
-    Res res(PQexecParams(conn_,
-                         "INSERT INTO log_matches(agent_id,indicator_name,path,matched_line,severity,created_at) "
-                         "VALUES($1,$2,$3,$4,$5,$6);",
-                         6, nullptr, params, nullptr, nullptr, 0));
+    Res res(conn_.exec_params("INSERT INTO log_matches(agent_id,indicator_name,path,matched_line,severity,created_at) "
+                              "VALUES($1,$2,$3,$4,$5,$6);",
+                              6, nullptr, params, nullptr, nullptr, 0));
     check_res(res.r, "insert_log_match");
 }
 
 std::vector<LogMatchRecord> PostgresStore::list_log_matches(const std::string& agent_id, int limit)
 {
+    if (limit <= 0)
+        return {};
     const auto p_lim = s(limit);
     const char* params[] = {agent_id.c_str(), p_lim.c_str()};
-    Res res(PQexecParams(conn_,
-                         "SELECT match_id,agent_id,indicator_name,path,matched_line,severity,created_at "
-                         "FROM log_matches WHERE agent_id=$1 ORDER BY created_at DESC LIMIT $2;",
-                         2, nullptr, params, nullptr, nullptr, 0));
+    Res res(conn_.exec_params("SELECT match_id,agent_id,indicator_name,path,matched_line,severity,created_at "
+                              "FROM log_matches WHERE agent_id=$1 ORDER BY created_at DESC,match_id DESC LIMIT $2;",
+                              2, nullptr, params, nullptr, nullptr, 0));
     check_res(res.r, "list_log_matches");
     std::vector<LogMatchRecord> out;
     for (int i = 0; i < PQntuples(res.r); ++i)
@@ -1659,10 +1710,9 @@ int64_t PostgresStore::create_view(const ViewRecord& rec)
     const auto p_cat = s(rec.created_at);
     const char* params[] = {rec.name.c_str(), p_uid.c_str(),    p_pub.c_str(),
                             p_group.c_str(),  cfg_json.c_str(), p_cat.c_str()};
-    Res res(PQexecParams(conn_,
-                         "INSERT INTO views(name,owner_user_id,is_public,group_id,config_json,created_at) "
-                         "VALUES($1,$2,$3::boolean,$4,$5,$6) RETURNING view_id;",
-                         6, nullptr, params, nullptr, nullptr, 0));
+    Res res(conn_.exec_params("INSERT INTO views(name,owner_user_id,is_public,group_id,config_json,created_at) "
+                              "VALUES($1,$2,$3::boolean,$4,$5,$6) RETURNING view_id;",
+                              6, nullptr, params, nullptr, nullptr, 0));
     check_res(res.r, "create_view");
     return col_int64(res.r, 0, 0);
 }
@@ -1671,12 +1721,12 @@ std::optional<ViewRecord> PostgresStore::get_view(int64_t view_id)
 {
     const auto p = s(view_id);
     const char* params[] = {p.c_str()};
-    Res res(PQexecParams(conn_, R"(
+    Res res(conn_.exec_params(R"(
         SELECT v.view_id,v.name,v.owner_user_id,COALESCE(u.username,''),v.is_public,v.group_id,v.created_at,v.config_json
         FROM views v LEFT JOIN users u ON u.user_id=v.owner_user_id
         WHERE v.view_id=$1;
     )",
-                         1, nullptr, params, nullptr, nullptr, 0));
+                              1, nullptr, params, nullptr, nullptr, 0));
     check_res(res.r, "get_view");
     if (PQntuples(res.r) == 0)
         return std::nullopt;
@@ -1687,14 +1737,14 @@ std::vector<ViewRecord> PostgresStore::list_views(int64_t user_id)
 {
     const auto p = s(user_id);
     const char* params[] = {p.c_str()};
-    Res res(PQexecParams(conn_, R"(
+    Res res(conn_.exec_params(R"(
         SELECT v.view_id,v.name,v.owner_user_id,COALESCE(u.username,''),v.is_public,v.group_id,v.created_at,v.config_json
         FROM views v LEFT JOIN users u ON u.user_id=v.owner_user_id
         WHERE $1::bigint <= 0 OR v.owner_user_id=$1 OR v.is_public=TRUE
            OR EXISTS (SELECT 1 FROM user_groups ug WHERE ug.user_id=$1 AND ug.group_id=v.group_id)
-        ORDER BY v.created_at ASC;
+        ORDER BY v.created_at ASC,v.view_id ASC;
     )",
-                         1, nullptr, params, nullptr, nullptr, 0));
+                              1, nullptr, params, nullptr, nullptr, 0));
     check_res(res.r, "list_views");
     std::vector<ViewRecord> out;
     for (int i = 0; i < PQntuples(res.r); ++i)
@@ -1712,9 +1762,9 @@ void PostgresStore::update_view(const ViewRecord& rec)
     const auto p_group = s(rec.group_id);
     const auto p_id = s(rec.view_id);
     const char* params[] = {rec.name.c_str(), p_pub.c_str(), p_group.c_str(), cfg_json.c_str(), p_id.c_str()};
-    Res res(PQexecParams(conn_,
-                         "UPDATE views SET name=$1,is_public=$2::boolean,group_id=$3,config_json=$4 WHERE view_id=$5;",
-                         5, nullptr, params, nullptr, nullptr, 0));
+    Res res(
+        conn_.exec_params("UPDATE views SET name=$1,is_public=$2::boolean,group_id=$3,config_json=$4 WHERE view_id=$5;",
+                          5, nullptr, params, nullptr, nullptr, 0));
     check_res(res.r, "update_view");
 }
 
@@ -1722,7 +1772,7 @@ void PostgresStore::delete_view(int64_t view_id)
 {
     const auto p = s(view_id);
     const char* params[] = {p.c_str()};
-    Res res(PQexecParams(conn_, "DELETE FROM views WHERE view_id=$1;", 1, nullptr, params, nullptr, nullptr, 0));
+    Res res(conn_.exec_params("DELETE FROM views WHERE view_id=$1;", 1, nullptr, params, nullptr, nullptr, 0));
     check_res(res.r, "delete_view");
 }
 
@@ -1733,18 +1783,18 @@ int64_t PostgresStore::create_runbook(const RunbookRecord& rec)
     const auto p_cat = s(rec.created_at);
     const char* params[] = {rec.agent_id.c_str(), rec.indicator.c_str(), rec.status.c_str(),     rec.url.c_str(),
                             rec.markdown.c_str(), rec.notes.c_str(),     rec.created_by.c_str(), p_cat.c_str()};
-    Res res(PQexecParams(conn_,
-                         "INSERT INTO runbooks(agent_id,indicator,status,url,markdown,notes,created_by,created_at) "
-                         "VALUES($1,$2,$3,$4,$5,$6,$7,$8) RETURNING runbook_id;",
-                         8, nullptr, params, nullptr, nullptr, 0));
+    Res res(
+        conn_.exec_params("INSERT INTO runbooks(agent_id,indicator,status,url,markdown,notes,created_by,created_at) "
+                          "VALUES($1,$2,$3,$4,$5,$6,$7,$8) RETURNING runbook_id;",
+                          8, nullptr, params, nullptr, nullptr, 0));
     check_res(res.r, "create_runbook");
     return col_int64(res.r, 0, 0);
 }
 
 std::vector<RunbookRecord> PostgresStore::list_runbooks()
 {
-    Res res(PQexec(conn_, "SELECT runbook_id,agent_id,indicator,status,url,markdown,notes,created_by,created_at "
-                          "FROM runbooks ORDER BY created_at ASC;"));
+    Res res(conn_.exec("SELECT runbook_id,agent_id,indicator,status,url,markdown,notes,created_by,created_at "
+                       "FROM runbooks ORDER BY created_at ASC,runbook_id ASC;"));
     check_res(res.r, "list_runbooks");
     std::vector<RunbookRecord> out;
     for (int i = 0; i < PQntuples(res.r); ++i)
@@ -1768,7 +1818,7 @@ void PostgresStore::delete_runbook(int64_t runbook_id)
 {
     const auto p = s(runbook_id);
     const char* params[] = {p.c_str()};
-    Res res(PQexecParams(conn_, "DELETE FROM runbooks WHERE runbook_id=$1;", 1, nullptr, params, nullptr, nullptr, 0));
+    Res res(conn_.exec_params("DELETE FROM runbooks WHERE runbook_id=$1;", 1, nullptr, params, nullptr, nullptr, 0));
     check_res(res.r, "delete_runbook");
 }
 
@@ -1777,7 +1827,7 @@ std::optional<RunbookRecord> PostgresStore::get_runbook(const std::string& agent
 {
     // SEC-11: same selection rules as SqliteStore::get_runbook.
     const char* params[] = {agent_id.c_str(), indicator.c_str(), status.c_str()};
-    Res res(PQexecParams(conn_, R"(
+    Res res(conn_.exec_params(R"(
         SELECT runbook_id,agent_id,indicator,status,url,markdown,notes,created_by,created_at
         FROM runbooks
         WHERE (agent_id=$1 OR agent_id='') AND (indicator=$2 OR indicator='*') AND status=$3
@@ -1785,7 +1835,7 @@ std::optional<RunbookRecord> PostgresStore::get_runbook(const std::string& agent
                  CASE WHEN agent_id='' THEN 1 ELSE 0 END, runbook_id DESC
         LIMIT 1;
     )",
-                         3, nullptr, params, nullptr, nullptr, 0));
+                              3, nullptr, params, nullptr, nullptr, 0));
     check_res(res.r, "get_runbook");
     if (PQntuples(res.r) == 0)
         return std::nullopt;

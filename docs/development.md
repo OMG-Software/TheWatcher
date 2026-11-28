@@ -81,6 +81,44 @@ npm.cmd test
   capture `this` or values, not references to stack-local helper lambdas from
   route setup.
 
+## PostgreSQL Tests
+
+The PostgreSQL store is built when Meson finds libpq (`libpq-dev` on
+Debian/Ubuntu). Two tests then exist besides the SQLite ones:
+
+- `store_postgres_suite` runs every scenario of `server_tests/store_test.cpp`
+  against a `PostgresStore`, each in its own throwaway schema, so the two
+  backends are held to one contract.
+- `store_postgres` has the PostgreSQL-only scenarios: migration of an old
+  schema, non-public schemas, nodes starting together, reconnection, rollback,
+  multi-node sharing.
+
+They need a server and a role that may create schemas in a database. Point them
+at it with `THEWATCHER_POSTGRES_TEST_DSN` (the default is
+`host=localhost dbname=thewatcher_test user=thewatcher_test
+password=thewatcher_test`). Tests create and drop their own `tw_test_*`
+schemas, so they are safe to re-run on a used database and never touch your
+data.
+
+```bash
+# one-off: a private cluster, no root or Docker needed
+P=/usr/lib/postgresql/16/bin
+$P/initdb -D ~/tw-pg/data -U postgres --auth=trust
+$P/pg_ctl -D ~/tw-pg/data -o "-p 55432 -k /tmp" -l ~/tw-pg/log start
+psql -h 127.0.0.1 -p 55432 -U postgres \
+  -c "CREATE USER thewatcher_test WITH PASSWORD 'thewatcher_test';" \
+  -c "CREATE DATABASE thewatcher_test OWNER thewatcher_test;"
+
+export THEWATCHER_POSTGRES_TEST_DSN="host=127.0.0.1 port=55432 dbname=thewatcher_test user=thewatcher_test password=thewatcher_test"
+meson test -C builddir-release store_postgres store_postgres_suite --print-errorlogs
+```
+
+With no reachable server the tests skip, loudly: Catch2 prints a `SKIP` with
+the connection error, and the executable exits with 77, which Meson reports as
+SKIP rather than OK. This holds for `store_postgres` and for `store_postgres_suite`, where every test skips and Catch2 itself would exit with 4 (a Meson FAIL); the test `main` translates that to 77. Set `THEWATCHER_REQUIRE_POSTGRES=1` to make an unreachable
+server a failure instead; CI does, so a broken PostgreSQL service cannot turn
+the job green. `meson.build` does not set the DSN, so whatever you export wins.
+
 ## Adding A New Collector End To End
 
 Use this checklist when adding a metric family such as GPU, filesystem inode

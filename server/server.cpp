@@ -249,71 +249,81 @@ void Server::run(StartupSignal* startup)
         dispatch_commands(router);
         if (std::chrono::steady_clock::now() >= next_offline_scan)
         {
-            const auto now = now_ms();
-            if (config_.offline_after_seconds > 0)
+            // A store failure (for example PostgreSQL restarting) must not end run():
+            // log it and let the next tick retry; every write below is derived from
+            // stored state, so repeating it is safe.
+            try
             {
-                const auto cutoff = now - (static_cast<int64_t>(config_.offline_after_seconds) * 1000);
-                LOGF_TRACE("Scanning for offline agents cutoff_ms=%lld", static_cast<long long>(cutoff));
-                store_->mark_agents_offline_before(cutoff);
-                expire_routes();
-                offline_alerts_->raise_for_offline_agents(now_ms());
-            }
-
-            // Escalate unacknowledged alerts older than the configurable timeout.
-            const auto escalation_seconds_str = store_->get_setting("escalation_timeout_seconds", "3600");
-            const auto escalation_seconds = std::stoi(escalation_seconds_str);
-            if (escalation_seconds > 0)
-            {
-                const auto esc_cutoff = now - (static_cast<int64_t>(escalation_seconds) * 1000LL);
-                store_->escalate_old_alerts(esc_cutoff, now);
-            }
-
-            // Apply scheduled maintenance windows: start or end maintenance for affected agents.
-            const auto active_windows = store_->active_maintenance_windows(now);
-            for (const auto& agent : store_->list_approved_agents())
-            {
-                bool in_window = false;
-                std::string window_reason;
-                for (const auto& win : active_windows)
+                const auto now = now_ms();
+                if (config_.offline_after_seconds > 0)
                 {
-                    if (win.agent_id == "*" || win.agent_id == agent.agent_id)
+                    const auto cutoff = now - (static_cast<int64_t>(config_.offline_after_seconds) * 1000);
+                    LOGF_TRACE("Scanning for offline agents cutoff_ms=%lld", static_cast<long long>(cutoff));
+                    store_->mark_agents_offline_before(cutoff);
+                    expire_routes();
+                    offline_alerts_->raise_for_offline_agents(now_ms());
+                }
+
+                // Escalate unacknowledged alerts older than the configurable timeout.
+                const auto escalation_seconds_str = store_->get_setting("escalation_timeout_seconds", "3600");
+                const auto escalation_seconds = std::stoi(escalation_seconds_str);
+                if (escalation_seconds > 0)
+                {
+                    const auto esc_cutoff = now - (static_cast<int64_t>(escalation_seconds) * 1000LL);
+                    store_->escalate_old_alerts(esc_cutoff, now);
+                }
+
+                // Apply scheduled maintenance windows: start or end maintenance for affected agents.
+                const auto active_windows = store_->active_maintenance_windows(now);
+                for (const auto& agent : store_->list_approved_agents())
+                {
+                    bool in_window = false;
+                    std::string window_reason;
+                    for (const auto& win : active_windows)
                     {
-                        in_window = true;
-                        window_reason = win.reason;
-                        break;
+                        if (win.agent_id == "*" || win.agent_id == agent.agent_id)
+                        {
+                            in_window = true;
+                            window_reason = win.reason;
+                            break;
+                        }
+                    }
+                    if (in_window && !agent.maintenance)
+                    {
+                        store_->set_agent_maintenance(agent.agent_id, true, "mw:" + window_reason, 0);
+                        store_->clear_active_alerts_for_agent(agent.agent_id, now);
+                        LOGF_INFO("Scheduled maintenance started agent_id=%s reason=%s", agent.agent_id.c_str(),
+                                  window_reason.c_str());
+                    }
+                    else if (!in_window && agent.maintenance && agent.maintenance_reason.rfind("mw:", 0) == 0)
+                    {
+                        // Only auto-resume agents put into maintenance by a window (prefix "mw:").
+                        store_->set_agent_maintenance(agent.agent_id, false, "", 0);
+                        LOGF_INFO("Scheduled maintenance ended agent_id=%s", agent.agent_id.c_str());
                     }
                 }
-                if (in_window && !agent.maintenance)
-                {
-                    store_->set_agent_maintenance(agent.agent_id, true, "mw:" + window_reason, 0);
-                    store_->clear_active_alerts_for_agent(agent.agent_id, now);
-                    LOGF_INFO("Scheduled maintenance started agent_id=%s reason=%s", agent.agent_id.c_str(),
-                              window_reason.c_str());
-                }
-                else if (!in_window && agent.maintenance && agent.maintenance_reason.rfind("mw:", 0) == 0)
-                {
-                    // Only auto-resume agents put into maintenance by a window (prefix "mw:").
-                    store_->set_agent_maintenance(agent.agent_id, false, "", 0);
-                    LOGF_INFO("Scheduled maintenance ended agent_id=%s", agent.agent_id.c_str());
-                }
-            }
 
-            // Evict dispatched commands that never received an ACK (M-8).
-            constexpr int64_t command_ttl_ms = 5LL * 60LL * 1000LL;
-            for (auto it = dispatched_commands_.begin(); it != dispatched_commands_.end();)
+                // Evict dispatched commands that never received an ACK (M-8).
+                constexpr int64_t command_ttl_ms = 5LL * 60LL * 1000LL;
+                for (auto it = dispatched_commands_.begin(); it != dispatched_commands_.end();)
+                {
+                    if (now - it->second.dispatched_at_ms > command_ttl_ms)
+                    {
+                        LOGF_DEBUG("Evicting stale dispatched command id=%s", it->first.c_str());
+                        it = dispatched_commands_.erase(it);
+                    }
+                    else
+                    {
+                        ++it;
+                    }
+                }
+
+                maybe_send_report(now);
+            }
+            catch (const std::exception& e)
             {
-                if (now - it->second.dispatched_at_ms > command_ttl_ms)
-                {
-                    LOGF_DEBUG("Evicting stale dispatched command id=%s", it->first.c_str());
-                    it = dispatched_commands_.erase(it);
-                }
-                else
-                {
-                    ++it;
-                }
+                LOGF_ERROR("Periodic scan failed, retrying next tick: %s", e.what());
             }
-
-            maybe_send_report(now);
 
             next_offline_scan = std::chrono::steady_clock::now() + std::chrono::seconds{1};
         }

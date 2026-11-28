@@ -139,8 +139,53 @@ see [Build Environment](build-environment.md)) both persist:
 - metric snapshots;
 - silences, saved views, runbooks, maintenance windows, and matched log lines.
 
-Schema migrations are implemented as additive `ALTER TABLE` calls guarded by
-column checks in `init_schema()` of each store.
+Schema migrations are additive and idempotent in both backends:
+`SqliteStore::init_schema()` adds missing columns after a column check;
+`PostgresStore::init_schema()` uses `ADD COLUMN IF NOT EXISTS` and
+`current_schema()`, so the store lives in whichever schema the connection's
+`search_path` selects (set it with `options=-csearch_path=myschema` in
+`POSTGRES_DSN`; the default is `public`). The PostgreSQL constructor runs the
+whole migration and the default-admin bootstrap in one transaction that holds
+`pg_advisory_xact_lock`, so server nodes starting together queue behind one
+another instead of racing, and a failed start leaves nothing half migrated.
+The lock is transaction-scoped on purpose: it also works behind pgBouncer in
+transaction pooling mode.
+
+### SQLite and PostgreSQL behave the same
+
+Both backends sit behind the `Store` interface and the same scenario list
+(`server_tests/store_test.cpp`) runs against each. Where they used to differ,
+the contract is now:
+
+| Behaviour | Both backends |
+| --- | --- |
+| `get_metrics_in_window` | Newest `limit` rows (default 2,880) in `[since, until]`, oldest first. |
+| Limit of 0 or less (`get_metrics`, `get_metrics_in_window`, `list_status_history`, `list_log_matches`) | Returns no rows. |
+| Status history, metrics, alerts, agents, silences, log matches, views, runbooks, maintenance windows | Ordered by the documented column, then by id (or agent id), so ties are deterministic. |
+| `list_groups`, `list_users` | Byte order of the name (PostgreSQL uses `COLLATE "C"`, not the database collation). |
+| `latest_metrics` | One row per agent; the later insert wins a timestamp tie; sorted by agent id. |
+| `create_session` with an existing token | Replaces that session. |
+| `prune_metrics_before` | Deletes in batches of 5,000 rows, using `metrics(timestamp_ms)`. |
+
+Differences that remain, by design: SQLite stores booleans as integers and
+uses `AUTOINCREMENT` ids; PostgreSQL uses `BOOLEAN`/`BIGSERIAL`. SQLite is a
+single file written by one process; PostgreSQL is shared by several server
+nodes, which is why multi-statement writes and the heartbeat alert insert are
+atomic on the database (not only under the in-process mutex).
+
+### PostgreSQL connection recovery
+
+`postgres::Connection` (`server/postgres_raii.hpp`) runs every statement
+through `exec`/`exec_params`. A connection found dead before a statement is
+reset (`PQreset`, three attempts, 100/200 ms apart) and the statement runs. If
+the connection dies during a `SELECT`, the `SELECT` is retried once on the new
+connection. A write that dies with the connection is not repeated, because it
+may already have been applied: it throws, and the next call reconnects. A
+connection lost inside a transaction is never reset mid-transaction; the call
+throws, the guard rolls back, and the next call reconnects. After a pgBouncer
+restart or failover the server therefore recovers by itself, with at most one
+failed write per outage. `PostgresStore::set_statement_hook` is a test seam (unset in production) that lets the tests cut the connection while a statement or transaction is in flight. Add `connect_timeout=5` to `POSTGRES_DSN` so a
+black-holed server does not stall a call for the OS default.
 
 ### Store threading and transactions
 

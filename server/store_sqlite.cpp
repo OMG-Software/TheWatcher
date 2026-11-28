@@ -1,5 +1,6 @@
 #include "store_sqlite.hpp"
 
+#include "dsn_redaction.hpp"
 #include "store_synchronized.hpp"
 
 #ifdef HAVE_LIBPQ
@@ -327,6 +328,8 @@ void SqliteStore::init_schema()
         );
     )");
     exec("CREATE INDEX IF NOT EXISTS idx_metrics_agent_ts ON metrics(agent_id, timestamp_ms DESC);");
+    // The retention prune filters on timestamp alone, across all agents.
+    exec("CREATE INDEX IF NOT EXISTS idx_metrics_ts ON metrics(timestamp_ms);");
     exec(R"(
         CREATE TABLE IF NOT EXISTS groups (
             group_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -416,6 +419,13 @@ void SqliteStore::init_schema()
     add_column_if_missing("alerts", "escalated_at",
                           "ALTER TABLE alerts ADD COLUMN escalated_at INTEGER NOT NULL DEFAULT 0;");
     exec("CREATE INDEX IF NOT EXISTS idx_alerts_active ON alerts(deleted_at, acknowledged_at, created_at DESC);");
+    // Indexes for the hot paths (#77): the offline/heartbeat alert lookups,
+    // the ON DELETE CASCADE from groups, and session expiry/revocation.
+    exec("CREATE INDEX IF NOT EXISTS idx_alerts_agent_indicator ON alerts(agent_id, indicator, deleted_at);");
+    exec("CREATE INDEX IF NOT EXISTS idx_agent_groups_group ON agent_groups(group_id);");
+    exec("CREATE INDEX IF NOT EXISTS idx_user_groups_group ON user_groups(group_id);");
+    exec("CREATE INDEX IF NOT EXISTS idx_sessions_expires ON sessions(expires_at);");
+    exec("CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);");
     exec(R"(
         CREATE TABLE IF NOT EXISTS maintenance_windows (
             window_id  INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -579,7 +589,7 @@ std::optional<AgentRecord> SqliteStore::get_agent(const std::string& agent_id)
 
 std::vector<AgentRecord> SqliteStore::list_agents()
 {
-    const auto sql = std::string("SELECT ") + AGENT_COLUMNS + " FROM agents ORDER BY last_seen DESC;";
+    const auto sql = std::string("SELECT ") + AGENT_COLUMNS + " FROM agents ORDER BY last_seen DESC,agent_id;";
     Stmt st;
     check(sqlite3_prepare_v2(db_, sql.c_str(), -1, &st.s, nullptr), db_, "prepare list_agents");
     std::vector<AgentRecord> out;
@@ -591,7 +601,7 @@ std::vector<AgentRecord> SqliteStore::list_agents()
 std::vector<AgentRecord> SqliteStore::list_approved_agents()
 {
     const auto sql = std::string("SELECT ") + AGENT_COLUMNS +
-                     " FROM agents WHERE approved=1 AND rejected=0 ORDER BY last_seen DESC;";
+                     " FROM agents WHERE approved=1 AND rejected=0 ORDER BY last_seen DESC,agent_id;";
     Stmt st;
     check(sqlite3_prepare_v2(db_, sql.c_str(), -1, &st.s, nullptr), db_, "prepare list_approved_agents");
     std::vector<AgentRecord> out;
@@ -603,7 +613,7 @@ std::vector<AgentRecord> SqliteStore::list_approved_agents()
 std::vector<AgentRecord> SqliteStore::list_pending_agents()
 {
     const auto sql = std::string("SELECT ") + AGENT_COLUMNS +
-                     " FROM agents WHERE approved=0 AND rejected=0 ORDER BY first_seen DESC;";
+                     " FROM agents WHERE approved=0 AND rejected=0 ORDER BY first_seen DESC,agent_id;";
     Stmt st;
     check(sqlite3_prepare_v2(db_, sql.c_str(), -1, &st.s, nullptr), db_, "prepare list_pending_agents");
     std::vector<AgentRecord> out;
@@ -1025,10 +1035,12 @@ void SqliteStore::insert_metrics(const MetricsRow& row)
 
 std::vector<MetricsRow> SqliteStore::get_metrics(const std::string& agent_id, int limit)
 {
+    if (limit <= 0)
+        return {}; // same on every backend: a non-positive limit returns nothing
     Stmt st;
     check(sqlite3_prepare_v2(db_,
                              "SELECT agent_id,timestamp_ms,metrics_cbor FROM metrics WHERE agent_id=? ORDER BY "
-                             "timestamp_ms DESC LIMIT ?;",
+                             "timestamp_ms DESC,id DESC LIMIT ?;",
                              -1, &st.s, nullptr),
           db_, "prepare get_metrics");
     sqlite3_bind_text(st.s, 1, agent_id.c_str(), -1, SQLITE_TRANSIENT);
@@ -1040,18 +1052,25 @@ std::vector<MetricsRow> SqliteStore::get_metrics(const std::string& agent_id, in
 }
 
 std::vector<MetricsRow> SqliteStore::get_metrics_in_window(const std::string& agent_id, int64_t since_ms,
-                                                           int64_t until_ms)
+                                                           int64_t until_ms, int limit)
 {
+    if (limit <= 0)
+        return {};
+    // The newest `limit` rows (a baseline built from stale data is wrong),
+    // returned oldest first.
     Stmt st;
     check(sqlite3_prepare_v2(db_,
-                             "SELECT agent_id,timestamp_ms,metrics_cbor FROM metrics "
+                             "SELECT agent_id,timestamp_ms,metrics_cbor FROM ("
+                             "SELECT id,agent_id,timestamp_ms,metrics_cbor FROM metrics "
                              "WHERE agent_id=? AND timestamp_ms>=? AND timestamp_ms<=? "
-                             "ORDER BY timestamp_ms ASC LIMIT 2880;",
+                             "ORDER BY timestamp_ms DESC,id DESC LIMIT ?) "
+                             "ORDER BY timestamp_ms ASC,id ASC;",
                              -1, &st.s, nullptr),
           db_, "prepare get_metrics_in_window");
     sqlite3_bind_text(st.s, 1, agent_id.c_str(), -1, SQLITE_TRANSIENT);
     sqlite3_bind_int64(st.s, 2, since_ms);
     sqlite3_bind_int64(st.s, 3, until_ms);
+    sqlite3_bind_int(st.s, 4, limit);
     std::vector<MetricsRow> out;
     while (step_row(st.s, db_, __func__))
         out.push_back(row_to_metrics(st.s));
@@ -1066,6 +1085,9 @@ std::vector<MetricsRow> SqliteStore::latest_metrics()
         INNER JOIN (
             SELECT agent_id, MAX(timestamp_ms) AS ts FROM metrics GROUP BY agent_id
         ) latest ON m.agent_id = latest.agent_id AND m.timestamp_ms = latest.ts
+        -- Equal timestamps: keep only the newest insert, like PostgreSQL.
+        WHERE m.id = (SELECT MAX(m2.id) FROM metrics m2
+                      WHERE m2.agent_id = m.agent_id AND m2.timestamp_ms = m.timestamp_ms)
         ORDER BY m.agent_id;
     )";
     Stmt st;
@@ -1112,6 +1134,8 @@ std::optional<StatusHistoryRow> SqliteStore::latest_status_for_indicator(const s
 
 std::vector<StatusHistoryRow> SqliteStore::list_status_history(const std::string& agent_id, int limit)
 {
+    if (limit <= 0)
+        return {};
     Stmt st;
     check(sqlite3_prepare_v2(db_,
                              "SELECT id,agent_id,indicator,old_status,new_status,message,created_at FROM "
@@ -1432,7 +1456,7 @@ std::vector<MaintenanceWindowRecord> SqliteStore::list_maintenance_windows()
     Stmt st;
     check(sqlite3_prepare_v2(db_,
                              "SELECT window_id,agent_id,start_ms,end_ms,reason,created_by,created_at FROM "
-                             "maintenance_windows ORDER BY start_ms DESC;",
+                             "maintenance_windows ORDER BY start_ms DESC,window_id DESC;",
                              -1, &st.s, nullptr),
           db_, "prepare list_maintenance_windows");
     std::vector<MaintenanceWindowRecord> out;
@@ -1453,11 +1477,12 @@ void SqliteStore::delete_maintenance_window(int64_t window_id)
 std::vector<MaintenanceWindowRecord> SqliteStore::active_maintenance_windows(int64_t now_ms)
 {
     Stmt st;
-    check(sqlite3_prepare_v2(db_,
-                             "SELECT window_id,agent_id,start_ms,end_ms,reason,created_by,created_at FROM "
-                             "maintenance_windows WHERE start_ms<=? AND end_ms>? ORDER BY start_ms DESC;",
-                             -1, &st.s, nullptr),
-          db_, "prepare active_maintenance_windows");
+    check(
+        sqlite3_prepare_v2(db_,
+                           "SELECT window_id,agent_id,start_ms,end_ms,reason,created_by,created_at FROM "
+                           "maintenance_windows WHERE start_ms<=? AND end_ms>? ORDER BY start_ms DESC,window_id DESC;",
+                           -1, &st.s, nullptr),
+        db_, "prepare active_maintenance_windows");
     sqlite3_bind_int64(st.s, 1, now_ms);
     sqlite3_bind_int64(st.s, 2, now_ms);
     std::vector<MaintenanceWindowRecord> out;
@@ -1529,7 +1554,7 @@ std::vector<SilenceRecord> SqliteStore::list_silences()
     Stmt st;
     check(sqlite3_prepare_v2(db_,
                              "SELECT silence_id,agent_id,indicator,reason,until_ms,created_by,created_at "
-                             "FROM silences ORDER BY created_at DESC;",
+                             "FROM silences ORDER BY created_at DESC,silence_id DESC;",
                              -1, &st.s, nullptr),
           db_, "prepare list_silences");
     std::vector<SilenceRecord> out;
@@ -1565,11 +1590,21 @@ bool SqliteStore::is_silenced(const std::string& agent_id, const std::string& in
 
 void SqliteStore::prune_metrics_before(int64_t cutoff_ms)
 {
-    Stmt st;
-    check(sqlite3_prepare_v2(db_, "DELETE FROM metrics WHERE timestamp_ms < ?;", -1, &st.s, nullptr), db_,
-          "prepare prune_metrics_before");
-    sqlite3_bind_int64(st.s, 1, cutoff_ms);
-    check(sqlite3_step(st.s), db_, "step prune_metrics_before");
+    // Batches keep each statement (and the WAL it writes) bounded on a large table.
+    for (;;)
+    {
+        Stmt st;
+        check(sqlite3_prepare_v2(db_,
+                                 "DELETE FROM metrics WHERE id IN "
+                                 "(SELECT id FROM metrics WHERE timestamp_ms < ? LIMIT ?);",
+                                 -1, &st.s, nullptr),
+              db_, "prepare prune_metrics_before");
+        sqlite3_bind_int64(st.s, 1, cutoff_ms);
+        sqlite3_bind_int(st.s, 2, kPruneBatchRows);
+        check(sqlite3_step(st.s), db_, "step prune_metrics_before");
+        if (sqlite3_changes(db_) < kPruneBatchRows)
+            return;
+    }
 }
 
 void SqliteStore::insert_log_match(const LogMatchRecord& rec)
@@ -1591,10 +1626,12 @@ void SqliteStore::insert_log_match(const LogMatchRecord& rec)
 
 std::vector<LogMatchRecord> SqliteStore::list_log_matches(const std::string& agent_id, int limit)
 {
+    if (limit <= 0)
+        return {};
     Stmt st;
     check(sqlite3_prepare_v2(db_,
                              "SELECT match_id,agent_id,indicator_name,path,matched_line,severity,created_at "
-                             "FROM log_matches WHERE agent_id=? ORDER BY created_at DESC LIMIT ?;",
+                             "FROM log_matches WHERE agent_id=? ORDER BY created_at DESC,match_id DESC LIMIT ?;",
                              -1, &st.s, nullptr),
           db_, "prepare list_log_matches");
     sqlite3_bind_text(st.s, 1, agent_id.c_str(), -1, SQLITE_TRANSIENT);
@@ -1696,7 +1733,7 @@ std::vector<ViewRecord> SqliteStore::list_views(int64_t user_id)
                              "FROM views v LEFT JOIN users u ON u.user_id=v.owner_user_id "
                              "WHERE ? <= 0 OR v.owner_user_id=? OR v.is_public=1 OR EXISTS ("
                              "SELECT 1 FROM user_groups ug WHERE ug.user_id=? AND ug.group_id=v.group_id) "
-                             "ORDER BY v.created_at ASC;",
+                             "ORDER BY v.created_at ASC,v.view_id ASC;",
                              -1, &st.s, nullptr),
           db_, "prepare list_views");
     sqlite3_bind_int64(st.s, 1, user_id);
@@ -1777,7 +1814,7 @@ std::vector<RunbookRecord> SqliteStore::list_runbooks()
     Stmt st;
     check(sqlite3_prepare_v2(db_,
                              "SELECT runbook_id,agent_id,indicator,status,url,markdown,notes,created_by,created_at "
-                             "FROM runbooks ORDER BY created_at ASC;",
+                             "FROM runbooks ORDER BY created_at ASC,runbook_id ASC;",
                              -1, &st.s, nullptr),
           db_, "prepare list_runbooks");
     std::vector<RunbookRecord> out;
@@ -1823,7 +1860,9 @@ std::optional<RunbookRecord> SqliteStore::get_runbook(const std::string& agent_i
 // The returned store is safe to share between threads (see SynchronizedStore).
 std::unique_ptr<Store> make_store(const std::string& db_type, const std::string& db_path_or_dsn)
 {
-    LOGF_DEBUG("Creating store db_type=%s target=%s", db_type.c_str(), db_path_or_dsn.c_str());
+    // The PostgreSQL target is a DSN that may carry a password: never log it raw.
+    const auto logged_target = db_type == "postgres" ? redact_dsn(db_path_or_dsn) : db_path_or_dsn;
+    LOGF_DEBUG("Creating store db_type=%s target=%s", db_type.c_str(), logged_target.c_str());
     if (db_type == "sqlite")
         return std::make_unique<SynchronizedStore>(std::make_unique<SqliteStore>(db_path_or_dsn));
 #ifdef HAVE_LIBPQ

@@ -111,7 +111,7 @@ read; the server would ignore them and start with SQLite.
 
 ```text
 DB_TYPE=postgres
-POSTGRES_DSN=host=10.0.0.20 port=6432 dbname=thewatcher user=thewatcher password=change-me sslmode=require
+POSTGRES_DSN=host=10.0.0.20 port=6432 dbname=thewatcher user=thewatcher password=change-me sslmode=require connect_timeout=5
 
 BIND_ADDRESS=tcp://10.0.0.10:5555
 ENROLLMENT_ADDRESS=tcp://10.0.0.10:5556
@@ -126,6 +126,12 @@ bind them once it holds the VIP. Both nodes must use the same
 `SERVER_PUBLIC_KEY` / `SERVER_SECRET_KEY` pair: agents pin the server public
 key, so a node with a different key is rejected after failover. Keep the file
 owner-only, because it holds the CURVE secret and the database password.
+
+The store uses the schema that `search_path` selects (`public` unless the DSN
+says `options=-csearch_path=myschema`); the server creates and migrates its
+tables on start, and nodes that start together wait for each other, so both
+nodes can use the same config and start at once. See
+[Configuration](configuration.md) for every option.
 
 A server built without PostgreSQL support exits at startup with
 `Unsupported db_type: postgres`, so a wrong binary is caught immediately.
@@ -199,11 +205,20 @@ Make both scripts executable: `chmod +x /usr/local/bin/thewatcher-*.sh`
 4. The `notify_master` script starts TheWatcherServer on the standby.
 5. Agents reconnect automatically — their ZeroMQ sockets will retry until
    the new endpoint accepts connections.
-6. TheWatcherServer connects to PostgreSQL through pgBouncer and resumes
-   normal operation.  Persistent state (agents, metrics, users, sessions, alerts and settings) is in
-   PostgreSQL and survives the failover. State held in memory by the failed
-   node is lost: queued commands that were not yet delivered to an agent, and
-   login throttling counters.
+6. TheWatcherServer reconnects to PostgreSQL through pgBouncer (the store
+   resets a dead connection by itself; no process restart) and resumes
+   normal operation. Persistent state (agents, metrics, users, sessions,
+   alerts and settings) is in PostgreSQL, so failover does not lose
+   committed data. A write that was in flight when the connection died
+   is not retried, because it may already have been applied, so it can fail:
+   the server logs it and carries on (the periodic scan catches the error
+   instead of ending the server loop). A dropped metrics sample is
+   simply missing (the agent sends the next one); the periodic scans
+   (offline detection, dead-agent and heartbeat alerts, escalation) and
+   agent heartbeats re-derive their writes from stored state and repeat on
+   the next tick. Reads are retried once on the new connection. State held
+   in memory by the failed node is lost: queued commands that were not yet
+   delivered to an agent, and login throttling counters.
 
 Typical failover time is **5–15 seconds** depending on `advert_int` and
 agent reconnect intervals.
