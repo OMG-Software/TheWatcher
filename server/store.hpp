@@ -186,7 +186,9 @@ public:
     virtual std::vector<AgentRecord> list_approved_agents() = 0;
     virtual std::vector<AgentRecord> list_pending_agents() = 0;
     virtual void approve_agent(const std::string& agent_id) = 0;
-    virtual void reject_agent(const std::string& agent_id) = 0;
+    // Rejects a pending agent. Returns false, changing nothing, when the agent is
+    // unknown or not pending (already approved or rejected).
+    virtual bool reject_agent(const std::string& agent_id) = 0;
     // Approves a pending agent and sets its groups in one transaction. Returns
     // false, changing nothing, when the agent is unknown or no longer pending
     // (already approved or rejected). Throws, changing nothing, when a group

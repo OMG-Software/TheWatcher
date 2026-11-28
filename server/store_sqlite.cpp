@@ -697,13 +697,16 @@ void SqliteStore::approve_agent(const std::string& agent_id)
     check(sqlite3_step(st.s), db_, "step approve_agent");
 }
 
-void SqliteStore::reject_agent(const std::string& agent_id)
+bool SqliteStore::reject_agent(const std::string& agent_id)
 {
     Stmt st;
-    check(sqlite3_prepare_v2(db_, "UPDATE agents SET approved=0,rejected=1 WHERE agent_id=?;", -1, &st.s, nullptr), db_,
-          "prepare reject_agent");
+    check(sqlite3_prepare_v2(db_,
+                             "UPDATE agents SET approved=0,rejected=1 WHERE agent_id=? AND approved=0 AND rejected=0;",
+                             -1, &st.s, nullptr),
+          db_, "prepare reject_agent");
     sqlite3_bind_text(st.s, 1, agent_id.c_str(), -1, SQLITE_TRANSIENT);
     check(sqlite3_step(st.s), db_, "step reject_agent");
+    return sqlite3_changes(db_) > 0;
 }
 
 bool SqliteStore::approve_pending_agent(const std::string& agent_id, const std::vector<int64_t>& group_ids)

@@ -226,7 +226,8 @@ SCENARIO("A command for an agent with no learned route is not sent to a peer usi
     }
 }
 
-SCENARIO("A rejected agent cannot keep submitting data on its live session")
+// Reject now applies to pending enrollments only; an approved agent is revoked by deleting it.
+SCENARIO("A deleted agent cannot keep submitting data on its live session")
 {
     GIVEN("a CURVE server with an approved agent that has already delivered metrics")
     {
@@ -246,15 +247,19 @@ SCENARIO("A rejected agent cannot keep submitting data on its live session")
             },
             5s));
 
-        WHEN("the agent is rejected and sends another metrics frame on the same session")
+        WHEN("the agent is deleted and sends another metrics frame on the same session")
         {
-            REQUIRE(fx.reject("agent-doomed"));
+            const auto deleted = fx.client.Delete("/api/agents/agent-doomed");
+            REQUIRE(deleted);
+            REQUIRE(deleted->status == 200);
             peer.send_metrics("agent-doomed", 20.0);
             std::this_thread::sleep_for(2s);
 
-            THEN("the frame is dropped and no new metrics row appears")
+            THEN("the frame is dropped and the agent does not come back")
             {
-                REQUIRE(metric_row_count(fx.client, "agent-doomed") == 1);
+                const auto agents = fx.client.Get("/api/agents");
+                REQUIRE(agents);
+                REQUIRE(agents->body.find("agent-doomed") == std::string::npos);
                 REQUIRE(fx.error == nullptr);
             }
         }

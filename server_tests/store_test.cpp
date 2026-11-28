@@ -3125,3 +3125,40 @@ SCENARIO("An agent configuration save writes the config and groups in one transa
         }
     }
 }
+
+SCENARIO("reject_agent reports whether it rejected a pending agent")
+{
+    GIVEN("a pending agent and an approved agent")
+    {
+        SqliteStore store(":memory:");
+        AgentRecord pending;
+        pending.agent_id = "pending";
+        store.upsert_agent(pending);
+        AgentRecord approved;
+        approved.agent_id = "approved";
+        approved.approved = true;
+        store.upsert_agent(approved);
+
+        THEN("rejecting the pending agent returns true and sets rejected")
+        {
+            REQUIRE(store.reject_agent("pending"));
+            REQUIRE(store.get_agent("pending")->rejected);
+            AND_THEN("rejecting it again returns false")
+            {
+                REQUIRE_FALSE(store.reject_agent("pending"));
+            }
+        }
+
+        THEN("rejecting the approved agent returns false and changes nothing")
+        {
+            REQUIRE_FALSE(store.reject_agent("approved"));
+            REQUIRE(store.get_agent("approved")->approved);
+            REQUIRE_FALSE(store.get_agent("approved")->rejected);
+        }
+
+        THEN("rejecting an unknown agent returns false")
+        {
+            REQUIRE_FALSE(store.reject_agent("nobody"));
+        }
+    }
+}

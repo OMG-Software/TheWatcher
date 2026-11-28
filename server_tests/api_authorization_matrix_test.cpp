@@ -274,6 +274,10 @@ const std::vector<Row>& rows()
          "/api/users/{self}/password",                         R"({"password":"another-long-password"})",
          {401, 200, 200, 200, 200, 200, 200}                                                                                                                                                              },
         {"PUT",    "/api/users/{victim_password}/password",    R"({"password":"another-long-password"})",                                                              ADMIN                              },
+        // Permission before existence: only a global admin learns that an id is unknown (404).
+        {"PUT",
+         "/api/users/999999/password",                         R"({"password":"another-long-password"})",
+         {401, 404, 403, 403, 403, 403, 403}                                                                                                                                                              },
         // ── Alerts ────────────────────────────────────────────────────────────
         {"GET",    "/api/alerts",                              "",                                                                                                     ANYONE                             },
         {"GET",    "/api/alerts/unacknowledged",               "",                                                                                                     ANYONE                             },
@@ -289,6 +293,9 @@ const std::vector<Row>& rows()
         {"GET",    "/api/pending-enrollments",                 "",                                                                                                     GLOBAL_ANY                         },
         {"POST",   "/api/agents/pending-1/approve",            R"({"group_ids":[{group_a}]})",                                                                         GLOBAL_OPS                         },
         {"POST",   "/api/agents/pending-2/reject",             "",                                                                                                     GLOBAL_OPS                         },
+        // Reject needs a pending agent: unknown is 404, approved is 409 (global operators); others are refused first.
+        {"POST",   "/api/agents/ghost/reject",                 "",                                                                                                     {401, 404, 404, 403, 403, 403, 403}},
+        {"POST",   "/api/agents/{agent_b}/reject",             "",                                                                                                     {401, 409, 409, 403, 403, 403, 403}},
         // ── Agents ────────────────────────────────────────────────────────────
         {"GET",    "/api/agents",                              "",                                                                                                     ANYONE                             },
         {"POST",   "/api/agents/{agent_a}/groups",             R"({"group_ids":[{group_a}]})",                                                                         GLOBAL_OPS                         },

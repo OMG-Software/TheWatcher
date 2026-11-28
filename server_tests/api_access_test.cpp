@@ -785,3 +785,115 @@ SCENARIO("Global viewers read pending enrollments and silences; group users see 
         }
     }
 }
+
+// ── Password changes do not reveal which user ids exist ──────────────────────
+
+SCENARIO("A password change checks permission before it looks the user up")
+{
+    GIVEN("a global admin, a group admin and a group viewer")
+    {
+        AccessWorld w;
+        const auto victim = w.add_user("victim", "group_viewer", {w.group_a});
+        const json body = {
+            {"password", "a-new-long-password"}
+        };
+
+        WHEN("a group viewer targets an id that does not exist")
+        {
+            const auto res = w.request("PUT", "/api/users/99999/password", "a_viewer", body);
+
+            THEN("they get 403, the same as for a real user that is not them")
+            {
+                REQUIRE(res.status == 403);
+                REQUIRE(
+                    w.request("PUT", "/api/users/" + std::to_string(victim) + "/password", "a_viewer", body).status ==
+                    403);
+            }
+        }
+
+        WHEN("a group admin targets an id that does not exist")
+        {
+            THEN("they get 403: group admins may only change their own password")
+            {
+                REQUIRE(w.request("PUT", "/api/users/99999/password", "a_admin", body).status == 403);
+            }
+        }
+
+        WHEN("a global admin targets an id that does not exist")
+        {
+            const auto res = w.request("PUT", "/api/users/99999/password", "admin", body);
+
+            THEN("they get 404")
+            {
+                REQUIRE(res.status == 404);
+            }
+        }
+
+        WHEN("a global admin sends a non-numeric id or a bad body")
+        {
+            const auto bad_id = w.request("PUT", "/api/users/abc/password", "admin", body);
+            const auto bad_body = w.request("PUT", "/api/users/" + std::to_string(victim) + "/password", "admin",
+                                            {
+                                                {"password", ""}
+            });
+
+            THEN("both stay 400")
+            {
+                REQUIRE(bad_id.status == 400);
+                REQUIRE(bad_body.status == 400);
+            }
+        }
+    }
+}
+
+// ── Rejecting an agent ────────────────────────────────────────────────────────
+
+SCENARIO("Rejecting an agent only works on a pending enrollment")
+{
+    GIVEN("a pending agent, an approved agent and a rejected agent")
+    {
+        AccessWorld w;
+        w.add_agent("pending-host", false);
+        w.add_agent("rejected-host", false);
+        REQUIRE(w.request("POST", "/api/agents/rejected-host/reject", "admin").status == 200);
+
+        WHEN("an admin rejects the pending agent")
+        {
+            const auto res = w.request("POST", "/api/agents/pending-host/reject", "admin");
+
+            THEN("it is rejected")
+            {
+                REQUIRE(res.status == 200);
+                REQUIRE(w.store->get_agent("pending-host")->rejected);
+            }
+        }
+
+        WHEN("an admin rejects an agent that does not exist")
+        {
+            THEN("it is a 404")
+            {
+                REQUIRE(w.request("POST", "/api/agents/ghost/reject", "admin").status == 404);
+            }
+        }
+
+        WHEN("an admin rejects an approved agent")
+        {
+            const auto res = w.request("POST", "/api/agents/agent-a/reject", "admin");
+
+            THEN("it is a 409 and the agent stays approved")
+            {
+                REQUIRE(res.status == 409);
+                REQUIRE(w.store->get_agent("agent-a")->approved);
+                REQUIRE_FALSE(w.store->get_agent("agent-a")->rejected);
+            }
+        }
+
+        WHEN("an admin rejects an already rejected agent")
+        {
+            THEN("it is a 409")
+            {
+                REQUIRE(w.request("POST", "/api/agents/rejected-host/reject", "admin").status == 409);
+            }
+        }
+    }
+}

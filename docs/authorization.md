@@ -44,6 +44,11 @@ test. Do not change a single route to 404 without changing the rule.
   global roles only. There is no default group. The request is validated first
   (404 unknown agent, 400 bad or unknown group ids, 409 not pending or key
   already bound) and approval and groups are written in one transaction.
+- **Passwords.** Permission is checked before the user is looked up: anyone but
+  a global admin gets 403 for every id except their own, whether or not it
+  exists. Only a global admin sees 404 for an unknown id.
+- **Reject** applies to pending agents only: unknown is 404, already approved
+  or rejected is 409, and nothing changes in either case.
 - **Agent groups** are changed by global operators and admins only. The
   Configure save (`collector_config`) accepts `group_ids` from a group user
   only when it equals the agent's current groups; a different list is a 403.
@@ -88,11 +93,11 @@ resource in another group (group users get 403).
 | `GET /api/users` | 401 | 200 | 200 | 200 | 200 | 200 | 200 |
 | `POST /api/users` | 401 | 200 | 403 | 403 | 200 (own groups, group roles only) | 403 | 403 |
 | `PUT /api/users/:id/disable`, `/enable`, `DELETE /api/users/:id` | 401 | 200 | 403 | 403 | 403 | 403 | 403 |
-| `PUT /api/users/:id/password` | 401 | any user | own | own | own | own | own |
+| `PUT /api/users/:id/password` | 401 | any user (404 unknown id) | own | own | own | own | own |
 | `GET /api/alerts`, `/unacknowledged` | 401 | 200 | 200 | 200 | 200 | 200 | 200 |
 | `POST /api/alerts/:id/ack`, `DELETE /api/alerts/:id`, `bulk-ack`, `bulk-archive` | 401 | 200 | 200 | 403 | scoped | scoped | 403 |
 | `GET /api/pending-enrollments` | 401 | 200 | 200 | 200 | 403 | 403 | 403 |
-| `POST /api/agents/:id/approve`, `/reject` | 401 | 200 | 200 | 403 | 403 | 403 | 403 |
+| `POST /api/agents/:id/approve`, `/reject` | 401 | 200 (404 unknown, 409 not pending) | same | 403 | 403 | 403 | 403 |
 | `GET /api/agents`, `GET /api/metrics` | 401 | 200 | 200 | 200 | 200 | 200 | 200 |
 | `POST /api/agents/:id/groups` | 401 | 200 | 200 | 403 | 403 | 403 | 403 |
 | `DELETE /api/agents/:id` | 401 | 200 | 200 | 403 | scoped | scoped | 403 |
@@ -114,12 +119,8 @@ in the test.
 
 - `DELETE /api/agents/:id` is open to group operators for agents of their
   groups. Deleting a host and its history is arguably an admin action.
-- `PUT /api/users/:id/password` reports an unknown user (400) before checking
-  permission (403), so a non-admin can tell whether a user id exists.
 - `GET /api/settings` includes the webhook URLs and is open to global
   operators, not only admins.
 - A non-numeric id in a path (`/api/alerts/abc/ack`, `/api/views/abc`)
   is answered 500 by some routes and 400 by others; the validation work
   (#184) makes it a uniform 400.
-- `POST /api/agents/:id/reject` answers 200 for an unknown id and can reject an
-  approved agent.

@@ -9,6 +9,9 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Security
 
+- `PUT /api/users/:id/password` checks permission before looking the user up:
+  a non-admin gets 403 for any id but their own, so user ids can no longer be
+  probed. A global admin gets 404 (was 400) for an unknown id.
 - Views no longer reveal agent ids from other groups: group-scoped users
   only receive the agent ids they can access, in the list, in a single view
   and in create/update replies (#163).
@@ -63,6 +66,10 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 
+- `POST /api/agents/:id/reject` answers 404 for an unknown agent and 409 for an
+  agent that is not pending, instead of 200. It no longer removes a ZAP key
+  (a pending agent has none). `Store::reject_agent` now returns whether it
+  rejected the agent.
 - Group-scoped users can see and open public and ungrouped views, including
   their own. View visibility is decided in the API only, and legacy views whose
   group is stored only in the view config are matched too (#60).

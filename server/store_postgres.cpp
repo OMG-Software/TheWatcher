@@ -747,12 +747,15 @@ void PostgresStore::approve_agent(const std::string& agent_id)
     check_res(res.r, "approve_agent");
 }
 
-void PostgresStore::reject_agent(const std::string& agent_id)
+bool PostgresStore::reject_agent(const std::string& agent_id)
 {
     const char* params[] = {agent_id.c_str()};
-    Res res(PQexecParams(conn_, "UPDATE agents SET approved=FALSE,rejected=TRUE WHERE agent_id=$1;", 1, nullptr, params,
-                         nullptr, nullptr, 0));
+    Res res(PQexecParams(
+        conn_,
+        "UPDATE agents SET approved=FALSE,rejected=TRUE WHERE agent_id=$1 AND approved=FALSE AND rejected=FALSE;", 1,
+        nullptr, params, nullptr, nullptr, 0));
     check_res(res.r, "reject_agent");
+    return std::string(PQcmdTuples(res.r)) != "0";
 }
 
 bool PostgresStore::approve_pending_agent(const std::string& agent_id, const std::vector<int64_t>& group_ids)

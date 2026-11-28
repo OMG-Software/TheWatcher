@@ -1717,13 +1717,26 @@ void ApiServer::setup_routes()
         {
             auto id = req.path_params.at("id");
             LOGF_INFO("Rejecting agent id=%s", id.c_str());
-            auto rec = store_.get_agent(id);
-            if (rec)
+            if (!store_.get_agent(id))
             {
-                zap_.remove_key(rec->curve_public_key_z85);
-                LOGF_DEBUG("Rejected agent key removed from ZAP id=%s", id.c_str());
+                res.status = 404;
+                set_json(res, json{
+                                  {"error", "agent not found"}
+                });
+                return;
             }
-            store_.reject_agent(id);
+            // Only a pending agent can be rejected, and the store decides that
+            // atomically. A pending agent has no ZAP key yet (approval adds it),
+            // so there is nothing to remove; removing it here could cut off an
+            // approved agent that shares the key.
+            if (!store_.reject_agent(id))
+            {
+                res.status = 409;
+                set_json(res, json{
+                                  {"error", "agent is not pending"}
+                });
+                return;
+            }
             res.set_content(
                 json{
                     {"ok", true}
@@ -2819,6 +2832,17 @@ void ApiServer::setup_routes()
         try
         {
             const auto user_id = std::stoll(req.path_params.at("id"));
+            // Permission first, so a non-admin learns nothing about which ids
+            // exist: they may only change their own password.
+            const bool admin = normalize_role(session->role) == "global_admin";
+            if (!admin && user_id != session->user_id)
+            {
+                res.status = 403;
+                set_json(res, json{
+                                  {"error", "forbidden"}
+                });
+                return;
+            }
             const auto target_user = [&]() -> std::optional<UserRecord> {
                 for (const auto& u : store_.list_users())
                     if (u.user_id == user_id)
@@ -2826,13 +2850,10 @@ void ApiServer::setup_routes()
                 return std::nullopt;
             }();
             if (!target_user)
-                throw std::runtime_error("user not found");
-            // Non-admins can only change their own password
-            if (normalize_role(session->role) != "global_admin" && target_user->username != session->username)
             {
-                res.status = 403;
+                res.status = 404;
                 set_json(res, json{
-                                  {"error", "forbidden"}
+                                  {"error", "user not found"}
                 });
                 return;
             }
