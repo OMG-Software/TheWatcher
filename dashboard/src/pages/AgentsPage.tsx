@@ -13,6 +13,7 @@ import { colorLabel } from '../uiLogic';
 export function AgentsPage({
   agents,
   busyAction,
+  isBusy,
   groups,
   onConfigure,
   operator,
@@ -23,6 +24,7 @@ export function AgentsPage({
 }: {
   agents: DashboardAgent[];
   busyAction: string | null;
+  isBusy: (key: string) => boolean;
   groups: GroupRecord[];
   onConfigure: (agentId: string) => void;
   operator: boolean;
@@ -35,7 +37,7 @@ export function AgentsPage({
 
   return (
     <main className="table-wrap management-wrap">
-      {showPending ? <PendingEnrollments agents={pending} busyAction={busyAction} groups={groups} loadFailed={pendingLoadFailed} runAction={runAction} /> : null}
+      {showPending ? <PendingEnrollments agents={pending} isBusy={isBusy} groups={groups} loadFailed={pendingLoadFailed} runAction={runAction} /> : null}
       <div className="management-header"><h1>Agent Management</h1></div>
       <div className="table-container">
         <table className="management-table">

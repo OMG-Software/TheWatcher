@@ -44,7 +44,7 @@ function Dashboard({ session, onSignOut }: { session: SessionInfo; onSignOut: ()
   const [overviewGroupFilter, setOverviewGroupFilter] = React.useState<OverviewGroupFilter>('all');
 
   const { agents, pending, groups, alerts, allAlerts, users, maintenanceWindows, silences, customViews, sectionErrors, loadedAt, error, loading, refresh } = useDashboardData();
-  const { busyAction, runAction, failure, clearFailure } = useRunAction(refresh);
+  const { busyAction, isBusy, runAction, failure, clearFailure } = useRunAction(refresh);
 
   // A bookmark (#view-N) to a view that was deleted, or that this user may not
   // open, must not leave the page filtered to nothing: the filter is ignored
@@ -163,7 +163,7 @@ function Dashboard({ session, onSignOut }: { session: SessionInfo; onSignOut: ()
           {sectionErrors.groups ? <LoadFailed what="groups" message={sectionErrors.groups} onRetry={retry} /> : null}
           <ViewsPage
             agents={agents}
-            busyAction={busyAction}
+            isBusy={isBusy}
             loadFailed={Boolean(sectionErrors.views)}
             operator={operator}
             runAction={runAction}
@@ -181,6 +181,7 @@ function Dashboard({ session, onSignOut }: { session: SessionInfo; onSignOut: ()
           <AgentsPage
             agents={agents}
             busyAction={busyAction}
+            isBusy={isBusy}
             groups={groups}
             onConfigure={setConfigAgentId}
             operator={operator}
@@ -194,7 +195,7 @@ function Dashboard({ session, onSignOut }: { session: SessionInfo; onSignOut: ()
       {configAgent ? (
         <AgentConfigModal
           agent={configAgent}
-          busy={busyAction === `${configAgent.id}:collector_config`}
+          busy={isBusy(`${configAgent.id}:collector_config`)}
           onClose={() => setConfigAgentId(null)}
           operator={operator && canManageAgent(configAgent)}
           global={global}

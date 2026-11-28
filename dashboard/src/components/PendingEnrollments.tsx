@@ -6,7 +6,7 @@ import { AgentIdentity } from './AgentIdentity';
 import type { RunAction } from '../hooks/useRunAction';
 import type { DashboardAgent, GroupRecord } from '../models';
 
-export function PendingEnrollments({ agents, busyAction, groups, loadFailed = false, runAction }: { agents: DashboardAgent[]; busyAction: string | null; groups: GroupRecord[]; loadFailed?: boolean; runAction: RunAction }) {
+export function PendingEnrollments({ agents, groups, isBusy, loadFailed = false, runAction }: { agents: DashboardAgent[]; isBusy: (key: string) => boolean; groups: GroupRecord[]; loadFailed?: boolean; runAction: RunAction }) {
   // The group each pending agent will be approved into. Nothing is chosen by
   // default: an agent with no group is visible to global users only, so an
   // operator has to name a group on purpose. Group ids start at 1, but compare
@@ -34,8 +34,8 @@ export function PendingEnrollments({ agents, busyAction, groups, loadFailed = fa
                 </select>
               </td>
               <td><div className="button-row">
-                <ActionButton busy={busyAction === `${agent.id}:approve`} icon={<Check size={14} />} label="Approve" onClick={() => runAction(`${agent.id}:approve`, () => approveAgent(agent.id, chosenGroup[agent.id] == null ? [] : [chosenGroup[agent.id] as number]))} />
-                <ActionButton busy={busyAction === `${agent.id}:reject`} icon={<X size={14} />} label="Reject" onClick={() => runAction(`${agent.id}:reject`, () => rejectAgent(agent.id))} />
+                <ActionButton busy={isBusy(`${agent.id}:approve`)} icon={<Check size={14} />} label="Approve" onClick={() => runAction(`${agent.id}:approve`, () => approveAgent(agent.id, chosenGroup[agent.id] == null ? [] : [chosenGroup[agent.id] as number]))} />
+                <ActionButton busy={isBusy(`${agent.id}:reject`)} icon={<X size={14} />} label="Reject" onClick={() => runAction(`${agent.id}:reject`, () => rejectAgent(agent.id))} />
               </div></td>
             </tr>
           ))}
