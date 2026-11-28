@@ -9,6 +9,7 @@
 #include "../server/store.hpp"
 #include "../server/zap_handler.hpp"
 #include "common/crypto.hpp"
+#include "test_support/background_call.hpp"
 #include "test_support/net_helpers.hpp"
 #include "test_support/server_fixture.hpp"
 
@@ -311,7 +312,7 @@ SCENARIO("ApiServer::stop returns promptly when called right after start (issue 
 
         WHEN("stop() is called before the accept loop has had time to run")
         {
-            auto stopped = std::async(std::launch::async, [&] {
+            thewatcher::test::BackgroundCall stopped([&] {
                 api.stop();
             });
 

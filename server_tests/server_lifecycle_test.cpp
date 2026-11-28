@@ -1,5 +1,6 @@
 #include "server/setting_parse.hpp"
 #include "server/store.hpp"
+#include "test_support/background_call.hpp"
 #include "test_support/enrollment_client.hpp"
 #include "test_support/server_runner.hpp"
 #include "test_support/temp_dir.hpp"
@@ -93,7 +94,7 @@ SCENARIO("A stop requested before the server finishes starting is not lost (issu
         WHEN("run() is started afterwards")
         {
             thewatcher::server::StartupSignal startup;
-            auto finished = std::async(std::launch::async, [&] {
+            thewatcher::test::BackgroundCall finished([&] {
                 server.run(&startup);
             });
 

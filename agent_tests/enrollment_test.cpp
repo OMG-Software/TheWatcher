@@ -3,6 +3,7 @@
 #include "../agent/enrollment.hpp"
 #include "common/crypto.hpp"
 #include "common/protocol.hpp"
+#include "test_support/background_call.hpp"
 #include "test_support/enroll_reply_server.hpp"
 
 #include <catch2/catch_test_macros.hpp>
@@ -365,12 +366,12 @@ SCENARIO("A stop requested before Agent::start is not cleared by start (issue #8
 
         WHEN("start() is called afterwards")
         {
-            auto finished = std::async(std::launch::async, [&] {
+            thewatcher::test::BackgroundCall finished([&] {
                 agent.start();
             });
             const auto status = finished.wait_for(std::chrono::seconds(5));
             if (status != std::future_status::ready)
-                agent.stop(); // release the worker so the future can be destroyed
+                agent.stop(); // make start() return so the worker thread can be joined
 
             THEN("start() returns instead of retrying enrollment forever")
             {
