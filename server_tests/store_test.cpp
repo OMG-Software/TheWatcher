@@ -3338,18 +3338,20 @@ SCENARIO("A read error while scanning views rolls the agent delete back")
     GIVEN("a file store whose views relation fails when it is read")
     {
         const auto path = unique_store_path("failing-views.db").string();
-        {
-            SqliteStore store(path);
-            store.upsert_agent(make_agent("gone"));
-            SilenceRecord silence;
-            silence.agent_id = "gone";
-            silence.indicator = "*";
-            silence.until_ms = 9'000'000'000'000;
-            silence.created_at = 1;
-            store.create_silence(silence);
-        }
+        // One store stays open for the whole scenario, so its schema set-up never
+        // runs against the replaced relation (a later migration that alters or
+        // indexes views would otherwise break this fixture).
+        SqliteStore store(path);
+        store.upsert_agent(make_agent("gone"));
+        SilenceRecord silence;
+        silence.agent_id = "gone";
+        silence.indicator = "*";
+        silence.until_ms = 9'000'000'000'000;
+        silence.created_at = 1;
+        store.create_silence(silence);
 
-        // Replace the views table by a SQL view whose config_json raises
+        // Through a second connection (the store holds no transaction here),
+        // replace the views table by a SQL view whose config_json raises
         // "integer overflow" (SQLITE_ERROR) when a row is stepped. Unlike a
         // corrupt page, this error does not make SQLite roll the transaction
         // back by itself, so only the store's own error handling can.
@@ -3362,8 +3364,6 @@ SCENARIO("A read error while scanning views rolls the agent delete back")
                          " 0 AS group_id, abs(-9223372036854775807-1) AS config_json, 1 AS created_at;",
                          nullptr, nullptr, nullptr) == SQLITE_OK);
         sqlite3_close(raw);
-
-        SqliteStore store(path);
 
         WHEN("the agent is deleted")
         {
