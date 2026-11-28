@@ -78,6 +78,14 @@ agent_runtime_test = executable(
 )
 test('agent_runtime', agent_runtime_test, is_parallel: false, timeout: 180)
 
+process_collector_test = executable(
+  'process_collector_test',
+  ['process_collector_test.cpp'],
+  include_directories: root_inc,
+  dependencies: [collectors_dep, common_dep, catch2_dep, platform_deps],
+)
+test('process_collector', process_collector_test)
+
 cpu_collector_test = executable(
   'cpu_collector_test',
   ['cpu_collector_test.cpp'],
