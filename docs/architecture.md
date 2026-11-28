@@ -12,6 +12,7 @@ server/main.cpp
 server/server.cpp
 server/api.cpp
 server/store_sqlite.cpp
+server/store_postgres.cpp
 server/status_engine.cpp
 server/zap_handler.cpp
 server/config.cpp
@@ -23,8 +24,9 @@ Responsibilities:
 - Bind the ZeroMQ ROUTER data socket on `bind_address`.
 - Bind the ZeroMQ REP enrollment socket on `enrollment_address`.
 - Start the HTTP REST API on `api_host:api_port`.
-- Persist agents and metrics through `Store`, currently `SqliteStore`.
-- Persist users, groups, sessions, status history, alerts, and server settings.
+- Persist agents and metrics through `Store`: `SqliteStore` (default) or `PostgresStore` (`DB_TYPE=postgres`).
+- Persist users, groups, sessions, status history, alerts, silences, views,
+  runbooks, maintenance windows, log matches, and server settings.
 - Persist per-agent CPU, memory, disk, and network status thresholds.
 - Approve/reject/delete enrolled agents.
 - Dispatch queued commands to agents over the existing agent connection.
@@ -120,7 +122,7 @@ Frame types:
 
 Commands are defined in `common/commands.hpp` and CBOR-serialised. Metrics are
 defined in `common/metrics.hpp`, CBOR-serialised on the wire, persisted as a
-CBOR BLOB in SQLite, and converted to JSON inside `server/api.cpp` (via
+CBOR BLOB in the store, and converted to JSON inside `server/api.cpp` (via
 `server/api_json.hpp`'s nlohmann adapters) when served to the dashboard.
 
 ## Storage
@@ -131,9 +133,13 @@ Files:
 server/store.hpp
 server/store_sqlite.cpp
 server/store_sqlite.hpp
+server/store_postgres.cpp
+server/store_postgres.hpp
 ```
 
-`Store` is the server storage boundary. `SqliteStore` persists:
+`Store` is the server storage boundary. `SqliteStore` and `PostgresStore`
+(the latter only compiled when PostgreSQL support is enabled at build time;
+see [Build Environment](build-environment.md)) both persist:
 
 - agent identity and enrollment state;
 - approved/rejected flags;
@@ -145,10 +151,11 @@ server/store_sqlite.hpp
 - status history and soft-deletable alerts;
 - runtime server settings such as thresholds and webhook URL;
 - first seen and last seen timestamps;
-- metric snapshots.
+- metric snapshots;
+- silences, saved views, runbooks, maintenance windows, and matched log lines.
 
 Schema migrations are implemented as additive `ALTER TABLE` calls guarded by
-column checks in `SqliteStore::init_schema()`.
+column checks in `init_schema()` of each store.
 
 ## REST API
 

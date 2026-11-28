@@ -49,10 +49,10 @@ namespace
     void log_metrics_summary(const char* prefix, const std::string& agent_id, const SystemMetrics& metrics)
     {
         LOGF_DEBUG("%s agent_id=%s host=%s platform=%s uptime_seconds=%.0f cpu_usage=%.2f memory_usage=%.2f disks=%zu "
-                   "networks=%zu temperatures=%zu processes=%zu",
+                   "networks=%zu processes=%zu",
                    prefix, agent_id.c_str(), metrics.hostname.c_str(), metrics.platform.c_str(), metrics.uptime_seconds,
                    metrics.cpu.usage_percent, metrics.memory.usage_percent, metrics.disks.size(),
-                   metrics.networks.size(), metrics.temperatures.size(), metrics.top_processes.size());
+                   metrics.networks.size(), metrics.top_processes.size());
         if (!metrics.disks.empty())
         {
             const auto& disk = metrics.disks.front();
