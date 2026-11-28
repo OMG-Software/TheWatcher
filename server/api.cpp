@@ -1850,11 +1850,8 @@ void ApiServer::setup_routes()
                 return;
             }
             LOGF_INFO("Deleting agent id=%s", id.c_str());
-            if (rec)
-            {
-                zap_.remove_key(rec->curve_public_key_z85);
-                LOGF_DEBUG("Deleted agent key removed from ZAP id=%s", id.c_str());
-            }
+            zap_.remove_key(rec->curve_public_key_z85);
+            LOGF_DEBUG("Deleted agent key removed from ZAP id=%s", id.c_str());
             store_.delete_agent(id);
             res.set_content(
                 json{
