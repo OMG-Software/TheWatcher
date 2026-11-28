@@ -45,7 +45,7 @@ function Dashboard({ session, onSignOut }: { session: SessionInfo; onSignOut: ()
   const [overviewGroupFilter, setOverviewGroupFilter] = React.useState<OverviewGroupFilter>('all');
 
   const { agents, pending, groups, alerts, allAlerts, users, maintenanceWindows, silences, customViews, sectionErrors, loadedAt, error, loading, refresh } = useDashboardData();
-  const { busyAction, runAction, failure, clearFailure } = useRunAction(refresh);
+  const { busyAction, isBusy, runAction, failure, clearFailure } = useRunAction(refresh);
 
   const counts = summaryCounts(agents);
   const displayAlerts = toDisplayAlerts(alerts, agents);
@@ -207,10 +207,10 @@ function Dashboard({ session, onSignOut }: { session: SessionInfo; onSignOut: ()
       {!unloaded && view === 'silences' ? (
         <>
           {sectionErrors.silences ? <LoadFailed what="silence rules" message={sectionErrors.silences} onRetry={retry} /> : null}
-          <SilencesPage agents={agents} busyAction={busyAction} global={global} loadFailed={Boolean(sectionErrors.silences)} operator={operator} runAction={runAction} silences={silences} />
+          <SilencesPage agents={agents} global={global} isBusy={isBusy} loadFailed={Boolean(sectionErrors.silences)} operator={operator} runAction={runAction} silences={silences} />
         </>
       ) : null}
-      {!unloaded && view === 'runbooks' ? <RunbooksPage agents={agents} global={global} runAction={runAction} /> : null}
+      {!unloaded && view === 'runbooks' ? <RunbooksPage agents={agents} global={global} isBusy={isBusy} runAction={runAction} /> : null}
       {!unloaded && view === 'users' ? (
         <>
           {sectionErrors.users ? <LoadFailed what="users" message={sectionErrors.users} onRetry={retry} /> : null}

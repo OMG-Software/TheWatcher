@@ -18,10 +18,12 @@ import { safeRunbookUrl } from '../uiLogic';
 export function RunbooksPage({
   agents = [],
   global = true,
+  isBusy = () => false,
   runAction,
 }: {
   agents?: DashboardAgent[];
   global?: boolean;
+  isBusy?: (key: string) => boolean;
   runAction: RunAction;
 }) {
   const [agentId, setAgentId] = React.useState('');
@@ -104,7 +106,7 @@ export function RunbooksPage({
         </div>
         <ActionError actionKey="runbook:create" />
         <div className="button-row">
-          <button className="text-button" type="submit" disabled={!url}>
+          <button className="text-button" type="submit" disabled={!url || isBusy('runbook:create')}>
             <Plus size={14} /> Add Runbook
           </button>
         </div>
@@ -130,7 +132,7 @@ export function RunbooksPage({
                 <td className="uptime">{rb.created_by}</td>
                 <td>
                   <ActionButton
-                    busy={false}
+                    busy={isBusy(`runbook:delete:${rb.runbook_id}`)}
                     danger
                     icon={<Trash2 size={14} />}
                     label="Delete"

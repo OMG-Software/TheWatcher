@@ -10,16 +10,16 @@ import type { DashboardAgent, SilenceRecord } from '../models';
 
 export function SilencesPage({
   agents,
-  busyAction,
   global,
+  isBusy,
   loadFailed = false,
   operator,
   runAction,
   silences,
 }: {
   agents: DashboardAgent[];
-  busyAction: string | null;
   global: boolean;
+  isBusy: (key: string) => boolean;
   loadFailed?: boolean;
   operator: boolean;
   runAction: RunAction;
@@ -91,7 +91,7 @@ export function SilencesPage({
           {kinds.error ? <LoadFailed what="indicator names" message={kinds.error} onRetry={() => void kinds.refresh()} stale={kinds.data !== null} /> : null}
           <ActionError actionKey="silence:create" />
           <div className="button-row">
-            <button className="text-button" disabled={busyAction !== null} type="submit">
+            <button className="text-button" disabled={isBusy('silence:create')} type="submit">
               <Plus size={14} /> Add Silence Rule
             </button>
           </div>
@@ -126,7 +126,7 @@ export function SilencesPage({
                   {operator ? (
                     <td>
                       <ActionButton
-                        busy={busyAction === `silence:delete:${s.silence_id}`}
+                        busy={isBusy(`silence:delete:${s.silence_id}`)}
                         danger
                         icon={<Trash2 size={14} />}
                         label="Delete"
