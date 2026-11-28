@@ -14,6 +14,11 @@ ready. Build tool setup is covered in [Build Environment](build-environment.md).
   - `5556/tcp` enrollment;
   - `8080/tcp` REST API.
 - SQLite support from the built binary. No external SQLite service is required.
+- Optional: a PostgreSQL server (14 or later) if you set `DB_TYPE=postgres`.
+  The server binary must have been built with PostgreSQL support; see
+  [Build Environment](build-environment.md). See [Configuration](configuration.md)
+  for the settings and [High-Availability Topology](ha-topology.md) for a
+  two-node setup.
 - The generated server CURVE public key is returned to agents in approved
   enrollment responses and then pinned by the agent.
 
@@ -228,14 +233,14 @@ New-Item -ItemType Directory -Force C:\ProgramData\TheWatcher
 Recommended files:
 
 ```text
-C:\ProgramData\TheWatcher\server.json
+C:\ProgramData\TheWatcher\TheWatcherServer.conf
 C:\ProgramData\TheWatcher\TheWatcherServer.log
 C:\ProgramData\TheWatcher\TheWatcherAgent.conf
 C:\ProgramData\TheWatcher\TheWatcherAgent.log
 ```
 
-The server creates `server.json` on first run if it does not exist. The agent
-creates `TheWatcherAgent.conf` on first run if it does not exist.
+The server creates `TheWatcherServer.conf` on first run if it does not exist.
+The agent creates `TheWatcherAgent.conf` on first run if it does not exist.
 
 The config directory holds the server and agent CURVE secret keys. On POSIX
 installs the generated config files are owner-only (`0600`). On Windows,
@@ -253,6 +258,87 @@ added. `/grant:r` alone does not remove it. The second command makes existing
 files inherit only the restricted ACL; skip it when the directory is empty. Use
 the third command to confirm that only `Administrators` and `SYSTEM` remain.
 
+### Upgrading from an installer that used `server.json`
+
+Older Windows installers registered the server service with
+`--config C:\ProgramData\TheWatcher\server.json`. The server wrote a
+`KEY=VALUE` file at that path, the same format as `TheWatcherServer.conf`. The
+current installer copies it to the new name and keeps the original as a
+backup, as described below.
+
+Steps 0 to 2 run in `PrepareToInstall`, before any file is touched. Inno Setup
+carries on after an error raised later in the install, but a failure here
+aborts the install cleanly with a message, so the server can never be
+registered against a missing or keyless `TheWatcherServer.conf` (the server
+would generate a new CURVE keypair, or run without CURVE, and every enrolled
+agent would break).
+
+The services that were running before the upgrade are started again whatever
+happens next, server first:
+
+- a later step in `PrepareToInstall` fails: no file has been replaced yet, so
+  they start on their old registrations, and the abort message says whether
+  that worked;
+- the file copy fails or you cancel it: they start on their old registrations
+  when Setup exits, and the setup log (`/LOG`) says whether that worked;
+- the install finishes: they start on their new registrations after step 3.
+  A service that does not start is reported as in step 3 (exit code 10).
+
+A service that was stopped before the upgrade, or a fresh install, is not
+started; see [Windows Services](#windows-services).
+
+The steps are:
+
+0. checks, before stopping anything, that a `server.json` without a
+   `TheWatcherServer.conf` next to it can be migrated (see below). If it
+   cannot, the installer refuses to continue and the running install is left
+   exactly as it was;
+1. stops the TheWatcher agent and server services, waiting up to 30 seconds
+   for each. A service that is not installed or already stopped is skipped; if
+   an installed service cannot be stopped the installer aborts, so stop it
+   manually and run the installer again. It then creates the config directory
+   and restricts it to SYSTEM and Administrators;
+2. copies `server.json` to `TheWatcherServer.conf` when the old file exists,
+   `TheWatcherServer.conf` does not (an existing `.conf` is never overwritten,
+   and `server.json` is kept as a backup), and `server.json` has non-comment
+   `SERVER_PUBLIC_KEY=<key>` and `SERVER_SECRET_KEY=<key>` lines whose values
+   are 40-character Z85 keys (spaces around `=` are fine and a repeated key
+   keeps its last value, as in the server parser). The file is copied
+   unchanged, so the server keeps the CURVE identity it had and agents keep
+   working. The installer checks the form of each key but cannot check that
+   the two keys are a pair; the server checks that when it starts with the
+   new config, and a pair that does not match makes the start fail, which is
+   reported as below. The copy is read back and must
+   pass the same check; a failed or incomplete copy is deleted, so the next run
+   migrates again instead of finding a broken `.conf`. An unreadable
+   `server.json` aborts the install;
+3. after the files are copied, removes the old service registration (skipped
+   when the service is not installed), waits up to 30 seconds for it to
+   disappear, and registers it again so the service command line points at
+   `TheWatcherServer.conf`, retrying 5 times if the old service is still marked
+   for deletion. Exit codes are checked in the installer script, because
+   `[Run]` entries cannot check them. Registration cannot abort an install that
+   has already copied its files, so a failure here is reported instead: the
+   installer shows an error with the exact
+   `--install-service --config <path>` commands to run as Administrator, the
+   finished page repeats them, and the setup process exits with code 10 (so
+   silent installs can detect it; `/LOG` records the message). Close
+   `services.msc` and run the installer again if the old service is still marked
+   for deletion. The services that were running before the upgrade are then
+   started; one that does not start is reported the same way (message,
+   finished page, exit code 10), so check its log and the Windows event log
+   and start it with `sc.exe start <name>`.
+
+If `server.json` lacks either key line or a key is not a valid Z85 key (for
+example JSON you wrote by hand, even if it mentions both keys, or a file with
+an empty `SERVER_PUBLIC_KEY`) and there is no `TheWatcherServer.conf`, the
+installer stops at step 0 without changing anything; the message names the
+key that is missing or malformed, never its value. Copy the settings into
+`TheWatcherServer.conf` yourself, keeping the old `SERVER_PUBLIC_KEY` and
+`SERVER_SECRET_KEY` (without them the server generates a new keypair, or runs
+without CURVE, and every agent must be re-enrolled), then run the installer
+again. `server.json` is never modified.
+
 ## Foreground Install
 
 Foreground mode is the simplest local setup. No service registration is needed.
@@ -260,7 +346,7 @@ Foreground mode is the simplest local setup. No service registration is needed.
 Create the server config and print its public key:
 
 ```powershell
-.\builddir-release\server\TheWatcherServer.exe --config C:\ProgramData\TheWatcher\server.json
+.\builddir-release\server\TheWatcherServer.exe --config C:\ProgramData\TheWatcher\TheWatcherServer.conf
 ```
 
 Stop it with `Ctrl+C` if you only wanted to create the config. Normal agents
@@ -286,7 +372,7 @@ Open the dashboard and approve the pending agent.
 Install the server service:
 
 ```powershell
-.\builddir-release\server\TheWatcherServer.exe --install-service --config C:\ProgramData\TheWatcher\server.json
+.\builddir-release\server\TheWatcherServer.exe --install-service --config C:\ProgramData\TheWatcher\TheWatcherServer.conf
 ```
 
 Install the agent service:
@@ -363,7 +449,7 @@ explanatory error outside Windows.
 Typical config paths:
 
 ```text
-/etc/thewatcher/server.json
+/etc/thewatcher/TheWatcherServer.conf
 ~/.config/thewatcher/TheWatcherAgent.conf
 ```
 

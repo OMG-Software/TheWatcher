@@ -42,7 +42,7 @@ connect to the VIP so failover is transparent to them.
 
 | Component | Version | Notes |
 |---|---|---|
-| TheWatcher | ≥ 0.5.0 | compiled with `HAVE_LIBPQ` |
+| TheWatcher | current release | built with PostgreSQL support, see [Build Environment](build-environment.md) |
 | PostgreSQL | ≥ 14 | streaming replication optional but recommended |
 | pgBouncer | ≥ 1.18 | transaction-pool mode |
 | keepalived | ≥ 2.2 | VRRP for VIP management |
@@ -82,6 +82,15 @@ auth_file   = /etc/pgbouncer/userlist.txt
 pool_mode   = transaction
 max_client_conn = 200
 default_pool_size = 20
+
+; TLS from TheWatcherServer to pgBouncer (the DSN below uses sslmode=require)
+client_tls_sslmode   = require
+client_tls_cert_file = /etc/pgbouncer/server.crt
+client_tls_key_file  = /etc/pgbouncer/server.key
+
+; TLS from pgBouncer onward to PostgreSQL (PostgreSQL must have ssl = on)
+server_tls_sslmode   = verify-full
+server_tls_ca_file   = /etc/pgbouncer/postgres-ca.crt
 ```
 
 `/etc/pgbouncer/userlist.txt`:
@@ -94,7 +103,11 @@ dedicated pgBouncer host.
 
 ---
 
-## TheWatcher configuration (`TheWatcherServer.conf`)
+## TheWatcher configuration (`/etc/thewatcher/TheWatcherServer.conf`)
+
+The server reads a `KEY=VALUE` file with upper-case keys, one per line (see
+[Configuration](configuration.md)). Other formats such as TOML or JSON are not
+read; the server would ignore them and start with SQLite.
 
 ```text
 DB_TYPE=postgres
@@ -104,16 +117,24 @@ BIND_ADDRESS=tcp://10.0.0.10:5555
 ENROLLMENT_ADDRESS=tcp://10.0.0.10:5556
 API_HOST=0.0.0.0
 API_PORT=8080
+SERVER_PUBLIC_KEY=<same 40-character z85 key on both nodes>
+SERVER_SECRET_KEY=<same 40-character z85 key on both nodes>
 ```
 
-`BIND_ADDRESS` and `ENROLLMENT_ADDRESS` use the VIP. See
-[Configuration](configuration.md) for every option. The store uses the schema
-that `search_path` selects (`public` unless the DSN says
-`options=-csearch_path=myschema`); the server creates and migrates its tables
-on start, and nodes that start together wait for each other, so both nodes
-can use the same config and start at once.
+`BIND_ADDRESS` and `ENROLLMENT_ADDRESS` use the VIP, so the standby can only
+bind them once it holds the VIP. Both nodes must use the same
+`SERVER_PUBLIC_KEY` / `SERVER_SECRET_KEY` pair: agents pin the server public
+key, so a node with a different key is rejected after failover. Keep the file
+owner-only, because it holds the CURVE secret and the database password.
 
-Use the same config on both nodes.  Only the active node will hold the VIP.
+The store uses the schema that `search_path` selects (`public` unless the DSN
+says `options=-csearch_path=myschema`); the server creates and migrates its
+tables on start, and nodes that start together wait for each other, so both
+nodes can use the same config and start at once. See
+[Configuration](configuration.md) for every option.
+
+A server built without PostgreSQL support exits at startup with
+`Unsupported db_type: postgres`, so a wrong binary is caught immediately.
 
 ---
 
@@ -186,15 +207,18 @@ Make both scripts executable: `chmod +x /usr/local/bin/thewatcher-*.sh`
    the new endpoint accepts connections.
 6. TheWatcherServer reconnects to PostgreSQL through pgBouncer (the store
    resets a dead connection by itself; no process restart) and resumes
-   normal operation. Committed state is in PostgreSQL, so failover does not
-   lose committed data. A write that was in flight when the connection died
+   normal operation. Persistent state (agents, metrics, users, sessions,
+   alerts and settings) is in PostgreSQL, so failover does not lose
+   committed data. A write that was in flight when the connection died
    is not retried, because it may already have been applied, so it can fail:
    the server logs it and carries on (the periodic scan catches the error
    instead of ending the server loop). A dropped metrics sample is
    simply missing (the agent sends the next one); the periodic scans
    (offline detection, dead-agent and heartbeat alerts, escalation) and
    agent heartbeats re-derive their writes from stored state and repeat on
-   the next tick. Reads are retried once on the new connection.
+   the next tick. Reads are retried once on the new connection. State held
+   in memory by the failed node is lost: queued commands that were not yet
+   delivered to an agent, and login throttling counters.
 
 Typical failover time is **5–15 seconds** depending on `advert_int` and
 agent reconnect intervals.
@@ -203,6 +227,10 @@ agent reconnect intervals.
 
 ## Caveats
 
+- **No single-writer guard**: the server does not check whether another
+  node is already running against the same database. Two active nodes both
+  write to PostgreSQL, so keep the standby stopped until it takes the VIP
+  (the `notify_master` / demote scripts above do this).
 - **Split-brain**: Both nodes could briefly believe they are primary.
   To guard against duplicate alerts, ensure the ZeroMQ enrollment port
   is only reachable via the VIP (firewall the per-node IPs).

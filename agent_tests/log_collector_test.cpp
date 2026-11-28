@@ -70,6 +70,17 @@ void allow_test_logs_dir(LogCollector& collector)
     collector.set_allowed_dirs({scratch_root() / "logs"});
 }
 
+// Creates the (empty) file, configures the collector and polls once. A watch
+// starts at the end of an existing file (#90), so content written after this
+// call is what the tests expect to see.
+void start_tailing(LogCollector& collector, const std::filesystem::path& path, std::vector<LogMonitorConfig> configs)
+{
+    append_raw(path, "");
+    collector.set_configs(std::move(configs));
+    collector.tick();
+    collector.take_matches();
+}
+
 } // namespace
 
 // ── Empty configuration ───────────────────────────────────────────────────────
@@ -163,8 +174,8 @@ SCENARIO("LogCollector returns a match for every line that matches the regex pat
         LogCollector collector;
         allow_test_logs_dir(collector);
         auto path = temp_log_path("matching.log");
+        start_tailing(collector, path, {make_config(path.string(), "ERROR", "log:disk", "amber")});
         write_lines(path, {"INFO  application started", "ERROR disk full", "ERROR network timeout"});
-        collector.set_configs({make_config(path.string(), "ERROR", "log:disk", "amber")});
 
         WHEN("tick() is called")
         {
@@ -202,8 +213,8 @@ SCENARIO("LogCollector produces no matches when the pattern does not appear in t
         LogCollector collector;
         allow_test_logs_dir(collector);
         auto path = temp_log_path("no_match.log");
+        start_tailing(collector, path, {make_config(path.string(), "CRITICAL")});
         write_lines(path, {"INFO  all good", "DEBUG verbose line", "TRACE startup"});
-        collector.set_configs({make_config(path.string(), "CRITICAL")});
 
         WHEN("tick() is called")
         {
@@ -226,8 +237,8 @@ SCENARIO("take_matches drains all pending matches and leaves the queue empty")
         LogCollector collector;
         allow_test_logs_dir(collector);
         auto path = temp_log_path("drain.log");
+        start_tailing(collector, path, {make_config(path.string(), "ERROR")});
         write_lines(path, {"ERROR first", "ERROR second"});
-        collector.set_configs({make_config(path.string(), "ERROR")});
         collector.tick();
 
         WHEN("take_matches is called once")
@@ -261,8 +272,8 @@ SCENARIO("LogCollector only returns new lines on subsequent ticks — it does no
         LogCollector collector;
         allow_test_logs_dir(collector);
         auto path = temp_log_path("incremental.log");
+        start_tailing(collector, path, {make_config(path.string(), "ERROR")});
         write_lines(path, {"ERROR first line"});
-        collector.set_configs({make_config(path.string(), "ERROR")});
 
         collector.tick();
         auto first_batch = collector.take_matches();
@@ -302,8 +313,8 @@ SCENARIO("LogCollector detects file rotation via truncation and re-reads from th
         LogCollector collector;
         allow_test_logs_dir(collector);
         auto path = temp_log_path("rotation.log");
+        start_tailing(collector, path, {make_config(path.string(), "ERROR")});
         write_lines(path, {"ERROR stale line 1", "ERROR stale line 2"});
-        collector.set_configs({make_config(path.string(), "ERROR")});
 
         collector.tick();
         auto before_rotation = collector.take_matches();
@@ -333,8 +344,8 @@ SCENARIO("LogCollector skips a config entry whose enabled flag is false")
         LogCollector collector;
         allow_test_logs_dir(collector);
         auto path = temp_log_path("disabled.log");
+        start_tailing(collector, path, {make_config(path.string(), "ERROR", "log:disabled", "red", false)});
         write_lines(path, {"ERROR this should be ignored"});
-        collector.set_configs({make_config(path.string(), "ERROR", "log:disabled", "red", false)});
 
         WHEN("tick() is called")
         {
@@ -384,11 +395,11 @@ SCENARIO("set_configs removes file state for paths that are no longer configured
         auto path_a = temp_log_path("path_a.log");
         auto path_b = temp_log_path("path_b.log");
 
+        append_raw(path_b, "");
+        start_tailing(collector, path_a,
+                      {make_config(path_a.string(), "ERROR", "log:a"), make_config(path_b.string(), "ERROR", "log:b")});
         write_lines(path_a, {"ERROR from a"});
         write_lines(path_b, {"ERROR from b"});
-
-        collector.set_configs(
-            {make_config(path_a.string(), "ERROR", "log:a"), make_config(path_b.string(), "ERROR", "log:b")});
         collector.tick();
         auto first = collector.take_matches();
         REQUIRE(first.size() == 2);
@@ -496,8 +507,8 @@ SCENARIO("LogCollector matches a line that straddles the per-tick byte cap exact
             contents += std::string(1023, 'x') + "\n";
         const std::string straddling = "ERROR straddle" + std::string(1986, 'y');
         contents += straddling + "\nERROR after\n";
+        start_tailing(collector, path, {make_config(path.string(), "ERROR")});
         append_raw(path, contents);
-        collector.set_configs({make_config(path.string(), "ERROR")});
 
         WHEN("tick() is called twice")
         {
@@ -522,6 +533,244 @@ SCENARIO("LogCollector matches a line that straddles the per-tick byte cap exact
             {
                 collector.tick();
                 REQUIRE(collector.take_matches().empty());
+            }
+        }
+    }
+}
+
+// ── Per-watch offsets, first sight, CRLF, rotation (issue #90) ────────────────
+
+SCENARIO("Two indicators on the same file each see every matching line")
+{
+    GIVEN("two watches with different patterns on one log file")
+    {
+        LogCollector collector;
+        allow_test_logs_dir(collector);
+        auto path = temp_log_path("two_watches.log");
+        start_tailing(collector, path,
+                      {make_config(path.string(), "ERROR", "log:errors"),
+                       make_config(path.string(), "disk", "log:disk", "amber")});
+
+        WHEN("a line matching both patterns and a line matching one are appended")
+        {
+            write_lines(path, {"ERROR disk full", "ERROR network down"});
+            collector.tick();
+            auto matches = collector.take_matches();
+
+            THEN("the first watch reports both lines and the second reports only the disk line")
+            {
+                std::size_t errors = 0;
+                std::size_t disk = 0;
+                for (const auto& m : matches)
+                {
+                    if (m.indicator_name == "log:errors")
+                        ++errors;
+                    if (m.indicator_name == "log:disk")
+                        ++disk;
+                }
+                REQUIRE(errors == 2);
+                REQUIRE(disk == 1);
+            }
+        }
+    }
+}
+
+SCENARIO("A watch starts at the end of an existing file and reports only new lines")
+{
+    GIVEN("a log file that already holds matching history")
+    {
+        LogCollector collector;
+        allow_test_logs_dir(collector);
+        auto path = temp_log_path("history.log");
+        write_lines(path, {"ERROR old 1", "ERROR old 2"});
+
+        WHEN("monitoring is enabled and polled")
+        {
+            collector.set_configs({make_config(path.string(), "ERROR")});
+            collector.tick();
+
+            THEN("no historical line is reported")
+            {
+                REQUIRE(collector.take_matches().empty());
+            }
+
+            AND_WHEN("a new line is appended")
+            {
+                write_lines(path, {"ERROR fresh"});
+                collector.tick();
+                auto matches = collector.take_matches();
+
+                THEN("only the new line is reported")
+                {
+                    REQUIRE(matches.size() == 1);
+                    REQUIRE(matches[0].matched_line == "ERROR fresh");
+                }
+            }
+        }
+    }
+
+    GIVEN("a file that ends in a line the writer has not finished")
+    {
+        LogCollector collector;
+        allow_test_logs_dir(collector);
+        auto path = temp_log_path("history_partial.log");
+        write_lines(path, {"ERROR old"});
+        append_raw(path, "ERROR half");
+        collector.set_configs({make_config(path.string(), "ERROR")});
+        collector.tick();
+        REQUIRE(collector.take_matches().empty());
+
+        WHEN("the writer finishes that line")
+        {
+            append_raw(path, " done\n");
+            collector.tick();
+            auto matches = collector.take_matches();
+
+            THEN("the line is evaluated whole, not as a fragment")
+            {
+                REQUIRE(matches.size() == 1);
+                REQUIRE(matches[0].matched_line == "ERROR half done");
+            }
+        }
+    }
+
+    GIVEN("a watch added on a file that another watch already tails")
+    {
+        LogCollector collector;
+        allow_test_logs_dir(collector);
+        auto path = temp_log_path("added_watch.log");
+        start_tailing(collector, path, {make_config(path.string(), "ERROR", "log:first")});
+        write_lines(path, {"ERROR before second watch"});
+        collector.tick();
+        REQUIRE(collector.take_matches().size() == 1);
+
+        WHEN("a second watch is configured")
+        {
+            collector.set_configs(
+                {make_config(path.string(), "ERROR", "log:first"), make_config(path.string(), "ERROR", "log:second")});
+            collector.tick();
+
+            THEN("the second watch does not replay the existing lines and the first is not disturbed")
+            {
+                REQUIRE(collector.take_matches().empty());
+            }
+
+            AND_WHEN("another line is appended")
+            {
+                write_lines(path, {"ERROR after second watch"});
+                collector.tick();
+
+                THEN("both watches report it once")
+                {
+                    REQUIRE(collector.take_matches().size() == 2);
+                }
+            }
+        }
+    }
+}
+
+SCENARIO("A file created after monitoring began is read from its first byte")
+{
+    GIVEN("a watch on a path that does not exist yet")
+    {
+        LogCollector collector;
+        allow_test_logs_dir(collector);
+        auto path = temp_log_path("created_later.log");
+        collector.set_configs({make_config(path.string(), "ERROR")});
+        collector.tick();
+        REQUIRE(collector.take_matches().empty());
+
+        WHEN("the file appears with content and is polled")
+        {
+            write_lines(path, {"ERROR first", "ERROR second"});
+            collector.tick();
+
+            THEN("every line in it is new and is reported")
+            {
+                REQUIRE(collector.take_matches().size() == 2);
+            }
+        }
+    }
+}
+
+SCENARIO("CRLF line endings do not defeat end-anchored patterns")
+{
+    GIVEN("a Windows-style log and a pattern anchored at the end of the line")
+    {
+        LogCollector collector;
+        allow_test_logs_dir(collector);
+        auto path = temp_log_path("crlf.log");
+        start_tailing(collector, path, {make_config(path.string(), "ERROR$")});
+
+        WHEN("lines ending in CRLF are appended")
+        {
+            append_raw(path, "disk ERROR\r\nall fine\r\nnet ERROR\r\n");
+            collector.tick();
+            auto matches = collector.take_matches();
+
+            THEN("both ERROR lines match and the reported text has no carriage return")
+            {
+                REQUIRE(matches.size() == 2);
+                REQUIRE(matches[0].matched_line == "disk ERROR");
+                REQUIRE(matches[1].matched_line == "net ERROR");
+            }
+        }
+    }
+}
+
+SCENARIO("A replaced log file is read from its start even if the new file is larger")
+{
+    GIVEN("a tailed file that is rotated by renaming it and creating a new file")
+    {
+        LogCollector collector;
+        allow_test_logs_dir(collector);
+        auto path = temp_log_path("replaced.log");
+        auto rotated = path;
+        rotated += ".1";
+        std::filesystem::remove(rotated);
+        start_tailing(collector, path, {make_config(path.string(), "ERROR")});
+        write_lines(path, {"ERROR a"});
+        collector.tick();
+        REQUIRE(collector.take_matches().size() == 1);
+
+        WHEN("the new file is already longer than the old read offset when polled")
+        {
+            std::filesystem::rename(path, rotated);
+            write_lines(path, {"ERROR new 1", "ERROR new 2", "ERROR new 3"});
+            collector.tick();
+
+            THEN("all its lines are reported, from byte 0")
+            {
+                REQUIRE(collector.take_matches().size() == 3);
+            }
+        }
+    }
+}
+
+SCENARIO("A file that is deleted and recreated is read from its start")
+{
+    GIVEN("a tailed file that disappears between polls")
+    {
+        LogCollector collector;
+        allow_test_logs_dir(collector);
+        auto path = temp_log_path("recreated.log");
+        start_tailing(collector, path, {make_config(path.string(), "ERROR")});
+        write_lines(path, {"ERROR before delete"});
+        collector.tick();
+        REQUIRE(collector.take_matches().size() == 1);
+        std::filesystem::remove(path);
+        collector.tick();
+
+        WHEN("it is recreated with new content")
+        {
+            write_lines(path, {"ERROR recreated"});
+            collector.tick();
+            auto matches = collector.take_matches();
+
+            THEN("the new content is reported")
+            {
+                REQUIRE(matches.size() == 1);
+                REQUIRE(matches[0].matched_line == "ERROR recreated");
             }
         }
     }
