@@ -51,10 +51,10 @@ namespace
     void log_metrics_summary(const char* prefix, const std::string& agent_id, const SystemMetrics& metrics)
     {
         LOGF_DEBUG("%s agent_id=%s host=%s platform=%s uptime_seconds=%.0f cpu_usage=%.2f memory_usage=%.2f disks=%zu "
-                   "networks=%zu temperatures=%zu processes=%zu",
+                   "networks=%zu processes=%zu",
                    prefix, agent_id.c_str(), metrics.hostname.c_str(), metrics.platform.c_str(), metrics.uptime_seconds,
                    metrics.cpu.usage_percent, metrics.memory.usage_percent, metrics.disks.size(),
-                   metrics.networks.size(), metrics.temperatures.size(), metrics.top_processes.size());
+                   metrics.networks.size(), metrics.top_processes.size());
         if (!metrics.disks.empty())
         {
             const auto& disk = metrics.disks.front();
@@ -376,9 +376,9 @@ SystemMetrics Agent::collect_metrics()
     {
         LOGF_TRACE("Updating collector: %s", std::string(c->name()).c_str());
         c->update(m);
-        LOGF_TRACE("Collector %s snapshot cpu=%.2f memory=%.2f disks=%zu networks=%zu temperatures=%zu processes=%zu",
+        LOGF_TRACE("Collector %s snapshot cpu=%.2f memory=%.2f disks=%zu networks=%zu processes=%zu",
                    std::string(c->name()).c_str(), m.cpu.usage_percent, m.memory.usage_percent, m.disks.size(),
-                   m.networks.size(), m.temperatures.size(), m.top_processes.size());
+                   m.networks.size(), m.top_processes.size());
     }
     return m;
 }
