@@ -28,8 +28,6 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   4 KiB of a line is no longer reported, and `$` does not match at the cut.
   A pattern that nests groups more than 16 levels deep is skipped with a
   warning; 100 nested groups overflowed the 64 MB stack.
-  Patterns with exponential backtracking can still use a lot of CPU
-  (#169).
 - **Behaviour change:** the data plane no longer trusts the ROUTER routing
   id. Agents no longer set it (libzmq generates one), and the server sends
   commands only to the connection that last sent an authenticated frame for
@@ -55,6 +53,21 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 
+- Log tailing (#90): each indicator keeps its own read offset, so two
+  indicators on one file both match; a monitor starts at the end of an
+  existing file instead of replaying its history as new alerts (a file that
+  appears later is read from its first byte); a line the writer has not
+  finished is matched whole once it ends; the carriage return of CRLF lines is
+  dropped so `$`-anchored patterns match; a replaced, deleted or truncated
+  file is read again from its start. A regex engine failure on one line (for
+  example MSVC `error_stack`) skips that line and is logged once per poll,
+  instead of stalling the file.
+- Log patterns that can backtrack exponentially are rejected (#169). The
+  server answers 400 when a collector config is saved with one and the agent
+  skips it with a warning. Refused: back-references; a repeated group that
+  contains a quantifier or alternation, such as `(a+)+` or `(a|aa)*`;
+  overlapping unbounded quantifiers back to back, such as `.*.*`; and more
+  than three unbounded quantifiers (`*`, `+`, `{n,}`) in one pattern.
 - Dashboard: `tsc` no longer writes `.js`/`.d.ts` files into `dashboard/src`
   (`noEmit`), the 21 committed compiled twins are removed, and vitest runs
   only `*.test.ts(x)`. Before, Vite served the stale twins and every test ran
@@ -114,6 +127,27 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   `Agent::start()`; the agent's stop state is sticky. `--install-service` now
   forwards `--log-level` to the service command line for both binaries, and
   agent ZeroMQ sends, like receives, retry on `EINTR` (#84, #99).
+- The Windows installer registers the server service with
+  `TheWatcherServer.conf`, the file the server actually reads, instead of a
+  non-existent `server.json`; the docs name the same file and
+  `OFFLINE_AFTER_SECONDS` key (#131). On upgrade the installer stops the
+  services (aborting if one cannot be stopped), copies a KEY=VALUE
+  `server.json` whose `SERVER_PUBLIC_KEY` and `SERVER_SECRET_KEY` are both
+  40-character Z85 keys to `TheWatcherServer.conf` without overwriting an
+  existing one, and re-registers the service, so agents keep the same server
+  identity. A `server.json` that cannot be converted (either key missing,
+  empty or malformed), with no `TheWatcherServer.conf` beside it, makes the
+  installer refuse to run before it stops or changes anything, so the server
+  never starts without its keypair or without CURVE. The copy is checked again
+  and removed if it is incomplete. Config preparation and migration run in
+  `PrepareToInstall` and abort the install on failure. Services that were
+  running before the upgrade are started again in every outcome: on a
+  preparation failure, when the file copy fails or is cancelled, and on the
+  new registrations once the install finishes (installers used to leave them
+  stopped until they were started by hand or the host rebooted). Service
+  registration checks exit codes and retries while the old service is marked
+  for deletion; a registration or restart failure shows what to run by hand
+  and makes setup exit with code 10 (#131).
 - Disk collector (Linux): LVM/device-mapper volumes now report I/O rates
   (`/dev/mapper/<name>` is mapped to its `dm-N` node, and symlinks such as
   `/dev/disk/by-uuid/...` are resolved); loop, snap (squashfs), pseudo and
@@ -174,6 +208,17 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   rotate by size (default 10 MiB, 5 backups). New `LOG_LEVEL`,
   `LOG_MAX_SIZE_MB` and `LOG_MAX_FILES` config keys and a `--log-level`
   option on both binaries; set `LOG_LEVEL=trace` to get the old output (#99).
+- Documentation: PostgreSQL is documented as an implemented backend selected
+  with `DB_TYPE=postgres` / `POSTGRES_DSN` (build-time support required), the
+  HA guide uses the real `TheWatcherServer.conf` KEY=VALUE format with its
+  failover and single-writer caveats, and architecture, configuration, README
+  and tracker match (#130).
+- Documentation: the new-collector checklists point at the real files
+  (`common/metrics.hpp` for the struct and CBOR, `server/api_json.hpp` for the
+  JSON mapping), and the nonexistent `dashboard_tests/` directory and
+  temperature collector references are gone (#133).
+- Agent and server metric log lines no longer print a `temperatures=` count
+  (#133).
 - The server config save now uses the shared `common::write_private_file_atomic`
   helper (atomic, owner-only write) that the agent config also uses; the
   duplicated code in `server/config.cpp` is removed. No behaviour change (#149).

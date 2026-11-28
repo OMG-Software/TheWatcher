@@ -8,7 +8,7 @@ around `SingleLog`; it is intended to be included and used as-is.
 Foreground and service modes write logs beside the active config file:
 
 ```text
-server config: <config-directory>\server.json
+server config: <config-directory>\TheWatcherServer.conf
 server log:    <config-directory>\TheWatcherServer.log
 
 agent config:  <config-directory>\TheWatcherAgent.conf
@@ -102,17 +102,15 @@ agent logger:
 - Network logs interface counts on supported platforms and unsupported-platform
   notices otherwise.
 - Process logs discovered and reported process counts.
-- Temperature logs sensor counts where implemented and unsupported Windows
-  collection otherwise.
 
 The agent also logs a collected metrics summary after each collection cycle,
 including host, platform, uptime, CPU usage, memory usage, and disk, network,
-temperature, and process counts. The agent logs queued and sent frame details
+and process counts. The agent logs queued and sent frame details
 for metrics, config requests, heartbeat frames, and command acknowledgements.
 
 The server logs every decoded inbound agent frame with identity, frame type,
 payload size, and frame timestamp. Metric frames include decoded CPU, memory,
-disk, network, temperature, process, host, platform, and uptime summaries before
+disk, network, process, host, platform, and uptime summaries before
 the metrics are stored. Heartbeat frames include the agent id and heartbeat
 timestamp.
 
