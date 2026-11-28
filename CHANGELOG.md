@@ -56,8 +56,9 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Dashboard: `ActionButton`, `AgentConfigModal` and `StatusHistoryModal` held
   Windows-1252 bytes for "…" and "—", which `vite build` rejects as invalid
   UTF-8. They are UTF-8 again, and a new test fails whenever any file under
-  `dashboard/src` is not valid UTF-8, since vitest decodes such files without
-  complaint.
+  `dashboard/src` is not valid UTF-8, whatever its extension, since vitest
+  decodes such files without complaint. Only binary assets (images, fonts,
+  media) are skipped.
 - All alerts now go through one pipeline that applies maintenance, silences,
   severity validation, de-duplication, the runbook link and the webhook.
   Log-match alerts no longer fire during maintenance, offline and log-match

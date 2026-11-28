@@ -62,7 +62,9 @@ npm.cmd test      # Vitest + jsdom + React Testing Library UI tests; see docs/da
   setup in helpers when it carries logic.
 - Save every source file as UTF-8. `vite build` rejects any other encoding,
   and `dashboard/src/sourceEncoding.test.ts` fails the unit tests when a file
-  under `dashboard/src` is not valid UTF-8. On Windows, PowerShell 5.1's
+  under `dashboard/src` is not valid UTF-8. It checks every file whatever its
+  extension and skips only binary assets (images, fonts, media); add a new
+  binary type to its `binaryAsset` list. On Windows, PowerShell 5.1's
   `Set-Content` writes the ANSI code page unless you pass `-Encoding utf8`.
 - Keep top-level C++ namespace as `thewatcher`.
 - Prefer structured types in `common/metrics.hpp`, `common/protocol.hpp`, and
