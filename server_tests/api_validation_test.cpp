@@ -85,6 +85,9 @@ AgentRecord approved_agent(const std::string& agent_id)
     rec.platform = "linux";
     rec.curve_public_key_z85 = agent_id + "-key";
     rec.approved = true;
+    // Command routes refuse an agent that is not connected (409, #54) before they
+    // look at the body; these tests are about the body, so the agent is online.
+    rec.connected = true;
     return rec;
 }
 
