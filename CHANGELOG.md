@@ -97,6 +97,10 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 
+- Dashboard: `tsc` no longer writes `.js`/`.d.ts` files into `dashboard/src`
+  (`noEmit`), the 21 committed compiled twins are removed, and vitest runs
+  only `*.test.ts(x)`. Before, Vite served the stale twins and every test ran
+  twice (8 files / 172 tests became 4 / 86) (#103).
 - Agent enrollment recovers after a reply timeout: each attempt uses a new
   REQ socket, so a late server is reached without restarting the agent (#86).
 - A malformed enrollment reply is logged and retried instead of terminating
@@ -152,6 +156,38 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   `postgres::Connection`), so a constructor that throws no longer leaks the
   connection; prepared statements are movable and transactions use a guard
   that rolls back without masking the original error (part of #100).
+- Disk collector (Linux): LVM/device-mapper volumes now report I/O rates
+  (`/dev/mapper/<name>` is mapped to its `dm-N` node, and symlinks such as
+  `/dev/disk/by-uuid/...` are resolved); loop, snap (squashfs), pseudo and
+  bind-mounted duplicates are no longer reported; octal escapes such as
+  `\040` in mount paths are decoded so those disks are no longer dropped
+  (#96).
+- Disk collector (Linux): loop-device filtering, de-duplication and the
+  `/proc/diskstats` lookup now all use the device resolved once through
+  symlinks, so a `/dev/disk/by-id/...` alias of a loop device is excluded and
+  two aliases of one volume are reported once; the reported `device` stays the
+  string from the mount table (#96).
+- Disk collector (BSD): every real mount is reported through `getmntinfo`
+  instead of only `/` (FreeBSD, OpenBSD, NetBSD; not yet compiled on
+  OpenBSD or NetBSD) (#93, part of).
+- Process collector: a watch longer than 15 characters now matches on Linux
+  through the executable basename (`/proc/<pid>/exe`, falling back to
+  `argv[0]`); matching is case-insensitive on Windows; a matched process is
+  reported under the watch name (#95).
+- Process CPU is now percent of one core on every OS (Windows was divided by
+  the core count, and Linux/BSD values were clamped to 100); a process using
+  two cores reports about 200 (#95).
+- Windows process collection opens each process with
+  `PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ`, the rights
+  `GetProcessMemoryInfo` documents. If that is denied (protected processes,
+  other users' processes) it reopens with `PROCESS_QUERY_LIMITED_INFORMATION`
+  only: the process stays listed with its name and CPU and its memory is
+  reported as 0 (#95).
+- The Toolhelp snapshot, process handles and the Linux `/proc` `DIR*` are now
+  RAII-owned (#100, part of).
+- Process collector (BSD): FreeBSD owner comes from the uid, not the login
+  name; OpenBSD (`struct kinfo_proc`, `p_*`) and NetBSD (`kinfo_proc2`) now
+  have their own readers instead of the FreeBSD layout (#93).
 - The CPU collector reports a real usage value on its first `update()` and
   after a collector restart. The constructor takes a baseline and the first
   update waits until it is at least 100 ms old. Calls closer than 100 ms to
@@ -197,6 +233,26 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   history. `*.cmd`/`*.bat` are checked out with CRLF (#128).
 - Version bumped to 0.9.0 in `meson.build`, `dashboard/package.json` and
   the Windows installer.
+- Dashboard: `main.tsx` is split into `App.tsx`, `pages/`, `components/`,
+  `hooks/` and `permissions.ts` (role helpers, now unit tested); inline
+  styles moved into `styles.css`. No behaviour change (#117).
+- Dashboard: removed the unused API helpers `deleteAlert` (identical to
+  `archiveAlert`), `setAgentGroups`, `setAgentRunbook`, `setAgentInterval`,
+  `setAgentProcessLimit`, `setAgentThresholds` and `fetchUptimeReport`, and
+  the unused imports in `main.tsx` (#116).
+- `docs/dashboard.md` now describes the UI as it behaves, including the
+  Silences, Maintenance and Settings pages, the fixed maintenance reason and
+  the first-group approval, and that the server does not serve the bundle
+  (#135).
+
+### Added
+
+- Dashboard: ESLint (flat config, `typescript-eslint`, `react-hooks`) with
+  `npm run lint`, and a `dashboard` CI job running
+  `npm ci --ignore-scripts` (no package install scripts), lint, build, tests
+  and `npm audit --omit=dev` (#120).
+- Dashboard: the footer shows the dashboard version from `package.json`
+  (#127).
 
 ## [0.8.0] - 2026-11-02
 
