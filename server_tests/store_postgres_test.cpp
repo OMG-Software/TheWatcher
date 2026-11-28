@@ -14,10 +14,13 @@
 #include <cstdlib>
 #include <functional>
 #include <future>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -38,6 +41,76 @@ const char* test_dsn()
     if (env && *env)
         return env;
     return "host=localhost dbname=thewatcher_test user=thewatcher_test password=thewatcher_test";
+}
+
+// A conninfo value in single quotes, with backslash and quote escaped as libpq
+// expects in keyword/value form.
+std::string quote_conninfo_value(std::string_view value)
+{
+    std::string quoted = "'";
+    for (const char c : value)
+    {
+        if (c == '\\' || c == '\'')
+            quoted += '\\';
+        quoted += c;
+    }
+    return quoted + "'";
+}
+
+// Returns `dsn` with `extra` added to its server `options` (after any it
+// already has). libpq parses the DSN, so keyword/value and URI forms both
+// work; the result is always keyword/value. Throws std::invalid_argument if
+// libpq cannot parse the DSN.
+std::string dsn_with_server_options(const std::string& dsn, const std::string& extra)
+{
+    char* error = nullptr;
+    const std::unique_ptr<PQconninfoOption, decltype(&PQconninfoFree)> parsed(PQconninfoParse(dsn.c_str(), &error),
+                                                                              &PQconninfoFree);
+    const std::unique_ptr<char, decltype(&PQfreemem)> error_owner(error, &PQfreemem);
+    if (!parsed)
+        throw std::invalid_argument(std::string("test DSN does not parse: ") +
+                                    (error != nullptr ? error : "out of memory"));
+    std::string options = extra;
+    std::string result;
+    // Only settings the DSN names have a value; libpq fills in no defaults.
+    for (const PQconninfoOption* option = parsed.get(); option->keyword != nullptr; ++option)
+    {
+        if (option->val == nullptr)
+            continue;
+        if (std::string_view(option->keyword) == "options")
+        {
+            if (*option->val != '\0')
+                options = std::string(option->val) + " " + extra;
+            continue;
+        }
+        result += std::string(option->keyword) + "=" + quote_conninfo_value(option->val) + " ";
+    }
+    return result + "options=" + quote_conninfo_value(options);
+}
+
+// Every setting a conninfo string (keyword/value or URI form) names, parsed by
+// libpq itself. An unparsable string gives an empty map.
+std::map<std::string, std::string> conninfo_settings(const std::string& dsn)
+{
+    char* error = nullptr;
+    const std::unique_ptr<PQconninfoOption, decltype(&PQconninfoFree)> parsed(PQconninfoParse(dsn.c_str(), &error),
+                                                                              &PQconninfoFree);
+    const std::unique_ptr<char, decltype(&PQfreemem)> error_owner(error, &PQfreemem);
+    std::map<std::string, std::string> settings;
+    if (!parsed)
+        return settings;
+    for (const PQconninfoOption* option = parsed.get(); option->keyword != nullptr; ++option)
+        if (option->val != nullptr)
+            settings[option->keyword] = option->val;
+    return settings;
+}
+
+// A clock that always reads `ms`.
+thewatcher::server::WallClock fixed_clock(int64_t ms)
+{
+    return [ms] {
+        return ms;
+    };
 }
 
 // Returns true if a PostgreSQL server is reachable at the test DSN.
@@ -1572,13 +1645,14 @@ SCENARIO("[postgres] A self-service change applies only to the hash that was ver
 
         WHEN("the change names the stored hash")
         {
-            const auto result = store.update_user_password_if_current_and_revoke_sessions(user_id, old_hash,
-                                                                                          "new-" + suffix, keep, 5000);
+            const auto result = store.update_user_password_if_current_and_revoke_sessions(
+                user_id, old_hash, "new-" + suffix, keep, fixed_clock(5000));
 
             THEN("the hash changes and only the other session is revoked")
             {
                 CHECK(result.status == Status::Changed);
                 CHECK(result.revoked == 1);
+                CHECK(store.get_user_by_username("own-" + suffix)->password_hash == "new-" + suffix);
                 CHECK(store.get_session(keep, 5000).has_value());
                 CHECK_FALSE(store.get_session(other, 5000).has_value());
             }
@@ -1587,8 +1661,8 @@ SCENARIO("[postgres] A self-service change applies only to the hash that was ver
         WHEN("an admin reset replaced the hash after it was verified")
         {
             store.update_user_password(user_id, "reset-" + suffix);
-            const auto result = store.update_user_password_if_current_and_revoke_sessions(user_id, old_hash,
-                                                                                          "new-" + suffix, keep, 5000);
+            const auto result = store.update_user_password_if_current_and_revoke_sessions(
+                user_id, old_hash, "new-" + suffix, keep, fixed_clock(5000));
 
             THEN("the change is refused and nothing is revoked")
             {
@@ -1602,8 +1676,8 @@ SCENARIO("[postgres] A self-service change applies only to the hash that was ver
         WHEN("the user was disabled, and their sessions revoked, after the password was verified")
         {
             REQUIRE(store.disable_user_and_revoke_sessions(user_id) == 1);
-            const auto result = store.update_user_password_if_current_and_revoke_sessions(user_id, old_hash,
-                                                                                          "new-" + suffix, keep, 5000);
+            const auto result = store.update_user_password_if_current_and_revoke_sessions(
+                user_id, old_hash, "new-" + suffix, keep, fixed_clock(5000));
 
             THEN("nothing changes and the store reports that the session ended")
             {
@@ -1617,8 +1691,8 @@ SCENARIO("[postgres] A self-service change applies only to the hash that was ver
         {
             REQUIRE(store.disable_user_and_revoke_sessions(user_id) == 1);
             REQUIRE(store.enable_user_and_revoke_sessions(user_id).has_value());
-            const auto result = store.update_user_password_if_current_and_revoke_sessions(user_id, old_hash,
-                                                                                          "new-" + suffix, keep, 5000);
+            const auto result = store.update_user_password_if_current_and_revoke_sessions(
+                user_id, old_hash, "new-" + suffix, keep, fixed_clock(5000));
 
             THEN("nothing changes: the session that verified the password is gone")
             {
@@ -1631,8 +1705,8 @@ SCENARIO("[postgres] A self-service change applies only to the hash that was ver
         WHEN("the user was disabled without their sessions being revoked")
         {
             REQUIRE(store.disable_user(user_id) == 1);
-            const auto result = store.update_user_password_if_current_and_revoke_sessions(user_id, old_hash,
-                                                                                          "new-" + suffix, keep, 5000);
+            const auto result = store.update_user_password_if_current_and_revoke_sessions(
+                user_id, old_hash, "new-" + suffix, keep, fixed_clock(5000));
 
             THEN("nothing changes or is revoked while the user is disabled")
             {
@@ -1649,8 +1723,8 @@ SCENARIO("[postgres] A self-service change applies only to the hash that was ver
         WHEN("the caller's session ended after the password was verified")
         {
             store.delete_session(keep);
-            const auto result = store.update_user_password_if_current_and_revoke_sessions(user_id, old_hash,
-                                                                                          "new-" + suffix, keep, 5000);
+            const auto result = store.update_user_password_if_current_and_revoke_sessions(
+                user_id, old_hash, "new-" + suffix, keep, fixed_clock(5000));
 
             THEN("nothing changes and the user's other session is kept")
             {
@@ -1665,8 +1739,8 @@ SCENARIO("[postgres] A self-service change applies only to the hash that was ver
         {
             THEN("the store reports it")
             {
-                CHECK(store.update_user_password_if_current_and_revoke_sessions(-1, "x", "y", keep, 5000).status ==
-                      Status::UserNotFound);
+                CHECK(store.update_user_password_if_current_and_revoke_sessions(-1, "x", "y", keep, fixed_clock(5000))
+                          .status == Status::UserNotFound);
             }
         }
 
@@ -1675,7 +1749,7 @@ SCENARIO("[postgres] A self-service change applies only to the hash that was ver
             // make_pg_session expires at 4'000'000'000'000; at that instant the
             // session is no longer valid, although its row is still there.
             const auto result = store.update_user_password_if_current_and_revoke_sessions(
-                user_id, old_hash, "new-" + suffix, keep, 4'000'000'000'000LL);
+                user_id, old_hash, "new-" + suffix, keep, fixed_clock(4'000'000'000'000LL));
 
             THEN("nothing changes and the store reports that the session ended")
             {
@@ -1701,7 +1775,11 @@ SCENARIO("[postgres] A self-service change waits for a sign-out of the caller's 
         const auto user_id = store.create_user("out-" + suffix, old_hash, "global_viewer");
         const auto mine = "out-mine-" + suffix;
         const auto other = "out-other-" + suffix;
-        store.create_session(make_pg_session(user_id, mine));
+        // The caller's session expires at 10'000 on the clock the change reads;
+        // the clock starts at 5'000 and only the test moves it.
+        constexpr int64_t mine_expires_at = 10'000;
+        std::atomic<int64_t> clock_ms{5'000};
+        store.create_session(make_pg_session(user_id, mine, mine_expires_at));
         store.create_session(make_pg_session(user_id, other));
         using Status = PasswordChangeResult::Status;
         // Another server node's logout: its DELETE of the caller's session row
@@ -1721,7 +1799,9 @@ SCENARIO("[postgres] A self-service change waits for a sign-out of the caller's 
             const int holder_pid = PQbackendPID(logout.conn);
             change.start([&] {
                 return store.update_user_password_if_current_and_revoke_sessions(user_id, old_hash, "new-" + suffix,
-                                                                                 mine, 5000);
+                                                                                 mine, [&clock_ms] {
+                                                                                     return clock_ms.load();
+                                                                                 });
             });
             const bool blocked = wait_until_blocked_by(observer.conn, waiter_pid, holder_pid) && change.running();
 
@@ -1740,7 +1820,26 @@ SCENARIO("[postgres] A self-service change waits for a sign-out of the caller's 
                 }
             }
 
-            AND_WHEN("the sign-out rolls back")
+            AND_WHEN("the sign-out rolls back only after the caller's session expired")
+            {
+                // The change read the clock before it blocked; time moves on
+                // while it waits, which a row lock does not prevent.
+                clock_ms = mine_expires_at;
+                logout.run("ROLLBACK");
+                const auto result = change.get();
+
+                THEN("the change judges expiry after the wait and changes nothing")
+                {
+                    CHECK(blocked);
+                    CHECK(result.status == Status::SessionEnded);
+                    CHECK(result.revoked == 0);
+                    CHECK(store.get_user_by_username("out-" + suffix)->password_hash == old_hash);
+                    CHECK(store.get_session(other, 5000).has_value());
+                    CHECK(store.get_session(mine, 5000).has_value()); // rolled back, not deleted
+                }
+            }
+
+            AND_WHEN("the sign-out rolls back while the caller's session is still valid")
             {
                 logout.run("ROLLBACK");
                 const auto result = change.get();
@@ -1760,6 +1859,66 @@ SCENARIO("[postgres] A self-service change waits for a sign-out of the caller's 
     }
 }
 
+// A self-service password change holds the caller's session row FOR SHARE and
+// then deletes the user's other sessions. A purge that waited for that row
+// while holding the user's other expired rows would deadlock with it, so the
+// purge must skip rows another transaction holds and leave them for later.
+SCENARIO("[postgres] A purge skips an expired session another transaction holds instead of waiting for it")
+{
+    if (!postgres_is_available())
+        SKIP("PostgreSQL not available");
+    GIVEN("a user with two expired sessions, one of them locked by another transaction")
+    {
+        PostgresStore store(test_dsn());
+        const auto suffix = unique_suffix();
+        const auto user_id = store.create_user("purge-" + suffix, "hash", "global_viewer");
+        const auto held = "purge-held-" + suffix;
+        store.create_session(make_pg_session(user_id, held, 2'000));
+        store.create_session(make_pg_session(user_id, "purge-loose-" + suffix, 2'000));
+
+        WHEN("a purge runs while that transaction still holds the lock")
+        {
+            // Declared first, so the connections close (releasing the lock)
+            // before the call is joined.
+            BackgroundCall<int> purge;
+            PgSideConnection observer;
+            PgSideConnection holder;
+            // This user's session rows, counted on a connection of its own.
+            const auto rows_left = [&] {
+                const auto sql = "SELECT COUNT(*) FROM sessions WHERE user_id=" + std::to_string(user_id);
+                const std::unique_ptr<PGresult, decltype(&PQclear)> res(PQexec(observer.conn, sql.c_str()), &PQclear);
+                REQUIRE(PQresultStatus(res.get()) == PGRES_TUPLES_OK);
+                return std::stoi(PQgetvalue(res.get(), 0, 0));
+            };
+            holder.run("BEGIN");
+            // What a self-service password change holds on the caller's session.
+            holder.run("SELECT 1 FROM sessions WHERE token='" + hash_session_token(held) + "' FOR SHARE");
+            purge.start([&] {
+                return store.delete_expired_sessions(5'000);
+            });
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+            while (purge.running() && std::chrono::steady_clock::now() < deadline)
+                std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            const bool finished_while_held = !purge.running();
+            const auto left_while_held = rows_left();
+            holder.run("COMMIT");
+            const int removed = purge.get();
+            const int removed_later = store.delete_expired_sessions(5'000);
+            const auto left_at_end = rows_left();
+
+            THEN("it removes the other expired session without waiting, and a later purge removes the held one")
+            {
+                CHECK(finished_while_held);
+                CHECK(left_while_held == 1);
+                CHECK(removed >= 1); // the shared test database may hold other expired rows
+                CHECK(removed_later >= 1);
+                CHECK(left_at_end == 0);
+            }
+        }
+        store.delete_user(user_id);
+    }
+}
+
 namespace
 {
 // Value of `SHOW transaction_isolation` on conn: inside a transaction block
@@ -1771,6 +1930,66 @@ std::string isolation_level(PGconn* conn)
     return PQgetvalue(res.get(), 0, 0);
 }
 } // namespace
+
+// Needs no server: libpq parses and rebuilds the DSN locally. The isolation
+// test below opens a connection with an extra server option, and the test DSN
+// may be in either libpq form, so the option cannot simply be appended.
+SCENARIO("A test DSN gains a server option whatever form it is written in")
+{
+    constexpr std::string_view extra = "-c default_transaction_isolation=serializable";
+
+    GIVEN("a URI-form DSN with credentials, a port and a query parameter")
+    {
+        const std::string dsn = "postgresql://tw_user:s3cret@db.example:6543/tw_db?sslmode=disable";
+
+        WHEN("the server option is added")
+        {
+            const auto settings = conninfo_settings(dsn_with_server_options(dsn, std::string(extra)));
+
+            THEN("the result parses, keeps every setting and carries the option")
+            {
+                REQUIRE_FALSE(settings.empty());
+                CHECK(settings.at("user") == "tw_user");
+                CHECK(settings.at("password") == "s3cret");
+                CHECK(settings.at("host") == "db.example");
+                CHECK(settings.at("port") == "6543");
+                CHECK(settings.at("dbname") == "tw_db");
+                CHECK(settings.at("sslmode") == "disable");
+                CHECK(settings.at("options") == extra);
+            }
+        }
+    }
+
+    GIVEN("a keyword DSN that already sets server options and has a password with a quote and a backslash")
+    {
+        const std::string dsn =
+            R"(host=localhost dbname=tw_db password='it\'s\\x' options='-c statement_timeout=5000')";
+
+        WHEN("the server option is added")
+        {
+            const auto settings = conninfo_settings(dsn_with_server_options(dsn, std::string(extra)));
+
+            THEN("the existing options stay in front of the new one and the password is unchanged")
+            {
+                REQUIRE_FALSE(settings.empty());
+                CHECK(settings.at("options") == "-c statement_timeout=5000 " + std::string(extra));
+                CHECK(settings.at("password") == R"(it's\x)");
+                CHECK(settings.at("host") == "localhost");
+                CHECK(settings.at("dbname") == "tw_db");
+            }
+        }
+    }
+
+    GIVEN("a DSN that libpq cannot parse")
+    {
+        const std::string dsn = "host='unterminated";
+
+        THEN("adding an option is refused instead of producing a broken DSN")
+        {
+            REQUIRE_THROWS_AS(dsn_with_server_options(dsn, std::string(extra)), std::invalid_argument);
+        }
+    }
+}
 
 SCENARIO("[postgres] Store statements run at READ COMMITTED whatever the connection's default")
 {
@@ -1798,7 +2017,7 @@ SCENARIO("[postgres] Store statements run at READ COMMITTED whatever the connect
 
     GIVEN("a store connection opened with a DSN that makes SERIALIZABLE the default")
     {
-        postgres::Connection conn(std::string(test_dsn()) + " options='-c default_transaction_isolation=serializable'");
+        postgres::Connection conn(dsn_with_server_options(test_dsn(), "-c default_transaction_isolation=serializable"));
 
         WHEN("a statement runs outside any transaction block")
         {

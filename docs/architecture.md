@@ -285,8 +285,15 @@ Files: `server/store_synchronized.hpp`, `server/sqlite_raii.hpp`,
   `users` row first: a disable, an admin reset and a self-service password
   change (whose UPDATE locks the user and which then locks the caller's
   session `FOR SHARE`, so a sign-out on another node cannot delete it before
-  the change commits). A sign-out locks only its `sessions` row. Keep that
+  the change commits). A sign-out locks only its `sessions` row, and the
+  expired-session purge takes only rows no one else holds
+  (`FOR UPDATE SKIP LOCKED`), leaving the rest to a later purge. Keep that
   order in new code so these cannot deadlock.
+- A store method that judges time inside a transaction takes a `WallClock`
+  (`std::function<int64_t()>`, milliseconds since the epoch) rather than a
+  fixed time, and reads it after any wait for a lock (SQLite once it holds
+  the write lock, PostgreSQL again after its last statement), so time spent
+  waiting counts.
 - Insert-if-absent across server nodes (`insert_heartbeat_alert_if_absent`)
   cannot rely on the in-process mutex. On PostgreSQL the check and the insert
   run in one transaction holding

@@ -1148,11 +1148,15 @@ PasswordChangeResult SqliteStore::update_user_password_if_current_and_revoke_ses
                                                                                       const std::string& expected_hash,
                                                                                       const std::string& new_hash,
                                                                                       const std::string& caller_token,
-                                                                                      int64_t now_ms)
+                                                                                      const WallClock& clock)
 {
     // BEGIN IMMEDIATE makes this the only writer, so no logout, disable or
     // reset can commit while the transaction is open.
     sqlite::Transaction tx(db_);
+    // Read only now: BEGIN IMMEDIATE may have waited (busy timeout) for
+    // another writer, and the session must still be valid when the change is
+    // made. Nothing below waits, so this one reading holds until the commit.
+    const int64_t now_ms = clock();
     {
         // Every condition is in the one statement, so an admin reset, a
         // disable, a revocation or the expiry of the caller's session cannot

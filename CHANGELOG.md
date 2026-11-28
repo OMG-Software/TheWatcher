@@ -153,22 +153,34 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   `PasswordChangeResult::Status::SessionEnded`). Before, a disable followed by
   an enable in that window let a session that had been revoked still set a new
   password. The store method's token argument is now the required
-  `caller_token`, and it takes `now_ms`: the caller's session must also be
-  unexpired (`expires_at > now`, as `get_session` checks), so a session that
-  expired after the request was authenticated cannot finish the change. On
-  PostgreSQL the change then locks the caller's session row `FOR SHARE` before
-  it revokes or commits, so a sign-out of that session on another node either
-  commits first, and the change is refused with 401, or waits for the change
-  to commit. The lock order (users row, then sessions row) matches a disable
-  and an admin reset, and a sign-out locks only the sessions row, so they
-  cannot deadlock. Expired-session purges are now spaced five minutes from the
+  `caller_token`, and it takes a `WallClock` (`std::function<int64_t()>`)
+  instead of a fixed time: the caller's session must also be unexpired
+  (`expires_at > now`, as `get_session` checks), judged when the change runs,
+  not when the request arrived: SQLite reads the clock once it holds the write
+  lock, so a change that waited for it cannot use a stale time. On PostgreSQL
+  the change then locks the caller's session row
+  `FOR SHARE` before it revokes or commits, so a sign-out of that session on
+  another node either commits first, and the change is refused with 401, or
+  waits for the change to commit; it reads the clock once more just before it
+  commits, and refuses with 401 if the session expired while it waited. The
+  lock order (users row, then sessions row) matches a disable and an admin
+  reset, and a sign-out locks only the sessions row, so they cannot deadlock.
+  The PostgreSQL expired-session purge now skips rows another transaction
+  holds (`FOR UPDATE SKIP LOCKED`) and leaves them to a later purge, so it
+  never waits behind a password change. A request's session lookup reads the
+  clock again after its purge, so a session that expired while the purge
+  waited is refused rather than accepted. The purge-spacing test waits for a
+  lock observer to see the purge reach the store instead of sleeping 200 ms.
+  Expired-session purges are now spaced five minutes from the
   end of the previous successful purge on a monotonic clock, so a slow purge or
   a wall-clock jump cannot make them run back to back or stop them.
   PostgreSQL now always runs at READ COMMITTED: `postgres::Connection` sets it
   as the session default after connecting and `postgres::Transaction` begins
   with `BEGIN ISOLATION LEVEL READ COMMITTED`, so a stricter default from the
   DSN, role or database cannot turn the store's lock-wait re-checks into
-  serialization errors (#145).
+  serialization errors (#145). The isolation test adds its server option
+  through libpq's own DSN parser, so it also works when
+  `THEWATCHER_POSTGRES_TEST_DSN` is a `postgresql://` URI.
 - Session tokens are stored as their SHA-256 (lowercase hex) instead of raw, so a
   database copy or backup no longer contains usable logins. The stores hash
   inside `create_session`, `get_session`, `delete_session`,

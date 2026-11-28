@@ -1139,7 +1139,14 @@ int PostgresStore::delete_expired_sessions(int64_t now_ms)
 {
     const auto p_now = s(now_ms);
     const char* params[] = {p_now.c_str()};
-    Res res(PQexecParams(conn_, "DELETE FROM sessions WHERE expires_at<=$1;", 1, nullptr, params, nullptr, nullptr, 0));
+    // SKIP LOCKED: an expired row that another transaction holds (a password
+    // change holds the caller's session FOR SHARE while it deletes the user's
+    // other sessions) is left for a later purge instead of waited for, so the
+    // purge can never hold some of a user's rows while waiting on another.
+    Res res(PQexecParams(conn_,
+                         "DELETE FROM sessions WHERE token IN "
+                         "(SELECT token FROM sessions WHERE expires_at<=$1::bigint FOR UPDATE SKIP LOCKED);",
+                         1, nullptr, params, nullptr, nullptr, 0));
     check_res(res.r, "delete_expired_sessions");
     const char* affected = PQcmdTuples(res.r);
     return affected != nullptr ? std::atoi(affected) : 0;
@@ -1206,13 +1213,15 @@ std::optional<int> PostgresStore::update_user_password_and_revoke_sessions(int64
 
 PasswordChangeResult PostgresStore::update_user_password_if_current_and_revoke_sessions(
     int64_t user_id, const std::string& expected_hash, const std::string& new_hash, const std::string& caller_token,
-    int64_t now_ms)
+    const WallClock& clock)
 {
     const auto p_uid = s(user_id);
-    const auto p_now = s(now_ms);
     // An empty caller_token hashes to "" and matches no session.
     const auto caller_hash = hash_kept_session_token(caller_token);
     postgres::Transaction tx(conn_);
+    // The statements below can wait for row locks, and time passes while they
+    // do, so expiry is judged on a fresh reading again before the commit.
+    const auto p_now = s(clock());
     // Every condition is in the one statement. If an admin reset or a disable
     // holds the row lock, this waits for it and re-evaluates the WHERE against
     // the committed row (READ COMMITTED), so a changed hash or a disabled
@@ -1255,19 +1264,25 @@ PasswordChangeResult PostgresStore::update_user_password_if_current_and_revoke_s
     // is refused; a delete that starts later waits for this commit. The lock
     // order is the users row (taken by the UPDATE) and then the sessions row,
     // the same order a disable or an admin reset uses; a sign-out locks only
-    // the sessions row. No pair of these can deadlock.
-    const char* lock_params[] = {caller_hash.c_str(), p_uid.c_str(), p_now.c_str()};
-    Res lock(PQexecParams(conn_,
-                          "SELECT 1 FROM sessions "
-                          "WHERE token=$1 AND user_id=$2::bigint AND expires_at>$3::bigint FOR SHARE;",
-                          3, nullptr, lock_params, nullptr, nullptr, 0));
+    // the sessions row, and the expired-session purge skips locked rows. No
+    // pair of these can deadlock. The lock also keeps expires_at fixed, so it
+    // is read here and compared with the clock just before the commit.
+    const char* lock_params[] = {caller_hash.c_str(), p_uid.c_str()};
+    Res lock(PQexecParams(conn_, "SELECT expires_at FROM sessions WHERE token=$1 AND user_id=$2::bigint FOR SHARE;", 2,
+                          nullptr, lock_params, nullptr, nullptr, 0));
     check_res(lock.r, "update_user_password_if_current lock session");
     if (PQntuples(lock.r) == 0)
         return {PasswordChangeResult::Status::SessionEnded, 0}; // the guard rolls back the UPDATE
+    const int64_t caller_expires_at = std::stoll(PQgetvalue(lock.r, 0, 0));
     const char* del_params[] = {p_uid.c_str(), caller_hash.c_str()};
     Res del(PQexecParams(conn_, "DELETE FROM sessions WHERE user_id=$1::bigint AND token<>$2;", 2, nullptr, del_params,
                          nullptr, nullptr, 0));
     check_res(del.r, "update_user_password_if_current delete");
+    // Final check, after every statement that could wait: the caller's
+    // session must still be valid now (expires_at > now, as get_session
+    // checks). Otherwise the guard rolls back the UPDATE and the DELETE.
+    if (caller_expires_at <= clock())
+        return {PasswordChangeResult::Status::SessionEnded, 0};
     const char* affected = PQcmdTuples(del.r);
     const int revoked = affected != nullptr ? std::atoi(affected) : 0;
     tx.commit();

@@ -222,10 +222,15 @@ own row; only a global admin sees it on other users' rows, because the API
 refuses anyone else with 403. On your own account (any role, including a
 global admin) the form asks for the Current password as well as the New
 password, and Save stays disabled until both are filled in. The form stays open
-until the server accepts the change: a refusal (wrong current password 403,
-throttled 429, an admin reset that landed first 409, or your session ended
-while the change was in flight 401) is shown inside the form, the new password
-is kept and the current one is cleared so you can retry.
+until the server accepts the change, and a refusal is shown inside the form
+with the server's reason. After a wrong current password (403) or a throttle
+(429, wait for the time it gives), the new password is kept and the current
+one is cleared so you can retry in the form. Two refusals mean your session is
+gone, and retrying in the form cannot work:
+- 401: your session ended (signed out, revoked, expired, or the account was
+  disabled) while the change was in flight. Sign in again before retrying.
+- 409: an admin reset your password first. A reset also signs out all of your
+  sessions, so sign in again with the password the admin set, then change it.
 Both fields are cleared on success or Cancel. While a change is saving, both
 fields are locked. Closing the form before the server answers is final: the
 answer is discarded, so a refusal does not reopen the form and a late answer

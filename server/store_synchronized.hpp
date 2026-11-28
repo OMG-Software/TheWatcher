@@ -279,11 +279,11 @@ public:
                                                                              const std::string& expected_hash,
                                                                              const std::string& new_hash,
                                                                              const std::string& caller_token,
-                                                                             int64_t now_ms) override
+                                                                             const WallClock& clock) override
     {
         const auto lock = lock_for_call(__func__);
         return inner_->update_user_password_if_current_and_revoke_sessions(user_id, expected_hash, new_hash,
-                                                                           caller_token, now_ms);
+                                                                           caller_token, clock);
     }
 
     std::optional<int> enable_user_and_revoke_sessions(int64_t user_id) override

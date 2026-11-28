@@ -35,6 +35,17 @@ meson test    -C builddir-release server_agent_integration_test --print-errorlog
 meson test    -C builddir-release --print-errorlogs
 ```
 
+The PostgreSQL store tests (`store_postgres_test`, built when libpq is found)
+connect with `THEWATCHER_POSTGRES_TEST_DSN`, or a local `thewatcher_test`
+database if it is unset, and skip when no server answers. The meson test
+`store_postgres` sets that variable to the local `thewatcher_test` database;
+run `server_tests/store_postgres_test` from the build directory to use
+another DSN. The DSN may be in
+keyword/value form (`host=... dbname=...`) or URI form
+(`postgresql://user:password@host:port/db`). A test that needs an extra
+server option adds it through libpq's own parser, so both forms work. Point
+it at a disposable database: the tests create users, sessions and alerts.
+
 Dashboard:
 
 ```powershell

@@ -4,6 +4,7 @@
 #include "common/metrics.hpp"
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <string>
@@ -79,6 +80,11 @@ struct SessionRecord
     int64_t created_at = 0;
     int64_t expires_at = 0;
 };
+
+// Milliseconds since the Unix epoch, read afresh on every call, for a store
+// operation that must judge expiry at the moment it acts rather than when
+// the request arrived.
+using WallClock = std::function<int64_t()>;
 
 // Outcome of Store::update_user_password_if_current_and_revoke_sessions.
 struct PasswordChangeResult
@@ -275,7 +281,10 @@ public:
     // Revokes every session of user_id except the one whose token is
     // keep_token (empty keeps none). Returns the number of rows removed.
     virtual int delete_sessions_for_user(int64_t user_id, const std::string& keep_token = "") = 0;
-    // Removes sessions that expired at or before now_ms. Returns the number removed.
+    // Removes sessions that expired at or before now_ms. Returns the number
+    // removed. A row another transaction holds (PostgreSQL) is skipped rather
+    // than waited for and is left for a later purge, so a purge never holds
+    // some of a user's rows while waiting on another of them.
     virtual int delete_expired_sessions(int64_t now_ms) = 0;
     // Creates the session only while the user still exists, is enabled and
     // still has password_hash (the hash the login verified). Returns false
@@ -294,8 +303,12 @@ public:
     // token of the session that asked). The update is one statement that
     // applies only while the stored hash still equals expected_hash (the hash
     // the caller verified the current password against), the user is enabled
-    // and caller_token is still one of the user's sessions and unexpired at
-    // now_ms (expires_at > now_ms, as get_session checks). Otherwise nothing
+    // and caller_token is still one of the user's sessions and unexpired
+    // (expires_at > now, as get_session checks). The request's arrival time is
+    // not used: SQLite reads `clock` once it holds the write lock, and
+    // PostgreSQL reads it when its transaction begins and again after its
+    // last statement, just before the commit, because a statement can wait
+    // for a row lock while the session runs out. Otherwise nothing
     // is changed or revoked and the status says why, checked in this order:
     // UserNotFound (no such user), PasswordChanged (an admin reset landed in
     // between; it may also have revoked the caller's session), SessionEnded
@@ -309,7 +322,7 @@ public:
                                                                                      const std::string& expected_hash,
                                                                                      const std::string& new_hash,
                                                                                      const std::string& caller_token,
-                                                                                     int64_t now_ms) = 0;
+                                                                                     const WallClock& clock) = 0;
     // Enables the user and, only when that is a real disabled-to-enabled
     // change, revokes every leftover session of the user, in one transaction.
     // Returns the number of sessions revoked (0 for an already enabled user,

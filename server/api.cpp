@@ -1148,9 +1148,10 @@ std::optional<SessionRecord> ApiServer::current_session(const httplib::Request& 
     auto token = cookie_value(req, "tw_session");
     if (token.empty())
         return std::nullopt;
-    const auto now = now_ms();
-    purge_expired_sessions_if_due(now);
-    return store_.get_session(token, now);
+    purge_expired_sessions_if_due(now_ms());
+    // Read the clock again: the purge may have waited (for another writer or
+    // the store's lock), and a session that expired meanwhile must be refused.
+    return store_.get_session(token, now_ms());
 }
 
 std::optional<SessionRecord> ApiServer::require_role(const httplib::Request& req, httplib::Response& res,
@@ -3188,7 +3189,7 @@ void ApiServer::setup_routes()
                 // changed, no session revoked and no success audited. The user
                 // can retry with the new password the admin chose.
                 const auto outcome = store_.update_user_password_if_current_and_revoke_sessions(
-                    user_id, target_user->password_hash, new_hash, cookie_value(req, "tw_session"), now_ms());
+                    user_id, target_user->password_hash, new_hash, cookie_value(req, "tw_session"), now_ms);
                 if (outcome.status == PasswordChangeResult::Status::PasswordChanged)
                 {
                     audit("password_change", "conflict", session->username, remote, target_user->username);

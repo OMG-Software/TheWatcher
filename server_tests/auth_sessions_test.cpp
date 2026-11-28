@@ -47,6 +47,14 @@ int64_t now_ms()
         .count();
 }
 
+// A clock that always reads `ms`.
+thewatcher::server::WallClock fixed_clock(int64_t ms)
+{
+    return [ms] {
+        return ms;
+    };
+}
+
 std::string hash_for(const std::string& password)
 {
     REQUIRE(sodium_init() >= 0);
@@ -1155,9 +1163,18 @@ SCENARIO("Session purges are spaced five minutes from the end of the previous pu
 {
     GIVEN("an API server over a file-backed store whose purge clock the test controls")
     {
+        using thewatcher::server::SynchronizedStore;
+        using LockEvent = SynchronizedStore::LockEvent;
         thewatcher::test::ScopedTempDir dir{"auth-purge-spacing"};
         const auto path = (dir / "purge.db").string();
-        auto store = thewatcher::server::make_store("sqlite", path);
+        // Set by the lock observer when a purge's store call starts, which is
+        // after the purge read its clock on entry. Declared before the store.
+        std::atomic<bool> purge_reached_store{false};
+        auto store = std::make_unique<SynchronizedStore>(std::make_unique<thewatcher::server::SqliteStore>(path));
+        store->set_lock_observer([&](const char* method, LockEvent event) {
+            if (event == LockEvent::Acquired && std::string_view(method) == "delete_expired_sessions")
+                purge_reached_store = true;
+        });
         zmq::context_t ctx{1};
         thewatcher::server::ZapHandler zap{ctx};
         // Never started: the test calls the purge directly.
@@ -1190,10 +1207,15 @@ SCENARIO("Session purges are spaced five minutes from the end of the previous pu
                 api.purge_expired_sessions_if_due(now_ms());
                 purge_returned = true;
             });
-            // An unblocked purge returns within milliseconds, so one still
-            // running after this pause is waiting for the writer's lock.
-            std::this_thread::sleep_for(200ms);
-            const bool purge_held = !purge_returned.load();
+            // Advance the clock only once the purge is inside its store call:
+            // by then a purge that stamps its entry time has already read the
+            // clock (0), so it would wrongly run again at 300'000.
+            const bool purge_reached = thewatcher::test::eventually(
+                [&] {
+                    return purge_reached_store.load();
+                },
+                5000ms, 5ms);
+            const bool purge_held = purge_reached && !purge_returned.load();
             purge_clock_ms = 8'000;
             writer.exec("ROLLBACK;");
             purge.join();
@@ -1235,6 +1257,136 @@ SCENARIO("Session purges are spaced five minutes from the end of the previous pu
                 REQUIRE(after_first == 0);
                 REQUIRE(after_forward_jump == 1);  // one second on the purge clock: too soon
                 REQUIRE(after_backward_jump == 0); // five minutes on the purge clock: due
+            }
+        }
+    }
+}
+
+// current_session purges before it looks the session up, and a purge can be
+// held up (here by another writer). The lookup must read the clock again: the
+// time read before the purge would still accept a session that expired while
+// the purge waited.
+SCENARIO("A session that expires while the request's purge is held up is refused")
+{
+    GIVEN("an API server over a synchronized file-backed store and a session that expires in under a second")
+    {
+        using thewatcher::server::SynchronizedStore;
+        using LockEvent = SynchronizedStore::LockEvent;
+        thewatcher::test::ScopedTempDir dir{"auth-purge-expiry"};
+        const auto path = (dir / "expiry.db").string();
+        // Read by the lock observer, so declared before the store that owns it.
+        std::atomic<bool> purge_reached_store{false};
+        auto synchronized =
+            std::make_unique<SynchronizedStore>(std::make_unique<thewatcher::server::SqliteStore>(path));
+        synchronized->set_lock_observer([&](const char* method, LockEvent event) {
+            if (event == LockEvent::Acquired && std::string_view(method) == "delete_expired_sessions")
+                purge_reached_store = true;
+        });
+        ApiFixture fx(std::move(synchronized));
+        const auto admin_id = fx.store->get_user_by_username("thewatcher")->user_id;
+        const auto expires_at = now_ms() + 600;
+        fx.store->create_session(make_session("short-lived", admin_id, expires_at));
+        SideConnection observer(path);
+
+        WHEN("the first request's purge waits for another writer until after the session expired")
+        {
+            std::atomic<int> status{0};
+            // Declared before the writer, so on an early failure the writer is
+            // closed (releasing the write lock) before the thread is joined.
+            ScopedThread request;
+            SideConnection writer(path);
+            writer.exec("BEGIN IMMEDIATE;");
+            request.start([&] {
+                // No REQUIRE off the main thread: record the status only.
+                const httplib::Headers headers{
+                    {"Cookie", "tw_session=short-lived"}
+                };
+                const auto res = fx.client.Get("/api/session", headers);
+                status = res ? res->status : -1;
+            });
+            const bool purge_reached = thewatcher::test::eventually(
+                [&] {
+                    return purge_reached_store.load();
+                },
+                5000ms, 5ms);
+            const bool expired_while_held = thewatcher::test::eventually(
+                [&] {
+                    return now_ms() > expires_at + 50;
+                },
+                5000ms, 10ms);
+            const bool request_waiting = status.load() == 0;
+            writer.exec("ROLLBACK;");
+            request.join();
+            const auto sessions_left =
+                observer.scalar("SELECT COUNT(*) FROM sessions WHERE user_id=" + std::to_string(admin_id) + ";");
+
+            THEN("the purge's earlier cutoff kept the row, but the lookup refuses the expired session")
+            {
+                REQUIRE(purge_reached);
+                REQUIRE(expired_while_held);
+                REQUIRE(request_waiting);
+                REQUIRE(sessions_left == 1);
+                REQUIRE(status.load() == 401);
+            }
+        }
+    }
+}
+
+// SQLite runs the change under BEGIN IMMEDIATE, which waits (busy timeout) for
+// any other writer on the file. Expiry has to be judged once the change holds
+// the write lock, not when it was asked for.
+SCENARIO("A self-service change that waits for the write lock judges expiry once it holds it")
+{
+    GIVEN("a file-backed store and a user whose session expires at 10'000 on the change's clock")
+    {
+        thewatcher::test::ScopedTempDir dir{"auth-cas-clock"};
+        const auto path = (dir / "cas.db").string();
+        thewatcher::server::SqliteStore store(path);
+        const auto user_id = store.create_user("ivy", "old-hash", "global_viewer");
+        constexpr int64_t expires_at = 10'000;
+        store.create_session(make_session("ivy-1", user_id, expires_at));
+        store.create_session(make_session("ivy-2", user_id, 4'000'000'000'000LL));
+        using Status = thewatcher::server::PasswordChangeResult::Status;
+
+        WHEN("the session expires while the change waits for another writer")
+        {
+            std::atomic<int64_t> clock_ms{5'000};
+            std::atomic<bool> writer_holds{true};
+            std::atomic<int> reads_while_held{0};
+            std::atomic<int> status{-1};
+            // Declared before the writer, so on an early failure the writer is
+            // closed (releasing the write lock) before the thread is joined.
+            ScopedThread change;
+            SideConnection writer(path);
+            writer.exec("BEGIN IMMEDIATE;");
+            change.start([&] {
+                const auto result = store.update_user_password_if_current_and_revoke_sessions(
+                    user_id, "old-hash", "new-hash", "ivy-1", [&] {
+                        if (writer_holds.load())
+                            ++reads_while_held;
+                        return clock_ms.load();
+                    });
+                status = static_cast<int>(result.status);
+            });
+            // A change that reads the clock on entry does so within
+            // milliseconds; one that reads it once it holds the write lock
+            // cannot until the writer lets go.
+            const bool read_before_lock = thewatcher::test::eventually(
+                [&] {
+                    return reads_while_held.load() > 0;
+                },
+                300ms, 5ms);
+            clock_ms = expires_at;
+            writer_holds = false;
+            writer.exec("ROLLBACK;");
+            change.join();
+
+            THEN("it reads the clock only after taking the lock, and refuses the expired session")
+            {
+                REQUIRE_FALSE(read_before_lock);
+                REQUIRE(status.load() == static_cast<int>(Status::SessionEnded));
+                REQUIRE(store.get_user_by_username("ivy")->password_hash == "old-hash");
+                REQUIRE(store.get_session("ivy-2", 5'000));
             }
         }
     }
@@ -1340,7 +1492,7 @@ SCENARIO("A self-service change applies only to the password hash that was verif
         WHEN("the change names the hash that is still stored")
         {
             const auto result = store->update_user_password_if_current_and_revoke_sessions(
-                user_id, old_hash, "new-hash", "gina-1", now_ms());
+                user_id, old_hash, "new-hash", "gina-1", now_ms);
 
             THEN("the password changes and the other session is revoked")
             {
@@ -1356,7 +1508,7 @@ SCENARIO("A self-service change applies only to the password hash that was verif
         {
             store->update_user_password(user_id, "reset-by-admin");
             const auto result = store->update_user_password_if_current_and_revoke_sessions(
-                user_id, old_hash, "new-hash", "gina-1", now_ms());
+                user_id, old_hash, "new-hash", "gina-1", now_ms);
 
             THEN("nothing changes: the reset stays and no session is revoked")
             {
@@ -1372,7 +1524,7 @@ SCENARIO("A self-service change applies only to the password hash that was verif
         {
             REQUIRE(store->disable_user_and_revoke_sessions(user_id) == 1);
             const auto result = store->update_user_password_if_current_and_revoke_sessions(
-                user_id, old_hash, "new-hash", "gina-1", now_ms());
+                user_id, old_hash, "new-hash", "gina-1", now_ms);
 
             THEN("nothing changes and the store reports that the session ended")
             {
@@ -1387,7 +1539,7 @@ SCENARIO("A self-service change applies only to the password hash that was verif
             REQUIRE(store->disable_user_and_revoke_sessions(user_id) == 1);
             REQUIRE(store->enable_user_and_revoke_sessions(user_id).has_value());
             const auto result = store->update_user_password_if_current_and_revoke_sessions(
-                user_id, old_hash, "new-hash", "gina-1", now_ms());
+                user_id, old_hash, "new-hash", "gina-1", now_ms);
 
             THEN("nothing changes: the session that verified the password is gone")
             {
@@ -1401,7 +1553,7 @@ SCENARIO("A self-service change applies only to the password hash that was verif
         {
             REQUIRE(store->disable_user(user_id) == 1);
             const auto result = store->update_user_password_if_current_and_revoke_sessions(
-                user_id, old_hash, "new-hash", "gina-1", now_ms());
+                user_id, old_hash, "new-hash", "gina-1", now_ms);
 
             THEN("nothing changes or is revoked while the user is disabled")
             {
@@ -1419,7 +1571,7 @@ SCENARIO("A self-service change applies only to the password hash that was verif
         {
             store->delete_session("gina-1");
             const auto result = store->update_user_password_if_current_and_revoke_sessions(
-                user_id, old_hash, "new-hash", "gina-1", now_ms());
+                user_id, old_hash, "new-hash", "gina-1", now_ms);
 
             THEN("nothing changes and the user's other session is kept")
             {
@@ -1435,7 +1587,7 @@ SCENARIO("A self-service change applies only to the password hash that was verif
             // At `expires` the session is no longer valid (get_session needs
             // expires_at > now), although its row is still there.
             const auto result = store->update_user_password_if_current_and_revoke_sessions(
-                user_id, old_hash, "new-hash", "gina-1", expires);
+                user_id, old_hash, "new-hash", "gina-1", fixed_clock(expires));
 
             THEN("nothing changes and the store reports that the session ended")
             {
@@ -1449,7 +1601,7 @@ SCENARIO("A self-service change applies only to the password hash that was verif
         WHEN("the user does not exist")
         {
             const auto result =
-                store->update_user_password_if_current_and_revoke_sessions(987654, old_hash, "x", "gina-1", now_ms());
+                store->update_user_password_if_current_and_revoke_sessions(987654, old_hash, "x", "gina-1", now_ms);
 
             THEN("the store reports it")
             {

@@ -166,7 +166,12 @@ working document for audit, design review, and regression testing.
   validation, and from the server's periodic job, so an idle server purges
   too. The five minutes are counted on a monotonic clock from the end of the
   last successful purge, so a slow purge or a wall-clock jump cannot make
-  purges run back to back or stop them.
+  purges run back to back or stop them. A request looks up its session with
+  a fresh reading of the clock after its purge, so a session that expired
+  while the purge waited for a lock is refused (401), not accepted. On
+  PostgreSQL the purge skips rows another transaction holds
+  (`FOR UPDATE SKIP LOCKED`); a skipped row is already expired, so no request
+  accepts it, and a later purge removes it.
 - A username containing a NUL byte is rejected (400) at login and user
   creation, before the throttle keys are built. The stores bind names as C
   strings, so otherwise `admin\0x` would reach `admin` under fresh throttle
@@ -190,7 +195,13 @@ working document for audit, design review, and regression testing.
   refused (401) and rolled back; a sign-out that starts later waits for the
   change to commit. Both lock the users row before the sessions row, the
   order a disable and an admin reset use, and a sign-out locks only the
-  sessions row, so none of them can deadlock.
+  sessions row, so none of them can deadlock. An expired-session purge skips
+  locked rows, so it never waits behind a change either.
+- Expiry is judged when the change runs, not when the request arrived:
+  SQLite reads the clock once it holds the write lock, and PostgreSQL reads it
+  when its transaction begins and again after its last statement, just before
+  it commits. A session that expires while the change waits for a lock ends
+  the change with 401 and `password_change` `session_ended`.
 - A wrong current password is audited once, as `password_change` `failure`.
   Handlers that audit their own 403 mark the response, and the post-routing
   hook then skips its generic `permission_denied` line; every other 403 is
