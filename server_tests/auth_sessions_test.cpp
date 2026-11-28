@@ -23,6 +23,7 @@
 
 #include <httplib.h>
 #include <sodium.h>
+#include <sqlite3.h>
 #include <zmq.hpp>
 
 using namespace std::chrono_literals;
@@ -674,6 +675,131 @@ SCENARIO("Session creation racing a password reset never leaves an old-credentia
                 for (const auto& tokens : created)
                     for (const auto& token : tokens)
                         REQUIRE_FALSE(store->get_session(token, now));
+            }
+        }
+    }
+}
+
+namespace
+{
+
+// Owns a second SQLite connection to the same file, used only to plant a
+// fault trigger that the store under test does not know about.
+struct SideConnection
+{
+    explicit SideConnection(const std::string& path)
+    {
+        REQUIRE(sqlite3_open(path.c_str(), &db) == SQLITE_OK);
+        sqlite3_busy_timeout(db, 5000);
+    }
+    SideConnection(const SideConnection&) = delete;
+    SideConnection& operator=(const SideConnection&) = delete;
+    ~SideConnection()
+    {
+        sqlite3_close(db);
+    }
+    void exec(const std::string& sql)
+    {
+        char* err = nullptr;
+        const auto rc = sqlite3_exec(db, sql.c_str(), nullptr, nullptr, &err);
+        const std::string message = err != nullptr ? err : "";
+        sqlite3_free(err);
+        REQUIRE(message.empty());
+        REQUIRE(rc == SQLITE_OK);
+    }
+    sqlite3* db = nullptr;
+};
+
+} // namespace
+
+SCENARIO("A rolled-back password reset never takes other threads' sessions with it")
+{
+    GIVEN("a file-backed store where revoking one user's sessions is forced to fail")
+    {
+        thewatcher::test::ScopedTempDir dir{"auth-rollback"};
+        const auto path = (dir / "rollback.db").string();
+        auto store = thewatcher::server::make_store("sqlite", path);
+        const auto victim_hash = hash_for("victim-password");
+        const auto other_hash = hash_for("other-password");
+        const auto victim = store->create_user("victim", victim_hash, "global_viewer");
+        const auto other = store->create_user("other", other_hash, "global_viewer");
+        const int64_t expires = now_ms() + hour_ms;
+        store->create_session(make_session("victim-session", victim, expires));
+        {
+            // The reset updates the password first, then fails on the revoke
+            // and must roll the whole transaction back.
+            SideConnection side(path);
+            side.exec("CREATE TRIGGER force_revoke_failure BEFORE DELETE ON sessions WHEN OLD.user_id = " +
+                      std::to_string(victim) + " BEGIN SELECT RAISE(ABORT, 'forced'); END;");
+        }
+        const auto new_hash = hash_for("new-victim-password");
+
+        constexpr int creators = 4;
+        constexpr int resetters = 3;
+        constexpr int resets_each = 40;
+        std::atomic<int> reset_throws{0};
+        std::atomic<int> create_errors{0};
+        std::atomic<int> resets_done{0};
+        std::vector<std::vector<std::string>> created(creators);
+
+        WHEN("failing resets run while other users keep logging in")
+        {
+            std::vector<std::thread> threads;
+            for (int r = 0; r < resetters; ++r)
+            {
+                threads.emplace_back([&] {
+                    // No Catch2 assertions off the main thread.
+                    for (int i = 0; i < resets_each; ++i)
+                    {
+                        try
+                        {
+                            store->update_user_password_and_revoke_sessions(victim, new_hash);
+                        }
+                        catch (const std::exception&)
+                        {
+                            ++reset_throws;
+                        }
+                    }
+                    ++resets_done;
+                });
+            }
+            for (int c = 0; c < creators; ++c)
+            {
+                threads.emplace_back([&, c] {
+                    for (int i = 0; resets_done.load() < resetters; ++i)
+                    {
+                        const auto token = "other-" + std::to_string(c) + "-" + std::to_string(i);
+                        try
+                        {
+                            if (store->create_session_if_credentials_current(make_session(token, other, expires),
+                                                                             other_hash))
+                                created[c].push_back(token);
+                        }
+                        catch (const std::exception&)
+                        {
+                            ++create_errors;
+                        }
+                    }
+                });
+            }
+            for (auto& t : threads)
+                t.join();
+
+            THEN("every reset failed, every acknowledged login survives and the password is unchanged")
+            {
+                REQUIRE(reset_throws.load() == resetters * resets_each);
+                REQUIRE(create_errors.load() == 0);
+                const auto now = now_ms();
+                std::size_t total = 0;
+                for (const auto& tokens : created)
+                {
+                    total += tokens.size();
+                    for (const auto& token : tokens)
+                        REQUIRE(store->get_session(token, now));
+                }
+                REQUIRE(total > 0);
+                REQUIRE(store->get_user_by_username("victim")->password_hash == victim_hash);
+                REQUIRE(store->get_session("victim-session", now));
             }
         }
     }
