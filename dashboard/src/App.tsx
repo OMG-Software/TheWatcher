@@ -43,7 +43,7 @@ function Dashboard({ session, onSignOut }: { session: SessionInfo; onSignOut: ()
   const [overviewGroupFilter, setOverviewGroupFilter] = React.useState<OverviewGroupFilter>('all');
 
   const { agents, pending, groups, alerts, allAlerts, users, maintenanceWindows, silences, customViews, sectionErrors, loadedAt, error, loading, refresh } = useDashboardData();
-  const { busyAction, runAction, failure, clearFailure } = useRunAction(refresh);
+  const { busyAction, isBusy, runAction, failure, clearFailure } = useRunAction(refresh);
   // The filter is only trusted once the views list is known: not while it is loading or failed.
   const { activeViewId, setActiveViewId, view: activeView, resolved: viewResolved } = useActiveView(customViews, loadedAt !== null && !sectionErrors.views);
 
@@ -177,6 +177,7 @@ function Dashboard({ session, onSignOut }: { session: SessionInfo; onSignOut: ()
           <AgentsPage
             agents={agents}
             busyAction={busyAction}
+            isBusy={isBusy}
             groups={groups}
             onConfigure={setConfigAgentId}
             operator={operator}
@@ -191,7 +192,7 @@ function Dashboard({ session, onSignOut }: { session: SessionInfo; onSignOut: ()
         <AgentConfigModal
           key={configAgent.id}
           agent={configAgent}
-          busy={busyAction === `${configAgent.id}:collector_config`}
+          busy={isBusy(`${configAgent.id}:collector_config`)}
           onClose={() => setConfigAgentId(null)}
           operator={operator && canManageAgent(configAgent)}
           global={global}
@@ -202,13 +203,13 @@ function Dashboard({ session, onSignOut }: { session: SessionInfo; onSignOut: ()
       {!unloaded && view === 'alerts' ? (
         <>
           {sectionErrors.allAlerts ? <LoadFailed what="alerts" message={sectionErrors.allAlerts} onRetry={retry} /> : null}
-          <AlertsPage agents={agents} alerts={toDisplayAlerts(allAlerts, agents)} busyAction={busyAction} operator={operator} runAction={runAction} />
+          <AlertsPage agents={agents} alerts={toDisplayAlerts(allAlerts, agents)} isBusy={isBusy} operator={operator} runAction={runAction} />
         </>
       ) : null}
       {!unloaded && view === 'maintenance' ? (
         <>
           {sectionErrors.maintenanceWindows ? <LoadFailed what="maintenance windows" message={sectionErrors.maintenanceWindows} onRetry={retry} /> : null}
-          <MaintenancePage agents={agents} busyAction={busyAction} global={global} loadFailed={Boolean(sectionErrors.maintenanceWindows)} operator={operator} runAction={runAction} windows={maintenanceWindows} />
+          <MaintenancePage agents={agents} isBusy={isBusy} global={global} loadFailed={Boolean(sectionErrors.maintenanceWindows)} operator={operator} runAction={runAction} windows={maintenanceWindows} />
         </>
       ) : null}
       {!unloaded && view === 'silences' ? (

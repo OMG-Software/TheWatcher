@@ -16,6 +16,7 @@ export function AgentsPage({
   agents,
   busyAction,
   groups,
+  isBusy,
   onConfigure,
   operator,
   pending,
@@ -26,6 +27,7 @@ export function AgentsPage({
   agents: DashboardAgent[];
   busyAction: string | null;
   groups: GroupRecord[];
+  isBusy: (key: string) => boolean;
   onConfigure: (agentId: string) => void;
   operator: boolean;
   pending: DashboardAgent[];
@@ -43,7 +45,7 @@ export function AgentsPage({
     <main className="table-wrap management-wrap">
       {confirming?.kind === 'delete' ? (
         <ConfirmDialog
-          busy={busyAction === confirmKey}
+          busy={isBusy(confirmKey)}
           confirmLabel="Delete agent"
           danger
           errorKey={confirmKey}
@@ -55,7 +57,7 @@ export function AgentsPage({
       ) : null}
       {confirming?.kind === 'maintenance' ? (
         <ConfirmDialog
-          busy={busyAction === confirmKey}
+          busy={isBusy(confirmKey)}
           confirmLabel="Enter maintenance"
           errorKey={confirmKey}
           message={<>Put <strong>{confirming.agent.name}</strong> into maintenance? Its monitoring is paused and its active alerts are cleared until you resume it.</>}
@@ -99,7 +101,7 @@ export function AgentsPage({
                           onChange={(event) => setDescDrafts((current) => ({ ...current, [agent.id]: event.target.value }))}
                         />
                         <ActionButton
-                          busy={busyAction === `${agent.id}:desc`}
+                          busy={isBusy(`${agent.id}:desc`)}
                           disabled={!operator || descValue === agent.description}
                           icon={<Check size={14} />}
                           label="Set"
@@ -114,21 +116,21 @@ export function AgentsPage({
                   <td>{agent.groupIds.map((id) => groups.find((group) => group.group_id === id)?.name ?? id).join(', ') || 'No group'}</td>
                   <td>
                     <div className="button-row">
-                      <ActionButton busy={busyAction === `${agent.id}:${maintenanceCommand}`} disabled={!manageable} icon={agent.maintenance ? <Play size={14} /> : <Pause size={14} />} label={maintenanceActionLabel(agent)} onClick={() => (agent.maintenance ? void runAction(`${agent.id}:${maintenanceCommand}`, () => resumeAgent(agent.id)) : setConfirming({ kind: 'maintenance', agent }))} />
-                      <ActionButton busy={busyAction === `${agent.id}:restart`} disabled={!manageable} icon={<RotateCw size={14} />} label="Restart" onClick={() => runAction(`${agent.id}:restart`, () => restartAgentCollectors(agent.id))} />
-                      <ActionButton busy={busyAction === `${agent.id}:status`} disabled={!manageable} icon={<Search size={14} />} label="Status" onClick={() => runAction(`${agent.id}:status`, () => requestAgentStatus(agent.id))} />
+                      <ActionButton busy={isBusy(`${agent.id}:${maintenanceCommand}`)} disabled={!manageable} icon={agent.maintenance ? <Play size={14} /> : <Pause size={14} />} label={maintenanceActionLabel(agent)} onClick={() => (agent.maintenance ? void runAction(`${agent.id}:${maintenanceCommand}`, () => resumeAgent(agent.id)) : setConfirming({ kind: 'maintenance', agent }))} />
+                      <ActionButton busy={isBusy(`${agent.id}:restart`)} disabled={!manageable} icon={<RotateCw size={14} />} label="Restart" onClick={() => runAction(`${agent.id}:restart`, () => restartAgentCollectors(agent.id))} />
+                      <ActionButton busy={isBusy(`${agent.id}:status`)} disabled={!manageable} icon={<Search size={14} />} label="Status" onClick={() => runAction(`${agent.id}:status`, () => requestAgentStatus(agent.id))} />
                     </div>
                   </td>
                   <td>
                     <ActionButton
-                      busy={busyAction === `${agent.id}:configure`}
+                      busy={isBusy(`${agent.id}:configure`)}
                       disabled={!manageable}
                       icon={<SlidersHorizontal size={14} />}
                       label="Configure"
                       onClick={() => onConfigure(agent.id)}
                     />
                   </td>
-                  <td><ActionButton busy={busyAction === `${agent.id}:delete`} danger disabled={!manageable} icon={<Trash2 size={14} />} label="Delete" onClick={() => setConfirming({ kind: 'delete', agent })} /></td>
+                  <td><ActionButton busy={isBusy(`${agent.id}:delete`)} danger disabled={!manageable} icon={<Trash2 size={14} />} label="Delete" onClick={() => setConfirming({ kind: 'delete', agent })} /></td>
                 </tr>
               );
             })}

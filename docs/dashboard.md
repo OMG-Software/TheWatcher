@@ -235,8 +235,12 @@ Against a server that does not send `indicator_status`, component dots are grey.
 Each component dot is keyboard focusable and carries its status in words (for
 example "CPU: Critical, 96%"), which also opens as a tooltip on focus. Rows
 expand with the toggle button next to the server name (`aria-expanded`). An
-expanded row reloads its metric history and log matches every 5 seconds; a
-failed reload keeps the last data and shows the error.
+expanded row loads its metric history and log matches; the three most recently
+opened rows then reload every 5 seconds (and pause while the tab is hidden), so
+expanding many rows cannot flood the API. Older rows keep their last data and have
+a Refresh button. A failed reload keeps the last data and shows the error. A
+response that arrives after a row is closed is ignored; the request itself is not
+aborted.
 
 A `#view-<id>` filter is dropped, with its hash, once the views have loaded and
 the id is not among them (deleted, or not visible to the user). If the views
@@ -282,8 +286,8 @@ Agent Management handles approved agents:
 - network thresholds are combined receive plus transmit megabits per second per
   selected interface;
 - process watches use exact executable names plus an expected process count;
-- the Maintenance button opens a dialog with an optional reason (sent as typed,
-  empty if left blank) and enters maintenance with no expiry; for an end time use
+- the Maintenance button opens a dialog with an optional reason (sent exactly as
+  typed, empty if left blank) and enters maintenance with no expiry; for an end time use
   the Maintenance page. The button reads Resume while the agent is in
   maintenance, and Resume needs no confirmation;
 - Delete asks for confirmation in a dialog that names the agent; nothing is sent
@@ -375,7 +379,8 @@ threshold (seconds), escalation timeout (seconds), the retention periods in days
 the scheduled digest report (enabled, daily or weekly schedule, day of week,
 report webhook URL). The status history, alerts and log matches retention fields
 are enabled only when the server reports them (servers with the retention
-lifecycle); otherwise they are disabled and never sent. Save Settings persists them; Send Report Now sends the
+lifecycle, #174); until the server supports them they are shown disabled and are
+never sent. Save Settings persists them; Send Report Now sends the
 report immediately.
 
 ## API Contract
@@ -387,7 +392,8 @@ The dashboard consumes:
 | `POST /api/login` | Create a session for a local SQLite user. |
 | `POST /api/logout` | Delete the current session. |
 | `GET /api/session` | Return the current authenticated session. |
-| `GET /api/agents` | Approved agent identity, connection, maintenance, settings, groups, timestamps, and `indicator_status` (the status engine's latest status per indicator, the newest row per indicator however long ago it changed). |
+| `GET /api/agents` | Approved agent identity, connection, maintenance, settings, groups, timestamps, and `indicator_status` (the status engine's latest status per indicator, the newest row per indicator however long ago it changed, read for all agents in
+one query). |
 | `GET /api/pending-enrollments` | Pending enrollment records for global operators and admins. |
 | `GET /api/metrics` | Latest metrics snapshot per agent. |
 | `GET /api/groups` | List groups. |
@@ -511,5 +517,9 @@ When server API fields change:
 - Icon-only buttons have an accessible name; action buttons keep their label
   while busy; the active tab has `aria-current="page"`; focus is always visible
   (`:focus-visible`).
-- Time is read through `useNow` (state, refreshed on an interval), never during
-  render.
+- Time is read through `useNow` (state, refreshed every 5 seconds like the
+  dashboard poll, so an expiry shows within one poll), never during render.
+- A dialog remembers the element that had focus before it opened (read in its
+  first render) and returns focus there. It focuses the control marked
+  `data-autofocus`, else the first control after the header. Escape closes an
+  open info tip before it closes the dialog around it.

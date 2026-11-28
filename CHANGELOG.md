@@ -225,9 +225,10 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - `GET /api/agents` returns `indicator_status`, the status engine's latest
   status per indicator (the newest row of each, however long ago it
   changed), so the dashboard can show what alerting acted on (#114). Adds
-  `Store::latest_status_per_indicator`.
+  `Store::latest_indicator_status_all`, which reads it for all agents in one
+  query (`MAX(id)` per agent and indicator).
 - Dashboard Settings: status history, alerts and log matches retention fields
-  (enabled when the server reports them), and a notice when an Alerts list
+  (shown disabled and not sent until the server supports them, #174), and a notice when an Alerts list
   reaches the server's 1000-alert cap.
 
 ## [0.8.0] - 2026-11-02

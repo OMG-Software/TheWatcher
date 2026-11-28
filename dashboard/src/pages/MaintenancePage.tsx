@@ -11,7 +11,7 @@ import type { DashboardAgent, MaintenanceWindowRecord } from '../models';
 
 export function MaintenancePage({
   agents,
-  busyAction,
+  isBusy,
   global,
   loadFailed = false,
   operator,
@@ -19,7 +19,7 @@ export function MaintenancePage({
   windows,
 }: {
   agents: DashboardAgent[];
-  busyAction: string | null;
+  isBusy: (key: string) => boolean;
   global: boolean;
   loadFailed?: boolean;
   operator: boolean;
@@ -44,7 +44,7 @@ export function MaintenancePage({
     <main className="table-wrap management-wrap">
       {deleting ? (
         <ConfirmDialog
-          busy={busyAction === deleteKey}
+          busy={isBusy(deleteKey)}
           confirmLabel="Delete window"
           danger
           errorKey={deleteKey}
@@ -104,7 +104,7 @@ export function MaintenancePage({
               className="duration-input"
             />
           </label>
-          <ActionButton busy={busyAction === 'mw:create'} disabled={!operator} icon={<Plus size={14} />} label="Schedule" onClick={() => undefined} type="submit" />
+          <ActionButton busy={isBusy('mw:create')} disabled={!operator} icon={<Plus size={14} />} label="Schedule" onClick={() => undefined} type="submit" />
         </form>
       ) : null}
       <ActionError actionKey="mw:create" />
@@ -136,7 +136,7 @@ export function MaintenancePage({
                   <td>{w.created_by}</td>
                   <td>
                     <ActionButton
-                      busy={busyAction === `mw:delete:${w.window_id}`}
+                      busy={isBusy(`mw:delete:${w.window_id}`)}
                       danger
                       disabled={!operator}
                       icon={<Trash2 size={14} />}

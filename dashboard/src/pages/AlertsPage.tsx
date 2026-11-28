@@ -22,13 +22,13 @@ export const ALERT_LIST_CAP = 1000;
 export function AlertsPage({
   agents,
   alerts,
-  busyAction,
+  isBusy,
   operator,
   runAction,
 }: {
   agents: DashboardAgent[];
   alerts: ReturnType<typeof toDisplayAlerts>;
-  busyAction: string | null;
+  isBusy: (key: string) => boolean;
   operator: boolean;
   runAction: RunAction;
 }) {
@@ -98,11 +98,11 @@ export function AlertsPage({
   return (
     <main className="table-wrap management-wrap">
       {ackTarget !== null ? (
-        <AcknowledgeModal busy={busyAction === ackKey} bulk={ackTarget === 'bulk'} errorKey={ackKey} onClose={() => setAckTarget(null)} onSubmit={handleAckSubmit} />
+        <AcknowledgeModal busy={isBusy(ackKey)} bulk={ackTarget === 'bulk'} errorKey={ackKey} onClose={() => setAckTarget(null)} onSubmit={handleAckSubmit} />
       ) : null}
       {confirmArchive ? (
         <ConfirmDialog
-          busy={busyAction === archiveKey}
+          busy={isBusy(archiveKey)}
           confirmLabel={`Archive ${selectedCount} alert${selectedCount === 1 ? '' : 's'}`}
           danger
           errorKey={archiveKey}
@@ -148,8 +148,8 @@ export function AlertsPage({
         <div className="bulk-action-bar">
           <span>{selectedCount} selected</span>
           <div className="button-row">
-            <ActionButton busy={busyAction === 'bulk:ack'} icon={<Check size={14} />} label={`Acknowledge (${selectedCount})`} onClick={() => setAckTarget('bulk')} />
-            <ActionButton busy={busyAction === 'bulk:archive'} danger icon={<Archive size={14} />} label={`Archive (${selectedCount})`} onClick={() => setConfirmArchive(true)} />
+            <ActionButton busy={isBusy('bulk:ack')} icon={<Check size={14} />} label={`Acknowledge (${selectedCount})`} onClick={() => setAckTarget('bulk')} />
+            <ActionButton busy={isBusy('bulk:archive')} danger icon={<Archive size={14} />} label={`Archive (${selectedCount})`} onClick={() => setConfirmArchive(true)} />
           </div>
         </div>
       ) : null}
@@ -211,11 +211,11 @@ export function AlertsPage({
                     <div className="button-row">
                       {!isAcknowledged ? (
                         <>
-                          <ActionButton busy={busyAction === `alert:${alert.alert_id}:ack`} disabled={!operator} icon={<Check size={14} />} label="Acknowledge" onClick={() => setAckTarget(alert.alert_id)} />
-                          <ActionButton busy={busyAction === `alert:${alert.alert_id}:ack-archive`} disabled={!operator} icon={<Archive size={14} />} label="Acknowledge & Archive" onClick={() => runAction(`alert:${alert.alert_id}:ack-archive`, async () => { await acknowledgeAlert(alert.alert_id); await archiveAlert(alert.alert_id); })} />
+                          <ActionButton busy={isBusy(`alert:${alert.alert_id}:ack`)} disabled={!operator} icon={<Check size={14} />} label="Acknowledge" onClick={() => setAckTarget(alert.alert_id)} />
+                          <ActionButton busy={isBusy(`alert:${alert.alert_id}:ack-archive`)} disabled={!operator} icon={<Archive size={14} />} label="Acknowledge & Archive" onClick={() => runAction(`alert:${alert.alert_id}:ack-archive`, async () => { await acknowledgeAlert(alert.alert_id); await archiveAlert(alert.alert_id); })} />
                         </>
                       ) : (
-                        <ActionButton busy={busyAction === `alert:${alert.alert_id}:archive`} danger disabled={!operator} icon={<Archive size={14} />} label="Archive" onClick={() => runAction(`alert:${alert.alert_id}:archive`, () => archiveAlert(alert.alert_id))} />
+                        <ActionButton busy={isBusy(`alert:${alert.alert_id}:archive`)} danger disabled={!operator} icon={<Archive size={14} />} label="Archive" onClick={() => runAction(`alert:${alert.alert_id}:archive`, () => archiveAlert(alert.alert_id))} />
                       )}
                     </div>
                   ) : <span className="uptime">Archived</span>}
