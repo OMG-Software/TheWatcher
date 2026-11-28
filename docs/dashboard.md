@@ -115,6 +115,17 @@ server) over HTTPS, because the session cookie is `Secure`. Set
   `true` means the mutation itself succeeded: if the refresh afterwards fails,
   that is reported in the page banner ("Saved, but the dashboard could not be
   refreshed"), never as a failed action, so a retry cannot duplicate the change.
+  The failure carries a `kind`: `action` (the change failed; the banner reads
+  "Action failed: ...") or `refresh` (the change was saved; the banner shows
+  only its own "Saved, but ..." message, with no "Action failed" prefix).
+  An inline failure needs a form to show it: each `<ActionError>` registers
+  itself while it is on screen, and when none is on screen for the failing key
+  (the user navigated away or closed the form before the failure arrived, or
+  closes it afterwards) the page banner shows the failure instead of dropping
+  it. Per-control busy state uses `isBusy(key)`, which the pages receive as
+  `isBusy`; a control must never use `busyAction` (only the latest running key)
+  to decide whether its own action is still running, or Cancel could close an
+  editor whose save is still in flight.
   A dialog or form with a Cancel (acknowledge, agent configuration, password,
   view editor) cannot be dismissed while its request runs, because the failure
   would have nowhere to show, and it drops its own failure when closed, so
@@ -137,6 +148,16 @@ server) over HTTPS, because the session cookie is `Secure`. Set
 - **Session expiry.** Any API call that returns 401 (except the login and
   session probes) tells `useSession`, which returns to the login screen with
   "Your session expired" and unmounts the dashboard, which stops all polling.
+  Each request remembers the session it started under (a counter in `api.ts`
+  that `useSession` advances on every sign-in, expiry and sign-out); a 401 from
+  a request that started under an earlier session is ignored, so a slow
+  request from a previous session cannot sign out a newer one.
+- **Signing out.** The user stays signed in until the server confirms
+  (`POST /api/logout`), because the session cookie survives a failed request
+  and a reload would restore the session. A 401 answer means the session was
+  already gone and counts as signed out. Any other failure keeps the dashboard
+  open and shows "Sign out failed, and your session is still active: ..." with
+  Try again and Dismiss. The Log out button is disabled while the request runs.
   The login page warns when served over plain HTTP from a non-local host: the
   session cookie is `Secure`, so the browser drops it there.
 - **Polling.** `usePolling(fetcher, { intervalMs, enabled })` keeps at most one
@@ -144,7 +165,8 @@ server) over HTTPS, because the session cookie is `Secure`. Set
   in-flight request queues exactly one follow-up load, which starts when the
   current one settles (the running one may predate the change that prompted the
   refresh); further `refresh()` calls share that follow-up. Disabling or
-  unmounting ignores the in-flight result and drops the queued follow-up. The
+  unmounting aborts the in-flight request (its result is ignored even if the
+  fetcher did not honour the abort) and drops the queued follow-up. The
   poll pauses while the tab is hidden and refreshes as soon as it is visible
   again. `useDashboardData` polls every 5 s with it. `refresh()` resolves to
   the load error message of a load that started after the call (null on
@@ -163,6 +185,17 @@ server) over HTTPS, because the session cookie is `Secure`. Set
   fails, the form keeps the saved values and shows a "Could not refresh
   settings" warning. There is no request timeout in `api.ts`, so a hung request
   keeps its action busy, as a hung mutation always has.
+- **Aborting requests.** `usePolling` creates one `AbortController` per request
+  and calls the fetcher as `fetcher(signal)`. It aborts the request on cleanup,
+  unmount, when polling is disabled and on `reload()`; an abort is never shown
+  as an error (an `AbortError` is not a load failure) and a late response is
+  still ignored. `api.ts` takes an optional `signal` on the low-level request
+  and on the functions the polling callers use (`loadDashboardData` and every
+  list it loads, `fetchAlerts`, `fetchSettings`, `fetchRunbooks`); pass it on to
+  `fetch`. A fetcher that ignores the signal keeps working. `reload()` is
+  `refresh()` for when the request in flight is known to be out of date: it
+  aborts it, ignores its result and starts a new request at once (`refresh()`
+  instead waits for the running one and queues one follow-up).
 
 ## Tests
 
@@ -304,7 +337,13 @@ The Alerts view lists active, non-deleted alerts visible to the current user's
 groups. Operators and admins can acknowledge alerts (with an optional note),
 acknowledge and archive them in one step, or archive them; the list supports
 agent and status filters, bulk selection, and a Show archived toggle. Archiving
-is a soft delete on the server. The
+is a soft delete on the server. An empty list reads "No alerts." Show archived
+loads its list on its own timer: while the first request is pending the table
+shows nothing but the "Loading archived alerts..." banner, and when it fails the
+table says "Archived alerts are unavailable." next to the error banner (never
+"No alerts."). A successful alert action reloads the archived list at once and
+drops an archived request that started before the action, so the table shows
+the new state and not an older response. The
 Monitoring alert dot is green unless the host has an unacknowledged alert, in
 which case it is red. Monitoring alert notifications and Alert rows show the
 known hostname as primary text and the agent id as smaller secondary text.
@@ -381,7 +420,10 @@ report webhook URL). The status history, alerts and log matches retention fields
 are enabled only when the server reports them (servers with the retention
 lifecycle, #174); until the server supports them they are shown disabled and are
 never sent. Save Settings persists them; Send Report Now sends the
-report immediately.
+report immediately. The form tracks only the fields the user changed and shows
+every other field from the latest server copy, so a reload (or a change another
+administrator made) is never overridden by values the user did not touch. The
+changed fields stay across a failed save or a failed reload.
 
 ## API Contract
 

@@ -9,7 +9,7 @@ import type { DashboardAgent, SilenceRecord } from '../models';
 
 export function SilencesPage({
   agents,
-  busyAction,
+  isBusy,
   global,
   loadFailed = false,
   operator,
@@ -17,7 +17,7 @@ export function SilencesPage({
   silences,
 }: {
   agents: DashboardAgent[];
-  busyAction: string | null;
+  isBusy: (key: string) => boolean;
   global: boolean;
   loadFailed?: boolean;
   operator: boolean;
@@ -80,7 +80,7 @@ export function SilencesPage({
           </div>
           <ActionError actionKey="silence:create" />
           <div className="button-row">
-            <button className="text-button" disabled={busyAction !== null} type="submit">
+            <button className="text-button" disabled={isBusy('silence:create')} type="submit">
               <Plus size={14} /> Add Silence Rule
             </button>
           </div>
@@ -115,7 +115,7 @@ export function SilencesPage({
                   {operator ? (
                     <td>
                       <ActionButton
-                        busy={busyAction === `silence:delete:${s.silence_id}`}
+                        busy={isBusy(`silence:delete:${s.silence_id}`)}
                         danger
                         icon={<Trash2 size={14} />}
                         label="Delete"

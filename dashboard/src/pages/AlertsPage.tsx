@@ -24,7 +24,7 @@ export function AlertsPage({
   alerts,
   isBusy,
   operator,
-  runAction,
+  runAction: runPageAction,
 }: {
   agents: DashboardAgent[];
   alerts: ReturnType<typeof toDisplayAlerts>;
@@ -42,9 +42,22 @@ export function AlertsPage({
 
   // Archived alerts poll on their own timer, and only while they are shown.
   // (They used to re-fetch whenever the live list changed, i.e. on every poll.)
-  const archived = usePolling(React.useCallback(() => fetchAlerts(true), []), { intervalMs: ARCHIVED_POLL_MS, enabled: showArchived });
+  const archived = usePolling(React.useCallback((signal: AbortSignal) => fetchAlerts(true, signal), []), { intervalMs: ARCHIVED_POLL_MS, enabled: showArchived });
+  const reloadArchived = archived.reload;
   const archivedAlerts = React.useMemo(() => toDisplayAlerts(archived.data ?? [], agents), [archived.data, agents]);
+  // Until the first archived load succeeds there is no archived list: the table must not read as "no alerts".
   const archivedUnavailable = showArchived && archived.data === null;
+
+  // A successful action reloads the archived list too (it polls only every few seconds). `reload` drops
+  // an archived request that started before the action, so its old result cannot be shown afterwards.
+  const runAction = React.useCallback<RunAction>(
+    async (key, action, options) => {
+      const saved = await runPageAction(key, action, options);
+      if (saved && showArchived) await reloadArchived();
+      return saved;
+    },
+    [reloadArchived, runPageAction, showArchived],
+  );
 
   const baseAlerts = showArchived ? archivedAlerts : alerts;
   const displayed = baseAlerts.filter((a) => {
@@ -222,7 +235,14 @@ export function AlertsPage({
                 </td>
               </tr>
             );
-          })}</tbody>
+          })}
+            {archivedUnavailable ? (
+              // While loading, the banner above already says so; only a failed load needs a row.
+              archived.loading ? null : <tr><td colSpan={8} className="empty-row">Archived alerts are unavailable.</td></tr>
+            ) : displayed.length === 0 ? (
+              <tr><td colSpan={8} className="empty-row">{baseAlerts.length === 0 ? 'No alerts.' : 'No alerts match the filters.'}</td></tr>
+            ) : null}
+          </tbody>
         </table>
       </div>
     </main>

@@ -10,7 +10,7 @@ import { isGlobal } from '../permissions';
 
 export function ViewsPage({
   agents,
-  busyAction,
+  isBusy,
   loadFailed = false,
   operator,
   runAction,
@@ -20,7 +20,7 @@ export function ViewsPage({
   groups,
 }: {
   agents: DashboardAgent[];
-  busyAction: string | null;
+  isBusy: (key: string) => boolean;
   loadFailed?: boolean;
   operator: boolean;
   runAction: RunAction;
@@ -62,7 +62,7 @@ export function ViewsPage({
     <main className="table-wrap">
       {deleting ? (
         <ConfirmDialog
-          busy={busyAction === `view:delete:${deleting.view_id}`}
+          busy={isBusy(`view:delete:${deleting.view_id}`)}
           confirmLabel="Delete view"
           danger
           errorKey={`view:delete:${deleting.view_id}`}
@@ -111,12 +111,12 @@ export function ViewsPage({
                     </td>
                     <td>{new Date(v.created_at).toLocaleDateString()}</td>
                     <td>
-                      <ActionButton busy={busyAction === `view:save:${v.view_id}`} label="Save" icon={<Check size={14} />}
+                      <ActionButton busy={isBusy(`view:save:${v.view_id}`)} label="Save" icon={<Check size={14} />}
                         onClick={() => void runAction(`view:save:${v.view_id}`, () => updateView(v.view_id, editName, editAgentIds, editPublic, editGroupId).then(() => {}), { inline: true }).then((saved) => {
                           // Stay in the editor with the changes when the save failed.
                           if (saved) setEditId(null);
                         })} />
-                      <ActionButton busy={false} disabled={busyAction === `view:save:${v.view_id}`} label="Cancel" icon={<X size={14} />} onClick={() => { clear(`view:save:${v.view_id}`); setEditId(null); }} />
+                      <ActionButton busy={false} disabled={isBusy(`view:save:${v.view_id}`)} label="Cancel" icon={<X size={14} />} onClick={() => { clear(`view:save:${v.view_id}`); setEditId(null); }} />
                     </td>
                   </>
                 ) : (
@@ -131,7 +131,7 @@ export function ViewsPage({
                       <ActionButton busy={false} label="Open" icon={<Search size={14} />} onClick={() => onOpenView(v.view_id)} />
                       {canEdit(v) ? <ActionButton busy={false} label="Edit" icon={<SlidersHorizontal size={14} />} onClick={() => startEdit(v)} /> : null}
                       {canEdit(v) ? (
-                        <ActionButton busy={busyAction === `view:delete:${v.view_id}`} danger label="Delete"
+                        <ActionButton busy={isBusy(`view:delete:${v.view_id}`)} danger label="Delete"
                           icon={<Trash2 size={14} />}
                           onClick={() => setDeleting(v)} />
                       ) : null}
@@ -174,8 +174,8 @@ export function ViewsPage({
               {globalAccount ? <option value={0}>No group</option> : null}
               {groups.map((group) => <option key={group.group_id} value={group.group_id}>{group.name}</option>)}
             </select>
-            <button className="text-button" type="submit" disabled={busyAction === 'view:create' || !newName}>
-              {busyAction === 'view:create' ? '...' : 'Create View'}
+            <button className="text-button" type="submit" disabled={isBusy('view:create') || !newName}>
+              {isBusy('view:create') ? '...' : 'Create View'}
             </button>
             <ActionError actionKey="view:create" />
           </form>

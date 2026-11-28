@@ -6,7 +6,7 @@ import { useNow } from '../hooks/useNow';
 import type { RunAction } from '../hooks/useRunAction';
 import type { DashboardAgent, GroupRecord } from '../models';
 
-export function PendingEnrollments({ agents, busyAction, groups, loadFailed = false, runAction }: { agents: DashboardAgent[]; busyAction: string | null; groups: GroupRecord[]; loadFailed?: boolean; runAction: RunAction }) {
+export function PendingEnrollments({ agents, isBusy, groups, loadFailed = false, runAction }: { agents: DashboardAgent[]; isBusy: (key: string) => boolean; groups: GroupRecord[]; loadFailed?: boolean; runAction: RunAction }) {
   const defaultGroup = groups[0]?.group_id;
   const now = useNow();
   return (
@@ -21,8 +21,8 @@ export function PendingEnrollments({ agents, busyAction, groups, loadFailed = fa
               <td>{agent.platform}</td>
               <td className="uptime">{agent.lastSeen > 0 ? `${Math.max(0, Math.floor((now - agent.lastSeen) / 60000))}m` : 'never'}</td>
               <td><div className="button-row">
-                <ActionButton busy={busyAction === `${agent.id}:approve`} icon={<Check size={14} />} label="Approve" onClick={() => runAction(`${agent.id}:approve`, () => approveAgent(agent.id, defaultGroup ? [defaultGroup] : []))} />
-                <ActionButton busy={busyAction === `${agent.id}:reject`} icon={<X size={14} />} label="Reject" onClick={() => runAction(`${agent.id}:reject`, () => rejectAgent(agent.id))} />
+                <ActionButton busy={isBusy(`${agent.id}:approve`)} icon={<Check size={14} />} label="Approve" onClick={() => runAction(`${agent.id}:approve`, () => approveAgent(agent.id, defaultGroup ? [defaultGroup] : []))} />
+                <ActionButton busy={isBusy(`${agent.id}:reject`)} icon={<X size={14} />} label="Reject" onClick={() => runAction(`${agent.id}:reject`, () => rejectAgent(agent.id))} />
               </div></td>
             </tr>
           ))}

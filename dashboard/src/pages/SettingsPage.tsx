@@ -25,11 +25,12 @@ export function SettingsPage({
   // Settings come from the server only. If they cannot be loaded there is no form at
   // all: showing built-in defaults would let "Save" overwrite the real settings.
   const { data: saved, error, refresh } = usePolling(fetchSettings);
+  // Only the fields the user changed. Everything else comes from the latest server copy, so a reload
+  // (or a change another admin made) is never overridden by values the user did not touch.
   const [edits, setEdits] = React.useState<Partial<ServerSettings>>({});
   const [saving, setSaving] = React.useState(false); // the form is locked while a save runs, so nothing typed meanwhile is lost
   const draft = saved ? { ...saved, ...edits } : null;
-  const setDraft = (update: (current: ServerSettings) => ServerSettings) =>
-    setEdits((current) => (saved ? update({ ...saved, ...current }) : current));
+  const setField = <K extends keyof ServerSettings>(key: K, value: ServerSettings[K]) => setEdits((current) => ({ ...current, [key]: value }));
 
   return (
     <main className="table-wrap management-wrap">
@@ -61,7 +62,7 @@ export function SettingsPage({
                   placeholder="https://hooks.example.com/…"
                   type="url"
                   value={draft.webhook_url}
-                  onChange={(e) => setDraft((d) => ({ ...d, webhook_url: e.target.value }))}
+                  onChange={(e) => setField('webhook_url', e.target.value)}
                 />
               </label>
               <label>
@@ -71,7 +72,7 @@ export function SettingsPage({
                   step={1}
                   type="number"
                   value={draft.offline_after_seconds}
-                  onChange={(e) => setDraft((d) => ({ ...d, offline_after_seconds: Number(e.target.value) }))}
+                  onChange={(e) => setField('offline_after_seconds', Number(e.target.value))}
                 />
               </label>
               <label>
@@ -81,7 +82,7 @@ export function SettingsPage({
                   step={1}
                   type="number"
                   value={draft.escalation_timeout_seconds}
-                  onChange={(e) => setDraft((d) => ({ ...d, escalation_timeout_seconds: Number(e.target.value) }))}
+                  onChange={(e) => setField('escalation_timeout_seconds', Number(e.target.value))}
                 />
               </label>
               {RETENTION_FIELDS.map((field) => {
@@ -99,7 +100,7 @@ export function SettingsPage({
                         step={1}
                         type="number"
                         value={value ?? ''}
-                        onChange={(e) => setDraft((d) => ({ ...d, [field.key]: Number(e.target.value) }))}
+                        onChange={(e) => setField(field.key, Number(e.target.value))}
                       />
                     </label>
                     <InfoTip label={field.label} text={supported ? `${field.help} Allowed: ${field.min} to ${field.max}.` : `${field.help} This server version does not report this setting.`} />
@@ -114,14 +115,14 @@ export function SettingsPage({
                 <input
                   type="checkbox"
                   checked={draft.reports_enabled}
-                  onChange={(e) => setDraft((d) => ({ ...d, reports_enabled: e.target.checked }))}
+                  onChange={(e) => setField('reports_enabled', e.target.checked)}
                 />
               </label>
               <label>
                 Schedule
                 <select
                   value={draft.reports_schedule}
-                  onChange={(e) => setDraft((d) => ({ ...d, reports_schedule: e.target.value as 'daily' | 'weekly' }))}
+                  onChange={(e) => setField('reports_schedule', e.target.value as 'daily' | 'weekly')}
                 >
                   <option value="daily">Daily</option>
                   <option value="weekly">Weekly</option>
@@ -135,7 +136,7 @@ export function SettingsPage({
                   step={1}
                   type="number"
                   value={draft.reports_hour}
-                  onChange={(e) => setDraft((d) => ({ ...d, reports_hour: Number(e.target.value) }))}
+                  onChange={(e) => setField('reports_hour', Number(e.target.value))}
                 />
               </label>
               {draft.reports_schedule === 'weekly' ? (
@@ -143,7 +144,7 @@ export function SettingsPage({
                   Day of week
                   <select
                     value={draft.reports_day_of_week}
-                    onChange={(e) => setDraft((d) => ({ ...d, reports_day_of_week: Number(e.target.value) }))}
+                    onChange={(e) => setField('reports_day_of_week', Number(e.target.value))}
                   >
                     <option value={0}>Sunday</option>
                     <option value={1}>Monday</option>
@@ -161,7 +162,7 @@ export function SettingsPage({
                   placeholder="https://hooks.example.com/…"
                   type="url"
                   value={draft.reports_webhook_url}
-                  onChange={(e) => setDraft((d) => ({ ...d, reports_webhook_url: e.target.value }))}
+                  onChange={(e) => setField('reports_webhook_url', e.target.value)}
                 />
               </label>
             </div>
