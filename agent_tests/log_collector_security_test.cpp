@@ -5,6 +5,7 @@
 // allowlist the server cannot change, symlink resolution, regular-files-
 // only, and hard caps on reads and matches per tick.
 #include "../agent/collectors/log_collector.hpp"
+#include "common/log_pattern.hpp"
 #include "test_support/temp_dir.hpp"
 
 #include <catch2/catch_test_macros.hpp>
@@ -65,8 +66,11 @@ SCENARIO("LogCollector is disabled without an allowlist")
         LogCollector collector;
         auto dir = make_dir("fail-closed");
         auto path = dir / "app.log";
-        write_file(path, "ERROR leaked\n");
+        write_file(path, "");
         collector.set_configs({make_config(path)});
+        collector.tick(); // a watch starts at the end of an existing file (#90)
+        collector.take_matches();
+        write_file(path, "ERROR leaked\n");
 
         WHEN("tick() is called")
         {
@@ -89,10 +93,14 @@ SCENARIO("LogCollector refuses paths outside the allowlist")
         auto dir_b = make_dir("outside");
         auto path_a = dir_a / "inside.log";
         auto path_b = dir_b / "outside.log";
-        write_file(path_a, "ERROR inside\n");
-        write_file(path_b, "ERROR outside\n");
+        write_file(path_a, "");
+        write_file(path_b, "");
         collector.set_allowed_dirs({dir_a});
         collector.set_configs({make_config(path_a), make_config(path_b)});
+        collector.tick(); // a watch starts at the end of an existing file (#90)
+        collector.take_matches();
+        write_file(path_a, "ERROR inside\n");
+        write_file(path_b, "ERROR outside\n");
 
         WHEN("tick() is called")
         {
@@ -152,10 +160,13 @@ SCENARIO("set_allowed_dirs canonicalizes its entries")
         LogCollector collector;
         auto dir = make_dir("canon-dotdot");
         auto path = dir / "app.log";
-        write_file(path, "ERROR reachable\n");
         std::filesystem::create_directories(dir / "child");
         collector.set_allowed_dirs({dir / "child" / ".."});
+        write_file(path, "");
         collector.set_configs({make_config(path)});
+        collector.tick(); // a watch starts at the end of an existing file (#90)
+        collector.take_matches();
+        write_file(path, "ERROR reachable\n");
 
         WHEN("tick() is called")
         {
@@ -184,9 +195,12 @@ SCENARIO("set_allowed_dirs canonicalizes its entries")
         }
 
         auto path = real_dir / "app.log";
-        write_file(path, "ERROR via alias\n");
         collector.set_allowed_dirs({alias});
+        write_file(path, "");
         collector.set_configs({make_config(path)});
+        collector.tick(); // a watch starts at the end of an existing file (#90)
+        collector.take_matches();
+        write_file(path, "ERROR via alias\n");
 
         WHEN("tick() is called")
         {
@@ -209,10 +223,13 @@ SCENARIO("LogCollector refuses a log file replaced by a symlink to a file outsid
         auto dir_b = make_dir("swap-outside");
         auto path = dir_a / "app.log";
         auto secret = dir_b / "secret.log";
-        write_file(path, "ERROR before swap\n");
         write_file(secret, "ERROR secret\n");
         collector.set_allowed_dirs({dir_a});
+        write_file(path, "");
         collector.set_configs({make_config(path)});
+        collector.tick(); // a watch starts at the end of an existing file (#90)
+        collector.take_matches();
+        write_file(path, "ERROR before swap\n");
         collector.tick();
         REQUIRE(collector.take_matches().size() == 1);
 
@@ -294,10 +311,13 @@ SCENARIO("LogCollector truncates over-long lines")
         auto path = dir / "huge.log";
         // The marker sits at the start so it survives truncation; the tail
         // of the monster line is what gets dropped.
-        write_file(path, "ERROR " + std::string(300 * 1024, 'x') + "\n");
 
         collector.set_allowed_dirs({dir});
+        write_file(path, "");
         collector.set_configs({make_config(path)});
+        collector.tick(); // a watch starts at the end of an existing file (#90)
+        collector.take_matches();
+        write_file(path, "ERROR " + std::string(300 * 1024, 'x') + "\n");
 
         WHEN("tick() is called")
         {
@@ -324,10 +344,13 @@ SCENARIO("LogCollector caps matches per tick and continues next tick")
         std::string contents;
         for (int i = 0; i < 150; ++i)
             contents += "ERROR line " + std::to_string(i) + "\n";
-        write_file(path, contents);
 
         collector.set_allowed_dirs({dir});
+        write_file(path, "");
         collector.set_configs({make_config(path)});
+        collector.tick(); // a watch starts at the end of an existing file (#90)
+        collector.take_matches();
+        write_file(path, contents);
 
         WHEN("tick() is called twice")
         {
@@ -352,9 +375,12 @@ SCENARIO("LogCollector drops the remainder of an over-long line across ticks wit
         LogCollector collector;
         auto dir = make_dir("monster-line");
         auto path = dir / "monster.log";
-        write_file(path, "ERROR " + std::string(2 * 1024 * 1024, 'x') + "\nERROR next\n");
         collector.set_allowed_dirs({dir});
+        write_file(path, "");
         collector.set_configs({make_config(path)});
+        collector.tick(); // a watch starts at the end of an existing file (#90)
+        collector.take_matches();
+        write_file(path, "ERROR " + std::string(2 * 1024 * 1024, 'x') + "\nERROR next\n");
 
         WHEN("tick() is called until the file is consumed")
         {
@@ -414,7 +440,7 @@ SCENARIO("LogCollector survives long lines with recursion-heavy patterns (issue 
 {
     // std::regex recurses about once per character. Before the fix a ~40 KB
     // line with "ERROR.*timeout" overflowed the 8 MB thread stack (SIGSEGV).
-    for (const std::string pattern : {"ERROR.*timeout", "(a|b)*c"})
+    for (const std::string pattern : {"ERROR.*timeout", "(ab)*c"})
     {
         GIVEN("a 64 KiB line that does not match the pattern: " + pattern)
         {
@@ -424,10 +450,13 @@ SCENARIO("LogCollector survives long lines with recursion-heavy patterns (issue 
             // The long line does not match; the short line after it does, so
             // one match in total proves the long line was consumed (a reader
             // stuck on the long line would never reach the second one).
-            write_file(path, "ERROR " + std::string(64 * 1024 - 7, 'a') + "\nERROR timeout c\n");
 
             collector.set_allowed_dirs({dir});
+            write_file(path, "");
             collector.set_configs({make_config(path, pattern)});
+            collector.tick(); // a watch starts at the end of an existing file (#90)
+            collector.take_matches();
+            write_file(path, "ERROR " + std::string(64 * 1024 - 7, 'a') + "\nERROR timeout c\n");
 
             WHEN("tick() is called twice")
             {
@@ -451,10 +480,13 @@ SCENARIO("LogCollector survives long lines with recursion-heavy patterns (issue 
         LogCollector collector;
         auto dir = make_dir("regex-beyond-limit");
         auto path = dir / "beyond.log";
-        write_file(path, std::string(8 * 1024, 'x') + " ERROR db timeout " + std::string(50 * 1024, 'x') + "\n");
 
         collector.set_allowed_dirs({dir});
+        write_file(path, "");
         collector.set_configs({make_config(path, "ERROR.*timeout")});
+        collector.tick(); // a watch starts at the end of an existing file (#90)
+        collector.take_matches();
+        write_file(path, std::string(8 * 1024, 'x') + " ERROR db timeout " + std::string(50 * 1024, 'x') + "\n");
 
         WHEN("tick() is called")
         {
@@ -472,10 +504,13 @@ SCENARIO("LogCollector survives long lines with recursion-heavy patterns (issue 
         LogCollector collector;
         auto dir = make_dir("regex-anchor-cut");
         auto path = dir / "anchor.log";
-        write_file(path, std::string(4 * 1024 - 5, 'x') + "ERROR" + std::string(56 * 1024, 'y') + "\n");
 
         collector.set_allowed_dirs({dir});
+        write_file(path, "");
         collector.set_configs({make_config(path, "ERROR$")});
+        collector.tick(); // a watch starts at the end of an existing file (#90)
+        collector.take_matches();
+        write_file(path, std::string(4 * 1024 - 5, 'x') + "ERROR" + std::string(56 * 1024, 'y') + "\n");
 
         WHEN("tick() is called")
         {
@@ -493,10 +528,13 @@ SCENARIO("LogCollector survives long lines with recursion-heavy patterns (issue 
         LogCollector collector;
         auto dir = make_dir("regex-prefix");
         auto path = dir / "prefix.log";
-        write_file(path, "ERROR db timeout " + std::string(60 * 1024, 'x') + "\n");
 
         collector.set_allowed_dirs({dir});
+        write_file(path, "");
         collector.set_configs({make_config(path, "ERROR.*timeout")});
+        collector.tick(); // a watch starts at the end of an existing file (#90)
+        collector.take_matches();
+        write_file(path, "ERROR db timeout " + std::string(60 * 1024, 'x') + "\n");
 
         WHEN("tick() is called")
         {
@@ -518,12 +556,15 @@ SCENARIO("LogCollector refuses patterns that nest groups too deeply (issue #140)
         LogCollector collector;
         auto dir = make_dir("regex-nesting");
         auto path = dir / "nested.log";
-        write_file(path, std::string(4 * 1024, 'a') + "\n");
         // 100 nested groups overflowed the 64 MB matching stack on this line.
         const std::string pattern = std::string(100, '(') + "a" + std::string(100, ')') + "*b";
 
         collector.set_allowed_dirs({dir});
+        write_file(path, "");
         collector.set_configs({make_config(path, pattern)});
+        collector.tick(); // a watch starts at the end of an existing file (#90)
+        collector.take_matches();
+        write_file(path, std::string(4 * 1024, 'a') + "\n");
 
         WHEN("tick() is called")
         {
@@ -541,10 +582,13 @@ SCENARIO("LogCollector refuses patterns that nest groups too deeply (issue #140)
         LogCollector collector;
         auto dir = make_dir("regex-shallow");
         auto path = dir / "shallow.log";
-        write_file(path, "ERROR (disk) [sda] timeout\n");
 
         collector.set_allowed_dirs({dir});
+        write_file(path, "");
         collector.set_configs({make_config(path, "(ERROR|WARN) \\((disk|net)\\) [[(]sda[)\\]] (time(out))")});
+        collector.tick(); // a watch starts at the end of an existing file (#90)
+        collector.take_matches();
+        write_file(path, "ERROR (disk) [sda] timeout\n");
 
         WHEN("tick() is called")
         {
@@ -567,12 +611,15 @@ SCENARIO("The group nesting limit accepts 16 levels and rejects 17 (issue #140)"
             LogCollector collector;
             auto dir = make_dir("regex-depth-boundary");
             auto path = dir / ("depth" + std::to_string(depth) + ".log");
-            write_file(path, "ab\n");
             const std::string pattern = std::string(static_cast<std::size_t>(depth), '(') + "a" +
                                         std::string(static_cast<std::size_t>(depth), ')') + "b";
 
             collector.set_allowed_dirs({dir});
+            write_file(path, "");
             collector.set_configs({make_config(path, pattern)});
+            collector.tick(); // a watch starts at the end of an existing file (#90)
+            collector.take_matches();
+            write_file(path, "ab\n");
 
             WHEN("tick() is called")
             {
@@ -582,6 +629,69 @@ SCENARIO("The group nesting limit accepts 16 levels and rejects 17 (issue #140)"
                 {
                     REQUIRE(collector.take_matches().size() == (depth <= 16 ? 1U : 0U));
                 }
+            }
+        }
+    }
+}
+
+SCENARIO("Patterns that can backtrack exponentially are rejected (issue #169)")
+{
+    GIVEN("patterns with nested or overlapping quantifiers, or back-references")
+    {
+        for (const std::string bad : {"(a+)+$", "(a|aa)*c", R"((\w+\s?)*$)", "(a*)*b", "(a|a)+", "(ab+)*c", ".*.*.*z",
+                                      "a*a*b", R"(\d+\d+x)", R"((a)\1)", "(?:a+){2,}b", ".*a.*b.*c.*d"})
+        {
+            WHEN("log_pattern_error is asked about " + bad)
+            {
+                THEN("it names a reason")
+                {
+                    REQUIRE_FALSE(thewatcher::log_pattern_error(bad).empty());
+                }
+            }
+        }
+    }
+
+    GIVEN("ordinary monitoring patterns")
+    {
+        for (const std::string good :
+             {"ERROR", "ERROR.*timeout", "ERROR.*disk.*full", "(ERROR|WARN) disk", R"(\d{4}-\d{2})", R"(^\s*FATAL)",
+              "(ab)*c", "disk [a-z]+ (full|failing)", "ERROR$", "a?b?c?", "x{2,5}y"})
+        {
+            WHEN("log_pattern_error is asked about " + good)
+            {
+                THEN("it is accepted")
+                {
+                    REQUIRE(thewatcher::log_pattern_error(good).empty());
+                }
+            }
+        }
+    }
+}
+
+SCENARIO("A catastrophic pattern neither hangs the collector nor blocks other watches (issue #169)")
+{
+    GIVEN("a watch with (a+)+$ and a healthy watch on a file holding a line that almost matches")
+    {
+        LogCollector collector;
+        auto dir = make_dir("redos");
+        auto path = dir / "redos.log";
+        write_file(path, "");
+        collector.set_allowed_dirs({dir});
+        collector.set_configs({make_config(path, "(a+)+$", "log:bad"), make_config(path, "almost", "log:good")});
+        collector.tick();
+        collector.take_matches();
+        // 40 a's then a character that defeats "(a+)+$": exponential on a backtracking engine.
+        write_file(path, std::string(40, 'a') + "! almost\n");
+
+        WHEN("tick() is called")
+        {
+            collector.tick();
+            auto matches = collector.take_matches();
+
+            THEN("it returns promptly with only the healthy watch's match")
+            {
+                REQUIRE(matches.size() == 1);
+                REQUIRE(matches[0].indicator_name == "log:good");
             }
         }
     }

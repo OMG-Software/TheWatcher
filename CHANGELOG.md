@@ -28,8 +28,6 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   4 KiB of a line is no longer reported, and `$` does not match at the cut.
   A pattern that nests groups more than 16 levels deep is skipped with a
   warning; 100 nested groups overflowed the 64 MB stack.
-  Patterns with exponential backtracking can still use a lot of CPU
-  (#169).
 - **Behaviour change:** the data plane no longer trusts the ROUTER routing
   id. Agents no longer set it (libzmq generates one), and the server sends
   commands only to the connection that last sent an authenticated frame for
@@ -55,6 +53,21 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 
+- Log tailing (#90): each indicator keeps its own read offset, so two
+  indicators on one file both match; a monitor starts at the end of an
+  existing file instead of replaying its history as new alerts (a file that
+  appears later is read from its first byte); a line the writer has not
+  finished is matched whole once it ends; the carriage return of CRLF lines is
+  dropped so `$`-anchored patterns match; a replaced, deleted or truncated
+  file is read again from its start. A regex engine failure on one line (for
+  example MSVC `error_stack`) skips that line and is logged once per poll,
+  instead of stalling the file.
+- Log patterns that can backtrack exponentially are rejected (#169). The
+  server answers 400 when a collector config is saved with one and the agent
+  skips it with a warning. Refused: back-references; a repeated group that
+  contains a quantifier or alternation, such as `(a+)+` or `(a|aa)*`;
+  overlapping unbounded quantifiers back to back, such as `.*.*`; and more
+  than three unbounded quantifiers (`*`, `+`, `{n,}`) in one pattern.
 - Dashboard: `tsc` no longer writes `.js`/`.d.ts` files into `dashboard/src`
   (`noEmit`), the 21 committed compiled twins are removed, and vitest runs
   only `*.test.ts(x)`. Before, Vite served the stale twins and every test ran
