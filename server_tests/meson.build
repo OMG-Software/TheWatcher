@@ -160,7 +160,10 @@ auth_sessions_test = executable(
   include_directories: root_inc,
   dependencies: [server_dep, common_dep, catch2_dep, http_dep, cppzmq_dep, sqlite_dep, sodium_dep, platform_deps],
 )
-test('auth_sessions', auth_sessions_test, is_parallel: false)
+# Like login_rate_limit, these scenarios run real Argon2 hashes and
+# verifications through the HTTP API (about 17 s on a 16-core machine), which is
+# more than meson's 30s default allows on two-core CI runners and the FreeBSD VM.
+test('auth_sessions', auth_sessions_test, timeout: 120, is_parallel: false)
 
 store_concurrency_test = executable(
   'store_concurrency_test',

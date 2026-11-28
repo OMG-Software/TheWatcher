@@ -260,6 +260,11 @@ PostgresStore::~PostgresStore()
     LOG_DEBUG("Closing PostgreSQL store");
 }
 
+int PostgresStore::backend_pid() const noexcept
+{
+    return PQbackendPID(conn_);
+}
+
 void PostgresStore::exec(const char* sql)
 {
     LOGF_TRACE("Executing SQL prefix=%.80s", sql);

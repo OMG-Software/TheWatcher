@@ -10,6 +10,7 @@ import {
   closedPasswordForm,
   needsCurrentPassword,
   openPasswordForm,
+  settlePasswordChange,
   submitPasswordChange,
   type PasswordFormState,
 } from '../passwordForm';
@@ -64,6 +65,7 @@ export function UsersPage({
                   type="password"
                   autoComplete="current-password"
                   autoFocus
+                  disabled={pwForm.saving}
                   value={pwForm.current}
                   onChange={(e) => setPwForm({ ...pwForm, current: e.target.value })}
                 />
@@ -75,6 +77,8 @@ export function UsersPage({
                 type="password"
                 autoComplete="new-password"
                 autoFocus={!changingOwnPassword}
+                // Locked while saving: the answer replaces the form with the one that was sent.
+                disabled={pwForm.saving}
                 value={pwForm.value}
                 onChange={(e) => setPwForm({ ...pwForm, value: e.target.value })}
               />
@@ -86,12 +90,16 @@ export function UsersPage({
                 className="text-button"
                 disabled={pwForm.saving || !pwForm.value || (changingOwnPassword && !pwForm.current)}
                 onClick={() => {
-                  const form = pwForm;
-                  const id = form.userId;
+                  const id = pwForm.userId;
                   if (id === null) return;
-                  setPwForm({ ...form, error: null, saving: true });
-                  // The modal stays open until the server accepts the change; a refusal is shown inside it.
-                  void submitPasswordChange(form, () => changeUserPassword(id, form.value, changingOwnPassword ? form.current : undefined)).then(setPwForm);
+                  const sent = { ...pwForm, error: null, saving: true };
+                  const current = changingOwnPassword ? sent.current : undefined;
+                  setPwForm(sent);
+                  // The modal stays open until the server accepts the change; a refusal is shown inside it. The answer is
+                  // applied only if this opening is still shown, so dismissing the modal meanwhile is final.
+                  void submitPasswordChange(sent, () => changeUserPassword(id, sent.value, current)).then((result) =>
+                    setPwForm((shown) => settlePasswordChange(shown, sent, result)),
+                  );
                 }}
               >
                 Save

@@ -225,8 +225,12 @@ password, and Save stays disabled until both are filled in. The form stays open
 until the server accepts the change: a refusal (wrong current password 403,
 throttled 429, or an admin reset that landed first 409) is shown inside the
 form, the new password is kept and the current one is cleared so you can retry.
-Both fields are cleared on success or Cancel. A global admin resetting another
-user's password is asked only for the new password.
+Both fields are cleared on success or Cancel. While a change is saving, both
+fields are locked. Closing the form before the server answers is final: the
+answer is discarded, so a refusal does not reopen the form and a late answer
+never touches a form opened since. Closing does not cancel a request already
+sent, so the change may still have been applied. A global admin resetting
+another user's password is asked only for the new password.
 
 A self-service change keeps the session that made it and signs out your other
 sessions; a global admin's reset signs out all of that user's sessions.

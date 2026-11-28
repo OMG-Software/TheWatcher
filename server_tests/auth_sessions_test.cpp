@@ -934,6 +934,34 @@ struct SideConnection
     thewatcher::server::sqlite::Connection conn;
 };
 
+// A thread that is always joined on scope exit, so a failed REQUIRE never
+// destroys a joinable std::thread (std::terminate). Declare it before anything
+// the thread waits on, so that is released first and the join cannot hang.
+class ScopedThread
+{
+public:
+    ScopedThread() = default;
+    ScopedThread(const ScopedThread&) = delete;
+    ScopedThread& operator=(const ScopedThread&) = delete;
+    ~ScopedThread()
+    {
+        join();
+    }
+    template <typename Fn>
+    void start(Fn fn)
+    {
+        thread_ = std::thread(std::move(fn));
+    }
+    void join()
+    {
+        if (thread_.joinable())
+            thread_.join();
+    }
+
+private:
+    std::thread thread_;
+};
+
 } // namespace
 
 SCENARIO("A rolled-back password reset never takes other threads' sessions with it")
@@ -958,110 +986,93 @@ SCENARIO("A rolled-back password reset never takes other threads' sessions with 
         }
         const auto new_hash = hash_for("new-victim-password");
 
-        constexpr int creators = 4;
-        // Creators run until the resets finish; this wall-clock cap bounds the
-        // loops on a slow disk.
-        const auto creator_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
-        constexpr int resetters = 3;
-        constexpr int resets_each = 40;
-        std::atomic<int> reset_throws{0};
-        std::atomic<int> create_errors{0};
-        std::atomic<bool> starved{false};
-        std::atomic<int> resets_started{0};
-        std::atomic<int> resets_done{0};
-        std::atomic<int> acknowledged{0};
-        // Logins acknowledged while the reset phase was under way (some reset
-        // had started and not all had finished).
-        std::atomic<int> acknowledged_during_resets{0};
-        std::vector<std::vector<std::string>> created(creators);
-
-        WHEN("failing resets run while other users keep logging in")
+        WHEN("another user's login attempts its store call while the failing reset is still inside its own")
         {
-            std::vector<std::thread> threads;
-            // Creators start first, and the resets are only released once a
-            // login was acknowledged, so the creators cannot be starved.
-            for (int c = 0; c < creators; ++c)
-            {
-                threads.emplace_back([&, c] {
-                    for (int i = 0;
-                         resets_done.load() < resetters && std::chrono::steady_clock::now() < creator_deadline; ++i)
-                    {
-                        const auto token = "other-" + std::to_string(c) + "-" + std::to_string(i);
-                        try
-                        {
-                            if (store->create_session_if_credentials_current(make_session(token, other, expires),
-                                                                             other_hash))
-                            {
-                                created[c].push_back(token);
-                                ++acknowledged;
-                                if (resets_started.load() > 0 && resets_done.load() < resetters)
-                                    ++acknowledged_during_resets;
-                            }
-                        }
-                        catch (const std::exception&)
-                        {
-                            ++create_errors;
-                        }
-                    }
-                });
-            }
-            const bool logins_running = thewatcher::test::eventually(
-                [&] {
-                    return acknowledged.load() >= 1;
-                },
-                10s, 5ms);
-            for (int r = 0; r < resetters; ++r)
-            {
-                threads.emplace_back([&] {
-                    // No Catch2 assertions off the main thread.
-                    for (int i = 0; i < resets_each; ++i)
-                    {
-                        ++resets_started;
-                        const auto before = acknowledged_during_resets.load();
-                        try
-                        {
-                            store->update_user_password_and_revoke_sessions(victim, new_hash);
-                        }
-                        catch (const std::exception&)
-                        {
-                            ++reset_throws;
-                        }
-                        // Pace the resets: do not start the next one until a
-                        // login was acknowledged since this one began. The
-                        // overlap is therefore guaranteed, and the final check
-                        // fails if the creators never got through.
-                        // After one timeout the creators are starved: stop waiting
-                        // so the failure arrives quickly.
-                        if (!starved.load() && !thewatcher::test::eventually(
-                                                   [&] {
-                                                       return acknowledged_during_resets.load() > before;
-                                                   },
-                                                   2s, 1ms))
-                            starved = true;
-                    }
-                    ++resets_done;
-                });
-            }
-            for (auto& t : threads)
-                t.join();
+            std::atomic<bool> reset_entered{false};
+            std::atomic<bool> reset_returned{false};
+            std::atomic<bool> reset_threw{false};
+            std::atomic<bool> login_attempting{false};
+            std::atomic<bool> login_returned{false};
+            std::atomic<bool> login_created{false};
+            std::atomic<bool> login_threw{false};
 
-            THEN("every reset failed, every acknowledged login survives and the password is unchanged")
-            {
-                REQUIRE(logins_running);
-                REQUIRE(reset_throws.load() == resetters * resets_each);
-                REQUIRE(create_errors.load() == 0);
-                // The test proves nothing unless logins really completed while
-                // resets were running.
-                REQUIRE(acknowledged_during_resets.load() >= 1);
-                const auto now = now_ms();
-                std::size_t total = 0;
-                for (const auto& tokens : created)
+            // Declared before the writer, so on an early failure the writer is
+            // closed (releasing the write lock) before the threads are joined.
+            ScopedThread reset;
+            ScopedThread login;
+            // Holds SQLite's write lock. The reset's BEGIN IMMEDIATE waits for it
+            // (busy timeout 5 s) inside the store call, holding the store's
+            // mutex, until the test releases it: the reset is active for as long
+            // as the test needs. No Catch2 assertions run off the main thread.
+            SideConnection writer(path);
+            writer.exec("BEGIN IMMEDIATE;");
+
+            reset.start([&] {
+                reset_entered = true;
+                try
                 {
-                    total += tokens.size();
-                    for (const auto& token : tokens)
-                        REQUIRE(store->get_session(token, now));
+                    store->update_user_password_and_revoke_sessions(victim, new_hash);
                 }
-                REQUIRE(total > 0);
+                catch (const std::exception&)
+                {
+                    reset_threw = true;
+                }
+                reset_returned = true;
+            });
+            const bool reset_started = thewatcher::test::eventually(
+                [&] {
+                    return reset_entered.load();
+                },
+                5s, 1ms);
+            // An unblocked call returns within milliseconds, so a reset still
+            // running after this pause is held inside its store call.
+            std::this_thread::sleep_for(200ms);
+            const bool reset_held = reset_started && !reset_returned.load();
+
+            login.start([&] {
+                login_attempting = true;
+                try
+                {
+                    login_created = store->create_session_if_credentials_current(
+                        make_session("other-session", other, expires), other_hash);
+                }
+                catch (const std::exception&)
+                {
+                    login_threw = true;
+                }
+                login_returned = true;
+            });
+            const bool login_started = thewatcher::test::eventually(
+                [&] {
+                    return login_attempting.load();
+                },
+                5s, 1ms);
+            std::this_thread::sleep_for(200ms);
+            // The barrier: the login has attempted its call while the reset is
+            // still inside its own, and neither has returned.
+            const bool overlapped = login_started && !reset_returned.load() && !login_returned.load();
+
+            writer.exec("ROLLBACK;");
+            const bool both_returned = thewatcher::test::eventually(
+                [&] {
+                    return reset_returned.load() && login_returned.load();
+                },
+                5s, 1ms);
+            reset.join();
+            login.join();
+
+            THEN("the reset fails and rolls back, and the login's session survives it")
+            {
+                // Each barrier fails the test on timeout instead of letting it
+                // pass without the overlap it is meant to prove.
+                REQUIRE(reset_held);
+                REQUIRE(overlapped);
+                REQUIRE(both_returned);
+                REQUIRE(reset_threw.load());
+                REQUIRE_FALSE(login_threw.load());
+                REQUIRE(login_created.load());
+                const auto now = now_ms();
+                REQUIRE(store->get_session("other-session", now));
                 REQUIRE(store->get_user_by_username("victim")->password_hash == victim_hash);
                 REQUIRE(store->get_session("victim-session", now));
             }

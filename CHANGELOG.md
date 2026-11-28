@@ -125,6 +125,16 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   keeps the Change Password form open and shows the server's reason when a
   change is refused, hides the Password button on other users' rows unless you
   are a global admin, and stops waiting for an error body after two seconds.
+  The form's fields are locked while it saves, and an answer that arrives after
+  the form was closed (or replaced by a new one) is discarded instead of
+  reopening or overwriting it. The rolled-back-reset test now holds the reset
+  inside its store call with a SQLite write lock, and fails unless a login
+  attempts its call during the reset and its session survives the rollback.
+  The PostgreSQL lock tests check that the fixture connection blocks the exact
+  backend under test (new `PostgresStore::backend_pid`), so an unrelated lock
+  wait no longer counts. The `auth_sessions` suite gets a 120-second test
+  timeout like `login_rate_limit`, because its real Argon2 work exceeded
+  meson's 30-second default on the Linux and FreeBSD CI runners.
 - Session tokens are stored as their SHA-256 (lowercase hex) instead of raw, so a
   database copy or backup no longer contains usable logins. The stores hash
   inside `create_session`, `get_session`, `delete_session`,

@@ -999,17 +999,21 @@ private:
     std::thread thread_;
 };
 
-// Polls (bounded) until some backend is waiting on a lock held by another,
-// using a third connection. Returns false if nothing ever waited, so a call
-// that finished without blocking on the fixture's lock fails the overlap case.
-bool wait_until_a_backend_is_blocked(PGconn* observer)
+// Polls (bounded) until the backend `waiter_pid` (the store connection the
+// call under test runs on) is waiting on a lock that the fixture connection
+// `holder_pid` holds, using a third connection. A lock wait anywhere else in
+// the database does not count. Returns false if that pair never appeared, so a
+// call that finished without blocking on the fixture's lock fails the overlap
+// case.
+bool wait_until_blocked_by(PGconn* observer, int waiter_pid, int holder_pid)
 {
+    const auto sql =
+        "SELECT " + std::to_string(holder_pid) + " = ANY(pg_blocking_pids(" + std::to_string(waiter_pid) + "))";
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
     while (std::chrono::steady_clock::now() < deadline)
     {
-        PGresult* res = PQexec(observer, "SELECT count(*) FROM pg_stat_activity WHERE datname=current_database() "
-                                         "AND pid<>pg_backend_pid() AND cardinality(pg_blocking_pids(pid))>0");
-        const bool blocked = PQresultStatus(res) == PGRES_TUPLES_OK && std::atoi(PQgetvalue(res, 0, 0)) > 0;
+        PGresult* res = PQexec(observer, sql.c_str());
+        const bool blocked = PQresultStatus(res) == PGRES_TUPLES_OK && std::string(PQgetvalue(res, 0, 0)) == "t";
         PQclear(res);
         if (blocked)
             return true;
@@ -1043,6 +1047,9 @@ SCENARIO("[postgres] A login waits for a concurrent credential change instead of
         PgSideConnection observer;
         REQUIRE(PQstatus(side.conn) == CONNECTION_OK);
         REQUIRE(PQstatus(observer.conn) == CONNECTION_OK);
+        // Read before the login thread starts using the store's connection.
+        const int waiter_pid = store.backend_pid();
+        const int holder_pid = PQbackendPID(side.conn);
         side.run("BEGIN");
 
         WHEN("the password is changed and not yet committed")
@@ -1052,7 +1059,7 @@ SCENARIO("[postgres] A login waits for a concurrent credential change instead of
             login.start([&] {
                 return store.create_session_if_credentials_current(session, old_hash);
             });
-            const bool blocked = wait_until_a_backend_is_blocked(observer.conn) && login.running();
+            const bool blocked = wait_until_blocked_by(observer.conn, waiter_pid, holder_pid) && login.running();
             side.run("COMMIT");
             const bool created = login.get();
 
@@ -1070,7 +1077,7 @@ SCENARIO("[postgres] A login waits for a concurrent credential change instead of
             login.start([&] {
                 return store.create_session_if_credentials_current(session, old_hash);
             });
-            const bool blocked = wait_until_a_backend_is_blocked(observer.conn) && login.running();
+            const bool blocked = wait_until_blocked_by(observer.conn, waiter_pid, holder_pid) && login.running();
             side.run("COMMIT");
             const bool created = login.get();
 
@@ -1163,6 +1170,9 @@ SCENARIO("[postgres] A password reset or disable revokes a session a login commi
         PgSideConnection observer;
         REQUIRE(PQstatus(login_tx.conn) == CONNECTION_OK);
         REQUIRE(PQstatus(observer.conn) == CONNECTION_OK);
+        // Read before a change thread starts using the store's connection.
+        const int waiter_pid = change_store.backend_pid();
+        const int holder_pid = PQbackendPID(login_tx.conn);
         // The same lock-then-insert a login performs, but left open so the
         // change can start while the login is still in flight.
         const std::string held_login = "WITH u AS (SELECT user_id FROM users WHERE user_id=" + uid +
@@ -1203,7 +1213,7 @@ SCENARIO("[postgres] A password reset or disable revokes a session a login commi
             reset.start([&] {
                 return change_store.update_user_password_and_revoke_sessions(user_id, "new-" + suffix);
             });
-            const bool blocked = wait_until_a_backend_is_blocked(observer.conn) && reset.running();
+            const bool blocked = wait_until_blocked_by(observer.conn, waiter_pid, holder_pid) && reset.running();
             login_tx.run("COMMIT");
             const auto revoked = reset.get();
 
@@ -1224,7 +1234,7 @@ SCENARIO("[postgres] A password reset or disable revokes a session a login commi
             disable.start([&] {
                 return change_store.disable_user_and_revoke_sessions(user_id);
             });
-            const bool blocked = wait_until_a_backend_is_blocked(observer.conn) && disable.running();
+            const bool blocked = wait_until_blocked_by(observer.conn, waiter_pid, holder_pid) && disable.running();
             login_tx.run("COMMIT");
             const auto affected = disable.get();
 

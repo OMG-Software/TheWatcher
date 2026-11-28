@@ -18,6 +18,11 @@ public:
     explicit PostgresStore(const std::string& dsn);
     ~PostgresStore() override;
 
+    // Process ID of the server backend serving this store's connection
+    // (PQbackendPID). For diagnostics and for tests that must name exactly
+    // which backend is waiting on a lock (pg_blocking_pids). Not part of Store.
+    int backend_pid() const noexcept;
+
     void upsert_agent(const AgentRecord& rec) override;
     std::optional<AgentRecord> get_agent(const std::string& agent_id) override;
     std::vector<AgentRecord> list_agents() override;
