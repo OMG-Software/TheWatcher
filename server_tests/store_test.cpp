@@ -2993,46 +2993,59 @@ SCENARIO("get_runbook never returns another agent's runbook")
     }
 }
 
-// ── Retention and per-agent offline (#76, #46) ────────────────────────────────
-
-SCENARIO("latest_status_per_indicator returns the newest row of each indicator")
+SCENARIO("latest_indicator_status_all returns the newest status of every indicator of every agent in one call")
 {
     SqliteStore store(":memory:");
 
-    GIVEN("an agent with two indicators and two rows for one of them")
+    GIVEN("two agents with several transitions, one indicator that has not changed for a long time")
     {
-        AgentRecord agent;
-        agent.agent_id = "agent-latest";
-        agent.hostname = "host";
-        agent.approved = true;
-        store.upsert_agent(agent);
-        store.insert_status_history({0, "agent-latest", "cpu", "green", "red", "", 1000});
-        store.insert_status_history({0, "agent-latest", "cpu", "red", "green", "", 2000});
-        store.insert_status_history({0, "agent-latest", "memory", "green", "yellow", "", 1500});
-
-        WHEN("the latest rows are listed")
+        const auto add = [&](const std::string& agent, const std::string& indicator, const std::string& to,
+                             int64_t at) {
+            StatusHistoryRow row;
+            row.agent_id = agent;
+            row.indicator = indicator;
+            row.old_status = "grey";
+            row.new_status = to;
+            row.created_at = at;
+            store.insert_status_history(row);
+        };
+        for (const auto* id : {"agent-a", "agent-b"})
         {
-            const auto rows = store.latest_status_per_indicator("agent-latest");
+            AgentRecord rec;
+            rec.agent_id = id;
+            rec.hostname = id;
+            store.upsert_agent(rec);
+        }
+        add("agent-b", "cpu", "green", 10);
+        add("agent-a", "disk:/", "green", 1); // old, and never changed again
+        add("agent-a", "cpu", "yellow", 2000);
+        add("agent-a", "cpu", "red", 3000);
+        add("agent-a", "cpu", "green", 1500); // a later insert with an earlier timestamp is still the newest row
 
-            THEN("there is one row per indicator and it is the newest")
+        WHEN("the latest statuses of all agents are read")
+        {
+            const auto rows = store.latest_indicator_status_all();
+
+            THEN("there is one row per agent and indicator, ordered by agent then indicator")
             {
-                REQUIRE(rows.size() == 2);
-                for (const auto& row : rows)
-                {
-                    if (row.indicator == "cpu")
-                        REQUIRE(row.new_status == "green");
-                    else
-                        REQUIRE(row.new_status == "yellow");
-                }
+                REQUIRE(rows.size() == 3);
+                REQUIRE(rows[0].agent_id == "agent-a");
+                REQUIRE(rows[0].indicator == "cpu");
+                REQUIRE(rows[0].new_status == "green");
+                REQUIRE(rows[1].agent_id == "agent-a");
+                REQUIRE(rows[1].indicator == "disk:/");
+                REQUIRE(rows[1].new_status == "green");
+                REQUIRE(rows[2].agent_id == "agent-b");
+                REQUIRE(rows[2].indicator == "cpu");
             }
         }
+    }
 
-        WHEN("another agent is queried")
+    GIVEN("no status history")
+    {
+        THEN("the result is empty")
         {
-            THEN("nothing is returned")
-            {
-                REQUIRE(store.latest_status_per_indicator("nobody").empty());
-            }
+            REQUIRE(store.latest_indicator_status_all().empty());
         }
     }
 }

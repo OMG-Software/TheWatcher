@@ -3,6 +3,7 @@ import { fireEvent, render, screen, waitFor, within } from '@testing-library/rea
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { App } from './App';
 import { ConfirmDialog } from './components/ConfirmDialog';
+import { InfoTip } from './components/InfoTip';
 import { Modal } from './components/Modal';
 import { FakeApi, agentRecord, ok } from './testing/fakeApi';
 
@@ -316,5 +317,130 @@ describe('GIVEN an expanded row (issue #111)', () => {
     await vi.advanceTimersByTimeAsync(5500);
 
     expect(api.count('GET /api/metrics/agent-1?limit=20')).toBeGreaterThanOrEqual(2);
+  });
+});
+
+describe('GIVEN the maintenance reason (review)', () => {
+  it('WHEN the reason has surrounding spaces THEN it is sent exactly as typed', async () => {
+    const api = new FakeApi('global_admin');
+    await openDashboard(api);
+    goTo('Agents');
+    fireEvent.click(within(await screen.findByRole('main')).getByRole('button', { name: 'Maintenance' }));
+
+    fireEvent.change(within(dialog()).getByLabelText(/Reason/), { target: { value: '  patch window  ' } });
+    fireEvent.click(within(dialog()).getByRole('button', { name: 'Enter maintenance' }));
+
+    await waitFor(() => expect(api.count('POST /api/agents/agent-1/maintenance')).toBe(1));
+    expect(api.calls.find((call) => call.path.endsWith('/maintenance'))?.body).toEqual({ reason: '  patch window  ', until_ms: 0 });
+  });
+});
+
+describe('GIVEN many expanded rows (review: bounded polling)', () => {
+  const four = () =>
+    new FakeApi('global_admin').on('GET /api/agents', ok(['a', 'b', 'c', 'd'].map((id) => agentRecord(`agent-${id}`, `host-${id}`))));
+
+  it('WHEN four rows are expanded THEN only the three most recent keep polling, and the oldest can be refreshed by hand', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const api = four();
+    await openDashboard(api);
+    for (const id of ['a', 'b', 'c', 'd']) fireEvent.click(await screen.findByRole('button', { name: `Expand host-${id}` }));
+    await waitFor(() => expect(api.count('GET /api/metrics/agent-d?limit=20')).toBeGreaterThanOrEqual(1));
+    const before = (id: string) => api.count(`GET /api/metrics/agent-${id}?limit=20`);
+    const start = { a: before('a'), d: before('d') };
+
+    await vi.advanceTimersByTimeAsync(5500);
+
+    expect(before('a')).toBe(start.a); // the oldest expanded row stopped polling
+    expect(before('d')).toBeGreaterThan(start.d);
+
+    fireEvent.click(screen.getAllByRole('button', { name: 'Refresh' })[0]);
+    await waitFor(() => expect(before('a')).toBe(start.a + 1));
+  });
+
+  it('WHEN the tab is hidden THEN detail polling pauses', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const api = new FakeApi('global_admin');
+    await openDashboard(api);
+    fireEvent.click(await screen.findByRole('button', { name: 'Expand web-01' }));
+    await waitFor(() => expect(api.count('GET /api/metrics/agent-1?limit=20')).toBe(1));
+    Object.defineProperty(document, 'hidden', { configurable: true, get: () => true });
+    try {
+      await vi.advanceTimersByTimeAsync(11_000);
+      expect(api.count('GET /api/metrics/agent-1?limit=20')).toBe(1);
+    } finally {
+      Object.defineProperty(document, 'hidden', { configurable: true, get: () => false });
+    }
+  });
+});
+
+describe('GIVEN time-based rows (review: useNow)', () => {
+  it('WHEN a maintenance window ends THEN it stops showing as active within one poll interval', async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    const now = Date.now();
+    const windows = [{ window_id: 1, agent_id: '*', start_ms: now - 60_000, end_ms: now + 2000, reason: 'patch', created_by: 'tester', created_at: 1 }];
+    await openDashboard(new FakeApi('global_admin').on('GET /api/maintenance-windows', ok(windows)));
+    goTo('Maintenance');
+    const row = (await screen.findByText('patch')).closest('tr') as HTMLElement;
+    expect(row).toHaveClass('maint-active');
+
+    await vi.advanceTimersByTimeAsync(5500);
+
+    expect(row).not.toHaveClass('maint-active');
+  });
+});
+
+describe('GIVEN an info tip inside a dialog (review)', () => {
+  it('WHEN Escape is pressed with the tip open THEN the tip closes first and the dialog stays; a second Escape closes the dialog', () => {
+    function Harness() {
+      const [open, setOpen] = React.useState(true);
+      return open ? (
+        <Modal onClose={() => setOpen(false)} title="With help">
+          <InfoTip label="Thing" text="Explains the thing." />
+        </Modal>
+      ) : null;
+    }
+    render(<Harness />);
+    const tip = screen.getByRole('button', { name: 'About Thing' });
+    fireEvent.click(tip);
+    expect(tip).toHaveAttribute('aria-expanded', 'true');
+
+    fireEvent.keyDown(tip, { key: 'Escape' });
+    expect(tip).toHaveAttribute('aria-expanded', 'false');
+    expect(screen.getByRole('dialog')).toBeInTheDocument();
+
+    fireEvent.keyDown(tip, { key: 'Escape' });
+    expect(screen.queryByRole('dialog')).toBeNull();
+  });
+});
+
+describe('GIVEN a dialog that focuses its own field (review: focus return)', () => {
+  it('WHEN a ConfirmDialog with a reason field closes THEN focus returns to the opener, not the removed input', () => {
+    function Harness() {
+      const [open, setOpen] = React.useState(false);
+      return (
+        <>
+          <button onClick={() => setOpen(true)}>opener</button>
+          {open ? <ConfirmDialog busy={false} confirmLabel="Go" errorKey="k" message="m" onCancel={() => setOpen(false)} onConfirm={async () => true} reasonLabel="Reason" title="t" /> : null}
+        </>
+      );
+    }
+    render(<Harness />);
+    const opener = screen.getByText('opener');
+    opener.focus();
+    fireEvent.click(opener);
+    expect(dialog().contains(document.activeElement)).toBe(true);
+    expect(document.activeElement).toBe(within(dialog()).getByLabelText(/Reason/));
+
+    fireEvent.click(within(dialog()).getByRole('button', { name: 'Cancel' }));
+
+    expect(document.activeElement).toBe(opener);
+  });
+});
+
+describe('GIVEN the component status dots (review: Sonar S6845)', () => {
+  it('WHEN a dot is rendered THEN it is a real button named with its status', async () => {
+    await openDashboard(new FakeApi('global_admin'));
+
+    expect(await screen.findByRole('button', { name: /^CPU: / })).toBeInTheDocument();
   });
 });

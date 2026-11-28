@@ -1561,3 +1561,17 @@ select:focus-visible {
   font-size: 12px;
   line-height: 1.5;
 }
+
+.dot-button {
+  padding: 0;
+  border: 0;
+  background: none;
+  color: inherit;
+  cursor: default;
+}
+
+.dot-button:focus .tooltip,
+.dot-button:focus-visible .tooltip {
+  opacity: 1;
+  transform: translateX(-50%) translateY(0);
+}

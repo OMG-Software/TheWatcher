@@ -134,3 +134,18 @@ describe('GIVEN runbook markdown with numbered lists and inline formatting (issu
     expect(parseInlineMarkdown('2 * 3 and <b>x</b> [open')).toEqual([{ type: 'text', text: '2 * 3 and <b>x</b> [open' }]);
   });
 });
+
+describe('GIVEN hostile runbook lines (Sonar S8786)', () => {
+  it('WHEN a line is a marker followed by very long whitespace THEN parsing stays fast and linear', () => {
+    const started = performance.now();
+    const blocks = parseMarkdownBlocks([`1.${' '.repeat(200_000)}x`, `-${' '.repeat(200_000)}`, `#${'\t'.repeat(200_000)}y`, `1${' '.repeat(200_000)}`].join('\n'));
+    expect(performance.now() - started).toBeLessThan(500);
+    expect(blocks.length).toBeGreaterThan(0);
+  });
+
+  it('WHEN markers are not followed by text THEN they stay a paragraph, and #### is not a heading', () => {
+    expect(parseMarkdownBlocks('- ')).toEqual([{ type: 'paragraph', text: '-' }]);
+    expect(parseMarkdownBlocks('#### big')).toEqual([{ type: 'paragraph', text: '#### big' }]);
+    expect(parseMarkdownBlocks('## Title')).toEqual([{ type: 'heading', level: 2, text: 'Title' }]);
+  });
+});

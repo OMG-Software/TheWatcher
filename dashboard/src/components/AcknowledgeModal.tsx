@@ -26,7 +26,7 @@ export function AcknowledgeModal({ busy, bulk, errorKey, onClose, onSubmit }: { 
           placeholder="Describe what you found or what action was taken…"
           value={note}
           onChange={(e) => setNote(e.target.value)}
-          autoFocus
+          data-autofocus
         />
       </label>
       <label className="checkbox-label">

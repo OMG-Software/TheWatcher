@@ -43,17 +43,17 @@ export function ConfirmDialog({
       {reasonLabel ? (
         <label>
           {reasonLabel} <span className="field-hint">(optional)</span>
-          <input autoFocus maxLength={500} value={reason} onChange={(event) => setReason(event.target.value)} />
+          <input data-autofocus maxLength={500} value={reason} onChange={(event) => setReason(event.target.value)} />
         </label>
       ) : null}
       <ActionError actionKey={errorKey} />
       <div className="button-row modal-actions">
         <button className="text-button secondary" disabled={busy} onClick={cancel} type="button">Cancel</button>
         <button
-          autoFocus={!reasonLabel}
+          data-autofocus={reasonLabel ? undefined : true}
           className={`text-button ${danger ? 'danger' : ''}`}
           disabled={busy}
-          onClick={() => void onConfirm(reason.trim()).then((done) => { if (done) onCancel(); })}
+          onClick={() => void onConfirm(reason).then((done) => { if (done) onCancel(); })}
           type="button"
         >
           {confirmLabel}

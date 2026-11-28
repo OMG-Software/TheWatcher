@@ -1065,20 +1065,25 @@ std::optional<StatusHistoryRow> SqliteStore::latest_status_for_indicator(const s
     return std::nullopt;
 }
 
-std::vector<StatusHistoryRow> SqliteStore::latest_status_per_indicator(const std::string& agent_id)
+std::vector<IndicatorStatusRow> SqliteStore::latest_indicator_status_all()
 {
+    // MAX(id) is the newest row of each (agent, indicator): ids only grow, so no timestamp tie-break is needed.
     Stmt st;
     check(sqlite3_prepare_v2(db_,
-                             "SELECT id,agent_id,indicator,old_status,new_status,message,created_at FROM "
-                             "status_history WHERE agent_id=? AND id IN (SELECT MAX(id) FROM status_history "
-                             "WHERE agent_id=? GROUP BY indicator);",
+                             "SELECT agent_id,indicator,new_status FROM status_history WHERE id IN "
+                             "(SELECT MAX(id) FROM status_history GROUP BY agent_id, indicator) "
+                             "ORDER BY agent_id, indicator;",
                              -1, &st.s, nullptr),
-          db_, "prepare latest_status_per_indicator");
-    sqlite3_bind_text(st.s, 1, agent_id.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(st.s, 2, agent_id.c_str(), -1, SQLITE_TRANSIENT);
-    std::vector<StatusHistoryRow> out;
+          db_, "prepare latest_indicator_status_all");
+    std::vector<IndicatorStatusRow> out;
     while (sqlite3_step(st.s) == SQLITE_ROW)
-        out.push_back(row_to_status(st.s));
+    {
+        const auto text = [&](int col) {
+            const auto* value = reinterpret_cast<const char*>(sqlite3_column_text(st.s, col));
+            return value ? std::string(value) : std::string();
+        };
+        out.push_back({text(0), text(1), text(2)});
+    }
     return out;
 }
 

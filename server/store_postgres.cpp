@@ -1121,19 +1121,16 @@ std::optional<StatusHistoryRow> PostgresStore::latest_status_for_indicator(const
                             col(res.r, 0, 4),       col(res.r, 0, 5), col_int64(res.r, 0, 6)};
 }
 
-std::vector<StatusHistoryRow> PostgresStore::latest_status_per_indicator(const std::string& agent_id)
+std::vector<IndicatorStatusRow> PostgresStore::latest_indicator_status_all()
 {
-    const char* params[] = {agent_id.c_str()};
-    Res res(PQexecParams(conn_,
-                         "SELECT id,agent_id,indicator,old_status,new_status,message,created_at FROM status_history "
-                         "WHERE agent_id=$1 AND id IN (SELECT MAX(id) FROM status_history WHERE agent_id=$1 "
-                         "GROUP BY indicator);",
-                         1, nullptr, params, nullptr, nullptr, 0));
-    check_res(res.r, "latest_status_per_indicator");
-    std::vector<StatusHistoryRow> out;
+    // MAX(id) is the newest row of each (agent, indicator); "C" collation keeps the order the same as SQLite's.
+    Res res(PQexec(conn_, "SELECT agent_id,indicator,new_status FROM status_history WHERE id IN "
+                          "(SELECT MAX(id) FROM status_history GROUP BY agent_id, indicator) "
+                          "ORDER BY agent_id COLLATE \"C\", indicator COLLATE \"C\";"));
+    check_res(res.r, "latest_indicator_status_all");
+    std::vector<IndicatorStatusRow> out;
     for (int i = 0; i < PQntuples(res.r); ++i)
-        out.push_back({col_int64(res.r, i, 0), col(res.r, i, 1), col(res.r, i, 2), col(res.r, i, 3), col(res.r, i, 4),
-                       col(res.r, i, 5), col_int64(res.r, i, 6)});
+        out.push_back({col(res.r, i, 0), col(res.r, i, 1), col(res.r, i, 2)});
     return out;
 }
 

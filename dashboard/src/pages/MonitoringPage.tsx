@@ -13,6 +13,14 @@ import { colorLabel } from '../uiLogic';
 /** An expanded row refreshes its history on this interval, like the rest of the dashboard. */
 const DETAIL_POLL_MS = 5000;
 
+/**
+ * Only the most recently expanded rows keep polling. Each polling row makes two requests per
+ * interval, so three rows is at most about 1.2 requests a second per open tab however many rows
+ * are expanded, which is enough to watch a few hosts side by side. The other rows keep their
+ * last data and have a Refresh button. Polling also pauses while the tab is hidden.
+ */
+export const MAX_LIVE_DETAIL_ROWS = 3;
+
 const COMPONENT_LABELS = ['CPU', 'Memory', 'Disk', 'Network', 'Proc', 'Heartbeat'];
 
 export function MonitoringPage({
@@ -41,6 +49,9 @@ export function MonitoringPage({
       else next.add(id);
       return next;
     });
+
+  // `expanded` is in expansion order (a re-expanded row moves to the end), so the tail is the newest.
+  const liveRows = new Set([...expanded].slice(-MAX_LIVE_DETAIL_ROWS));
 
   const overviewGroups = groupOverviewAgents(agents, groups, groupFilter);
   const visibleAgentCount = overviewGroups.reduce((count, group) => count + group.agents.length, 0);
@@ -121,21 +132,21 @@ export function MonitoringPage({
                         {agent.components.map((component) => (
                           <td className="dot-cell" key={component.key}>
                             {/* Focusable and named in words, so the status does not depend on colour or hover. */}
-                            <div aria-label={`${component.label}: ${colorLabel(component.color)}, ${component.value}. ${component.detail}`} className="dot-wrap" role="img" tabIndex={0}>
+                            <button aria-label={`${component.label}: ${colorLabel(component.color)}, ${component.value}. ${component.detail}`} className="dot-wrap dot-button" type="button">
                               <span aria-hidden="true" className={`dot ${component.color}`} />
-                              <div aria-hidden="true" className="tooltip">
+                              <span aria-hidden="true" className="tooltip">
                                 {component.label}: {colorLabel(component.color)}, {component.value}
                                 <br />
                                 <span>{component.detail}</span>
-                              </div>
-                            </div>
+                              </span>
+                            </button>
                           </td>
                         ))}
                       </tr>
                       {open ? (
                         <tr className="detail-row" id={`detail-${agent.id}`}>
                           <td colSpan={4 + COMPONENT_LABELS.length}>
-                            <AgentDetail agent={agent} onShowHistory={() => setHistoryAgent({ id: agent.id, name: agent.name })} />
+                            <AgentDetail agent={agent} live={liveRows.has(agent.id)} onShowHistory={() => setHistoryAgent({ id: agent.id, name: agent.name })} />
                           </td>
                         </tr>
                       ) : null}
@@ -162,11 +173,12 @@ export function MonitoringPage({
  * The expanded part of a row. It exists only while the row is open, and loads its metric history
  * and log matches on the poll interval, so the sparklines and log matches stay current. The two
  * load separately: one failing never hides the other, and each keeps its last good data.
- * Each request is cancelled with the row, and a slow response never overtakes a newer one.
+ * A response that arrives after the row is closed is ignored (the request itself is not aborted),
+ * and a slow response never overtakes a newer one. A row that is not live loads once and has a Refresh button.
  */
-function AgentDetail({ agent, onShowHistory }: { agent: DashboardAgent; onShowHistory: () => void }) {
-  const history = usePolling(React.useCallback(() => fetchMetricHistory(agent.id, 20), [agent.id]), { intervalMs: DETAIL_POLL_MS });
-  const logs = usePolling(React.useCallback(() => fetchLogMatches(agent.id, 20), [agent.id]), { intervalMs: DETAIL_POLL_MS });
+function AgentDetail({ agent, live, onShowHistory }: { agent: DashboardAgent; live: boolean; onShowHistory: () => void }) {
+  const history = usePolling(React.useCallback(() => fetchMetricHistory(agent.id, 20), [agent.id]), { intervalMs: live ? DETAIL_POLL_MS : undefined });
+  const logs = usePolling(React.useCallback(() => fetchLogMatches(agent.id, 20), [agent.id]), { intervalMs: live ? DETAIL_POLL_MS : undefined });
   const logMatches = logs.data ?? [];
 
   return (
@@ -209,6 +221,12 @@ function AgentDetail({ agent, onShowHistory }: { agent: DashboardAgent; onShowHi
       <div className="detail-card">
         <div className="detail-card-header"><span>Status History</span></div>
         <button className="text-button" onClick={onShowHistory}>View status history</button>
+        {live ? null : (
+          <>
+            <div className="detail-card-sub">Not updating automatically: only the {MAX_LIVE_DETAIL_ROWS} most recently opened rows do.</div>
+            <button className="text-button" onClick={() => void Promise.all([history.refresh(), logs.refresh()])}>Refresh</button>
+          </>
+        )}
       </div>
       {logMatches.length > 0 ? (
         <div className="detail-card detail-card-wide">

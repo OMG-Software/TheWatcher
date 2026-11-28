@@ -47,6 +47,34 @@ export type MarkdownBlock =
   | { type: 'list'; ordered: boolean; items: string[] }
   | { type: 'code'; text: string };
 
+const isSpace = (char: string | undefined) => char === ' ' || char === '	';
+
+/** "# text" to "### text". Scanned by hand: a regex with `\s+(.+)` backtracks badly on long whitespace runs. */
+function parseHeading(line: string): { level: 1 | 2 | 3; text: string } | null {
+  let level = 0;
+  while (line[level] === '#') level += 1;
+  if (level < 1 || level > 3 || !isSpace(line[level])) return null;
+  const text = line.slice(level).trimStart();
+  return text ? { level: level as 1 | 2 | 3, text } : null;
+}
+
+/** "- item", "* item", "1. item" or "1) item", scanned in one pass. */
+function parseListItem(line: string): { ordered: boolean; text: string } | null {
+  let marker = 0;
+  let ordered = false;
+  if (line[0] === '-' || line[0] === '*') {
+    marker = 1;
+  } else {
+    while (line[marker] >= '0' && line[marker] <= '9') marker += 1;
+    if (marker === 0 || (line[marker] !== '.' && line[marker] !== ')')) return null;
+    marker += 1;
+    ordered = true;
+  }
+  if (!isSpace(line[marker])) return null;
+  const text = line.slice(marker).trimStart();
+  return text ? { ordered, text } : null;
+}
+
 export function parseMarkdownBlocks(markdown: string): MarkdownBlock[] {
   const blocks: MarkdownBlock[] = [];
   const lines = markdown.replace(/\r\n/g, '\n').split('\n');
@@ -92,23 +120,21 @@ export function parseMarkdownBlocks(markdown: string): MarkdownBlock[] {
       continue;
     }
 
-    const heading = /^(#{1,3})\s+(.+)$/.exec(trimmed);
+    const heading = parseHeading(trimmed);
     if (heading) {
       flushParagraph();
       flushList();
-      blocks.push({ type: 'heading', level: heading[1].length as 1 | 2 | 3, text: heading[2] });
+      blocks.push({ type: 'heading', level: heading.level, text: heading.text });
       continue;
     }
 
     // A change between bullets and numbers starts a new list.
-    const bullet = /^[-*]\s+(.+)$/.exec(trimmed);
-    const numbered = /^\d+[.)]\s+(.+)$/.exec(trimmed);
-    const item = bullet ?? numbered;
+    const item = parseListItem(trimmed);
     if (item) {
       flushParagraph();
-      if (list.length > 0 && listOrdered !== (numbered !== null)) flushList();
-      listOrdered = numbered !== null;
-      list.push(item[1]);
+      if (list.length > 0 && listOrdered !== item.ordered) flushList();
+      listOrdered = item.ordered;
+      list.push(item.text);
       continue;
     }
 

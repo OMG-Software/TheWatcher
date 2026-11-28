@@ -57,7 +57,7 @@ export function UsersPage({
               <input
                 type="password"
                 autoComplete="new-password"
-                autoFocus
+                data-autofocus
                 value={pwValue}
                 onChange={(e) => setPwValue(e.target.value)}
               />

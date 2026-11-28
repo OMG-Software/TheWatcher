@@ -65,7 +65,7 @@ public:
     std::optional<StatusHistoryRow> latest_status_for_indicator(const std::string& agent_id,
                                                                 const std::string& indicator) override;
     std::vector<StatusHistoryRow> list_status_history(const std::string& agent_id, int limit) override;
-    std::vector<StatusHistoryRow> latest_status_per_indicator(const std::string& agent_id) override;
+    std::vector<IndicatorStatusRow> latest_indicator_status_all() override;
     std::optional<PendingStatusRecord> get_pending_status(const std::string& agent_id,
                                                           const std::string& indicator) override;
     void set_pending_status(const std::string& agent_id, const std::string& indicator, const std::string& target_status,

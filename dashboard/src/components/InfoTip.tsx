@@ -18,7 +18,13 @@ export function InfoTip({ label, text }: { label: string; text: string }) {
         className="info-tip-button"
         onBlur={() => setOpen(false)}
         onClick={() => setOpen((current) => !current)}
-        onKeyDown={(event) => { if (event.key === 'Escape') setOpen(false); }}
+        // Escape closes the tip first; it must not also close a dialog the tip sits in.
+        onKeyDown={(event) => {
+          if (event.key === 'Escape' && open) {
+            event.stopPropagation();
+            setOpen(false);
+          }
+        }}
         type="button"
       >
         <Info size={12} />
