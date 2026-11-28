@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { NAV_ITEMS, accountTypeLabel, parseMarkdownBlocks, safeMarkdownHref } from './uiLogic';
+import { NAV_ITEMS, accountTypeLabel, colorLabel, parseMarkdownBlocks, parseViewHash, safeMarkdownHref } from './uiLogic';
 
 describe('GIVEN dashboard navigation rules', () => {
   it('WHEN the nav item list is read THEN it matches the requested top-level order without pending enrollments', () => {
@@ -53,5 +53,30 @@ describe('GIVEN agent runbook markdown', () => {
     expect(safeMarkdownHref('https://wiki.example.com/runbook')).toBe('https://wiki.example.com/runbook');
     expect(safeMarkdownHref('mailto:oncall@example.com')).toBe('mailto:oncall@example.com');
     expect(safeMarkdownHref('javascript:alert(1)')).toBeNull();
+  });
+});
+
+describe('GIVEN health colours shown in the dashboard', () => {
+  it('WHEN each colour is labelled THEN it maps to its operator-facing status word', () => {
+    expect(colorLabel('green')).toBe('Healthy');
+    expect(colorLabel('yellow')).toBe('Warning');
+    expect(colorLabel('amber')).toBe('Degraded');
+    expect(colorLabel('red')).toBe('Critical');
+    expect(colorLabel('grey')).toBe('No Data');
+    expect(colorLabel('blue')).toBe('Maintenance');
+  });
+});
+
+describe('GIVEN a URL hash that may select a custom view', () => {
+  it('WHEN the hash is #view-<id> THEN the numeric id is returned', () => {
+    expect(parseViewHash('#view-42')).toBe(42);
+  });
+
+  it('WHEN the hash is empty, unrelated or malformed THEN no view is selected', () => {
+    expect(parseViewHash('')).toBeNull();
+    expect(parseViewHash('#alerts')).toBeNull();
+    expect(parseViewHash('#view-')).toBeNull();
+    expect(parseViewHash('#view-abc')).toBeNull();
+    expect(parseViewHash('#view-3-extra')).toBeNull();
   });
 });

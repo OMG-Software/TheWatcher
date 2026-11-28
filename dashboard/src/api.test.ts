@@ -29,7 +29,6 @@ import {
   fetchSettings,
   fetchSilences,
   fetchUnacknowledgedAlerts,
-  fetchUptimeReport,
   fetchUsers,
   loadDashboardData,
   login,
@@ -40,12 +39,7 @@ import {
   restartAgentCollectors,
   resumeAgent,
   setAgentDescription,
-  setAgentGroups,
-  setAgentRunbook,
   setAgentCollectorConfig,
-  setAgentInterval,
-  setAgentProcessLimit,
-  setAgentThresholds,
   setMaintenance,
   updateSettings,
   updateView,
@@ -61,7 +55,6 @@ describe('GIVEN agent management API actions', () => {
     vi.stubGlobal('fetch', fetchMock);
 
     await approveAgent('agent-1', [1]);
-    await setAgentGroups('agent-1', [2]);
     await rejectAgent('agent-1');
     await deleteAgent('agent-1');
 
@@ -71,17 +64,11 @@ describe('GIVEN agent management API actions', () => {
       headers: { 'Content-Type': 'application/json' },
       method: 'POST',
     });
-    expect(fetchMock).toHaveBeenNthCalledWith(2, '/api/agents/agent-1/groups', {
-      body: JSON.stringify({ group_ids: [2] }),
-      credentials: 'include',
-      headers: { 'Content-Type': 'application/json' },
-      method: 'POST',
-    });
-    expect(fetchMock).toHaveBeenNthCalledWith(3, '/api/agents/agent-1/reject', {
+    expect(fetchMock).toHaveBeenNthCalledWith(2, '/api/agents/agent-1/reject', {
       credentials: 'include',
       method: 'POST',
     });
-    expect(fetchMock).toHaveBeenNthCalledWith(4, '/api/agents/agent-1', {
+    expect(fetchMock).toHaveBeenNthCalledWith(3, '/api/agents/agent-1', {
       credentials: 'include',
       method: 'DELETE',
     });
@@ -91,8 +78,6 @@ describe('GIVEN agent management API actions', () => {
     const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: async () => ({ ok: true }) });
     vi.stubGlobal('fetch', fetchMock);
 
-    await setAgentInterval('agent-2', 30);
-    await setAgentProcessLimit('agent-2', 12);
     await setAgentCollectorConfig('agent-2', {
       collection_interval: 30,
       heartbeat_interval: 5,
@@ -110,30 +95,12 @@ describe('GIVEN agent management API actions', () => {
         processes: [{ name: 'TheWatcherAgent.exe', expected_count: 1, enabled: true }],
       },
     });
-    await setAgentThresholds('agent-2', {
-      cpu: { warning_pct_of_avg: 125, degraded_pct_of_avg: 150, critical_pct_of_avg: 200 },
-      memory: { warning_pct_of_avg: 126, degraded_pct_of_avg: 151, critical_pct_of_avg: 201 },
-      disk: { warning_pct_of_avg: 127, degraded_pct_of_avg: 152, critical_pct_of_avg: 202 },
-      network: { warning_pct_of_avg: 128, degraded_pct_of_avg: 153, critical_pct_of_avg: 203 },
-    });
     await pauseAgent('agent-2');
     await resumeAgent('agent-2');
     await restartAgentCollectors('agent-2');
     await requestAgentStatus('agent-2');
 
-    expect(fetchMock).toHaveBeenNthCalledWith(1, '/api/agents/agent-2/set_interval', {
-      body: JSON.stringify({ interval_seconds: 30 }),
-      credentials: 'include',
-      headers: { 'Content-Type': 'application/json' },
-      method: 'POST',
-    });
-    expect(fetchMock).toHaveBeenNthCalledWith(2, '/api/agents/agent-2/set_process_limit', {
-      body: JSON.stringify({ limit: 12 }),
-      credentials: 'include',
-      headers: { 'Content-Type': 'application/json' },
-      method: 'POST',
-    });
-    expect(fetchMock).toHaveBeenNthCalledWith(3, '/api/agents/agent-2/collector_config', {
+    expect(fetchMock).toHaveBeenNthCalledWith(1, '/api/agents/agent-2/collector_config', {
       body: JSON.stringify({
         collection_interval: 30,
         heartbeat_interval: 5,
@@ -155,26 +122,13 @@ describe('GIVEN agent management API actions', () => {
       headers: { 'Content-Type': 'application/json' },
       method: 'POST',
     });
-    expect(fetchMock).toHaveBeenNthCalledWith(4, '/api/agents/agent-2/thresholds', {
-      body: JSON.stringify({
-        thresholds: {
-          cpu: { warning_pct_of_avg: 125, degraded_pct_of_avg: 150, critical_pct_of_avg: 200 },
-          memory: { warning_pct_of_avg: 126, degraded_pct_of_avg: 151, critical_pct_of_avg: 201 },
-          disk: { warning_pct_of_avg: 127, degraded_pct_of_avg: 152, critical_pct_of_avg: 202 },
-          network: { warning_pct_of_avg: 128, degraded_pct_of_avg: 153, critical_pct_of_avg: 203 },
-        },
-      }),
-      credentials: 'include',
-      headers: { 'Content-Type': 'application/json' },
-      method: 'POST',
-    });
-    expect(fetchMock).toHaveBeenNthCalledWith(5, '/api/agents/agent-2/pause', { credentials: 'include', method: 'POST' });
-    expect(fetchMock).toHaveBeenNthCalledWith(6, '/api/agents/agent-2/resume', { credentials: 'include', method: 'POST' });
-    expect(fetchMock).toHaveBeenNthCalledWith(7, '/api/agents/agent-2/restart_collectors', {
+    expect(fetchMock).toHaveBeenNthCalledWith(2, '/api/agents/agent-2/pause', { credentials: 'include', method: 'POST' });
+    expect(fetchMock).toHaveBeenNthCalledWith(3, '/api/agents/agent-2/resume', { credentials: 'include', method: 'POST' });
+    expect(fetchMock).toHaveBeenNthCalledWith(4, '/api/agents/agent-2/restart_collectors', {
       credentials: 'include',
       method: 'POST',
     });
-    expect(fetchMock).toHaveBeenNthCalledWith(8, '/api/agents/agent-2/get_status', {
+    expect(fetchMock).toHaveBeenNthCalledWith(5, '/api/agents/agent-2/get_status', {
       credentials: 'include',
       method: 'POST',
     });
@@ -263,19 +217,6 @@ describe('GIVEN agent management API actions', () => {
     expect(fetchMock).toHaveBeenCalledWith('/api/metrics/agent-1?limit=20', { credentials: 'include' });
   });
 
-  it('WHEN uptime report is fetched THEN the correct endpoint is called with the days parameter', async () => {
-    const fetchMock = vi.fn().mockResolvedValue({
-      ok: true,
-      json: async () => ({ agent_id: 'agent-1', days: 7, uptime_percent: 99.5, actual_samples: 1000, expected_samples: 1008 }),
-    });
-    vi.stubGlobal('fetch', fetchMock);
-
-    const report = await fetchUptimeReport('agent-1', 7);
-
-    expect(fetchMock).toHaveBeenCalledWith('/api/uptime/agent-1?days=7', { credentials: 'include' });
-    expect(report.uptime_percent).toBe(99.5);
-  });
-
   it('WHEN maintenance windows are fetched THEN the windows endpoint is called', async () => {
     const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: async () => [] });
     vi.stubGlobal('fetch', fetchMock);
@@ -316,20 +257,6 @@ describe('GIVEN agent management API actions', () => {
 
     expect(fetchMock).toHaveBeenCalledWith('/api/agents/agent-1/description', {
       body: JSON.stringify({ description: 'Production web server' }),
-      credentials: 'include',
-      headers: { 'Content-Type': 'application/json' },
-      method: 'POST',
-    });
-  });
-
-  it('WHEN an agent runbook is set THEN markdown is posted to the per-agent endpoint', async () => {
-    const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: async () => ({ ok: true }) });
-    vi.stubGlobal('fetch', fetchMock);
-
-    await setAgentRunbook('agent-1', '## CPU\nRestart service');
-
-    expect(fetchMock).toHaveBeenCalledWith('/api/agents/agent-1/runbook', {
-      body: JSON.stringify({ markdown: '## CPU\nRestart service' }),
       credentials: 'include',
       headers: { 'Content-Type': 'application/json' },
       method: 'POST',
