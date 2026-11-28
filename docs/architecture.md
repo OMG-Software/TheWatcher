@@ -259,8 +259,11 @@ Files: `server/store_synchronized.hpp`, `server/sqlite_raii.hpp`,
   can install a lock observer (`set_lock_observer`) that is told, with the
   method's name, when a call has to wait for the lock and when it takes it;
   race tests use it to prove that two calls really overlapped instead of
-  inferring it from sleeps. Production installs none, and the lock is then a
-  plain blocking lock.
+  inferring it from sleeps. Production installs none and takes the same path
+  without the reports: `lock_for_call` tries the lock and, if another call
+  holds it, blocks on a new `std::unique_lock`. The mutex is only ever held
+  by a `unique_lock`, never by a bare `lock()` or `unlock()`, so it is
+  released however the call ends.
   Backends never call back into the wrapper. Tests that construct
   `SqliteStore` or `PostgresStore` directly are single-threaded.
 - A method that writes more than one row or statement is atomic. Use the
@@ -278,6 +281,12 @@ Files: `server/store_synchronized.hpp`, `server/sqlite_raii.hpp`,
   lock; under REPEATABLE READ or SERIALIZABLE (for example `options=-c
   default_transaction_isolation=serializable` in the DSN) those waits would
   end in serialization errors.
+  Transactions that lock both a `users` row and a `sessions` row take the
+  `users` row first: a disable, an admin reset and a self-service password
+  change (whose UPDATE locks the user and which then locks the caller's
+  session `FOR SHARE`, so a sign-out on another node cannot delete it before
+  the change commits). A sign-out locks only its `sessions` row. Keep that
+  order in new code so these cannot deadlock.
 - Insert-if-absent across server nodes (`insert_heartbeat_alert_if_absent`)
   cannot rely on the in-process mutex. On PostgreSQL the check and the insert
   run in one transaction holding

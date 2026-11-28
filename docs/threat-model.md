@@ -173,14 +173,24 @@ working document for audit, design review, and regression testing.
   keys and sidestep the per-pair and per-username limits.
 - A self-service password change is applied only while the stored hash is
   still the one the current password was verified against, the user is still
-  enabled and the session that sent the request still exists, all checked in
-  the one UPDATE, in the same transaction that revokes sessions. An admin reset
-  that lands in between wins: the change is refused with 409, nothing is
-  revoked and no success is audited (`password_change` `conflict`). A disable
-  (even one followed by an enable), a sign-out or any other revocation of the
-  caller's session that lands in between also wins: the change is refused with
-  401, nothing is changed and `password_change` `session_ended` is audited, so
-  a session that was ended cannot still set a new password.
+  enabled and the session that sent the request still exists and has not
+  expired, all checked in the one UPDATE, in the same transaction that revokes
+  sessions. An admin reset that lands in between wins: the change is refused
+  with 409, nothing is revoked and no success is audited (`password_change`
+  `conflict`). A disable (even one followed by an enable), a sign-out, an
+  expiry or any other revocation of the caller's session that lands in between
+  also wins: the change is refused with 401, nothing is changed and
+  `password_change` `session_ended` is audited, so a session that was ended
+  cannot still set a new password.
+- The caller's session stays valid until the change commits. SQLite runs the
+  change under `BEGIN IMMEDIATE`, the only write lock, so no sign-out can
+  commit inside it. PostgreSQL locks the caller's session row `FOR SHARE`
+  right after the UPDATE: a sign-out on another node that already deleted the
+  row makes the change wait, and if that sign-out commits the change is
+  refused (401) and rolled back; a sign-out that starts later waits for the
+  change to commit. Both lock the users row before the sessions row, the
+  order a disable and an admin reset use, and a sign-out locks only the
+  sessions row, so none of them can deadlock.
 - A wrong current password is audited once, as `password_change` `failure`.
   Handlers that audit their own 403 mark the response, and the post-routing
   hook then skips its generic `permission_denied` line; every other 403 is

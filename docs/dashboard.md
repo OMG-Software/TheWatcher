@@ -302,7 +302,7 @@ The dashboard consumes:
 | `POST /api/groups` | Create a group. |
 | `GET /api/users` | List users and group memberships. |
 | `POST /api/users` | Create a user with hashed password, role, and group memberships. |
-| `PUT /api/users/:id/password` | Change a password. Own account (any role): body needs `password` and `current_password` (400 if missing, 403 if wrong, 429 when throttled). A global admin resetting another user sends only `password` (only a global admin may reset another user; 403 otherwise). A self-service change keeps the requesting session and revokes the account's others (409 if an admin reset landed first; 401 if the account was disabled or the requesting session ended first, and nothing changes); an admin reset revokes all of the target's sessions. |
+| `PUT /api/users/:id/password` | Change a password. Own account (any role): body needs `password` and `current_password` (400 if missing, 403 if wrong, 429 when throttled). A global admin resetting another user sends only `password` (only a global admin may reset another user; 403 otherwise). A self-service change keeps the requesting session and revokes the account's others (409 if an admin reset landed first; 401 if the account was disabled or the requesting session ended or expired first, and nothing changes); an admin reset revokes all of the target's sessions. |
 | `GET /api/alerts` | List active, non-deleted alerts. |
 | `GET /api/alerts/unacknowledged` | List active unacknowledged alerts. |
 | `POST /api/alerts/:id/ack` | Acknowledge an alert. |

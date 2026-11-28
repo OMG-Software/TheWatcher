@@ -1572,8 +1572,8 @@ SCENARIO("[postgres] A self-service change applies only to the hash that was ver
 
         WHEN("the change names the stored hash")
         {
-            const auto result =
-                store.update_user_password_if_current_and_revoke_sessions(user_id, old_hash, "new-" + suffix, keep);
+            const auto result = store.update_user_password_if_current_and_revoke_sessions(user_id, old_hash,
+                                                                                          "new-" + suffix, keep, 5000);
 
             THEN("the hash changes and only the other session is revoked")
             {
@@ -1587,8 +1587,8 @@ SCENARIO("[postgres] A self-service change applies only to the hash that was ver
         WHEN("an admin reset replaced the hash after it was verified")
         {
             store.update_user_password(user_id, "reset-" + suffix);
-            const auto result =
-                store.update_user_password_if_current_and_revoke_sessions(user_id, old_hash, "new-" + suffix, keep);
+            const auto result = store.update_user_password_if_current_and_revoke_sessions(user_id, old_hash,
+                                                                                          "new-" + suffix, keep, 5000);
 
             THEN("the change is refused and nothing is revoked")
             {
@@ -1602,8 +1602,8 @@ SCENARIO("[postgres] A self-service change applies only to the hash that was ver
         WHEN("the user was disabled, and their sessions revoked, after the password was verified")
         {
             REQUIRE(store.disable_user_and_revoke_sessions(user_id) == 1);
-            const auto result =
-                store.update_user_password_if_current_and_revoke_sessions(user_id, old_hash, "new-" + suffix, keep);
+            const auto result = store.update_user_password_if_current_and_revoke_sessions(user_id, old_hash,
+                                                                                          "new-" + suffix, keep, 5000);
 
             THEN("nothing changes and the store reports that the session ended")
             {
@@ -1617,8 +1617,8 @@ SCENARIO("[postgres] A self-service change applies only to the hash that was ver
         {
             REQUIRE(store.disable_user_and_revoke_sessions(user_id) == 1);
             REQUIRE(store.enable_user_and_revoke_sessions(user_id).has_value());
-            const auto result =
-                store.update_user_password_if_current_and_revoke_sessions(user_id, old_hash, "new-" + suffix, keep);
+            const auto result = store.update_user_password_if_current_and_revoke_sessions(user_id, old_hash,
+                                                                                          "new-" + suffix, keep, 5000);
 
             THEN("nothing changes: the session that verified the password is gone")
             {
@@ -1631,8 +1631,8 @@ SCENARIO("[postgres] A self-service change applies only to the hash that was ver
         WHEN("the user was disabled without their sessions being revoked")
         {
             REQUIRE(store.disable_user(user_id) == 1);
-            const auto result =
-                store.update_user_password_if_current_and_revoke_sessions(user_id, old_hash, "new-" + suffix, keep);
+            const auto result = store.update_user_password_if_current_and_revoke_sessions(user_id, old_hash,
+                                                                                          "new-" + suffix, keep, 5000);
 
             THEN("nothing changes or is revoked while the user is disabled")
             {
@@ -1649,8 +1649,8 @@ SCENARIO("[postgres] A self-service change applies only to the hash that was ver
         WHEN("the caller's session ended after the password was verified")
         {
             store.delete_session(keep);
-            const auto result =
-                store.update_user_password_if_current_and_revoke_sessions(user_id, old_hash, "new-" + suffix, keep);
+            const auto result = store.update_user_password_if_current_and_revoke_sessions(user_id, old_hash,
+                                                                                          "new-" + suffix, keep, 5000);
 
             THEN("nothing changes and the user's other session is kept")
             {
@@ -1665,8 +1665,95 @@ SCENARIO("[postgres] A self-service change applies only to the hash that was ver
         {
             THEN("the store reports it")
             {
-                CHECK(store.update_user_password_if_current_and_revoke_sessions(-1, "x", "y", keep).status ==
+                CHECK(store.update_user_password_if_current_and_revoke_sessions(-1, "x", "y", keep, 5000).status ==
                       Status::UserNotFound);
+            }
+        }
+
+        WHEN("the caller's session expired after the password was verified, before it was purged")
+        {
+            // make_pg_session expires at 4'000'000'000'000; at that instant the
+            // session is no longer valid, although its row is still there.
+            const auto result = store.update_user_password_if_current_and_revoke_sessions(
+                user_id, old_hash, "new-" + suffix, keep, 4'000'000'000'000LL);
+
+            THEN("nothing changes and the store reports that the session ended")
+            {
+                CHECK(result.status == Status::SessionEnded);
+                CHECK(result.revoked == 0);
+                CHECK(store.get_user_by_username("own-" + suffix)->password_hash == old_hash);
+                CHECK(store.get_session(other, 5000).has_value());
+            }
+        }
+        store.delete_user(user_id);
+    }
+}
+
+SCENARIO("[postgres] A self-service change waits for a sign-out of the caller's session on another node")
+{
+    if (!postgres_is_available())
+        SKIP("PostgreSQL not available");
+    GIVEN("a user with two sessions, one of which another connection is signing out")
+    {
+        PostgresStore store(test_dsn());
+        const auto suffix = unique_suffix();
+        const auto old_hash = "old-" + suffix;
+        const auto user_id = store.create_user("out-" + suffix, old_hash, "global_viewer");
+        const auto mine = "out-mine-" + suffix;
+        const auto other = "out-other-" + suffix;
+        store.create_session(make_pg_session(user_id, mine));
+        store.create_session(make_pg_session(user_id, other));
+        using Status = PasswordChangeResult::Status;
+        // Another server node's logout: its DELETE of the caller's session row
+        // is made but not yet committed when the change starts.
+        const auto delete_mine = "DELETE FROM sessions WHERE token='" + hash_session_token(mine) + "'";
+
+        WHEN("the change runs before that sign-out commits")
+        {
+            // Declared first, so the connections close (rolling back and
+            // releasing their locks) before the call is joined.
+            BackgroundCall<PasswordChangeResult> change;
+            PgSideConnection observer;
+            PgSideConnection logout;
+            logout.run("BEGIN");
+            logout.run(delete_mine);
+            const int waiter_pid = store.backend_pid();
+            const int holder_pid = PQbackendPID(logout.conn);
+            change.start([&] {
+                return store.update_user_password_if_current_and_revoke_sessions(user_id, old_hash, "new-" + suffix,
+                                                                                 mine, 5000);
+            });
+            const bool blocked = wait_until_blocked_by(observer.conn, waiter_pid, holder_pid) && change.running();
+
+            AND_WHEN("the sign-out commits")
+            {
+                logout.run("COMMIT");
+                const auto result = change.get();
+
+                THEN("the change waited for it and then changed nothing")
+                {
+                    CHECK(blocked);
+                    CHECK(result.status == Status::SessionEnded);
+                    CHECK(result.revoked == 0);
+                    CHECK(store.get_user_by_username("out-" + suffix)->password_hash == old_hash);
+                    CHECK(store.get_session(other, 5000).has_value());
+                }
+            }
+
+            AND_WHEN("the sign-out rolls back")
+            {
+                logout.run("ROLLBACK");
+                const auto result = change.get();
+
+                THEN("the change waited for it and then went ahead, keeping the caller's session")
+                {
+                    CHECK(blocked);
+                    CHECK(result.status == Status::Changed);
+                    CHECK(result.revoked == 1);
+                    CHECK(store.get_user_by_username("out-" + suffix)->password_hash == "new-" + suffix);
+                    CHECK(store.get_session(mine, 5000).has_value());
+                    CHECK_FALSE(store.get_session(other, 5000).has_value());
+                }
             }
         }
         store.delete_user(user_id);

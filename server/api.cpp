@@ -3188,7 +3188,7 @@ void ApiServer::setup_routes()
                 // changed, no session revoked and no success audited. The user
                 // can retry with the new password the admin chose.
                 const auto outcome = store_.update_user_password_if_current_and_revoke_sessions(
-                    user_id, target_user->password_hash, new_hash, cookie_value(req, "tw_session"));
+                    user_id, target_user->password_hash, new_hash, cookie_value(req, "tw_session"), now_ms());
                 if (outcome.status == PasswordChangeResult::Status::PasswordChanged)
                 {
                     audit("password_change", "conflict", session->username, remote, target_user->username);

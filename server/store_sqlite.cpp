@@ -1147,20 +1147,25 @@ namespace
 PasswordChangeResult SqliteStore::update_user_password_if_current_and_revoke_sessions(int64_t user_id,
                                                                                       const std::string& expected_hash,
                                                                                       const std::string& new_hash,
-                                                                                      const std::string& caller_token)
+                                                                                      const std::string& caller_token,
+                                                                                      int64_t now_ms)
 {
+    // BEGIN IMMEDIATE makes this the only writer, so no logout, disable or
+    // reset can commit while the transaction is open.
     sqlite::Transaction tx(db_);
     {
         // Every condition is in the one statement, so an admin reset, a
-        // disable or a revocation of the caller's session cannot slip in
-        // between the check and the write. An empty caller_token hashes to ""
-        // and matches no session.
+        // disable, a revocation or the expiry of the caller's session cannot
+        // slip in between the check and the write. A session is valid while
+        // expires_at > now, the same test get_session applies. An empty
+        // caller_token hashes to "" and matches no session.
         Stmt st;
         check(sqlite3_prepare_v2(db_,
                                  "UPDATE users SET password_hash=? "
                                  "WHERE user_id=? AND password_hash=? AND disabled=0 "
                                  "AND EXISTS (SELECT 1 FROM sessions "
-                                 "WHERE sessions.token=? AND sessions.user_id=users.user_id);",
+                                 "WHERE sessions.token=? AND sessions.user_id=users.user_id "
+                                 "AND sessions.expires_at>?);",
                                  -1, &st.s, nullptr),
               db_, "prepare update_user_password_if_current");
         const auto caller_hash = hash_kept_session_token(caller_token);
@@ -1168,6 +1173,7 @@ PasswordChangeResult SqliteStore::update_user_password_if_current_and_revoke_ses
         sqlite3_bind_int64(st.s, 2, user_id);
         sqlite3_bind_text(st.s, 3, expected_hash.c_str(), -1, SQLITE_TRANSIENT);
         sqlite3_bind_text(st.s, 4, caller_hash.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(st.s, 5, now_ms);
         check(sqlite3_step(st.s), db_, "step update_user_password_if_current");
     }
     if (sqlite3_changes(db_) == 0)

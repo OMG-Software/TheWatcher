@@ -1205,9 +1205,11 @@ std::optional<int> PostgresStore::update_user_password_and_revoke_sessions(int64
 }
 
 PasswordChangeResult PostgresStore::update_user_password_if_current_and_revoke_sessions(
-    int64_t user_id, const std::string& expected_hash, const std::string& new_hash, const std::string& caller_token)
+    int64_t user_id, const std::string& expected_hash, const std::string& new_hash, const std::string& caller_token,
+    int64_t now_ms)
 {
     const auto p_uid = s(user_id);
+    const auto p_now = s(now_ms);
     // An empty caller_token hashes to "" and matches no session.
     const auto caller_hash = hash_kept_session_token(caller_token);
     postgres::Transaction tx(conn_);
@@ -1217,13 +1219,17 @@ PasswordChangeResult PostgresStore::update_user_password_if_current_and_revoke_s
     // user updates nothing. A disable also deletes the caller's session, and a
     // later enable does not bring it back, so the EXISTS still fails after a
     // disable and enable that both committed before this statement started.
-    const char* upd_params[] = {new_hash.c_str(), p_uid.c_str(), expected_hash.c_str(), caller_hash.c_str()};
+    // A session is valid while expires_at > now, the same test get_session
+    // applies, so an expired session cannot finish a change either.
+    const char* upd_params[] = {new_hash.c_str(), p_uid.c_str(), expected_hash.c_str(), caller_hash.c_str(),
+                                p_now.c_str()};
     Res upd(PQexecParams(conn_,
                          "UPDATE users SET password_hash=$1 "
                          "WHERE user_id=$2::bigint AND password_hash=$3 AND disabled=FALSE "
                          "AND EXISTS (SELECT 1 FROM sessions "
-                         "WHERE sessions.token=$4 AND sessions.user_id=users.user_id);",
-                         4, nullptr, upd_params, nullptr, nullptr, 0));
+                         "WHERE sessions.token=$4 AND sessions.user_id=users.user_id "
+                         "AND sessions.expires_at>$5::bigint);",
+                         5, nullptr, upd_params, nullptr, nullptr, 0));
     check_res(upd.r, "update_user_password_if_current update");
     const char* changed = PQcmdTuples(upd.r);
     if (changed == nullptr || std::atoi(changed) == 0)
@@ -1241,6 +1247,23 @@ PasswordChangeResult PostgresStore::update_user_password_if_current_and_revoke_s
             return {PasswordChangeResult::Status::PasswordChanged, 0};
         return {PasswordChangeResult::Status::SessionEnded, 0};
     }
+    // The EXISTS above reads the caller's session without locking it, so a
+    // sign-out on another node could delete that row and commit before this
+    // transaction does. Locking the row FOR SHARE closes that gap: a delete
+    // already in flight makes this wait, and READ COMMITTED re-checks the row
+    // once it commits, so a committed sign-out returns no row and the change
+    // is refused; a delete that starts later waits for this commit. The lock
+    // order is the users row (taken by the UPDATE) and then the sessions row,
+    // the same order a disable or an admin reset uses; a sign-out locks only
+    // the sessions row. No pair of these can deadlock.
+    const char* lock_params[] = {caller_hash.c_str(), p_uid.c_str(), p_now.c_str()};
+    Res lock(PQexecParams(conn_,
+                          "SELECT 1 FROM sessions "
+                          "WHERE token=$1 AND user_id=$2::bigint AND expires_at>$3::bigint FOR SHARE;",
+                          3, nullptr, lock_params, nullptr, nullptr, 0));
+    check_res(lock.r, "update_user_password_if_current lock session");
+    if (PQntuples(lock.r) == 0)
+        return {PasswordChangeResult::Status::SessionEnded, 0}; // the guard rolls back the UPDATE
     const char* del_params[] = {p_uid.c_str(), caller_hash.c_str()};
     Res del(PQexecParams(conn_, "DELETE FROM sessions WHERE user_id=$1::bigint AND token<>$2;", 2, nullptr, del_params,
                          nullptr, nullptr, 0));

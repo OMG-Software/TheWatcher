@@ -294,15 +294,22 @@ public:
     // token of the session that asked). The update is one statement that
     // applies only while the stored hash still equals expected_hash (the hash
     // the caller verified the current password against), the user is enabled
-    // and caller_token is still one of the user's sessions. Otherwise nothing
+    // and caller_token is still one of the user's sessions and unexpired at
+    // now_ms (expires_at > now_ms, as get_session checks). Otherwise nothing
     // is changed or revoked and the status says why, checked in this order:
     // UserNotFound (no such user), PasswordChanged (an admin reset landed in
     // between; it may also have revoked the caller's session), SessionEnded
-    // (the user was disabled, or the caller's session was revoked or signed
-    // out, so the request no longer speaks for a live session). Atomic.
-    virtual PasswordChangeResult update_user_password_if_current_and_revoke_sessions(
-        int64_t user_id, const std::string& expected_hash, const std::string& new_hash,
-        const std::string& caller_token) = 0;
+    // (the user was disabled, or the caller's session was revoked, signed out
+    // or expired, so the request no longer speaks for a live session). The
+    // caller's session stays valid until the change commits: SQLite holds the
+    // only write lock for the whole transaction, and PostgreSQL locks the
+    // session row FOR SHARE after the update, so a sign-out on another node
+    // either commits first (and the change is refused) or waits. Atomic.
+    virtual PasswordChangeResult update_user_password_if_current_and_revoke_sessions(int64_t user_id,
+                                                                                     const std::string& expected_hash,
+                                                                                     const std::string& new_hash,
+                                                                                     const std::string& caller_token,
+                                                                                     int64_t now_ms) = 0;
     // Enables the user and, only when that is a real disabled-to-enabled
     // change, revokes every leftover session of the user, in one transaction.
     // Returns the number of sessions revoked (0 for an already enabled user,

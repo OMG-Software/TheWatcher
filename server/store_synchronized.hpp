@@ -278,11 +278,12 @@ public:
     PasswordChangeResult update_user_password_if_current_and_revoke_sessions(int64_t user_id,
                                                                              const std::string& expected_hash,
                                                                              const std::string& new_hash,
-                                                                             const std::string& caller_token) override
+                                                                             const std::string& caller_token,
+                                                                             int64_t now_ms) override
     {
         const auto lock = lock_for_call(__func__);
         return inner_->update_user_password_if_current_and_revoke_sessions(user_id, expected_hash, new_hash,
-                                                                           caller_token);
+                                                                           caller_token, now_ms);
     }
 
     std::optional<int> enable_user_and_revoke_sessions(int64_t user_id) override
@@ -630,20 +631,27 @@ public:
     }
 
 private:
-    // Takes the store's lock for one call of `method`. Only an observer is
-    // told about it; without one this is a plain blocking lock.
+    // Takes the store's lock for one call of `method`. The lock is only ever
+    // held by a unique_lock, so it is released however the call ends: a free
+    // lock is taken at once, a held one by a blocking unique_lock that
+    // replaces the empty one. Production and tests take the same path; only
+    // the reporting is skipped without an observer.
     std::unique_lock<std::mutex> lock_for_call(const char* method)
     {
-        if (!lock_observer_)
-            return std::unique_lock<std::mutex>(mutex_);
         std::unique_lock<std::mutex> lock(mutex_, std::try_to_lock);
         if (!lock.owns_lock())
         {
-            lock_observer_(method, LockEvent::Waiting);
-            lock.lock();
+            report(method, LockEvent::Waiting);
+            lock = std::unique_lock<std::mutex>(mutex_);
         }
-        lock_observer_(method, LockEvent::Acquired);
+        report(method, LockEvent::Acquired);
         return lock;
+    }
+
+    void report(const char* method, LockEvent event) const
+    {
+        if (lock_observer_)
+            lock_observer_(method, event);
     }
 
     std::unique_ptr<Store> inner_;

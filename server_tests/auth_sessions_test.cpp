@@ -1339,8 +1339,8 @@ SCENARIO("A self-service change applies only to the password hash that was verif
 
         WHEN("the change names the hash that is still stored")
         {
-            const auto result =
-                store->update_user_password_if_current_and_revoke_sessions(user_id, old_hash, "new-hash", "gina-1");
+            const auto result = store->update_user_password_if_current_and_revoke_sessions(
+                user_id, old_hash, "new-hash", "gina-1", now_ms());
 
             THEN("the password changes and the other session is revoked")
             {
@@ -1355,8 +1355,8 @@ SCENARIO("A self-service change applies only to the password hash that was verif
         WHEN("the stored hash was replaced after it was verified")
         {
             store->update_user_password(user_id, "reset-by-admin");
-            const auto result =
-                store->update_user_password_if_current_and_revoke_sessions(user_id, old_hash, "new-hash", "gina-1");
+            const auto result = store->update_user_password_if_current_and_revoke_sessions(
+                user_id, old_hash, "new-hash", "gina-1", now_ms());
 
             THEN("nothing changes: the reset stays and no session is revoked")
             {
@@ -1371,8 +1371,8 @@ SCENARIO("A self-service change applies only to the password hash that was verif
         WHEN("the user was disabled, and their sessions revoked, after the password was verified")
         {
             REQUIRE(store->disable_user_and_revoke_sessions(user_id) == 1);
-            const auto result =
-                store->update_user_password_if_current_and_revoke_sessions(user_id, old_hash, "new-hash", "gina-1");
+            const auto result = store->update_user_password_if_current_and_revoke_sessions(
+                user_id, old_hash, "new-hash", "gina-1", now_ms());
 
             THEN("nothing changes and the store reports that the session ended")
             {
@@ -1386,8 +1386,8 @@ SCENARIO("A self-service change applies only to the password hash that was verif
         {
             REQUIRE(store->disable_user_and_revoke_sessions(user_id) == 1);
             REQUIRE(store->enable_user_and_revoke_sessions(user_id).has_value());
-            const auto result =
-                store->update_user_password_if_current_and_revoke_sessions(user_id, old_hash, "new-hash", "gina-1");
+            const auto result = store->update_user_password_if_current_and_revoke_sessions(
+                user_id, old_hash, "new-hash", "gina-1", now_ms());
 
             THEN("nothing changes: the session that verified the password is gone")
             {
@@ -1400,8 +1400,8 @@ SCENARIO("A self-service change applies only to the password hash that was verif
         WHEN("the user was disabled without their sessions being revoked")
         {
             REQUIRE(store->disable_user(user_id) == 1);
-            const auto result =
-                store->update_user_password_if_current_and_revoke_sessions(user_id, old_hash, "new-hash", "gina-1");
+            const auto result = store->update_user_password_if_current_and_revoke_sessions(
+                user_id, old_hash, "new-hash", "gina-1", now_ms());
 
             THEN("nothing changes or is revoked while the user is disabled")
             {
@@ -1418,10 +1418,26 @@ SCENARIO("A self-service change applies only to the password hash that was verif
         WHEN("the caller's session ended after the password was verified")
         {
             store->delete_session("gina-1");
-            const auto result =
-                store->update_user_password_if_current_and_revoke_sessions(user_id, old_hash, "new-hash", "gina-1");
+            const auto result = store->update_user_password_if_current_and_revoke_sessions(
+                user_id, old_hash, "new-hash", "gina-1", now_ms());
 
             THEN("nothing changes and the user's other session is kept")
+            {
+                REQUIRE(result.status == Status::SessionEnded);
+                REQUIRE(result.revoked == 0);
+                REQUIRE(store->get_user_by_username("gina")->password_hash == old_hash);
+                REQUIRE(store->get_session("gina-2", now_ms()));
+            }
+        }
+
+        WHEN("the caller's session expired after the password was verified, before it was purged")
+        {
+            // At `expires` the session is no longer valid (get_session needs
+            // expires_at > now), although its row is still there.
+            const auto result = store->update_user_password_if_current_and_revoke_sessions(
+                user_id, old_hash, "new-hash", "gina-1", expires);
+
+            THEN("nothing changes and the store reports that the session ended")
             {
                 REQUIRE(result.status == Status::SessionEnded);
                 REQUIRE(result.revoked == 0);
@@ -1433,7 +1449,7 @@ SCENARIO("A self-service change applies only to the password hash that was verif
         WHEN("the user does not exist")
         {
             const auto result =
-                store->update_user_password_if_current_and_revoke_sessions(987654, old_hash, "x", "gina-1");
+                store->update_user_password_if_current_and_revoke_sessions(987654, old_hash, "x", "gina-1", now_ms());
 
             THEN("the store reports it")
             {
@@ -1495,30 +1511,38 @@ SCENARIO("An admin reset that lands between verification and update wins over a 
     }
 }
 
-SCENARIO("A disable that lands between verification and update stops a self-service change")
+SCENARIO("A disable or an ended session between verification and update stops a self-service change")
 {
     GIVEN("a user who sends the correct current password while an admin acts on the account mid-request")
     {
         CapturedLog log;
         // What the hook does in the window: 0 nothing, 1 disable, 2 disable and
-        // enable again. Each is the store call the matching admin route makes.
+        // enable again (each the store call the matching admin route makes),
+        // 3 let the requesting session expire (its row stays, not yet purged).
         std::atomic<int> interference{0};
         int64_t hank_id = 0;
+        std::string hank_token; // raw token of the session that sends the change
         ApiFixture fx([&](ApiFixture& f) {
-            f.api.set_password_change_test_hook([&interference, &hank_id, fixture = &f](int64_t user_id) {
+            f.api.set_password_change_test_hook([&interference, &hank_id, &hank_token, fixture = &f](int64_t user_id) {
                 if (user_id != hank_id)
                     return;
                 const auto mode = interference.load();
-                if (mode >= 1)
+                if (mode == 1 || mode == 2)
                     fixture->store->disable_user_and_revoke_sessions(user_id);
                 if (mode == 2)
                     fixture->store->enable_user_and_revoke_sessions(user_id);
+                if (mode == 3)
+                {
+                    fixture->store->delete_session(hank_token);
+                    fixture->store->create_session(make_session(hank_token, user_id, now_ms() - 1));
+                }
             });
         });
         const auto admin = fx.login("thewatcher", "look_at_me");
         hank_id = fx.create_user(admin, "hank", "hank-pass-1");
         const auto hank = fx.login("hank", "hank-pass-1");
         REQUIRE_FALSE(hank.empty());
+        hank_token = hank.substr(hank.find('=') + 1);
         const auto old_hash = fx.store->get_user_by_username("hank")->password_hash;
         const auto change_password = [&] {
             auto res =
@@ -1560,6 +1584,20 @@ SCENARIO("A disable that lands between verification and update stops a self-serv
                 REQUIRE(status == 401);
                 REQUIRE(fx.store->get_user_by_username("hank")->password_hash == old_hash);
                 REQUIRE(fx.session_status(hank) == 401);
+                REQUIRE_FALSE(fx.login("hank", "hank-pass-1").empty());
+                REQUIRE(fx.login("hank", "hank-pass-new").empty());
+            }
+        }
+
+        WHEN("the session that sent the change expires in that window")
+        {
+            interference = 3;
+            const auto status = change_password();
+
+            THEN("the change is refused with 401: the old password still signs in and the new one does not")
+            {
+                REQUIRE(status == 401);
+                REQUIRE(fx.store->get_user_by_username("hank")->password_hash == old_hash);
                 REQUIRE_FALSE(fx.login("hank", "hank-pass-1").empty());
                 REQUIRE(fx.login("hank", "hank-pass-new").empty());
             }

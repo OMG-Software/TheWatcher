@@ -134,7 +134,12 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   it, so the test proves rather than infers that the reset held the lock and
   the login waited for it. It then checks that the login's session survives
   the rollback. A new test checks that `make_store` always returns a
-  `SynchronizedStore`.
+  `SynchronizedStore`. `lock_for_call` holds the store's mutex only through a
+  `std::unique_lock` (a held lock is waited for by constructing a new one, not
+  by a bare `lock()` in a branch), and production takes the same path as tests
+  with the reports skipped. `store_concurrency` checks the observer's events
+  exactly: `Acquired` alone for an uncontended call, `Waiting` then `Acquired`
+  for a call that arrives while another holds the lock.
   The PostgreSQL lock tests check that the fixture connection blocks the exact
   backend under test (new `PostgresStore::backend_pid`), so an unrelated lock
   wait no longer counts. The `auth_sessions` suite gets a 120-second test
@@ -148,7 +153,15 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   `PasswordChangeResult::Status::SessionEnded`). Before, a disable followed by
   an enable in that window let a session that had been revoked still set a new
   password. The store method's token argument is now the required
-  `caller_token`. Expired-session purges are now spaced five minutes from the
+  `caller_token`, and it takes `now_ms`: the caller's session must also be
+  unexpired (`expires_at > now`, as `get_session` checks), so a session that
+  expired after the request was authenticated cannot finish the change. On
+  PostgreSQL the change then locks the caller's session row `FOR SHARE` before
+  it revokes or commits, so a sign-out of that session on another node either
+  commits first, and the change is refused with 401, or waits for the change
+  to commit. The lock order (users row, then sessions row) matches a disable
+  and an admin reset, and a sign-out locks only the sessions row, so they
+  cannot deadlock. Expired-session purges are now spaced five minutes from the
   end of the previous successful purge on a monotonic clock, so a slow purge or
   a wall-clock jump cannot make them run back to back or stop them.
   PostgreSQL now always runs at READ COMMITTED: `postgres::Connection` sets it

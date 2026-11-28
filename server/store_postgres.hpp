@@ -74,7 +74,8 @@ public:
     PasswordChangeResult update_user_password_if_current_and_revoke_sessions(int64_t user_id,
                                                                              const std::string& expected_hash,
                                                                              const std::string& new_hash,
-                                                                             const std::string& caller_token) override;
+                                                                             const std::string& caller_token,
+                                                                             int64_t now_ms) override;
     std::optional<int> enable_user_and_revoke_sessions(int64_t user_id) override;
     int disable_user_and_revoke_sessions(int64_t user_id) override;
 
