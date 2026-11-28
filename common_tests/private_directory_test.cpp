@@ -461,6 +461,140 @@ SCENARIO("A default-like tree of 0755 directories is accepted (POSIX)")
 }
 #endif
 
+#ifndef _WIN32
+SCENARIO("A path that goes through a symbolic link is judged where the link lives (POSIX)")
+{
+    GIVEN("a private directory reached through a symlink that lives in a directory other users can write to")
+    {
+        const auto target = fresh_parent("private-dir-link-target") / "conf";
+        ensure_private_directory(target);
+        const auto loose = fresh_parent("private-dir-link-loose");
+        set_mode(loose, fs::perms::all); // 0777, no sticky bit
+        const auto link = loose / "link";
+        fs::create_symlink(target, link);
+
+        WHEN("ensure_private_directory is called with the path through the link")
+        {
+            const auto message = refusal_message(link);
+
+            THEN("it is refused and the error names the link's directory and says it is not private")
+            {
+                REQUIRE(message.find("is not private") != std::string::npos);
+                REQUIRE(message.find(link.string()) != std::string::npos);
+                REQUIRE(message.find(loose.string()) != std::string::npos);
+            }
+        }
+
+        WHEN("the path goes through the link and then a further component")
+        {
+            fs::create_directories(target / "inner");
+            set_mode(target / "inner", fs::perms::owner_all);
+
+            THEN("it is refused too")
+            {
+                REQUIRE_THROWS(ensure_private_directory(link / "inner"));
+            }
+        }
+    }
+
+    GIVEN("a link to a link, where only the first link lives in a writable directory")
+    {
+        const auto target = fresh_parent("private-dir-link2-target") / "conf";
+        ensure_private_directory(target);
+        const auto clean = fresh_parent("private-dir-link2-clean");
+        const auto loose = fresh_parent("private-dir-link2-loose");
+        set_mode(loose, fs::perms::all);
+        fs::create_symlink(target, clean / "second");
+        fs::create_symlink(clean / "second", loose / "first");
+
+        THEN("it is refused")
+        {
+            REQUIRE_THROWS(ensure_private_directory(loose / "first"));
+        }
+    }
+
+    GIVEN("the same link in a clean directory")
+    {
+        const auto target = fresh_parent("private-dir-link3-target") / "conf";
+        ensure_private_directory(target);
+        const auto clean = fresh_parent("private-dir-link3-clean");
+        const auto link = clean / "link";
+        fs::create_symlink(target, link);
+
+        THEN("it is accepted, also with a '..' component after it")
+        {
+            REQUIRE_NOTHROW(ensure_private_directory(link));
+            REQUIRE_NOTHROW(ensure_private_directory(link / ".." / "conf"));
+        }
+    }
+
+    GIVEN("a link in a sticky world-writable directory, owned by this user")
+    {
+        const auto target = fresh_parent("private-dir-link4-target") / "conf";
+        ensure_private_directory(target);
+        const auto sticky = fresh_parent("private-dir-link4-sticky");
+        set_mode(sticky, fs::perms::all | fs::perms::sticky_bit);
+        fs::create_symlink(target, sticky / "link");
+
+        THEN("it is accepted, because only its owner can rename it")
+        {
+            REQUIRE_NOTHROW(ensure_private_directory(sticky / "link"));
+        }
+    }
+}
+#endif
+
+#ifdef _WIN32
+SCENARIO("A path that goes through a junction is judged where the junction lives (Windows)")
+{
+    const auto make_junction = [](const fs::path& link, const fs::path& target) {
+        return std::system(("\"mklink /J \"" + link.string() + "\" \"" + target.string() + "\" > NUL\"").c_str());
+    };
+
+    GIVEN("a private directory reached through a junction inside a directory that grants Users modify rights")
+    {
+        const auto target = fresh_parent("private-dir-junction-target") / "conf";
+        ensure_private_directory(target);
+        const auto loose = fresh_parent("private-dir-junction-loose");
+        REQUIRE(run_icacls("\"" + loose.string() + "\" /grant *S-1-5-32-545:(OI)(CI)M") == 0);
+        const auto link = loose / "link";
+        REQUIRE(make_junction(link, target) == 0);
+        // The junction's own ACL is private (/L: the link itself, not its target), so
+        // only the directory it lives in is wrong.
+        REQUIRE(run_icacls("\"" + link.string() +
+                           "\" /L /inheritance:r /grant:r *S-1-5-32-544:F *S-1-5-18:F \"%USERNAME%\":F") == 0);
+
+        WHEN("ensure_private_directory is called with the path through the junction")
+        {
+            const auto message = refusal_message(link);
+
+            THEN("it is refused and the error says it is not private and names the junction")
+            {
+                REQUIRE(message.find("is not private") != std::string::npos);
+                REQUIRE(message.find(link.string()) != std::string::npos);
+            }
+        }
+    }
+
+    GIVEN("the same junction in a clean directory")
+    {
+        const auto target = fresh_parent("private-dir-junction2-target") / "conf";
+        ensure_private_directory(target);
+        const auto clean = fresh_parent("private-dir-junction2-clean");
+        REQUIRE(run_icacls("\"" + clean.string() +
+                           "\" /inheritance:r /grant:r *S-1-5-32-544:(OI)(CI)F *S-1-5-18:(OI)(CI)F "
+                           "\"%USERNAME%\":(OI)(CI)F") == 0);
+        const auto link = clean / "link";
+        REQUIRE(make_junction(link, target) == 0);
+
+        THEN("it is accepted")
+        {
+            REQUIRE_NOTHROW(ensure_private_directory(link));
+        }
+    }
+}
+#endif
+
 // Hidden: depends on the machine. Run with "[default-paths]" to see that the
 // real default parents (C:\ProgramData, /etc, /usr/local/etc) and their
 // ancestors are accepted.

@@ -9,6 +9,16 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Security
 
+- A config path that goes through a symbolic link or junction is now judged
+  where the link lives: the path is walked as given, and each link needs a
+  directory that passes the ancestor check and its own owner/ACL (POSIX: a
+  link in a sticky directory must be owned by root or the current user;
+  Windows: the link's owner and DACL are read without following it). Before,
+  only the resolved target chain was checked, so another user who owned
+  `/tmp/link` could retarget it after the check.
+- Command routes (`/command`, `/set_interval`, `/set_process_limit`) validate
+  the body before checking whether the agent is online, so an invalid body is
+  `400` for an offline agent instead of `409`.
 - The config-directory check now covers every existing ancestor up to the
   filesystem root, not only the directory itself: another user who can write
   to an ancestor (for example `/shared` for `/shared/thewatcher/...`) could

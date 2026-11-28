@@ -1984,8 +1984,6 @@ void ApiServer::setup_routes()
             auto id = req.path_params.at("id");
             if (!require_agent_access(req, res, "operator", id))
                 return;
-            if (!admit_command(id, res))
-                return;
             auto body = json::parse(req.body);
 
             CommandMessage cmd;
@@ -2014,6 +2012,11 @@ void ApiServer::setup_routes()
                     throw validation::ValidationError("args payload too large (max 4096 bytes)");
             }
 
+            // Body first: a malformed or out-of-range request is a 400 whether or
+            // not the agent is online. Nothing is changed or queued before this.
+            if (!admit_command(id, res))
+                return;
+
             {
                 std::lock_guard<std::mutex> lk(cmd_mutex_);
                 cmd_queue_.push({id, cmd});
@@ -2041,12 +2044,15 @@ void ApiServer::setup_routes()
             auto id = req.path_params.at("id");
             if (!require_agent_access(req, res, "operator", id))
                 return;
-            if (!admit_command(id, res))
-                return;
             auto body = json::parse(req.body);
             int secs = body.at("interval_seconds").get<int>();
             require_valid(validation::check_range("interval_seconds", secs, validation::limits::min_interval_seconds,
                                                   validation::limits::max_interval_seconds));
+            // Body first: a malformed or out-of-range request is a 400 whether or
+            // not the agent is online. Nothing is changed or queued before this.
+            if (!admit_command(id, res))
+                return;
+
             LOGF_INFO("Setting collection interval id=%s interval_seconds=%d", id.c_str(), secs);
 
             auto rec = store_.get_agent(id);
@@ -2088,12 +2094,15 @@ void ApiServer::setup_routes()
             auto id = req.path_params.at("id");
             if (!require_agent_access(req, res, "operator", id))
                 return;
-            if (!admit_command(id, res))
-                return;
             auto body = json::parse(req.body);
             int limit = body.at("limit").get<int>();
             require_valid(validation::check_range("limit", limit, validation::limits::min_process_limit,
                                                   validation::limits::max_process_limit));
+            // Body first: a malformed or out-of-range request is a 400 whether or
+            // not the agent is online. Nothing is changed or queued before this.
+            if (!admit_command(id, res))
+                return;
+
             LOGF_INFO("Setting process limit id=%s limit=%d", id.c_str(), limit);
 
             auto rec = store_.get_agent(id);

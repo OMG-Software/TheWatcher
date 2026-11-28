@@ -954,3 +954,71 @@ SCENARIO("A storage fault is a generic 500, not a 400 carrying the database erro
         }
     }
 }
+
+SCENARIO("A command body is validated before the agent's connection state is checked")
+{
+    GIVEN("an approved agent that is offline")
+    {
+        ApiFixture fx;
+        auto offline = approved_agent("off1");
+        offline.connected = false;
+        fx.store->upsert_agent(offline);
+        REQUIRE(login_as_default_admin(fx.client));
+
+        WHEN("a command, interval or process limit request has a malformed or invalid body")
+        {
+            THEN("each route answers 400, not 409")
+            {
+                // Not JSON at all.
+                REQUIRE(fx.client.Post("/api/agents/off1/command", "{not json", "application/json")->status == 400);
+                REQUIRE(fx.client.Post("/api/agents/off1/set_interval", "{not json", "application/json")->status ==
+                        400);
+                REQUIRE(fx.client.Post("/api/agents/off1/set_process_limit", "{not json", "application/json")->status ==
+                        400);
+                // Valid JSON, required key missing.
+                REQUIRE(fx.post("/api/agents/off1/command", json::object())->status == 400);
+                REQUIRE(fx.post("/api/agents/off1/set_interval", json::object())->status == 400);
+                REQUIRE(fx.post("/api/agents/off1/set_process_limit", json::object())->status == 400);
+                // Out of range or unknown values.
+                REQUIRE(fx.post("/api/agents/off1/command",
+                                json{
+                                    {"command_type", 250}
+                })
+                            ->status == 400);
+                REQUIRE(fx.post("/api/agents/off1/set_interval",
+                                json{
+                                    {"interval_seconds", 86401}
+                })
+                            ->status == 400);
+                REQUIRE(fx.post("/api/agents/off1/set_process_limit",
+                                json{
+                                    {"limit", 1001}
+                })
+                            ->status == 400);
+            }
+        }
+
+        WHEN("the bodies are valid")
+        {
+            THEN("each route still answers 409 and nothing is queued")
+            {
+                // command_type 6 is GET_STATUS.
+                REQUIRE(fx.post("/api/agents/off1/command",
+                                json{
+                                    {"command_type", 6}
+                })
+                            ->status == 409);
+                REQUIRE(fx.post("/api/agents/off1/set_interval",
+                                json{
+                                    {"interval_seconds", 30}
+                })
+                            ->status == 409);
+                REQUIRE(fx.post("/api/agents/off1/set_process_limit",
+                                json{
+                                    {"limit", 50}
+                })
+                            ->status == 409);
+            }
+        }
+    }
+}

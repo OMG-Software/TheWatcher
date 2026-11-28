@@ -49,6 +49,18 @@ refuses (naming the ancestor) when:
   it is group or other writable without the sticky bit (like OpenSSH
   `StrictModes`). A sticky directory such as `/tmp` is accepted.
 
+A config path that goes through a symbolic link (POSIX) or a junction (Windows)
+is judged where the link lives, not only where it leads: the path is walked as
+given, one component at a time (`..` is the parent of the directory reached so
+far). The directory that holds each link, and every directory above it, must
+pass the ancestor rules, and the link itself must not be replaceable by other
+users: on POSIX a link in a sticky directory must be owned by root or the
+user running the server; on Windows the link's own owner and ACL are judged
+like an ancestor's (read without following it). Links to links are followed.
+The error names the link. For example `--config /tmp/link/TheWatcherServer.conf`
+is refused when `/tmp/link` belongs to another user, even if its target is
+clean.
+
 On Windows the check fails closed: an allow entry of a kind it cannot read
 (for example an object-specific allow entry) makes the directory unsafe, and
 deny entries are skipped because they can only remove access. `/etc`,

@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -225,6 +226,17 @@ namespace
                                  "), so they could swap " + dir.string() + " after it is checked. " + advice);
     }
 
+    // `link` is a symbolic link or junction on the path to `dir`: whoever can
+    // retarget or replace it can point the path at a directory of their own.
+    [[noreturn]] void refuse_link(const fs::path& dir, const fs::path& link, const std::string& reason)
+    {
+        throw std::runtime_error("The directory " + dir.string() + " is not private: the link " + link.string() +
+                                 " on its path can be replaced by other users (" + reason +
+                                 "), so they could point it somewhere else after it is checked. Make the link and "
+                                 "the directory that holds it writable only by root or the user that runs the "
+                                 "server, or pass --config with a path that does not go through it.");
+    }
+
 #ifdef _WIN32
     // Frees memory returned by the security APIs (LocalFree).
     struct LocalFreeDeleter
@@ -316,6 +328,8 @@ namespace
         return std::vector<unsigned char>(begin, begin + length);
     }
 
+    std::optional<std::string> judge_security(PSID owner, PACL dacl, DirRole role);
+
     // Why `dir` is not safe for `role`, or nothing when it is.
     std::optional<std::string> unsafe_reason(const fs::path& dir, DirRole role)
     {
@@ -328,7 +342,12 @@ namespace
         if (status != ERROR_SUCCESS)
             return "its permissions cannot be read (error " + std::to_string(status) + ")";
         LocalMemory descriptor(raw_descriptor);
+        return judge_security(owner, dacl, role);
+    }
 
+    // Why a directory with this owner and DACL is not safe for `role`, or nothing when it is.
+    std::optional<std::string> judge_security(PSID owner, PACL dacl, DirRole role)
+    {
         const auto system_sid = well_known_sid(WinLocalSystemSid);
         const auto admins_sid = well_known_sid(WinBuiltinAdministratorsSid);
         const auto user_sid = current_user_sid();
@@ -345,6 +364,55 @@ namespace
                    (ancestor ? ", not by SYSTEM, Administrators, TrustedInstaller or the user running the server"
                              : ", not by SYSTEM, Administrators or the user running the server");
         return detail::find_unsafe_dacl_entry(dacl, owner, role);
+    }
+
+    // True for a symbolic link or a junction (any reparse point on a path component).
+    bool is_link(const fs::path& path)
+    {
+        std::error_code ec;
+        const auto type = fs::symlink_status(path, ec).type();
+        if (type == fs::file_type::symlink)
+            return true;
+        const DWORD attributes = GetFileAttributesW(path.c_str());
+        return attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
+    }
+
+    // Why the link itself could be replaced or retargeted by other users: its own
+    // owner and DACL are judged like an ancestor's. Opened with
+    // FILE_FLAG_OPEN_REPARSE_POINT so the link is read, not its target.
+    std::optional<std::string> unsafe_link_reason(const fs::path& link, const fs::path& /*container*/)
+    {
+        HANDLE raw =
+            CreateFileW(link.c_str(), READ_CONTROL, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                        OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+        if (raw == INVALID_HANDLE_VALUE)
+            return "its permissions cannot be read (error " + std::to_string(GetLastError()) + ")";
+        std::unique_ptr<void, HandleCloser> handle(raw);
+        PSID owner = nullptr;
+        PACL dacl = nullptr;
+        PSECURITY_DESCRIPTOR raw_descriptor = nullptr;
+        const DWORD status =
+            GetSecurityInfo(raw, SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION, &owner,
+                            nullptr, &dacl, nullptr, &raw_descriptor);
+        if (status != ERROR_SUCCESS)
+            return "its permissions cannot be read (error " + std::to_string(status) + ")";
+        LocalMemory descriptor(raw_descriptor);
+        return judge_security(owner, dacl, DirRole::Ancestor);
+    }
+
+    // Where the link points, as a path the walk can continue from.
+    std::optional<fs::path> link_target(const fs::path& link)
+    {
+        std::error_code ec;
+        fs::path target = fs::read_symlink(link, ec);
+        if (ec)
+            return std::nullopt;
+        // Junctions and some links report the NT namespace form (backslash, two
+        // question marks, backslash) or the Win32 extended form (backslash x2, ?, backslash).
+        const std::wstring text = target.wstring();
+        if (text.rfind(L"\\??\\", 0) == 0 || text.rfind(L"\\\\?\\", 0) == 0)
+            target = fs::path(text.substr(4));
+        return target;
     }
 
     // Creates one directory with a protected DACL: SYSTEM, Administrators and the
@@ -384,6 +452,41 @@ namespace
         if (role == DirRole::Ancestor)
             return "it is writable by its group or by other users and does not have the sticky bit";
         return "it is writable by its group or by other users";
+    }
+
+    bool is_link(const fs::path& path)
+    {
+        struct stat info{};
+        return ::lstat(path.c_str(), &info) == 0 && S_ISLNK(info.st_mode);
+    }
+
+    // Why the link itself could be replaced by other users. In a directory only
+    // its owner can write to, only that owner (checked as an ancestor) can replace
+    // it. In a group/other-writable (sticky) directory the entry's owner can, so
+    // the link must be owned by root or the user running the server.
+    std::optional<std::string> unsafe_link_reason(const fs::path& link, const fs::path& container)
+    {
+        struct stat dir_info{};
+        if (::stat(container.c_str(), &dir_info) != 0)
+            return std::string("its directory cannot be inspected: ") + std::strerror(errno);
+        if ((dir_info.st_mode & (S_IWGRP | S_IWOTH)) == 0)
+            return std::nullopt;
+        struct stat info{};
+        if (::lstat(link.c_str(), &info) != 0)
+            return std::string("it cannot be inspected: ") + std::strerror(errno);
+        if (info.st_uid != 0 && info.st_uid != ::geteuid())
+            return "it is owned by user id " + std::to_string(info.st_uid) +
+                   ", not by root or the user running the server";
+        return std::nullopt;
+    }
+
+    std::optional<fs::path> link_target(const fs::path& link)
+    {
+        std::error_code ec;
+        fs::path target = fs::read_symlink(link, ec);
+        if (ec)
+            return std::nullopt;
+        return target;
     }
 
     void create_private_directory_level(const fs::path& dir)
@@ -460,6 +563,87 @@ namespace detail
 } // namespace detail
 #endif
 
+namespace
+{
+    // `start` and every directory above it, as the ancestors of `dir`.
+    void check_ancestor_chain(const fs::path& dir, const fs::path& start)
+    {
+        for (fs::path ancestor = start; !ancestor.empty(); ancestor = ancestor.parent_path())
+        {
+            if (const auto reason = unsafe_reason(ancestor, DirRole::Ancestor))
+                refuse_ancestor(dir, ancestor, *reason);
+            if (ancestor == ancestor.parent_path())
+                break;
+        }
+    }
+
+    // Walks `dir` as given (made absolute, not resolved), one component at a time and
+    // resolving as the OS does: ".." is the parent of the physical directory reached so
+    // far. Every symbolic link or junction on the way is judged where it lives: the
+    // directory holding it, and every directory above that, must pass the ancestor
+    // check, and the link itself must not be replaceable by other users. The walk then
+    // continues from the link's target, so a link to a link is covered. The directories
+    // of the final target chain are checked by the caller.
+    void check_links_on_path(const fs::path& dir)
+    {
+        constexpr int max_links = 40;
+        std::error_code ec;
+        const fs::path absolute = fs::absolute(dir, ec);
+        if (ec)
+            refuse(dir, "its path cannot be made absolute: " + ec.message());
+
+        fs::path current = absolute.root_path();
+        std::deque<fs::path> pending;
+        for (const auto& part : absolute.relative_path())
+            pending.push_back(part);
+
+        int links_followed = 0;
+        while (!pending.empty())
+        {
+            const fs::path part = pending.front();
+            pending.pop_front();
+            if (part.empty() || part == ".")
+                continue;
+            if (part == "..")
+            {
+                current = current.parent_path();
+                continue;
+            }
+            const fs::path candidate = current / part;
+            if (!is_link(candidate))
+            {
+                current = candidate;
+                continue;
+            }
+            if (++links_followed > max_links)
+                refuse(dir, "its path goes through too many links");
+
+            try
+            {
+                check_ancestor_chain(dir, current);
+            }
+            catch (const std::runtime_error& e)
+            {
+                refuse_link(dir, candidate,
+                            "it lives in a directory that other users can change: " + std::string(e.what()));
+            }
+            if (const auto reason = unsafe_link_reason(candidate, current))
+                refuse_link(dir, candidate, *reason);
+
+            const auto target = link_target(candidate);
+            if (!target)
+                refuse_link(dir, candidate, "its target cannot be read");
+            // Continue from the target: its own components go in front of what is left.
+            if (target->has_root_path())
+                current = target->has_root_name() ? target->root_path() : current.root_path();
+            const auto relative = target->relative_path();
+            const std::vector<fs::path> parts(relative.begin(), relative.end());
+            for (auto it = parts.rbegin(); it != parts.rend(); ++it)
+                pending.push_front(*it);
+        }
+    }
+} // namespace
+
 void ensure_private_directory(const fs::path& dir)
 {
     // Levels that do not exist yet, deepest first; each is created private.
@@ -477,11 +661,14 @@ void ensure_private_directory(const fs::path& dir)
     if (const auto reason = unsafe_reason(dir, DirRole::Leaf))
         refuse(dir, *reason);
 
-    // Every existing ancestor, from the parent up to the root: whoever can rename
-    // or replace one of them can swap `dir` between this check and the open.
-    // Resolved first, so a symlink in the path is judged by where it leads.
-    // A directory this user cannot open (owner-only ACL checked above) cannot be
-    // resolved itself; its parent can.
+    // A path that goes through a symbolic link or junction is judged where each
+    // link lives, not only where it leads.
+    check_links_on_path(dir);
+
+    // Every existing ancestor of the resolved path, from the parent up to the root:
+    // whoever can rename or replace one of them can swap `dir` between this check
+    // and the open. A directory this user cannot open (owner-only ACL checked
+    // above) cannot be resolved itself; its parent can.
     std::error_code resolve_ec;
     fs::path resolved = fs::weakly_canonical(dir, resolve_ec);
     if (resolve_ec)
@@ -491,13 +678,7 @@ void ensure_private_directory(const fs::path& dir)
     }
     if (resolve_ec)
         refuse(dir, "its path cannot be resolved: " + resolve_ec.message());
-    for (fs::path ancestor = resolved.parent_path(); !ancestor.empty(); ancestor = ancestor.parent_path())
-    {
-        if (const auto reason = unsafe_reason(ancestor, DirRole::Ancestor))
-            refuse_ancestor(dir, ancestor, *reason);
-        if (ancestor == ancestor.parent_path())
-            break;
-    }
+    check_ancestor_chain(dir, resolved.parent_path());
 }
 
 } // namespace thewatcher::common
