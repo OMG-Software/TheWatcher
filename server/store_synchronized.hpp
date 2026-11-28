@@ -392,6 +392,13 @@ public:
         return inner_->get_offline_unalerted_agent_ids();
     }
 
+    bool has_open_alert(const std::string& agent_id, const std::string& indicator,
+                        const std::string& new_status) override
+    {
+        const std::lock_guard<std::mutex> lock(mutex_);
+        return inner_->has_open_alert(agent_id, indicator, new_status);
+    }
+
     void archive_heartbeat_alerts_for_agent(const std::string& agent_id, int64_t deleted_at) override
     {
         const std::lock_guard<std::mutex> lock(mutex_);

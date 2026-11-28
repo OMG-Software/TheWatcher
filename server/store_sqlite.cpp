@@ -1434,6 +1434,21 @@ std::vector<std::string> SqliteStore::get_offline_unalerted_agent_ids()
     return out;
 }
 
+bool SqliteStore::has_open_alert(const std::string& agent_id, const std::string& indicator,
+                                 const std::string& new_status)
+{
+    Stmt st;
+    check(sqlite3_prepare_v2(db_,
+                             "SELECT 1 FROM alerts WHERE agent_id=? AND indicator=? AND new_status=? "
+                             "AND deleted_at=0 AND acknowledged_at=0 LIMIT 1;",
+                             -1, &st.s, nullptr),
+          db_, "prepare has_open_alert");
+    sqlite3_bind_text(st.s, 1, agent_id.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st.s, 2, indicator.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st.s, 3, new_status.c_str(), -1, SQLITE_TRANSIENT);
+    return sqlite3_step(st.s) == SQLITE_ROW;
+}
+
 void SqliteStore::archive_heartbeat_alerts_for_agent(const std::string& agent_id, int64_t deleted_at)
 {
     Stmt st;
