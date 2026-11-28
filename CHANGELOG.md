@@ -53,6 +53,34 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 
+- The status engine is now one long-lived object owned by the server instead
+  of being rebuilt for every metrics frame, so stale-metric detection and the
+  anomaly baseline cache work and metrics are no longer pruned on every frame
+  (#43).
+- One maintenance state machine now serves manual, timed and scheduled
+  maintenance. Entering maintenance marks the agent's real indicators Blue
+  (not the phantom `disk`, `network`, `processes`); Blue no longer suppresses
+  the first alert after maintenance ends; scheduled windows go through the
+  same enter/exit code as manual maintenance (#44).
+- Timed manual maintenance (`until_ms`) now ends when its time passes (#45).
+- The dashboard `offline_after_seconds` setting now takes effect (the setting
+  page shows the real default, 60), and the offline timeout per agent is
+  `max(setting, 3 x heartbeat_interval)`, so a slow heartbeat no longer makes
+  an agent flap offline (#46).
+- Review follow-ups for the status engine: command routes expire with the same
+  per-agent offline timeout as the offline scan; an acknowledged PAUSE keeps
+  the maintenance reason and expiry set by the API instead of making timed
+  maintenance open ended; maintenance resets stale-value clocks; a saved
+  `offline_after_seconds` overrides the config value in both directions (0
+  disables, a positive value enables even if the config disables it); the engine drops
+  state of deleted agents; expiring timed maintenance inside an active window
+  hands over to the window without a gap.
+- A NaN or infinite reading no longer raises a "grey" alert: Grey means no
+  data and never alerts (#55).
+- Alerts, status history, log matches, expired silences and ended
+  maintenance windows are now pruned by an hourly server job that does not
+  depend on metrics arriving. New settings `status_history_retention_days`,
+  `alerts_retention_days` and `log_matches_retention_days` (#76).
 - All alerts now go through one pipeline that applies maintenance, silences,
   severity validation, de-duplication, the runbook link and the webhook.
   Log-match alerts no longer fire during maintenance, offline and log-match
@@ -97,7 +125,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Dashboard: `tsc` no longer writes `.js`/`.d.ts` files into `dashboard/src`
   (`noEmit`), the 21 committed compiled twins are removed, and vitest runs
   only `*.test.ts(x)`. Before, Vite served the stale twins and every test ran
-  twice (8 files / 172 tests became 4 / 86) (#103).
+  twice, once from its compiled copy (#103).
 - Agent enrollment recovers after a reply timeout: each attempt uses a new
   REQ socket, so a late server is reached without restarting the agent (#86).
 - An enrollment reply that cannot be decoded is logged and retried instead
@@ -150,7 +178,14 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
   so silences, maintenance and the webhook still apply and the webhook is sent
   only when the insert happened. `insert_heartbeat_alert_if_absent` now returns
   the new alert id (0 when a live Heartbeat alert already existed).
-- `SynchronizedStore` forwards `has_open_alert` under its lock.
+- `SynchronizedStore` forwards `has_open_alert`, and the per-agent
+  `mark_agent_offline`, `latest_status_per_indicator` and retention
+  `prune_*_before` calls (#46, #43, #76), under its lock.
+- A successful DISCONNECT, PAUSE or RESUME ACK is applied by
+  `apply_command_ack` through the server's one `StatusEngine`, so the engine's
+  maintenance state stays in step with the stored flag. A PAUSE ACK keeps the
+  maintenance reason and expiry the API stored before sending the command;
+  only an agent not yet in maintenance gets open-ended `command` maintenance.
 - A heartbeat or an API setting no longer rewrites the whole agent row from a
   stale snapshot, which silently reverted a collector config, heartbeat
   interval, runbook or maintenance change saved at the same moment. The data

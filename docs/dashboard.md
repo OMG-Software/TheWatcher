@@ -366,7 +366,9 @@ metrics
 - `connected` becomes true after inbound agent traffic.
 - `connected` becomes false after successful disconnect ACK or after
   `offline_after_seconds` with no inbound frame.
-- `maintenance` becomes true from the maintenance action or pause ACK.
+- `maintenance` becomes true from the maintenance action or pause ACK. A pause
+  ACK keeps the reason and expiry the maintenance action stored; an agent not
+  yet in maintenance gets open-ended maintenance with the reason `command`.
 - `maintenance` becomes false after successful resume ACK.
 - ACKs for the other commands (interval, process limit, restart collectors,
   status request) leave `maintenance` alone, so an operator's maintenance

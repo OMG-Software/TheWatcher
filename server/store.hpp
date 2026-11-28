@@ -214,6 +214,8 @@ public:
     virtual void reject_agent(const std::string& agent_id) = 0;
     virtual void delete_agent(const std::string& agent_id) = 0;
     virtual void mark_agents_offline_before(int64_t cutoff_ms) = 0;
+    // Marks one agent disconnected. Used by the per-agent offline check (#46).
+    virtual void mark_agent_offline(const std::string& agent_id) = 0;
     virtual void set_agent_maintenance(const std::string& agent_id, bool maintenance, const std::string& reason,
                                        int64_t until_ms) = 0;
     virtual void set_agent_thresholds(const AgentRecord& rec) = 0;
@@ -264,6 +266,8 @@ public:
     virtual std::optional<StatusHistoryRow> latest_status_for_indicator(const std::string& agent_id,
                                                                         const std::string& indicator) = 0;
     virtual std::vector<StatusHistoryRow> list_status_history(const std::string& agent_id, int limit = 100) = 0;
+    // The newest status row of every indicator the agent has (one row each).
+    virtual std::vector<StatusHistoryRow> latest_status_per_indicator(const std::string& agent_id) = 0;
     virtual std::optional<PendingStatusRecord> get_pending_status(const std::string& agent_id,
                                                                   const std::string& indicator) = 0;
     virtual void set_pending_status(const std::string& agent_id, const std::string& indicator,
@@ -304,6 +308,16 @@ public:
     virtual void delete_silence(int64_t silence_id) = 0;
     virtual bool is_silenced(const std::string& agent_id, const std::string& indicator, int64_t now_ms) = 0;
     virtual void prune_metrics_before(int64_t cutoff_ms) = 0;
+    // Retention (#76). Each method deletes rows older than cutoff_ms.
+    // status_history keeps the newest row of every (agent, indicator) pair so
+    // the current state survives pruning. Alerts are only removed once they
+    // were acknowledged or soft-deleted: an open alert is never pruned.
+    // Silences are judged by their expiry and maintenance windows by their end.
+    virtual void prune_status_history_before(int64_t cutoff_ms) = 0;
+    virtual void prune_alerts_before(int64_t cutoff_ms) = 0;
+    virtual void prune_log_matches_before(int64_t cutoff_ms) = 0;
+    virtual void prune_silences_before(int64_t cutoff_ms) = 0;
+    virtual void prune_maintenance_windows_before(int64_t cutoff_ms) = 0;
     virtual void insert_log_match(const LogMatchRecord& rec) = 0;
     virtual std::vector<LogMatchRecord> list_log_matches(const std::string& agent_id, int limit = 200) = 0;
     virtual int64_t create_view(const ViewRecord& rec) = 0;

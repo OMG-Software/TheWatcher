@@ -6,6 +6,7 @@
 #include "../server/alert_pipeline.hpp"
 #include "../server/command_ack.hpp"
 #include "../server/offline_alerts.hpp"
+#include "../server/status_engine.hpp"
 #include "../server/store_sqlite.hpp"
 
 #include <catch2/catch_test_macros.hpp>
@@ -44,6 +45,7 @@ SCENARIO("An ACK for a command that does not change maintenance leaves maintenan
         SqliteStore store(":memory:");
         AlertPipeline pipeline(store);
         OfflineAlerts offline(store, pipeline);
+        StatusEngine engine(store, pipeline);
         add_agent(store, "a1", true, "patching", 900000);
 
         const std::array<CommandType, 4> unrelated{CommandType::SET_INTERVAL, CommandType::SET_PROCESS_LIMIT,
@@ -52,7 +54,7 @@ SCENARIO("An ACK for a command that does not change maintenance leaves maintenan
         {
             WHEN("a successful ACK for command type " + std::to_string(static_cast<int>(type)) + " is applied")
             {
-                apply_command_ack(store, offline, pipeline, "a1", type, kAckTime);
+                apply_command_ack(store, offline, engine, "a1", type, kAckTime);
 
                 THEN("the agent is still in the same maintenance window and still connected")
                 {
@@ -76,11 +78,12 @@ SCENARIO("A PAUSE ACK puts the agent into command maintenance")
         SqliteStore store(":memory:");
         AlertPipeline pipeline(store);
         OfflineAlerts offline(store, pipeline);
+        StatusEngine engine(store, pipeline);
         add_agent(store, "a1", false, "", 0);
 
         WHEN("a successful PAUSE ACK is applied")
         {
-            apply_command_ack(store, offline, pipeline, "a1", CommandType::PAUSE, kAckTime);
+            apply_command_ack(store, offline, engine, "a1", CommandType::PAUSE, kAckTime);
 
             THEN("the agent is in maintenance for the command, with no expiry, and still connected")
             {
@@ -96,6 +99,34 @@ SCENARIO("A PAUSE ACK puts the agent into command maintenance")
     }
 }
 
+SCENARIO("A PAUSE ACK keeps the maintenance the API stored when it sent the command")
+{
+    GIVEN("a connected agent the API put into timed maintenance before sending PAUSE")
+    {
+        SqliteStore store(":memory:");
+        AlertPipeline pipeline(store);
+        OfflineAlerts offline(store, pipeline);
+        StatusEngine engine(store, pipeline);
+        add_agent(store, "a1", true, "kernel upgrade", 900000);
+
+        WHEN("the agent's successful PAUSE ACK is applied")
+        {
+            apply_command_ack(store, offline, engine, "a1", CommandType::PAUSE, kAckTime);
+
+            THEN("the agent is still in maintenance with the operator's reason and expiry, and still connected")
+            {
+                const auto agent = store.get_agent("a1");
+                REQUIRE(agent);
+                CHECK(agent->maintenance);
+                CHECK(agent->maintenance_reason == "kernel upgrade");
+                CHECK(agent->maintenance_until == 900000);
+                CHECK(agent->connected);
+                CHECK(agent->last_seen == kAckTime);
+            }
+        }
+    }
+}
+
 SCENARIO("A RESUME ACK ends the agent's maintenance")
 {
     GIVEN("a connected agent paused by a command")
@@ -103,11 +134,12 @@ SCENARIO("A RESUME ACK ends the agent's maintenance")
         SqliteStore store(":memory:");
         AlertPipeline pipeline(store);
         OfflineAlerts offline(store, pipeline);
+        StatusEngine engine(store, pipeline);
         add_agent(store, "a1", true, "command", 0);
 
         WHEN("a successful RESUME ACK is applied")
         {
-            apply_command_ack(store, offline, pipeline, "a1", CommandType::RESUME, kAckTime);
+            apply_command_ack(store, offline, engine, "a1", CommandType::RESUME, kAckTime);
 
             THEN("the agent is out of maintenance and still connected")
             {
@@ -129,11 +161,12 @@ SCENARIO("A DISCONNECT ACK marks the agent disconnected on purpose")
         SqliteStore store(":memory:");
         AlertPipeline pipeline(store);
         OfflineAlerts offline(store, pipeline);
+        StatusEngine engine(store, pipeline);
         add_agent(store, "a1", true, "patching", 900000);
 
         WHEN("a successful DISCONNECT ACK is applied")
         {
-            apply_command_ack(store, offline, pipeline, "a1", CommandType::DISCONNECT, kAckTime);
+            apply_command_ack(store, offline, engine, "a1", CommandType::DISCONNECT, kAckTime);
 
             THEN("the agent is disconnected, the offline scan is told it was deliberate, and maintenance is kept")
             {
@@ -156,11 +189,12 @@ SCENARIO("An ACK for an agent that no longer exists changes nothing")
         SqliteStore store(":memory:");
         AlertPipeline pipeline(store);
         OfflineAlerts offline(store, pipeline);
+        StatusEngine engine(store, pipeline);
 
         WHEN("a successful PAUSE or DISCONNECT ACK for it is applied")
         {
-            apply_command_ack(store, offline, pipeline, "gone", CommandType::PAUSE, kAckTime);
-            apply_command_ack(store, offline, pipeline, "gone", CommandType::DISCONNECT, kAckTime);
+            apply_command_ack(store, offline, engine, "gone", CommandType::PAUSE, kAckTime);
+            apply_command_ack(store, offline, engine, "gone", CommandType::DISCONNECT, kAckTime);
 
             THEN("no agent is created and it is not marked as disconnected")
             {

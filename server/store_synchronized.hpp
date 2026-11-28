@@ -78,6 +78,12 @@ public:
         return inner_->mark_agents_offline_before(cutoff_ms);
     }
 
+    void mark_agent_offline(const std::string& agent_id) override
+    {
+        const std::lock_guard<std::mutex> lock(mutex_);
+        return inner_->mark_agent_offline(agent_id);
+    }
+
     void set_agent_maintenance(const std::string& agent_id, bool maintenance, const std::string& reason,
                                int64_t until_ms) override
     {
@@ -265,6 +271,12 @@ public:
     {
         const std::lock_guard<std::mutex> lock(mutex_);
         return inner_->list_status_history(agent_id, limit);
+    }
+
+    std::vector<StatusHistoryRow> latest_status_per_indicator(const std::string& agent_id) override
+    {
+        const std::lock_guard<std::mutex> lock(mutex_);
+        return inner_->latest_status_per_indicator(agent_id);
     }
 
     std::optional<PendingStatusRecord> get_pending_status(const std::string& agent_id,
@@ -517,6 +529,38 @@ public:
     {
         const std::lock_guard<std::mutex> lock(mutex_);
         return inner_->get_runbook(agent_id, indicator, status);
+    }
+
+    // Retention (#76): each prune is one Store call, so it runs under the lock
+    // like any other and cannot interleave with a write it would race.
+    void prune_status_history_before(int64_t cutoff_ms) override
+    {
+        const std::lock_guard<std::mutex> lock(mutex_);
+        return inner_->prune_status_history_before(cutoff_ms);
+    }
+
+    void prune_alerts_before(int64_t cutoff_ms) override
+    {
+        const std::lock_guard<std::mutex> lock(mutex_);
+        return inner_->prune_alerts_before(cutoff_ms);
+    }
+
+    void prune_log_matches_before(int64_t cutoff_ms) override
+    {
+        const std::lock_guard<std::mutex> lock(mutex_);
+        return inner_->prune_log_matches_before(cutoff_ms);
+    }
+
+    void prune_silences_before(int64_t cutoff_ms) override
+    {
+        const std::lock_guard<std::mutex> lock(mutex_);
+        return inner_->prune_silences_before(cutoff_ms);
+    }
+
+    void prune_maintenance_windows_before(int64_t cutoff_ms) override
+    {
+        const std::lock_guard<std::mutex> lock(mutex_);
+        return inner_->prune_maintenance_windows_before(cutoff_ms);
     }
 
 private:

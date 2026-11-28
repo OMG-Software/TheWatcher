@@ -7,6 +7,7 @@
 #include "notification_worker.hpp"
 #include "offline_alerts.hpp"
 #include "startup_signal.hpp"
+#include "status_engine.hpp"
 #include "store.hpp"
 #include "zap_handler.hpp"
 
@@ -93,6 +94,13 @@ private:
     // of earlier ones.
     void maybe_send_report(int64_t now_ms);
 
+    // The periodic server maintenance tick, run about once a second from run()
+    // whether or not any agent is sending data. It ends timed and scheduled
+    // maintenance (#44, #45) and, at most once an hour, prunes data past its
+    // retention period (#76). Other periodic jobs that must not depend on
+    // traffic belong here.
+    void run_periodic_maintenance(int64_t now_ms);
+
     ServerConfig config_;
     zmq::context_t ctx_{2}; // 2 IO threads
     // Outbound webhooks and report digests run on this worker's own thread so
@@ -106,6 +114,11 @@ private:
     // use it (#156).
     std::unique_ptr<AlertPipeline> alerts_;
     std::unique_ptr<OfflineAlerts> offline_alerts_;
+    // #43: one engine for the life of the server, so its per-agent stale and
+    // baseline caches survive between frames. Only used from the run() thread.
+    // Declared after the store, notifier and pipeline it uses, so it is
+    // destroyed before them.
+    std::unique_ptr<StatusEngine> status_engine_;
     // command_id -> dispatched command; evicted on matching ACK or TTL expiry
     std::unordered_map<std::string, DispatchedCommand> dispatched_commands_;
     // Issue #141: agent_id -> ROUTER routing id of the connection that last
@@ -131,6 +144,7 @@ private:
     // attacker-chosen agent_id.
     std::unordered_map<std::string, int64_t> enrollment_peer_last_request_ms_;
     std::atomic<bool> running_{false};
+    int64_t last_retention_run_ms_ = 0;
     // Scheduled digest delivery state (#49). The last-sent time itself is
     // persisted in the reports.last_sent_ms setting.
     bool report_in_flight_ = false;
