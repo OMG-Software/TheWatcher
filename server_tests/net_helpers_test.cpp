@@ -19,11 +19,12 @@ SCENARIO("The free-port helpers never hand out the same port twice in one proces
 {
     GIVEN("a test that asks for many endpoints and HTTP ports before binding any of them")
     {
-        // A fixture picks its ROUTER, enrollment and REST ports up front and
-        // the server binds them later, so a probe cannot see an earlier pick.
-        // With independent random draws from the 12768-port range, 200 draws
-        // repeat a port about four times in five runs (400 draws repeated 4
-        // ports in the run that confirmed the bug).
+        // These helpers probe and release a port, so a probe cannot see an
+        // earlier pick that nothing has bound yet. With independent random
+        // draws from the 12768-port range, 200 draws repeat a port about four
+        // times in five runs. Uniqueness is per process only, and the
+        // probe-release window remains: new tests should use ServerFixture or
+        // an OS-assigned port instead.
         constexpr int draws = 200;
 
         WHEN("the ports are drawn")

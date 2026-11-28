@@ -13,13 +13,17 @@
 namespace thewatcher::test
 {
 
-// Minimal server configuration for transport-level tests: free local ZMQ
-// endpoints, no CURVE keys, an in-memory store and the REST API disabled.
+// Minimal server configuration for transport-level tests: OS-assigned local
+// ZMQ ports, no CURVE keys and an in-memory store. The REST API is not
+// disabled: Server always starts it, and port 0 makes it bind an OS-assigned
+// port. The OS-assigned ports are held by the server from the moment it binds
+// them, so no other process or outgoing connection can take them first; a
+// ServerRunner copies the actual endpoints into its `config` once it starts.
 inline thewatcher::server::ServerConfig make_in_memory_server_config()
 {
     thewatcher::server::ServerConfig config;
-    config.bind_address = free_zmq_endpoint();
-    config.enrollment_address = free_zmq_endpoint();
+    config.bind_address = "tcp://127.0.0.1:*";
+    config.enrollment_address = "tcp://127.0.0.1:*";
     config.api_host = "127.0.0.1";
     config.api_port = 0;
     config.db_path = ":memory:";
@@ -31,8 +35,12 @@ inline thewatcher::server::ServerConfig make_in_memory_server_config()
 class ServerRunner
 {
 public:
-    // Constructs the Server and immediately starts run() on a worker thread;
-    // wait for readiness with `startup.wait()`.
+    // Constructs the Server, starts run() on a worker thread and waits for the
+    // startup result (StartupSignal::wait() is a latch, so `startup.wait()`
+    // still returns it afterwards). When startup succeeded, `config` holds the
+    // endpoints and API port the server actually bound, so a config asking for
+    // "tcp://127.0.0.1:*" or API port 0 can be read back through it. When
+    // startup failed, `config` is unchanged and `error` is set.
     explicit ServerRunner(thewatcher::server::ServerConfig cfg)
         : config(std::move(cfg))
         , server(config)
@@ -48,6 +56,15 @@ public:
                 startup.fail(error);
             }
         });
+
+        if (startup.wait().started)
+        {
+            // Written by the server thread before startup.succeed(), which the
+            // wait() above synchronises with.
+            config.bind_address = server.router_endpoint();
+            config.enrollment_address = server.enrollment_endpoint();
+            config.api_port = server.api_port();
+        }
     }
 
     // Stops the server and joins the worker thread if it is still running.

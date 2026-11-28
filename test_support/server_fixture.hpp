@@ -78,6 +78,8 @@ public:
     explicit ServerFixture(const ServerFixtureOptions& options = {})
         : ScopedTempDir("thewatcher-server-test")
         , ServerRunner(make_config(ScopedTempDir::path(), options))
+        // The ServerRunner base has already waited for startup, so config.api_port
+        // is the port the API actually bound.
         , client("http://127.0.0.1:" + std::to_string(config.api_port))
     {
         client.set_connection_timeout(5, 0);
@@ -144,17 +146,18 @@ public:
     httplib::Client client;
 
 private:
-    // Builds a config with free ZMQ endpoints and HTTP port and a SQLite file in
-    // `dir`. Adds a CURVE keypair when options.curve is set, and the enrollment token.
+    // Builds a config with OS-assigned ZMQ endpoints and HTTP port (the runner
+    // reads the actual ones back into `config`) and a SQLite file in `dir`. Adds a CURVE keypair when options.curve is
+    // set, and the enrollment token.
     static thewatcher::server::ServerConfig make_config(const std::filesystem::path& dir,
                                                         const ServerFixtureOptions& options)
     {
         crypto::init();
         thewatcher::server::ServerConfig cfg;
-        cfg.bind_address = free_zmq_endpoint();
-        cfg.enrollment_address = free_zmq_endpoint();
+        cfg.bind_address = "tcp://127.0.0.1:*";
+        cfg.enrollment_address = "tcp://127.0.0.1:*";
         cfg.api_host = "127.0.0.1";
-        cfg.api_port = free_http_port();
+        cfg.api_port = 0;
         cfg.db_path = (dir / "thewatcher.db").string();
         if (options.curve)
         {

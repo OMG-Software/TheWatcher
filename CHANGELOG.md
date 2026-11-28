@@ -53,13 +53,23 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 
-- Tests: the free-port helpers in `test_support/net_helpers.hpp` no longer
-  hand out the same port twice in one test process. A fixture picks its
-  ROUTER, enrollment and REST ports before the server binds any of them, so
-  two independent random draws could match and the server then failed with
-  "Failed to listen" (seen on FreeBSD CI in `server_enrollment_security`).
-  Each process now starts at a random port and walks the range; the new
-  `net_helpers` test checks 200 draws are all distinct.
+- Docs: the local sanitizer command in `docs/build-environment.md` now
+  excludes the `timing` suite like CI's blocking step, and the informational
+  `--suite timing` command is listed separately.
+- Tests: test servers no longer take their ports from a probe-and-release
+  helper. That picked a port, freed it and let the server bind it later, so
+  two draws in one process could match, test processes could pick the same
+  port, and on FreeBSD (default ephemeral range from 10000) an outgoing
+  connection could take it; the server then failed with "Failed to listen"
+  (seen on FreeBSD CI in `server_enrollment_security`). `ServerFixture`,
+  `ServerRunner` and the API tests now bind OS-assigned ports
+  (`tcp://127.0.0.1:*`, API port 0) that the server holds from the bind on, and
+  read the actual ones back. `Server` gained `router_endpoint()`,
+  `enrollment_endpoint()` and `api_port()`, `ApiServer` gained `port()` and
+  accepts port 0, and the server logs the endpoints it actually bound. The
+  config file loader is unchanged. `free_zmq_endpoint()` / `free_http_port()`
+  remain, with corrected comments, but nothing in the tree calls them besides
+  the `net_helpers` test (per-process uniqueness only).
 - All alerts now go through one pipeline that applies maintenance, silences,
   severity validation, de-duplication, the runbook link and the webhook.
   Log-match alerts no longer fire during maintenance, offline and log-match

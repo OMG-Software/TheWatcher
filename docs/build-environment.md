@@ -170,8 +170,12 @@ slowdown can outrun those windows. Put any new wall-clock test in the
 ```bash
 meson setup builddir-asan --buildtype=debug -Db_sanitize=address,undefined -Db_lundef=false
 meson compile -C builddir-asan
+# Blocking step: everything except the wall-clock tests
 ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 \
-  meson test -C builddir-asan --suite thewatcher --timeout-multiplier 5 --print-errorlogs
+  meson test -C builddir-asan --suite thewatcher --no-suite timing --timeout-multiplier 5 --print-errorlogs
+# Informational step: the wall-clock tests, which may fail under the slowdown
+ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 \
+  meson test -C builddir-asan --suite timing --timeout-multiplier 5 --print-errorlogs
 ```
 
 Run the full server-agent integration path directly with:

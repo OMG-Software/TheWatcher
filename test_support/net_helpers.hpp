@@ -1,5 +1,13 @@
 // Small networking helpers (free local ports/endpoints) shared by the server,
 // agent and integration tests. Also re-exports the timing helpers.
+//
+// PREFER NOT TO USE free_zmq_endpoint() / free_http_port() in new tests. They
+// probe a port, release it, and let the code under test bind it later, and in
+// that window another process or an outgoing connection can take it. Start a
+// server through ServerFixture / ServerRunner (which bind OS-assigned ports
+// that the server holds from the moment of bind and reports back), or give a
+// Server "tcp://127.0.0.1:*" / an ApiServer port 0 and read the actual
+// endpoint or port from it after startup.
 #pragma once
 
 #include "test_support/timing.hpp"
@@ -15,12 +23,12 @@ namespace thewatcher::test
 
 // The next candidate port in 20000-32767 for this process.
 //
-// A fixture picks all of its ports before the server binds any of them, so a
-// bind probe cannot tell that an earlier pick in the same process already
-// took a port; independent random draws repeated one now and then (seen on
-// FreeBSD CI as "Failed to listen"). Instead each process starts at a random
-// offset, so test processes running side by side spread out, and then walks
-// the range, so no port repeats within a process until all 12768 are used.
+// Unique per process only: each process starts at a random offset and walks
+// the range, so no port repeats within one process until all 12768 are used.
+// Two processes can still pick the same port. The range is below the Linux,
+// Windows and macOS ephemeral ranges but inside FreeBSD's default one (from
+// 10000) and overlaps OpenBSD's, so an outgoing connection can be given a
+// candidate port too.
 inline int next_candidate_port()
 {
     static std::atomic<unsigned> next{std::random_device{}()};
@@ -29,12 +37,11 @@ inline int next_candidate_port()
 
 // A free "tcp://127.0.0.1:<port>" endpoint for a server under test to bind.
 //
-// The port comes from next_candidate_port(), below the OS ephemeral range
-// (Linux 32768-60999, Windows/macOS 49152-65535), and is checked by binding it.
-// A port from the ephemeral range ("tcp://127.0.0.1:*") is released before
-// the server binds it, and in that window the OS may hand it to an outgoing
-// client connection, which makes the server's bind fail intermittently.
-// Falls back to an OS-assigned port if no candidate can be bound.
+// The port comes from next_candidate_port() and is checked by binding it, then
+// released before returning. It is therefore only a hint: between the release
+// and the code under test binding it (the race window) another process may
+// pick the same port, and on FreeBSD/OpenBSD an outgoing connection may take
+// it. Falls back to an OS-assigned port if no candidate can be bound.
 inline std::string free_zmq_endpoint()
 {
     // A context per call: destroying it waits until the probe socket is fully

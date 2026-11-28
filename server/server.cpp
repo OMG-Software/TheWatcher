@@ -186,7 +186,8 @@ void Server::run(StartupSignal* startup)
         LOG_WARNING("Server public key is empty; ROUTER socket CURVE encryption is disabled");
     }
     router.bind(config_.bind_address);
-    LOGF_INFO("ROUTER bound to %s", config_.bind_address.c_str());
+    router_endpoint_ = router.get(zmq::sockopt::last_endpoint);
+    LOGF_INFO("ROUTER bound to %s", router_endpoint_.c_str());
 
     // REP: plain-text enrollment handshake (no CURVE)
     zmq::socket_t enroll(ctx_, ZMQ_REP);
@@ -198,10 +199,11 @@ void Server::run(StartupSignal* startup)
     enroll.set(zmq::sockopt::handshake_ivl, kHandshakeIvlMs);
     enroll.set(zmq::sockopt::sndtimeo, kEnrollSendTimeoutMs);
     enroll.bind(config_.enrollment_address);
-    LOGF_INFO("Enrollment REP bound to %s", config_.enrollment_address.c_str());
+    enrollment_endpoint_ = enroll.get(zmq::sockopt::last_endpoint);
+    LOGF_INFO("Enrollment REP bound to %s", enrollment_endpoint_.c_str());
 
     api_->start();
-    LOGF_INFO("REST API on %s:%d", config_.api_host.c_str(), config_.api_port);
+    LOGF_INFO("REST API on %s:%d", config_.api_host.c_str(), api_->port());
 
     running_.store(true);
     if (startup)

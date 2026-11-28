@@ -28,6 +28,13 @@ Responsibilities:
 - Bind the ZeroMQ ROUTER data socket on `bind_address`.
 - Bind the ZeroMQ REP enrollment socket on `enrollment_address`.
 - Start the HTTP REST API on `api_host:api_port`.
+- Log the endpoints and port actually bound (`ROUTER bound to ...`,
+  `Enrollment REP bound to ...`, `REST API on host:port`). They differ from the
+  configured values only when a ZeroMQ address ends in `:*` or the API port is
+  `0`, which asks the OS for a free port; the `Server` exposes them through
+  `router_endpoint()`, `enrollment_endpoint()` and `api_port()` once startup has
+  succeeded. These wildcard values are for tests; the config loader does not
+  treat them specially.
 - Persist agents and metrics through `Store`: `SqliteStore` (default) or `PostgresStore` (`DB_TYPE=postgres`).
 - Persist users, groups, sessions, status history, alerts, silences, views,
   runbooks, maintenance windows, log matches, and server settings.

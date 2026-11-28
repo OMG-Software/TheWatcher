@@ -65,13 +65,21 @@ void ApiServer::start()
     // connections by the time start() returns; only the accept loop runs on
     // the worker thread. Previously the bind raced with callers that treat
     // start() as "ready" (connection refused on the first request).
-    if (!http_->bind_to_port(host_.c_str(), port_))
+    // Port 0 asks the OS for a free port; bind_to_any_port returns it, or -1.
+    // Record it before the accept thread starts so port() is stable.
+    int bound_port = port_;
+    if (port_ == 0)
+        bound_port = http_->bind_to_any_port(host_);
+    else if (!http_->bind_to_port(host_.c_str(), port_))
+        bound_port = -1;
+    if (bound_port <= 0)
     {
         LOGF_ERROR("Failed to listen on %s:%d", host_.c_str(), port_);
         // Throw like the ZMQ socket binds in Server::run() do, so a busy or
         // invalid API address fails startup instead of being reported as up.
         throw std::runtime_error("Failed to bind REST API on " + host_ + ":" + std::to_string(port_));
     }
+    port_ = bound_port;
     thread_ = std::thread([this] {
         LOGF_INFO("Listening on %s:%d", host_.c_str(), port_);
         if (!http_->listen_after_bind())

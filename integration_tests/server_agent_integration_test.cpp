@@ -180,18 +180,18 @@ SCENARIO("A real agent enrolls, sends metrics, disconnects, and the server recor
         const thewatcher::test::ScopedTempDir scratch("thewatcher-integration");
 
         thewatcher::server::ServerConfig server_config;
-        server_config.bind_address = free_zmq_endpoint();
-        server_config.enrollment_address = free_zmq_endpoint();
+        // OS-assigned ports: the server holds them from the bind on, and the
+        // actual endpoints are read back from it once it has started.
+        server_config.bind_address = "tcp://127.0.0.1:*";
+        server_config.enrollment_address = "tcp://127.0.0.1:*";
         server_config.api_host = "127.0.0.1";
-        server_config.api_port = free_http_port();
+        server_config.api_port = 0;
         server_config.db_path = (scratch.path() / "thewatcher.db").string();
         server_config.server_public_key = server_keys.public_key_z85;
         server_config.server_secret_key = server_keys.secret_key_z85;
 
         thewatcher::agent::AgentConfig agent_config;
         agent_config.agent_id = agent_id;
-        agent_config.server_address = server_config.bind_address;
-        agent_config.enrollment_address = server_config.enrollment_address;
         agent_config.agent_public_key = agent_keys.public_key_z85;
         agent_config.agent_secret_key = agent_keys.secret_key_z85;
         agent_config.collection_interval = 1;
@@ -218,7 +218,11 @@ SCENARIO("A real agent enrolls, sends metrics, disconnects, and the server recor
         REQUIRE(startup_result.started);
         REQUIRE(server_error == nullptr);
 
-        httplib::Client client("http://127.0.0.1:" + std::to_string(server_config.api_port));
+        // The agent connects to the endpoints the server actually bound.
+        agent_config.server_address = server.router_endpoint();
+        agent_config.enrollment_address = server.enrollment_endpoint();
+
+        httplib::Client client("http://127.0.0.1:" + std::to_string(server.api_port()));
         client.set_connection_timeout(5, 0);
         client.set_read_timeout(5, 0);
 

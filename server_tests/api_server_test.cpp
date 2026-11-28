@@ -25,7 +25,6 @@
 
 using thewatcher::server::AgentRecord;
 using thewatcher::server::ApiServer;
-using thewatcher::test::free_http_port;
 using thewatcher::test::login_as_default_admin;
 
 namespace
@@ -36,12 +35,11 @@ struct ApiFixture
 {
     ApiFixture()
         : store(thewatcher::server::make_store("sqlite", ":memory:"))
-        , api(*store, zap, "127.0.0.1", port)
-        , client("http://127.0.0.1:" + std::to_string(port))
+        , api(*store, zap, "127.0.0.1", 0)
+        , client(start(api))
     {
         client.set_connection_timeout(5, 0);
         client.set_read_timeout(5, 0);
-        api.start();
     }
 
     ~ApiFixture()
@@ -49,13 +47,21 @@ struct ApiFixture
         api.stop();
     }
 
-    // Declared first so it is initialised before `api` uses it.
-    int port = free_http_port();
     zmq::context_t ctx{1};
     std::unique_ptr<thewatcher::server::Store> store;
     thewatcher::server::ZapHandler zap{ctx};
     ApiServer api;
     httplib::Client client;
+
+private:
+    // Starts `api` on its OS-assigned port (held from the bind on, so no other
+    // process can take it) and returns the base URL of that port, which the
+    // client member is built from.
+    static std::string start(ApiServer& api)
+    {
+        api.start();
+        return "http://127.0.0.1:" + std::to_string(api.port());
+    }
 };
 
 AgentRecord agent(const std::string& agent_id, const std::string& key, bool approved)
@@ -71,6 +77,33 @@ AgentRecord agent(const std::string& agent_id, const std::string& key, bool appr
 
 } // namespace
 
+SCENARIO("An ApiServer asked for port 0 binds an OS-assigned port and reports it")
+{
+    GIVEN("an API server configured with port 0")
+    {
+        zmq::context_t ctx{1};
+        auto store = thewatcher::server::make_store("sqlite", ":memory:");
+        thewatcher::server::ZapHandler zap{ctx};
+        ApiServer api(*store, zap, "127.0.0.1", 0);
+
+        WHEN("it is started")
+        {
+            api.start();
+
+            THEN("it reports a non-zero port and answers HTTP on it")
+            {
+                REQUIRE(api.port() > 0);
+                httplib::Client client("http://127.0.0.1:" + std::to_string(api.port()));
+                client.set_connection_timeout(5, 0);
+                client.set_read_timeout(5, 0);
+                REQUIRE(login_as_default_admin(client));
+            }
+
+            api.stop();
+        }
+    }
+}
+
 SCENARIO("ApiServer::start reports an address that cannot be bound")
 {
     GIVEN("an API server configured for an address this host does not own")
@@ -81,7 +114,7 @@ SCENARIO("ApiServer::start reports an address that cannot be bound")
         zmq::context_t ctx{1};
         auto store = thewatcher::server::make_store("sqlite", ":memory:");
         thewatcher::server::ZapHandler zap{ctx};
-        ApiServer api(*store, zap, "192.0.2.1", free_http_port());
+        ApiServer api(*store, zap, "192.0.2.1", 0);
 
         WHEN("it is started")
         {

@@ -86,12 +86,19 @@ npm.cmd test
 - Keep persistence/status tests on the lighter `server_store_lib` target when
   they do not need ZeroMQ. Use `server_lib` only for tests that exercise the
   full server runtime.
-- Get test ports from `test_support/net_helpers.hpp` (`free_zmq_endpoint()`,
-  `free_http_port()`), never from `tcp://127.0.0.1:*`. A fixture picks all of
-  its ports before the server binds them, so the helpers walk 20000-32767
-  from a random start per process: no port repeats within one test process,
-  and processes running side by side start far apart. The `net_helpers` test
-  checks this.
+- Test ports are assigned by the OS and held by the server from the moment it
+  binds them: start servers with `ServerFixture` / `ServerRunner`, or give a
+  `Server` `tcp://127.0.0.1:*` and an `ApiServer` port `0`, and read the actual
+  endpoints back (`Server::router_endpoint()`, `enrollment_endpoint()`,
+  `api_port()`, `ApiServer::port()`; valid once startup has succeeded). A
+  `ServerRunner` waits for startup and copies them into its `config`, so tests
+  read `runner.config.*` / `fx.config.*` as before. Do not probe a port, release
+  it and bind it later: another process, or on FreeBSD/OpenBSD an outgoing
+  connection, can take it in between. `free_zmq_endpoint()` / `free_http_port()`
+  in `test_support/net_helpers.hpp` still do that: they are unique within one
+  process only, 20000-32767 is inside FreeBSD's default ephemeral range, and the
+  race window exists, so new tests should not use them. A test that restarts a
+  server on the same port may rebind the explicit port it read back.
 - Keep `httplib` route callbacks self-contained. Shared authorization,
   session, and command helpers should live on `ApiServer` and callbacks should
   capture `this` or values, not references to stack-local helper lambdas from
