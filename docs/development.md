@@ -61,6 +61,10 @@ npm.cmd test      # Vitest + jsdom + React Testing Library UI tests; see docs/da
   directories and `*.test.ts(x)` files are excluded from duplication
   detection only (BDD scenarios repeat setup deliberately); keep shared
   setup in helpers when it carries logic.
+- Save every source file as UTF-8. `vite build` rejects any other encoding,
+  and `dashboard/src/sourceEncoding.test.ts` fails the unit tests when a file
+  under `dashboard/src` is not valid UTF-8. On Windows, PowerShell 5.1's
+  `Set-Content` writes the ANSI code page unless you pass `-Encoding utf8`.
 - Keep top-level C++ namespace as `thewatcher`.
 - Prefer structured types in `common/metrics.hpp`, `common/protocol.hpp`, and
   `common/commands.hpp` over ad hoc strings.

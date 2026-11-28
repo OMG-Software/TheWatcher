@@ -55,6 +55,11 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 
+- Dashboard: `ActionButton`, `AgentConfigModal` and `StatusHistoryModal` held
+  Windows-1252 bytes for "…" and "—", which `vite build` rejects as invalid
+  UTF-8. They are UTF-8 again, and a new test fails whenever any file under
+  `dashboard/src` is not valid UTF-8, since vitest decodes such files without
+  complaint.
 - Dashboard: `tsc` no longer writes `.js`/`.d.ts` files into `dashboard/src`
   (`noEmit`), the 21 committed compiled twins are removed, and vitest runs
   only `*.test.ts(x)`. Before, Vite served the stale twins and every test ran

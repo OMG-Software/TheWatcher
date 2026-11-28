@@ -24,7 +24,7 @@ export function StatusHistoryModal({
   }, [agentId]);
 
   return (
-    <Modal className="status-history-modal" onClose={onClose} title={`Status History � ${agentName}`}>
+    <Modal className="status-history-modal" onClose={onClose} title={`Status History — ${agentName}`}>
       <div className="status-history-body">
         {error ? <div className="banner error">{error}</div> : null}
         {!error && rows === null ? <div className="banner">Loading status history…</div> : null}

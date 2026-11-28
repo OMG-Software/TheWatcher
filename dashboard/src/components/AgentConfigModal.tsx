@@ -293,7 +293,7 @@ export function AgentConfigModal({
         <ActionError actionKey={`${agent.id}:collector_config`} />
         <div className="modal-actions">
           <button className="text-button" type="button" disabled={busy} onClick={dismiss}>Cancel</button>
-          <button className="text-button" type="submit" disabled={!operator || busy}>{busy ? 'Saving…' : 'Save'}</button>
+          <button className="text-button" type="submit" disabled={!operator || busy}>{busy ? 'Savingâ€¦' : 'Save'}</button>
         </div>
       </form>
     </div>
