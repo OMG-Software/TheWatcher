@@ -247,11 +247,9 @@ constexpr Expect OPERATORS{401, 200, 200, 403, 200, 200, 403};
 constexpr Expect GLOBAL_OPS{401, 200, 200, 403, 403, 403, 403};
 constexpr Expect GLOBAL_ANY{401, 200, 200, 200, 403, 403, 403};
 constexpr Expect ADMIN{401, 200, 403, 403, 403, 403, 403};
-constexpr Expect NO_ONE{401, 403, 403, 403, 403, 403, 403};
 constexpr Expect GLOBAL_READ{401, 200, 200, 200, 403, 403, 403};
 // Views are created with 201.
 constexpr Expect CREATE_OPERATORS{401, 201, 201, 403, 201, 201, 403};
-constexpr Expect CREATE_GLOBAL_OPS{401, 201, 201, 403, 403, 403, 403};
 
 const std::vector<Row>& rows()
 {
