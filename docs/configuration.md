@@ -45,7 +45,7 @@ Options:
 | `DB_PATH` | `thewatcher.db` | SQLite database path when `DB_TYPE` is `sqlite`. Relative paths resolve beside the active server config file so server restarts from different working directories keep using the same database. |
 | `DB_TYPE` | `sqlite` | Storage backend: `sqlite` or `postgres`. `postgres` needs a server binary built with PostgreSQL support (see [Build Environment](build-environment.md)); a binary built without it stops at startup with `Unsupported db_type: postgres`. Any other value stops the server the same way. |
 | `POSTGRES_DSN` | empty | libpq connection string used when `DB_TYPE` is `postgres`, for example `host=db.example.com port=5432 dbname=thewatcher user=thewatcher password=... sslmode=require`. It usually holds a password, so keep the config file owner-only like `SERVER_SECRET_KEY`. Known issue: at debug log level the server currently writes the raw DSN, password included, to `TheWatcherServer.log` (`make_store`); do not enable debug logging against a production database, and restrict the log file like the config until this is fixed. Ignored when `DB_TYPE` is `sqlite`. |
-| `OFFLINE_AFTER_SECONDS` | `60` | Approved connected agents are marked disconnected when `last_seen` is older than this number of seconds. Set `0` or a negative value to disable automatic offline marking. |
+| `OFFLINE_AFTER_SECONDS` | `60` | Default offline timeout. Approved connected agents are marked disconnected when `last_seen` is older than the effective timeout `max(base, 3 x the agent's heartbeat interval)`, where base is the `offline_after_seconds` runtime setting if saved in the dashboard, else this value. Set `0` or a negative value to disable automatic offline marking, unless a positive `offline_after_seconds` is saved in the dashboard, which then takes over. |
 | `SERVER_PUBLIC_KEY` | generated | Server CURVE public key. Approved enrollment responses include this key and its fingerprint so agents can learn and pin it. |
 | `SERVER_SECRET_KEY` | generated | Server CURVE secret key. Keep this private. |
 | `ENROLLMENT_TOKEN` | empty | Optional pre-shared token. When set, every enrollment request must carry a matching token (`ENROLLMENT_TOKEN` in the agent config), so arbitrary hosts cannot create pending-agent records. Leave empty for tokenless first-run enrollment. |
@@ -73,6 +73,11 @@ dedicated dashboard controls exist.
 
 | Key | Default | Description |
 | --- | --- | --- |
+| `offline_after_seconds` | `OFFLINE_AFTER_SECONDS` (60) | Base offline timeout in seconds (10-86400), editable in the dashboard Settings. The effective timeout for an agent is `max(this, 3 x heartbeat_interval)`. |
+| `metrics_retention_days` | `30` | Metrics older than this are deleted by the hourly retention job (1-365). |
+| `status_history_retention_days` | `90` | Status history older than this is deleted, except the newest row per indicator (1-3650). |
+| `alerts_retention_days` | `90` | Acknowledged or deleted alerts older than this are deleted; open alerts are kept. Also applies to expired silences and ended maintenance windows (1-3650). |
+| `log_matches_retention_days` | `30` | Log matches older than this are deleted (1-3650). |
 | `notifications.webhook_url` | empty | Optional HTTP webhook URL. The server posts alert JSON when an alert is generated. `http://` URLs are supported by the current build. Localhost, private, link-local, multicast, documentation, benchmark, malformed authority, userinfo, and invalid-port targets are rejected before sending. Delivery runs on a background worker with a 2 second timeout and up to 3 attempts; only a 2xx response counts as delivered. |
 | `reports.enabled`, `reports.webhook_url`, `reports.schedule`, `reports.hour`, `reports.day_of_week`, `reports.last_sent_ms` | disabled | Scheduled fleet digest. See [Scheduled reports](architecture.md#scheduled-reports). |
 
@@ -159,8 +164,8 @@ Status colors:
 | Yellow | Warning |
 | Amber | Degraded |
 | Red | Critical or failure |
-| Grey | No data |
-| Blue | Maintenance |
+| Grey | No data. Entering Grey (for example a NaN reading) never raises an alert. |
+| Blue | Maintenance. Entering Blue never raises an alert, and the first real reading after maintenance alerts normally. |
 
 ## Authentication And RBAC
 
@@ -290,7 +295,8 @@ Ordinary patterns such as `ERROR.*disk.*full`, `(ERROR|WARN) disk` and
 Each indicator tails its file independently. A monitor starts at the end of an
 existing file, so enabling it does not report old lines; a file that is created
 later is read from its first byte. A line is matched once it ends with a
-newline (a trailing `` is dropped, so CRLF logs work with `$`). If the file
+newline (a trailing `
+` is dropped, so CRLF logs work with `$`). If the file
 is replaced, deleted and recreated, or becomes shorter than the read position,
 it is read again from the start (#90).
 

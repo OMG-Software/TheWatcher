@@ -5,6 +5,7 @@ server_store_sources = [
   'notification_worker.cpp',
   'offline_alerts.cpp',
   'report_generator.cpp',
+  'retention.cpp',
   'status_engine.cpp',
   'store_sqlite.cpp',
   'webhook_security.cpp',

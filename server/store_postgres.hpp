@@ -26,6 +26,7 @@ public:
     void reject_agent(const std::string& agent_id) override;
     void delete_agent(const std::string& agent_id) override;
     void mark_agents_offline_before(int64_t cutoff_ms) override;
+    void mark_agent_offline(const std::string& agent_id) override;
     void set_agent_maintenance(const std::string& agent_id, bool maintenance, const std::string& reason,
                                int64_t until_ms) override;
     void set_agent_thresholds(const AgentRecord& rec) override;
@@ -65,6 +66,7 @@ public:
     std::optional<StatusHistoryRow> latest_status_for_indicator(const std::string& agent_id,
                                                                 const std::string& indicator) override;
     std::vector<StatusHistoryRow> list_status_history(const std::string& agent_id, int limit) override;
+    std::vector<StatusHistoryRow> latest_status_per_indicator(const std::string& agent_id) override;
     std::optional<PendingStatusRecord> get_pending_status(const std::string& agent_id,
                                                           const std::string& indicator) override;
     void set_pending_status(const std::string& agent_id, const std::string& indicator, const std::string& target_status,
@@ -99,6 +101,11 @@ public:
     void delete_silence(int64_t silence_id) override;
     bool is_silenced(const std::string& agent_id, const std::string& indicator, int64_t now_ms) override;
     void prune_metrics_before(int64_t cutoff_ms) override;
+    void prune_status_history_before(int64_t cutoff_ms) override;
+    void prune_alerts_before(int64_t cutoff_ms) override;
+    void prune_log_matches_before(int64_t cutoff_ms) override;
+    void prune_silences_before(int64_t cutoff_ms) override;
+    void prune_maintenance_windows_before(int64_t cutoff_ms) override;
     void insert_log_match(const LogMatchRecord& rec) override;
     std::vector<LogMatchRecord> list_log_matches(const std::string& agent_id, int limit) override;
     int64_t create_view(const ViewRecord& rec) override;

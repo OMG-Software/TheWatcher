@@ -126,8 +126,11 @@ working document for audit, design review, and regression testing.
 - Config parser file and line sizes are bounded to avoid unbounded local input.
 - The API still needs a global request-body size limit in httplib or a fronting
   reverse proxy; this is a residual risk.
-- Metrics and alert retention settings should be configured to limit database
-  growth in production.
+- An hourly retention job prunes metrics, status history, handled alerts, log
+  matches, expired silences and ended maintenance windows, independent of
+  agent traffic, so a flapping indicator or noisy log watch cannot grow the
+  database without bound. Retention periods are configurable; sessions are not
+  yet pruned.
 
 ### Elevation Of Privilege
 

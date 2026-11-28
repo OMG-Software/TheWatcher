@@ -1,3 +1,4 @@
+#include "../server/retention.hpp"
 #include "../server/status_engine.hpp"
 #include "../server/store_sqlite.hpp"
 #include "common/metrics.hpp"
@@ -6,6 +7,9 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
+#include <limits>
+#include <string>
+#include <vector>
 
 using namespace thewatcher;
 using namespace thewatcher::server;
@@ -416,11 +420,25 @@ SCENARIO("is_worse_status returns true only when severity strictly increases")
             }
         }
 
-        WHEN("either status is Blue (maintenance)")
+        WHEN("the previous status is Blue (maintenance) or Grey (no data)")
         {
-            THEN("is_worse_status always returns false")
+            THEN("it carries no severity, so any real problem is a worsening (#44, #55)")
             {
-                REQUIRE_FALSE(is_worse_status(IndicatorStatus::Blue, IndicatorStatus::Red));
+                REQUIRE(is_worse_status(IndicatorStatus::Blue, IndicatorStatus::Red));
+                REQUIRE(is_worse_status(IndicatorStatus::Blue, IndicatorStatus::Yellow));
+                REQUIRE(is_worse_status(IndicatorStatus::Grey, IndicatorStatus::Red));
+                REQUIRE_FALSE(is_worse_status(IndicatorStatus::Blue, IndicatorStatus::Green));
+                REQUIRE_FALSE(is_worse_status(IndicatorStatus::Grey, IndicatorStatus::Green));
+            }
+        }
+
+        WHEN("the new status is Blue or Grey")
+        {
+            THEN("it is never a worsening, so it never raises an alert (#55)")
+            {
+                REQUIRE_FALSE(is_worse_status(IndicatorStatus::Green, IndicatorStatus::Grey));
+                REQUIRE_FALSE(is_worse_status(IndicatorStatus::Yellow, IndicatorStatus::Grey));
+                REQUIRE_FALSE(is_worse_status(IndicatorStatus::Red, IndicatorStatus::Grey));
                 REQUIRE_FALSE(is_worse_status(IndicatorStatus::Green, IndicatorStatus::Blue));
                 REQUIRE_FALSE(is_worse_status(IndicatorStatus::Blue, IndicatorStatus::Blue));
             }
@@ -583,59 +601,6 @@ SCENARIO("Status engine steps through yellow then amber as CPU worsens")
                 }
                 REQUIRE(saw_yellow);
                 REQUIRE(saw_amber);
-            }
-        }
-    }
-}
-
-SCENARIO("Metrics pruning is triggered by evaluate_metrics after one hour")
-{
-    GIVEN("an approved agent with old metrics in the store")
-    {
-        SqliteStore store(":memory:");
-        insert_approved_agent(store, "agent-prune");
-
-        // Use timestamps far enough apart that the 30-day cutoff at eval_time
-        // falls between old_row and recent_row.
-        // eval_time = ~30.0042 days; cutoff = eval_time - 30 days ≈ 364 seconds.
-        const int64_t eval_time = 2'600'000'000LL + 3'600'001LL; // ~30 days + ~1 hour in ms
-        const int64_t recent_ts = 2'600'000'000LL;               // within retention window
-        const int64_t old_ts = 1'000LL;                          // well before cutoff
-
-        MetricsRow old_row;
-        old_row.agent_id = "agent-prune";
-        old_row.timestamp_ms = old_ts;
-        old_row.metrics_cbor = {0x01};
-        store.insert_metrics(old_row);
-
-        MetricsRow recent_row;
-        recent_row.agent_id = "agent-prune";
-        recent_row.timestamp_ms = recent_ts;
-        recent_row.metrics_cbor = {0x02};
-        store.insert_metrics(recent_row);
-
-        StatusEngine engine(store);
-
-        WHEN("evaluate_metrics is called one hour after last prune with default 30-day retention")
-        {
-            auto metrics = metrics_with_cpu(10.0);
-            engine.evaluate_metrics("agent-prune", metrics, eval_time);
-
-            THEN("the old metrics row is pruned")
-            {
-                auto rows = store.get_metrics("agent-prune", 100);
-                for (const auto& r : rows)
-                    REQUIRE(r.timestamp_ms != old_ts);
-            }
-
-            AND_THEN("the recent metrics row is retained")
-            {
-                auto rows = store.get_metrics("agent-prune", 100);
-                bool found = false;
-                for (const auto& r : rows)
-                    if (r.timestamp_ms == recent_ts)
-                        found = true;
-                REQUIRE(found);
             }
         }
     }
@@ -1157,6 +1122,623 @@ SCENARIO("record_transition leaves runbook_url empty when no matching runbook ex
                 });
                 REQUIRE(it != alerts.end());
                 REQUIRE(it->runbook_url.empty());
+            }
+        }
+    }
+}
+
+// ── Maintenance state machine (#44, #45) ─────────────────────────────────────
+
+namespace
+{
+bool has_alert(SqliteStore& store, const std::string& indicator, const std::string& new_status)
+{
+    for (const auto& alert : store.list_alerts(false))
+    {
+        if (alert.indicator == indicator && alert.new_status == new_status)
+            return true;
+    }
+    return false;
+}
+} // namespace
+
+SCENARIO("An indicator that is already red when maintenance ends raises an alert")
+{
+    GIVEN("an agent whose CPU was green before it entered maintenance")
+    {
+        SqliteStore store(":memory:");
+        insert_approved_agent(store, "agent-after-maint");
+        StatusEngine engine(store);
+        engine.evaluate_metrics("agent-after-maint", metrics_with_cpu(10.0), 1000);
+        engine.enter_maintenance("agent-after-maint", "patching", 0, 2000);
+
+        WHEN("maintenance ends and the next CPU reading is red")
+        {
+            engine.exit_maintenance("agent-after-maint");
+            engine.evaluate_metrics("agent-after-maint", metrics_with_cpu(99.0), 3000);
+
+            THEN("a red alert is raised for cpu")
+            {
+                REQUIRE(has_alert(store, "cpu", "red"));
+            }
+        }
+
+        WHEN("maintenance ends and the next CPU reading is green")
+        {
+            engine.exit_maintenance("agent-after-maint");
+            engine.evaluate_metrics("agent-after-maint", metrics_with_cpu(10.0), 3000);
+
+            THEN("no alert is raised and the indicator returns to green")
+            {
+                REQUIRE(store.list_alerts(false).empty());
+                REQUIRE(store.latest_status_for_indicator("agent-after-maint", "cpu")->new_status == "green");
+            }
+        }
+    }
+}
+
+SCENARIO("Entering maintenance marks the agent's real indicators blue and no phantom ones")
+{
+    GIVEN("an agent with disk, network and process indicators on record")
+    {
+        SqliteStore store(":memory:");
+        insert_approved_agent(store, "agent-real-ind");
+        auto agent = store.get_agent("agent-real-ind");
+        ProcessWatchConfig watch;
+        watch.name = "init";
+        watch.expected_count = 1;
+        agent->collector_config.processes.push_back(watch);
+        store.set_agent_collector_config("agent-real-ind", agent->collector_config);
+
+        StatusEngine engine(store);
+        engine.evaluate_metrics("agent-real-ind", metrics_with_cpu(10.0), 1000);
+        REQUIRE(store.latest_status_for_indicator("agent-real-ind", "disk:/").has_value());
+
+        WHEN("the agent enters maintenance")
+        {
+            engine.enter_maintenance("agent-real-ind", "patching", 0, 2000);
+
+            THEN("every existing indicator is blue")
+            {
+                for (const auto& name : {"cpu", "memory", "disk:/", "network:eth0", "process:init"})
+                {
+                    const auto row = store.latest_status_for_indicator("agent-real-ind", name);
+                    REQUIRE(row.has_value());
+                    REQUIRE(row->new_status == "blue");
+                }
+            }
+
+            AND_THEN("no indicator named after a whole category is created")
+            {
+                for (const auto& name : {"disk", "network", "processes"})
+                    REQUIRE_FALSE(store.latest_status_for_indicator("agent-real-ind", name).has_value());
+            }
+        }
+    }
+}
+
+SCENARIO("Timed manual maintenance ends when its until time passes")
+{
+    GIVEN("an agent put into maintenance until t=5000")
+    {
+        SqliteStore store(":memory:");
+        insert_approved_agent(store, "agent-timed");
+        StatusEngine engine(store);
+        engine.enter_maintenance("agent-timed", "patching", 5000, 1000);
+
+        WHEN("the maintenance tick runs before the until time")
+        {
+            engine.reconcile_maintenance(4000);
+
+            THEN("the agent is still in maintenance")
+            {
+                REQUIRE(store.get_agent("agent-timed")->maintenance);
+            }
+        }
+
+        WHEN("the maintenance tick runs after the until time")
+        {
+            engine.reconcile_maintenance(5000);
+
+            THEN("maintenance is cleared")
+            {
+                const auto agent = store.get_agent("agent-timed");
+                REQUIRE_FALSE(agent->maintenance);
+                REQUIRE(agent->maintenance_until == 0);
+            }
+
+            AND_WHEN("the next CPU reading is red")
+            {
+                engine.evaluate_metrics("agent-timed", metrics_with_cpu(99.0), 6000);
+
+                THEN("evaluation has resumed and alerts")
+                {
+                    REQUIRE(has_alert(store, "cpu", "red"));
+                }
+            }
+        }
+    }
+
+    GIVEN("an agent in open-ended manual maintenance (until=0)")
+    {
+        SqliteStore store(":memory:");
+        insert_approved_agent(store, "agent-open");
+        StatusEngine engine(store);
+        engine.enter_maintenance("agent-open", "command", 0, 1000);
+
+        WHEN("the maintenance tick runs much later")
+        {
+            engine.reconcile_maintenance(999'999'999);
+
+            THEN("the agent stays in maintenance")
+            {
+                REQUIRE(store.get_agent("agent-open")->maintenance);
+            }
+        }
+    }
+}
+
+SCENARIO("Scheduled maintenance windows follow the same state machine as manual maintenance")
+{
+    GIVEN("an agent with a CPU alert and a window from t=2000 to t=4000 covering all agents")
+    {
+        SqliteStore store(":memory:");
+        insert_approved_agent(store, "agent-window");
+        StatusEngine engine(store);
+        engine.evaluate_metrics("agent-window", metrics_with_cpu(10.0), 1000);
+        engine.evaluate_metrics("agent-window", metrics_with_cpu(99.0), 1500);
+        REQUIRE(store.list_unacknowledged_alerts().size() == 1);
+
+        MaintenanceWindowRecord window;
+        window.agent_id = "*";
+        window.start_ms = 2000;
+        window.end_ms = 4000;
+        window.reason = "nightly";
+        store.create_maintenance_window(window);
+
+        WHEN("the tick runs inside the window")
+        {
+            engine.reconcile_maintenance(3000);
+
+            THEN("the agent is in maintenance with the window reason and its indicators are blue")
+            {
+                const auto agent = store.get_agent("agent-window");
+                REQUIRE(agent->maintenance);
+                REQUIRE(agent->maintenance_reason == "mw:nightly");
+                REQUIRE(store.latest_status_for_indicator("agent-window", "cpu")->new_status == "blue");
+            }
+
+            AND_THEN("active alerts are cleared like manual maintenance")
+            {
+                REQUIRE(store.list_unacknowledged_alerts().empty());
+            }
+
+            AND_WHEN("the tick runs after the window ended")
+            {
+                engine.reconcile_maintenance(4000);
+
+                THEN("the agent leaves maintenance")
+                {
+                    REQUIRE_FALSE(store.get_agent("agent-window")->maintenance);
+                }
+
+                AND_THEN("a red reading afterwards alerts")
+                {
+                    engine.evaluate_metrics("agent-window", metrics_with_cpu(99.0), 5000);
+                    REQUIRE(has_alert(store, "cpu", "red"));
+                }
+            }
+        }
+    }
+
+    GIVEN("an agent in manual maintenance and no window")
+    {
+        SqliteStore store(":memory:");
+        insert_approved_agent(store, "agent-manual");
+        StatusEngine engine(store);
+        engine.enter_maintenance("agent-manual", "by hand", 0, 1000);
+
+        WHEN("the tick runs")
+        {
+            engine.reconcile_maintenance(2000);
+
+            THEN("the manual maintenance is not ended by the window logic")
+            {
+                REQUIRE(store.get_agent("agent-manual")->maintenance);
+            }
+        }
+    }
+}
+
+SCENARIO("Maintenance set directly in the store is reflected in the indicators by the tick")
+{
+    GIVEN("an agent with a green CPU whose maintenance flag was set by the API")
+    {
+        SqliteStore store(":memory:");
+        insert_approved_agent(store, "agent-api-flag");
+        StatusEngine engine(store);
+        engine.evaluate_metrics("agent-api-flag", metrics_with_cpu(10.0), 1000);
+        store.set_agent_maintenance("agent-api-flag", true, "from api", 0);
+
+        WHEN("the maintenance tick runs")
+        {
+            engine.reconcile_maintenance(2000);
+
+            THEN("the CPU indicator is blue")
+            {
+                REQUIRE(store.latest_status_for_indicator("agent-api-flag", "cpu")->new_status == "blue");
+            }
+        }
+    }
+}
+
+// ── Grey means no data (#55) ─────────────────────────────────────────────────
+
+SCENARIO("A non-finite reading after green raises no alert")
+{
+    GIVEN("an agent with an established green CPU")
+    {
+        SqliteStore store(":memory:");
+        insert_approved_agent(store, "agent-grey");
+        StatusEngine engine(store);
+        engine.evaluate_metrics("agent-grey", metrics_with_cpu(10.0), 1000);
+
+        WHEN("a NaN reading arrives and then a normal one")
+        {
+            engine.evaluate_metrics("agent-grey", metrics_with_cpu(std::numeric_limits<double>::quiet_NaN()), 2000);
+            engine.evaluate_metrics("agent-grey", metrics_with_cpu(10.0), 3000);
+
+            THEN("no alert exists at all")
+            {
+                REQUIRE(store.list_alerts(false).empty());
+            }
+        }
+
+        WHEN("an infinite reading arrives")
+        {
+            engine.evaluate_metrics("agent-grey", metrics_with_cpu(std::numeric_limits<double>::infinity()), 2000);
+
+            THEN("the indicator is grey and no alert exists")
+            {
+                REQUIRE(store.latest_status_for_indicator("agent-grey", "cpu")->new_status == "grey");
+                REQUIRE(store.list_alerts(false).empty());
+            }
+        }
+    }
+}
+
+// ── Long-lived engine (#43) ──────────────────────────────────────────────────
+
+SCENARIO("evaluate_metrics does not prune; retention is a separate periodic task")
+{
+    GIVEN("an agent with a metrics row far older than the retention period")
+    {
+        SqliteStore store(":memory:");
+        insert_approved_agent(store, "agent-no-prune");
+        store.insert_metrics({"agent-no-prune", 1000, {0x01}});
+        StatusEngine engine(store);
+
+        WHEN("a frame is evaluated long after the old row")
+        {
+            engine.evaluate_metrics("agent-no-prune", metrics_with_cpu(10.0), 5'000'000'000LL);
+
+            THEN("the old row is still there")
+            {
+                REQUIRE(store.get_metrics("agent-no-prune", 10).size() == 1);
+            }
+        }
+    }
+}
+
+SCENARIO("Stale detection works across separate evaluate_metrics calls on one engine and tracks agents separately")
+{
+    GIVEN("two agents with stale detection at 10 seconds and one engine")
+    {
+        SqliteStore store(":memory:");
+        for (const auto* id : {"agent-s1", "agent-s2"})
+        {
+            insert_approved_agent(store, id);
+            auto agent = store.get_agent(id);
+            agent->collector_config.stale_after_seconds = 10;
+            store.set_agent_collector_config(id, agent->collector_config);
+        }
+        StatusEngine engine(store);
+
+        WHEN("agent 1 repeats its value for 11 s while agent 2 changes its value")
+        {
+            engine.evaluate_metrics("agent-s1", metrics_with_cpu(50.0), 1000);
+            engine.evaluate_metrics("agent-s2", metrics_with_cpu(50.0), 1000);
+            engine.evaluate_metrics("agent-s1", metrics_with_cpu(50.0), 12'000);
+            engine.evaluate_metrics("agent-s2", metrics_with_cpu(60.0), 12'000);
+
+            THEN("only agent 1 is stale")
+            {
+                REQUIRE(store.latest_status_for_indicator("agent-s1", "cpu")->new_status == "yellow");
+                REQUIRE(store.latest_status_for_indicator("agent-s2", "cpu")->new_status == "green");
+            }
+        }
+    }
+}
+
+// ── Retention (#76) ──────────────────────────────────────────────────────────
+
+SCENARIO("The retention task prunes every growing table without any metrics arriving")
+{
+    constexpr int64_t day = 86'400'000LL;
+    constexpr int64_t now = 400 * day;
+
+    GIVEN("old and recent rows in each growing table")
+    {
+        SqliteStore store(":memory:");
+        insert_approved_agent(store, "agent-ret");
+        store.insert_metrics({"agent-ret", now - 40 * day, {0x01}});
+        store.insert_metrics({"agent-ret", now - day, {0x02}});
+
+        // status_history: an old row that is also the newest of its indicator, and
+        // old+new rows for another indicator.
+        store.insert_status_history({0, "agent-ret", "stable", "green", "green", "", now - 300 * day});
+        store.insert_status_history({0, "agent-ret", "flappy", "green", "red", "", now - 300 * day});
+        store.insert_status_history({0, "agent-ret", "flappy", "red", "green", "", now - day});
+
+        AlertRecord old_open;
+        old_open.agent_id = "agent-ret";
+        old_open.indicator = "open";
+        old_open.created_at = now - 300 * day;
+        const auto open_id = store.insert_alert(old_open);
+        AlertRecord old_acked = old_open;
+        old_acked.indicator = "acked";
+        const auto acked_id = store.insert_alert(old_acked);
+        store.acknowledge_alert(acked_id, "admin", now - 299 * day);
+        AlertRecord recent = old_open;
+        recent.indicator = "recent";
+        recent.created_at = now - day;
+        store.insert_alert(recent);
+        (void)open_id;
+
+        store.insert_log_match({0, "agent-ret", "log", "/var/log/x", "old line", "red", now - 40 * day});
+        store.insert_log_match({0, "agent-ret", "log", "/var/log/x", "new line", "red", now - day});
+
+        SilenceRecord expired;
+        expired.agent_id = "*";
+        expired.indicator = "*";
+        expired.until_ms = now - 200 * day;
+        expired.created_at = now - 201 * day;
+        store.create_silence(expired);
+        SilenceRecord active = expired;
+        active.until_ms = now + day;
+        store.create_silence(active);
+
+        MaintenanceWindowRecord finished;
+        finished.agent_id = "*";
+        finished.start_ms = now - 201 * day;
+        finished.end_ms = now - 200 * day;
+        finished.created_at = now - 202 * day;
+        store.create_maintenance_window(finished);
+        MaintenanceWindowRecord upcoming = finished;
+        upcoming.start_ms = now + day;
+        upcoming.end_ms = now + 2 * day;
+        store.create_maintenance_window(upcoming);
+
+        WHEN("retention runs with the default settings")
+        {
+            run_retention(store, now);
+
+            THEN("old metrics and log matches are gone and recent ones stay")
+            {
+                REQUIRE(store.get_metrics("agent-ret", 10).size() == 1);
+                const auto matches = store.list_log_matches("agent-ret", 10);
+                REQUIRE(matches.size() == 1);
+                REQUIRE(matches[0].matched_line == "new line");
+            }
+
+            AND_THEN("old status history is gone but each indicator keeps its newest row")
+            {
+                REQUIRE(store.latest_status_for_indicator("agent-ret", "stable").has_value());
+                const auto flappy = store.latest_status_for_indicator("agent-ret", "flappy");
+                REQUIRE(flappy.has_value());
+                REQUIRE(flappy->new_status == "green");
+                REQUIRE(store.list_status_history("agent-ret", 100).size() == 2);
+            }
+
+            AND_THEN("old handled alerts are gone but open and recent alerts stay")
+            {
+                std::vector<std::string> kept;
+                for (const auto& alert : store.list_alerts(true))
+                    kept.push_back(alert.indicator);
+                std::sort(kept.begin(), kept.end());
+                REQUIRE(kept == std::vector<std::string>{"open", "recent"});
+            }
+
+            AND_THEN("expired silences and finished windows are removed, active ones stay")
+            {
+                REQUIRE(store.list_silences().size() == 1);
+                REQUIRE(store.list_maintenance_windows().size() == 1);
+            }
+        }
+
+        WHEN("a retention setting is shortened")
+        {
+            store.set_setting("metrics_retention_days", "1000");
+            store.set_setting("log_matches_retention_days", "1000");
+            run_retention(store, now);
+
+            THEN("the longer period is honoured")
+            {
+                REQUIRE(store.get_metrics("agent-ret", 10).size() == 2);
+                REQUIRE(store.list_log_matches("agent-ret", 10).size() == 2);
+            }
+        }
+
+        WHEN("a retention setting is garbage")
+        {
+            store.set_setting("metrics_retention_days", "not-a-number");
+            run_retention(store, now);
+
+            THEN("the default is used instead of throwing")
+            {
+                REQUIRE(store.get_metrics("agent-ret", 10).size() == 1);
+            }
+        }
+    }
+}
+
+// ── Review follow-ups for PR #174 ────────────────────────────────────────────
+
+SCENARIO("The first post-maintenance stale check starts a fresh clock")
+{
+    GIVEN("an agent with stale detection at 10 s that reported 50% before maintenance")
+    {
+        SqliteStore store(":memory:");
+        insert_approved_agent(store, "agent-stale-maint");
+        auto agent = store.get_agent("agent-stale-maint");
+        agent->collector_config.stale_after_seconds = 10;
+        store.set_agent_collector_config("agent-stale-maint", agent->collector_config);
+        StatusEngine engine(store);
+        engine.evaluate_metrics("agent-stale-maint", metrics_with_cpu(50.0), 1000);
+
+        WHEN("maintenance lasts a long time and the same value is reported afterwards")
+        {
+            engine.enter_maintenance("agent-stale-maint", "patching", 0, 2000);
+            engine.exit_maintenance("agent-stale-maint");
+            engine.evaluate_metrics("agent-stale-maint", metrics_with_cpu(50.0), 60'000);
+
+            THEN("the indicator is not flagged stale")
+            {
+                REQUIRE(store.latest_status_for_indicator("agent-stale-maint", "cpu")->new_status == "green");
+            }
+        }
+    }
+}
+
+SCENARIO("Consecutive-reading confirmation counts the first reading after maintenance")
+{
+    GIVEN("an agent needing 3 consecutive red CPU readings that was in maintenance")
+    {
+        SqliteStore store(":memory:");
+        insert_approved_agent(store, "agent-confirm");
+        auto agent = store.get_agent("agent-confirm");
+        agent->collector_config.cpu_readings = 3;
+        store.set_agent_collector_config("agent-confirm", agent->collector_config);
+        StatusEngine engine(store);
+        engine.evaluate_metrics("agent-confirm", metrics_with_cpu(10.0), 1000);
+        engine.enter_maintenance("agent-confirm", "patching", 0, 2000);
+        engine.exit_maintenance("agent-confirm");
+
+        WHEN("three red readings arrive after maintenance")
+        {
+            engine.evaluate_metrics("agent-confirm", metrics_with_cpu(99.0), 3000);
+            engine.evaluate_metrics("agent-confirm", metrics_with_cpu(99.0), 4000);
+            const bool alerted_before_third = has_alert(store, "cpu", "red");
+            engine.evaluate_metrics("agent-confirm", metrics_with_cpu(99.0), 5000);
+
+            THEN("the alert is raised on the third reading, not the fourth")
+            {
+                REQUIRE_FALSE(alerted_before_third);
+                REQUIRE(has_alert(store, "cpu", "red"));
+            }
+        }
+    }
+}
+
+SCENARIO("A pause acknowledgement keeps the maintenance reason and expiry already set")
+{
+    GIVEN("an agent put into timed maintenance through the API")
+    {
+        SqliteStore store(":memory:");
+        insert_approved_agent(store, "agent-pause");
+        store.set_agent_maintenance("agent-pause", true, "kernel patch", 9000);
+        StatusEngine engine(store);
+
+        WHEN("the agent acknowledges the pause command")
+        {
+            engine.pause_agent("agent-pause", 2000);
+
+            THEN("the reason and expiry are preserved and the indicators are blue")
+            {
+                const auto agent = store.get_agent("agent-pause");
+                REQUIRE(agent->maintenance);
+                REQUIRE(agent->maintenance_reason == "kernel patch");
+                REQUIRE(agent->maintenance_until == 9000);
+                REQUIRE(store.latest_status_for_indicator("agent-pause", "cpu")->new_status == "blue");
+            }
+        }
+    }
+
+    GIVEN("an agent not in maintenance")
+    {
+        SqliteStore store(":memory:");
+        insert_approved_agent(store, "agent-pause2");
+        StatusEngine engine(store);
+
+        WHEN("the agent acknowledges a pause command")
+        {
+            engine.pause_agent("agent-pause2", 2000);
+
+            THEN("it enters open-ended maintenance with the reason command")
+            {
+                const auto agent = store.get_agent("agent-pause2");
+                REQUIRE(agent->maintenance);
+                REQUIRE(agent->maintenance_reason == "command");
+                REQUIRE(agent->maintenance_until == 0);
+            }
+        }
+    }
+}
+
+SCENARIO("Engine state of agents that no longer exist is dropped by the maintenance tick")
+{
+    GIVEN("an engine that evaluated two agents")
+    {
+        SqliteStore store(":memory:");
+        for (const auto* id : {"agent-keep", "agent-gone"})
+        {
+            insert_approved_agent(store, id);
+            auto agent = store.get_agent(id);
+            agent->collector_config.stale_after_seconds = 10;
+            store.set_agent_collector_config(id, agent->collector_config);
+        }
+        StatusEngine engine(store);
+        engine.evaluate_metrics("agent-keep", metrics_with_cpu(50.0), 1000);
+        engine.evaluate_metrics("agent-gone", metrics_with_cpu(50.0), 1000);
+        REQUIRE(engine.tracked_agent_count() == 2);
+
+        WHEN("one agent is deleted and the tick runs")
+        {
+            store.delete_agent("agent-gone");
+            engine.reconcile_maintenance(2000);
+
+            THEN("only the remaining agent is tracked")
+            {
+                REQUIRE(engine.tracked_agent_count() == 1);
+            }
+        }
+    }
+}
+
+SCENARIO("Expired timed maintenance inside an active window re-enters for the window at once")
+{
+    GIVEN("an agent in timed manual maintenance until t=3000 and a window from 2000 to 4000")
+    {
+        SqliteStore store(":memory:");
+        insert_approved_agent(store, "agent-overlap");
+        StatusEngine engine(store);
+        engine.enter_maintenance("agent-overlap", "by hand", 3000, 1000);
+        MaintenanceWindowRecord window;
+        window.agent_id = "*";
+        window.start_ms = 2000;
+        window.end_ms = 4000;
+        window.reason = "nightly";
+        store.create_maintenance_window(window);
+
+        WHEN("the tick runs when the timed maintenance expires")
+        {
+            engine.reconcile_maintenance(3000);
+
+            THEN("the agent is in scheduled maintenance without a gap")
+            {
+                const auto agent = store.get_agent("agent-overlap");
+                REQUIRE(agent->maintenance);
+                REQUIRE(agent->maintenance_reason == "mw:nightly");
             }
         }
     }
