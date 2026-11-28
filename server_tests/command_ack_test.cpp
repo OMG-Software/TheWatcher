@@ -1,6 +1,8 @@
 // apply_command_ack: which successful command ACKs change the stored agent.
-// Only DISCONNECT, PAUSE and RESUME confirm a state change; every other ACK
-// must leave the agent row (connection and maintenance) as it was.
+// Only DISCONNECT, PAUSE and RESUME confirm a state change; for every other
+// ACK, apply_command_ack must leave the agent row (connection and
+// maintenance) as it was. The frame handler's own "inbound traffic means
+// connected" update happens before it and is not under test here.
 #include "../server/alert_pipeline.hpp"
 #include "../server/command_ack.hpp"
 #include "../server/offline_alerts.hpp"
